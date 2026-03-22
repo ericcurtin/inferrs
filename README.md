@@ -1,7 +1,7 @@
 # inferrs
 
 A conservative-memory LLM inference engine written in Rust. Ships as a single
-binary that downloads a model from HuggingFace and exposes an OpenAI-compatible
+binary that downloads a model from Hugging Face and exposes an OpenAI-compatible
 API — without pre-allocating all of your GPU memory.
 
 ## Why inferrs?
@@ -60,7 +60,7 @@ llama.cpp is an excellent CPU inference tool. inferrs differs in:
 - **Block-based KV cache** with free-list reuse
 - **Chat templates** — ChatML and Llama formats
 - **Sampling** — temperature, top-k, top-p, repetition penalty
-- **HuggingFace Hub** — downloads models and tokenizers on first run
+- **Hugging Face Hub** — downloads models and tokenizers on first run
 - **Hardware backends** — CPU, CUDA (NVIDIA), Metal (Apple Silicon)
 - **Model architectures** — Qwen2, Llama, Mistral, and other standard
   decoder-only transformers (safetensors format)
@@ -86,7 +86,7 @@ cargo build --release --features metal
 ### Run
 
 ```bash
-# Serve a model (downloads automatically from HuggingFace Hub)
+# Serve a model (downloads automatically from Hugging Face Hub)
 inferrs serve Qwen/Qwen3.5-0.8B
 
 # Specify dtype and port
@@ -123,7 +123,7 @@ inferrs serve <MODEL> [OPTIONS]
 
 | Option | Default | Description |
 |---|---|---|
-| `--revision` | latest | Git branch or tag on HuggingFace Hub |
+| `--revision` | latest | Git branch or tag on Hugging Face Hub |
 | `--dtype` | `f32` | Weight data type: `f32`, `f16`, `bf16` |
 | `--max-seq-len` | `0` (model default) | Maximum sequence length |
 | `--device` | auto | `cpu`, `cuda`, or `metal` |
