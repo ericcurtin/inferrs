@@ -50,10 +50,7 @@ impl Engine {
         let start = Instant::now();
 
         // 1. Download model files
-        let loader = ModelLoader::new(
-            &config.model.model_id,
-            config.model.revision.as_deref(),
-        );
+        let loader = ModelLoader::new(&config.model.model_id, config.model.revision.as_deref());
         let files = loader.fetch()?;
 
         // 2. Load model config
@@ -84,7 +81,11 @@ impl Engine {
         // 4. Load model weights
         let device = config.model.candle_device()?;
         let dtype = config.model.candle_dtype();
-        tracing::info!("loading model weights (dtype={:?}, device={:?})", dtype, device);
+        tracing::info!(
+            "loading model weights (dtype={:?}, device={:?})",
+            dtype,
+            device
+        );
         let model = TransformerModel::load(&model_config, &files.weights, &device, dtype)?;
         tracing::info!("model loaded successfully");
 
@@ -160,7 +161,9 @@ impl Engine {
             }
         }
 
-        let id = self.scheduler.add_request(tokens, params, request.token_sender);
+        let id = self
+            .scheduler
+            .add_request(tokens, params, request.token_sender);
         Ok(id)
     }
 

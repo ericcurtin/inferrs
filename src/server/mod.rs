@@ -281,7 +281,13 @@ async fn completions(
     let prompt_tokens = state
         .tokenizer
         .encode(&req.prompt)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string(), "invalid_request_error"))?
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                e.to_string(),
+                "invalid_request_error",
+            )
+        })?
         .len();
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -291,10 +297,13 @@ async fn completions(
         token_sender: tx,
     };
 
-    state
-        .request_tx
-        .send(engine_req)
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "engine unavailable", "server_error"))?;
+    state.request_tx.send(engine_req).map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine unavailable",
+            "server_error",
+        )
+    })?;
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
@@ -302,20 +311,22 @@ async fn completions(
         let model_id = state.model_id.clone();
         let rid = request_id.clone();
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-            .map(move |output: GenerationOutput| -> Result<Event, Infallible> {
-                let data = serde_json::json!({
-                    "id": rid,
-                    "object": "text_completion",
-                    "created": unix_timestamp(),
-                    "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "text": output.text,
-                        "finish_reason": output.finish_reason,
-                    }]
-                });
-                Ok(Event::default().data(data.to_string()))
-            })
+            .map(
+                move |output: GenerationOutput| -> Result<Event, Infallible> {
+                    let data = serde_json::json!({
+                        "id": rid,
+                        "object": "text_completion",
+                        "created": unix_timestamp(),
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "text": output.text,
+                            "finish_reason": output.finish_reason,
+                        }]
+                    });
+                    Ok(Event::default().data(data.to_string()))
+                },
+            )
             .chain(tokio_stream::once(Ok::<Event, Infallible>(
                 Event::default().data("[DONE]"),
             )));
@@ -409,9 +420,15 @@ async fn chat_completions(
 
     // Format messages into a prompt using the tokenizer's chat template
     // if available, otherwise fall back to ChatML.
-    let prompt = state.tokenizer.apply_chat_template(&req.messages.iter().map(|m| {
-        (m.role.as_str(), m.content.as_str())
-    }).collect::<Vec<_>>()).unwrap_or_else(|_| format_chat_messages(&req.messages));
+    let prompt = state
+        .tokenizer
+        .apply_chat_template(
+            &req.messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| format_chat_messages(&req.messages));
 
     let mut params = state.default_sampling.clone();
     if let Some(t) = req.temperature {
@@ -444,7 +461,13 @@ async fn chat_completions(
     let prompt_tokens = state
         .tokenizer
         .encode(&prompt)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string(), "invalid_request_error"))?
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                e.to_string(),
+                "invalid_request_error",
+            )
+        })?
         .len();
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -454,10 +477,13 @@ async fn chat_completions(
         token_sender: tx,
     };
 
-    state
-        .request_tx
-        .send(engine_req)
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "engine unavailable", "server_error"))?;
+    state.request_tx.send(engine_req).map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine unavailable",
+            "server_error",
+        )
+    })?;
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
 
@@ -465,22 +491,24 @@ async fn chat_completions(
         let model_id = state.model_id.clone();
         let rid = request_id.clone();
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-            .map(move |output: GenerationOutput| -> Result<Event, Infallible> {
-                let data = serde_json::json!({
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": unix_timestamp(),
-                    "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "content": output.text,
-                        },
-                        "finish_reason": output.finish_reason,
-                    }]
-                });
-                Ok(Event::default().data(data.to_string()))
-            })
+            .map(
+                move |output: GenerationOutput| -> Result<Event, Infallible> {
+                    let data = serde_json::json!({
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": unix_timestamp(),
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": output.text,
+                            },
+                            "finish_reason": output.finish_reason,
+                        }]
+                    });
+                    Ok(Event::default().data(data.to_string()))
+                },
+            )
             .chain(tokio_stream::once(Ok::<Event, Infallible>(
                 Event::default().data("[DONE]"),
             )));
