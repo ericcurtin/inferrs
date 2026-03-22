@@ -51,7 +51,36 @@ fn default_rope_theta() -> f64 {
 impl ModelConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("reading config.json")?;
-        let mut config: Self = serde_json::from_str(&content).context("parsing config.json")?;
+
+        // Try parsing directly first (standard decoder-only models).
+        // If that fails, look for a nested `text_config` object (VLMs like
+        // Qwen3.5, LLaVA, etc. put the language model config there).
+        let mut config: Self = match serde_json::from_str::<Self>(&content) {
+            Ok(cfg) => cfg,
+            Err(_top_err) => {
+                let raw: serde_json::Value =
+                    serde_json::from_str(&content).context("parsing config.json as JSON")?;
+                if let Some(text_cfg) = raw.get("text_config") {
+                    // Merge top-level fields (like eos_token_id, tie_word_embeddings)
+                    // with text_config so nothing is lost.
+                    let mut merged = text_cfg.clone();
+                    if let (Some(merged_obj), Some(raw_obj)) =
+                        (merged.as_object_mut(), raw.as_object())
+                    {
+                        for (k, v) in raw_obj {
+                            if k != "text_config" && k != "vision_config" {
+                                merged_obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                    }
+                    serde_json::from_value(merged)
+                        .context("parsing text_config from config.json")?
+                } else {
+                    return Err(_top_err).context("parsing config.json");
+                }
+            }
+        };
+
         // If num_key_value_heads is 0 (not specified), default to num_attention_heads (MHA)
         if config.num_key_value_heads == 0 {
             config.num_key_value_heads = config.num_attention_heads;
