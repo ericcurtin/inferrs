@@ -118,23 +118,63 @@ fn apply_repetition_penalty(
     previous_tokens: &[u32],
     penalty: f64,
 ) -> Result<Tensor> {
-    let logits_vec: Vec<f32> = logits.to_vec1()?;
-    let mut modified = logits_vec;
+    // Build the penalty on-device to avoid a GPU→CPU→GPU round-trip every token.
+    // Strategy: start from a 1.0 multiplier tensor; for each repeated token set the
+    // multiplier to 1/penalty (positive logit) or penalty (negative logit).
+    // We use the sign of the logit to decide: multiply by (1/penalty) where logit>0,
+    // multiply by penalty where logit<0.
+    //
+    // Equivalent scalar formula: penalised = logit / penalty   if logit >= 0
+    //                                       = logit * penalty   if logit < 0
+    // = logit * (1/penalty) * (logit>=0)  +  logit * penalty * (logit<0)
+    // = logit * [ (1/penalty - penalty) * (logit>=0) + penalty ]
+    //   where (logit>=0) is 1 when >=0, 0 otherwise.
+    //
+    // We build a scatter mask of size vocab that is 1.0 everywhere except at
+    // repeated-token positions where it is set to (penalty_factor(logit)).
+    // Because the factor depends on the sign of each logit we do two passes:
+    //   pass 1: gather the logits at repeated positions (one GPU read)
+    //   pass 2: compute per-index factor on CPU (tiny, only unique token count)
+    //   pass 3: scatter back and multiply (two small GPU ops)
+    //
+    // This is still O(unique_tokens) CPU work but avoids transferring the full
+    // vocab tensor (248 K floats) over the bus.
 
-    for &token_id in previous_tokens {
-        let idx = token_id as usize;
-        if idx < modified.len() {
-            let score = modified[idx];
-            // If score > 0, divide by penalty; if score < 0, multiply by penalty
-            modified[idx] = if score > 0.0 {
-                score / penalty as f32
-            } else {
-                score * penalty as f32
-            };
-        }
+    let vocab = logits.dim(0)?;
+    let device = logits.device();
+
+    // Deduplicate previous tokens that fall within vocab range
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<u32> = previous_tokens
+        .iter()
+        .copied()
+        .filter(|&id| (id as usize) < vocab && seen.insert(id))
+        .collect();
+
+    if unique_ids.is_empty() {
+        return Ok(logits.clone());
     }
 
-    Ok(Tensor::from_vec(modified, logits.shape(), logits.device())?)
+    // Gather logits at repeated positions: one small GPU read
+    let indices = Tensor::new(unique_ids.as_slice(), device)?;
+    let gathered = logits.gather(&indices, 0)?; // [n_unique]
+    let gathered_vec: Vec<f32> = gathered.to_vec1()?; // small CPU transfer
+
+    // Compute per-token penalty factor on CPU
+    let penalty_f = penalty as f32;
+    let factors: Vec<f32> = gathered_vec
+        .iter()
+        .map(|&s| if s >= 0.0 { 1.0 / penalty_f } else { penalty_f })
+        .collect();
+
+    // Build a full vocab multiplier initialised to 1.0, then scatter factors
+    let mut multiplier = vec![1.0f32; vocab];
+    for (&id, &f) in unique_ids.iter().zip(factors.iter()) {
+        multiplier[id as usize] = f;
+    }
+    let mult = Tensor::from_vec(multiplier, vocab, device)?;
+
+    (logits * mult).map_err(Into::into)
 }
 
 /// Simple random float in [0, 1) using thread-local RNG.

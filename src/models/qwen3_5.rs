@@ -675,11 +675,18 @@ impl LinearAttn {
 }
 
 /// Softplus activation: log(1 + exp(x))
+/// Numerically stable: for x > 0 use x + log(1 + exp(-x)) to avoid overflow.
 fn softplus(x: &Tensor) -> Result<Tensor> {
     // softplus(x) = log(1 + exp(x))
-    // numerically stable: log(1 + exp(x)) = x + log(1 + exp(-x)) for x > 0
+    //             = x + log(1 + exp(-x))   [stable for x > 0]
+    // Use: max(x, 0) + log(1 + exp(-|x|))
+    let abs_x = x.abs()?;
+    let neg_abs = abs_x.neg()?;
     let ones = x.ones_like()?;
-    (ones + x.exp()?)?.log().map_err(Into::into)
+    let log_term = (ones + neg_abs.exp()?)?.log()?;
+    // max(x, 0) = (x + |x|) / 2
+    let pos_part = ((x + &abs_x)? / 2.0)?;
+    (pos_part + log_term).map_err(Into::into)
 }
 
 /// Manual RMSNorm over the last dimension.
@@ -853,8 +860,9 @@ impl Qwen35Model {
 
         // Tied embedding: matmul with embed_tokens weight [vocab, hidden]
         // last is [b, 1, hidden]; flatten to [b, hidden] for 2D matmul then restore
-        let last_2d = last.squeeze(1)?; // [b, hidden]
-        let logits = last_2d.matmul(&self.lm_head_weight.t()?)?; // [b, vocab]
+        // Both operands must be contiguous for Metal matmul.
+        let last_2d = last.squeeze(1)?.contiguous()?; // [b, hidden]
+        let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
         let logits = logits.unsqueeze(1)?; // [b, 1, vocab]
         Ok(logits)
     }
