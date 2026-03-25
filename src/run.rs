@@ -12,10 +12,6 @@ use crossterm::{
 };
 use std::io::{self, Write};
 use std::sync::mpsc as stdmpsc;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 
 use candle_core::DType;
 
@@ -455,50 +451,14 @@ fn stream_response_collect(
         token_tx,
     })?;
 
-    // Track whether we were interrupted by Ctrl+C
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_clone = interrupted.clone();
-
-    // Spawn a small thread that watches for Ctrl+C and signals the flag.
-    // We do NOT actually cancel the engine here (there is no cancellation API),
-    // but we stop printing and return early so the REPL stays responsive.
-    std::thread::spawn(move || {
-        terminal::enable_raw_mode().ok();
-        loop {
-            if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers,
-                    ..
-                })) = event::read()
-                {
-                    if modifiers.contains(KeyModifiers::CONTROL) {
-                        interrupted_clone.store(true, Ordering::SeqCst);
-                        terminal::disable_raw_mode().ok();
-                        return;
-                    }
-                }
-            }
-            if interrupted_clone.load(Ordering::SeqCst) {
-                terminal::disable_raw_mode().ok();
-                return;
-            }
-        }
-    });
-
     let mut full_text = String::new();
     let mut stdout = io::stdout();
 
-    // Drain tokens until the channel closes or we get a finish reason
+    // Drain tokens until the channel closes or we get a finish reason.
+    // Raw mode must NOT be active while printing: it suppresses the implicit
+    // carriage-return on '\n', causing a staircase layout.  We stay in
+    // cooked mode throughout and simply print each token as it arrives.
     loop {
-        // Non-blocking check: has user interrupted?
-        if interrupted.load(Ordering::SeqCst) {
-            println!("\n[interrupted]");
-            // Drain remaining tokens silently so the engine thread finishes
-            while token_rx.recv().is_ok() {}
-            return Ok(full_text);
-        }
-
         match token_rx.recv() {
             Err(_) => break, // channel closed — engine done
             Ok(tok) => {
@@ -512,7 +472,6 @@ fn stream_response_collect(
         }
     }
 
-    interrupted.store(true, Ordering::SeqCst); // signal Ctrl+C watcher to stop
     Ok(full_text)
 }
 
