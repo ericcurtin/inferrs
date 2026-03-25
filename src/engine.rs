@@ -151,7 +151,7 @@ impl Engine {
         let logits = self.model.forward(&input_ids, 0)?;
 
         // Sample first token
-        let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+        let mut token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
         all_tokens.push(token_id);
 
@@ -164,7 +164,7 @@ impl Engine {
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
             let logits = self.model.forward(&input_ids, seqlen_offset)?;
 
-            let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+            token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
             all_tokens.push(token_id);
 
