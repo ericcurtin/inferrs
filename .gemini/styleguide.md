@@ -48,9 +48,20 @@ When building engineering plans from requirements:
 3. Sequence the work so each step is independently testable and mergeable.
 4. Call out risks, unknowns, and decisions that need stakeholder input.
 
+## Scoring rubric
+
+Assign a score 1–10 to every review. Use this rubric:
+
+- 1–3: Not ready (major issues, missing tests, breaks API)
+- 4–6: Needs work (minor issues, incomplete)
+- 7–8: Nearly ready (small nits only)
+- 9–10: Ready to merge
+
 ## Output format
 
-Structure your review clearly:
+Every review **must** end with a score line. A review without a score line is incomplete and must not be output.
+
+Use this exact structure — do not omit the score line:
 
 ```
 ## Review: <title>
@@ -73,21 +84,11 @@ Structure your review clearly:
 
 Omit empty sections. Keep it concise — density over length.
 
-## Scoring
-
-Every review response is incomplete without a score. A response that omits the score line is a malformed response.
-
-Scoring rubric:
-- 1–3: Not ready (major issues, missing tests, breaks API)
-- 4–6: Needs work (minor issues, incomplete)
-- 7–8: Nearly ready (small nits)
-- 9–10: Ready to merge
-
-After all other content, output the score as the absolute last line. Do not add any text, explanation, or blank lines after it. The score line must be plain text (not inside a code block) and must follow this exact format, replacing N with a digit 1–10:
+The **final line** of every response must be the score. No text, explanation, or blank lines after it. Plain text, not inside a code block. Format:
 
 SCORE: N/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
 
-Concrete examples of valid score lines:
+Valid examples:
 SCORE: 7/10 | VERDICT: Nearly ready | ISSUES: missing error handling in auth path, unclear variable name in parser
 SCORE: 9/10 | VERDICT: Ready to merge | ISSUES: None
 SCORE: 3/10 | VERDICT: Not ready | ISSUES: broken auth check, no input validation, missing tests
