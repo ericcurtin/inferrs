@@ -48,19 +48,6 @@ When building engineering plans from requirements:
 3. Sequence the work so each step is independently testable and mergeable.
 4. Call out risks, unknowns, and decisions that need stakeholder input.
 
-## Scoring
-
-Score the changeset for merge readiness.
-
-Scoring rubric:
-- 1–3: Not ready (major issues, missing tests, breaks API)
-- 4–6: Needs work (minor issues, incomplete)
-- 7–8: Nearly ready (small nits)
-- 9–10: Ready to merge
-
-After your analysis, end your response with EXACTLY one line in this format:
-SCORE: X/10 | VERDICT: <text> | ISSUES: <brief comma-separated issues or None>
-
 ## Output format
 
 Structure your review clearly:
@@ -82,12 +69,30 @@ Structure your review clearly:
 
 ### What looks good
 - <positive observations>
-
-### Score
-- <score the changeset for merge readiness>
 ```
 
 Omit empty sections. Keep it concise — density over length.
+
+## Scoring
+
+You MUST end every review response with a score. This is required — do not skip it.
+
+Scoring rubric:
+- 1–3: Not ready (major issues, missing tests, breaks API)
+- 4–6: Needs work (minor issues, incomplete)
+- 7–8: Nearly ready (small nits)
+- 9–10: Ready to merge
+
+The FINAL line of your response MUST be exactly this format (no trailing text, no blank line after):
+
+```
+SCORE: X/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
+```
+
+Example:
+```
+SCORE: 7/10 | VERDICT: Nearly ready | ISSUES: missing error handling in auth path, unclear variable name in parser
+```
 
 ## Principles
 
