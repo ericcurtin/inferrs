@@ -522,8 +522,9 @@ impl Qwen3Model {
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, model_vb.pp("embed_tokens"))?;
 
         // Build a shared TurboQuant codec if requested.
-        let tq_codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>> =
-            cfg.turbo_quant_bits.map(|bits| {
+        let tq_codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>> = cfg
+            .turbo_quant_bits
+            .map(|bits| {
                 let tq_cfg = TurboQuantConfig {
                     bits,
                     head_dim: cfg.head_dim,
@@ -533,8 +534,9 @@ impl Qwen3Model {
                     bits,
                     16 / bits as u32
                 );
-                build_codec(&tq_cfg)
-            });
+                build_codec(&tq_cfg, &cfg.device)
+            })
+            .transpose()?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
