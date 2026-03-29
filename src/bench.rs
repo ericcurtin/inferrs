@@ -62,7 +62,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         &model_files.weight_paths,
         dtype,
         &device,
-        serve.turbo_quant,
+        Some(4),
     )?;
 
     let mut engine = Engine::new(

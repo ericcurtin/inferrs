@@ -107,11 +107,6 @@ pub struct ServeArgs {
     #[arg(long)]
     pub paged_attention: Option<f64>,
 
-    /// Enable TurboQuant KV cache compression.
-    /// Use as a flag (`--turbo-quant`) for the default 4-bit compression, or with an explicit
-    /// bit-width (`--turbo-quant=2`) for 1–8 bits.  Reduces KV cache memory by (dtype_bits/bits)×.
-    #[arg(long, num_args(0..=1), default_missing_value("4"), require_equals(true))]
-    pub turbo_quant: Option<u8>,
 }
 
 impl ServeArgs {

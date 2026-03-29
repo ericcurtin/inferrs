@@ -172,7 +172,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         &model_files.weight_paths,
         dtype,
         &device,
-        args.turbo_quant,
+        Some(4),
     )?;
 
     // Effective sequence-length cap for this model.
