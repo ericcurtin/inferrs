@@ -1,13 +1,33 @@
 //! Inference engine: owns the model and runs the inference loop.
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::kv_cache::{BlockPool, BlockTable, PagedKvStore};
+use crate::config::{ModelArchitecture, RawConfig};
+use crate::kv_cache::{BlockPool, BlockTable, PagedCacheConfig, PagedKvStore};
 use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
+
+/// Abstraction over the two streaming channel flavours:
+/// - `tokio::sync::mpsc::Sender` (used by the HTTP server)
+/// - `std::sync::mpsc::SyncSender` (used by `inferrs run` on a plain OS thread)
+trait TokenSender: Send {
+    fn send_token(&self, token: StreamToken) -> bool;
+}
+
+impl TokenSender for mpsc::Sender<StreamToken> {
+    fn send_token(&self, token: StreamToken) -> bool {
+        self.blocking_send(token).is_ok()
+    }
+}
+
+impl TokenSender for std::sync::mpsc::SyncSender<StreamToken> {
+    fn send_token(&self, token: StreamToken) -> bool {
+        self.send(token).is_ok()
+    }
+}
 
 /// Request to the engine (async/tokio version, used by the HTTP server).
 pub enum EngineRequest {
@@ -56,6 +76,71 @@ pub struct GenerationResult {
     pub finish_reason: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+}
+
+/// Attach a paged KV store to `engine` if `--paged-attention` was requested.
+///
+/// This consolidates the identical paged-KV setup block that previously appeared
+/// in `server.rs`, `bench.rs`, and `run.rs`.
+pub fn attach_paged_kv_if_requested(
+    engine: Engine,
+    memory_fraction: Option<f64>,
+    block_size: usize,
+    dtype: DType,
+    device: &Device,
+    raw_config: &RawConfig,
+    arch: &ModelArchitecture,
+) -> Result<Engine> {
+    let Some(memory_fraction) = memory_fraction else {
+        return Ok(engine);
+    };
+
+    let bytes_per_element = match dtype {
+        DType::F32 => 4,
+        _ => 2, // f16 / bf16
+    };
+
+    // Estimate available device memory.  Candle does not expose a device
+    // memory query API, so we use a conservative platform heuristic:
+    //   CUDA / Metal  → 8 GiB
+    //   CPU           → 4 GiB
+    // The user-supplied fraction then scales this down to the actual
+    // allocation, e.g. 0.6 × 8 GiB = 4.8 GiB for KV blocks.
+    let total_memory_bytes: usize = match device {
+        Device::Cuda(_) | Device::Metal(_) => 8 * 1024 * 1024 * 1024,
+        _ => 4 * 1024 * 1024 * 1024,
+    };
+
+    let (num_kv_heads, head_dim, num_kv_layers) = raw_config.kv_cache_params(arch);
+
+    tracing::info!(
+        "Paged attention: fraction={:.2}, {} KV heads, head_dim={}, {} KV layers",
+        memory_fraction,
+        num_kv_heads,
+        head_dim,
+        num_kv_layers,
+    );
+
+    let paged_cfg = PagedCacheConfig::from_memory_fraction(
+        total_memory_bytes,
+        memory_fraction,
+        block_size,
+        num_kv_heads,
+        head_dim,
+        num_kv_layers,
+        bytes_per_element,
+    );
+
+    tracing::info!(
+        "Paged KV store: {} blocks × {} tokens/block = {} total slots",
+        paged_cfg.num_blocks,
+        paged_cfg.block_size,
+        paged_cfg.num_blocks * paged_cfg.block_size,
+    );
+
+    let block_pool = BlockPool::new(paged_cfg.num_blocks, paged_cfg.block_size);
+    let kv_store = PagedKvStore::new(paged_cfg, dtype, device)?;
+    Ok(engine.with_paged_kv(block_pool, kv_store))
 }
 
 /// The engine runs on a dedicated thread and processes requests sequentially.
@@ -321,6 +406,31 @@ impl Engine {
         sampling_params: &SamplingParams,
         token_tx: &mpsc::Sender<StreamToken>,
     ) -> Result<()> {
+        self.generate_stream_inner(request_id, prompt_tokens, sampling_params, token_tx)
+    }
+
+    /// Streaming generation using stdlib `SyncSender` — delegates to the
+    /// shared `generate_stream_inner` implementation.
+    fn generate_stream_sync(
+        &mut self,
+        request_id: &str,
+        prompt_tokens: &[u32],
+        sampling_params: &SamplingParams,
+        token_tx: &std::sync::mpsc::SyncSender<StreamToken>,
+    ) -> Result<()> {
+        self.generate_stream_inner(request_id, prompt_tokens, sampling_params, token_tx)
+    }
+
+    /// Shared streaming implementation.  Works with any channel that implements
+    /// `TokenSender`: both `tokio::sync::mpsc::Sender` (HTTP server) and
+    /// `std::sync::mpsc::SyncSender` (`inferrs run`).
+    fn generate_stream_inner(
+        &mut self,
+        request_id: &str,
+        prompt_tokens: &[u32],
+        sampling_params: &SamplingParams,
+        token_tx: &impl TokenSender,
+    ) -> Result<()> {
         tracing::debug!(
             "Streaming generation for request {} ({} prompt tokens)",
             request_id,
@@ -348,14 +458,11 @@ impl Engine {
         let text = self.tokenizer.decode(&[token_id], true)?;
         let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-        if token_tx
-            .blocking_send(StreamToken {
-                token_id,
-                text,
-                finish_reason: finish_reason.clone(),
-            })
-            .is_err()
-            || finish_reason.is_some()
+        if !token_tx.send_token(StreamToken {
+            token_id,
+            text,
+            finish_reason: finish_reason.clone(),
+        }) || finish_reason.is_some()
         {
             if let Some(ps) = &mut self.paged {
                 ps.block_table.free_all(&mut ps.block_pool);
@@ -388,111 +495,11 @@ impl Engine {
             let text = self.tokenizer.decode(&[token_id], true)?;
             let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-            if token_tx
-                .blocking_send(StreamToken {
-                    token_id,
-                    text,
-                    finish_reason: finish_reason.clone(),
-                })
-                .is_err()
-                || finish_reason.is_some()
-            {
-                break;
-            }
-        }
-
-        if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-        }
-
-        Ok(())
-    }
-
-    /// Streaming generation using stdlib `SyncSender` — identical logic to
-    /// `generate_stream` but sends tokens via `std::sync::mpsc` instead of
-    /// `tokio::sync::mpsc`, so it can be called from a plain OS thread.
-    fn generate_stream_sync(
-        &mut self,
-        request_id: &str,
-        prompt_tokens: &[u32],
-        sampling_params: &SamplingParams,
-        token_tx: &std::sync::mpsc::SyncSender<StreamToken>,
-    ) -> Result<()> {
-        tracing::debug!(
-            "Streaming generation (sync) for request {} ({} prompt tokens)",
-            request_id,
-            prompt_tokens.len()
-        );
-
-        let mut output_tokens: Vec<u32> = Vec::new();
-        let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
-
-        // Prefill
-        let logits = if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-            self.model.clear_kv_cache();
-            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
-        } else {
-            self.model.clear_kv_cache();
-            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-            self.model.forward(&input_ids, 0)?
-        };
-
-        let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
-        output_tokens.push(token_id);
-        all_tokens.push(token_id);
-
-        let text = self.tokenizer.decode(&[token_id], true)?;
-        let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
-
-        if token_tx
-            .send(StreamToken {
+            if !token_tx.send_token(StreamToken {
                 token_id,
                 text,
                 finish_reason: finish_reason.clone(),
-            })
-            .is_err()
-            || finish_reason.is_some()
-        {
-            if let Some(ps) = &mut self.paged {
-                ps.block_table.free_all(&mut ps.block_pool);
-            }
-            return Ok(());
-        }
-
-        // Decode loop
-        loop {
-            let last_token = *output_tokens.last().unwrap();
-            let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-
-            let logits = if let Some(ps) = &mut self.paged {
-                Self::paged_decode_step(
-                    &mut self.model,
-                    &self.device,
-                    last_token,
-                    seqlen_offset,
-                    ps,
-                )?
-            } else {
-                let input_ids = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
-                self.model.forward(&input_ids, seqlen_offset)?
-            };
-
-            let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
-            output_tokens.push(token_id);
-            all_tokens.push(token_id);
-
-            let text = self.tokenizer.decode(&[token_id], true)?;
-            let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
-
-            if token_tx
-                .send(StreamToken {
-                    token_id,
-                    text,
-                    finish_reason: finish_reason.clone(),
-                })
-                .is_err()
-                || finish_reason.is_some()
+            }) || finish_reason.is_some()
             {
                 break;
             }

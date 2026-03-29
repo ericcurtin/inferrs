@@ -11,11 +11,9 @@
 //!   - End-to-end latency           — total wall-time for the request
 
 use anyhow::Result;
-use candle_core::DType;
 
 use crate::config::RawConfig;
-use crate::engine::Engine;
-use crate::kv_cache::{BlockPool, PagedCacheConfig, PagedKvStore};
+use crate::engine::{attach_paged_kv_if_requested, Engine};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
 use crate::ServeArgs;
@@ -77,34 +75,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
     );
 
     // Wire up paged attention if requested (same logic as `serve`)
-    if let Some(memory_fraction) = serve.paged_attention {
-        let bytes_per_element = match dtype {
-            DType::F32 => 4,
-            _ => 2,
-        };
-        let total_memory_bytes: usize = match &device {
-            candle_core::Device::Cuda(_) | candle_core::Device::Metal(_) => 8 * 1024 * 1024 * 1024,
-            _ => 4 * 1024 * 1024 * 1024,
-        };
-        let (num_kv_heads, head_dim, num_kv_layers) = raw_config.kv_cache_params(&arch);
-        let paged_cfg = PagedCacheConfig::from_memory_fraction(
-            total_memory_bytes,
-            memory_fraction,
-            serve.block_size,
-            num_kv_heads,
-            head_dim,
-            num_kv_layers,
-            bytes_per_element,
-        );
-        tracing::info!(
-            "Paged KV store: {} blocks × {} tokens/block",
-            paged_cfg.num_blocks,
-            paged_cfg.block_size,
-        );
-        let block_pool = BlockPool::new(paged_cfg.num_blocks, paged_cfg.block_size);
-        let kv_store = PagedKvStore::new(paged_cfg, dtype, &device)?;
-        engine = engine.with_paged_kv(block_pool, kv_store);
-    }
+    engine = attach_paged_kv_if_requested(
+        engine,
+        serve.paged_attention,
+        serve.block_size,
+        dtype,
+        &device,
+        &raw_config,
+        &arch,
+    )?;
 
     // Build a synthetic prompt of the requested length.
     // Use the tokenizer's BOS token id if available, otherwise token id 1.

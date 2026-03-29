@@ -3,6 +3,7 @@
 //! We use candle-transformers' model implementations directly, wrapping them
 //! with a unified trait for the engine to use.
 
+pub mod attention_utils;
 pub mod qwen3;
 pub mod qwen3_5;
 

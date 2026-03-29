@@ -19,8 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
 use crate::config::RawConfig;
-use crate::engine::{EngineRequest, GenerationResult, StreamToken};
-use crate::kv_cache::{BlockPool, PagedCacheConfig, PagedKvStore};
+use crate::engine::{attach_paged_kv_if_requested, EngineRequest, GenerationResult, StreamToken};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Tokenizer};
 use crate::ServeArgs;
@@ -132,6 +131,20 @@ pub struct ErrorDetail {
     pub r#type: String,
 }
 
+// ─── Error helpers ──────────────────────────────────────────────────────────
+
+fn server_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message: message.into(),
+                r#type: "server_error".to_string(),
+            },
+        }),
+    )
+}
+
 // ─── Server state ───────────────────────────────────────────────────────────
 
 struct AppState {
@@ -207,55 +220,15 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         args.max_tokens_per_step,
     );
 
-    // If --paged-attention <fraction> was given, set up the paged KV store.
-    if let Some(memory_fraction) = args.paged_attention {
-        let bytes_per_element = match dtype {
-            candle_core::DType::F32 => 4,
-            _ => 2, // f16 / bf16
-        };
-
-        // Estimate available device memory.  Candle does not expose a device
-        // memory query API, so we use a conservative platform heuristic:
-        //   CUDA / Metal  → 8 GiB
-        //   CPU           → 4 GiB
-        // The user-supplied fraction then scales this down to the actual
-        // allocation, e.g. 0.6 × 8 GiB = 4.8 GiB for KV blocks.
-        let total_memory_bytes: usize = match &device {
-            candle_core::Device::Cuda(_) | candle_core::Device::Metal(_) => 8 * 1024 * 1024 * 1024,
-            _ => 4 * 1024 * 1024 * 1024,
-        };
-
-        let (num_kv_heads, head_dim, num_kv_layers) = raw_config.kv_cache_params(&arch);
-
-        tracing::info!(
-            "Paged attention: fraction={:.2}, {} KV heads, head_dim={}, {} KV layers",
-            memory_fraction,
-            num_kv_heads,
-            head_dim,
-            num_kv_layers,
-        );
-
-        let paged_cfg = PagedCacheConfig::from_memory_fraction(
-            total_memory_bytes,
-            memory_fraction,
-            args.block_size,
-            num_kv_heads,
-            head_dim,
-            num_kv_layers,
-            bytes_per_element,
-        );
-
-        tracing::info!(
-            "Paged KV store: {} blocks × {} tokens/block = {} total slots",
-            paged_cfg.num_blocks,
-            paged_cfg.block_size,
-            paged_cfg.num_blocks * paged_cfg.block_size,
-        );
-
-        let block_pool = BlockPool::new(paged_cfg.num_blocks, paged_cfg.block_size);
-        let kv_store = PagedKvStore::new(paged_cfg, dtype, &device)?;
-        engine = engine.with_paged_kv(block_pool, kv_store);
-    }
+    engine = attach_paged_kv_if_requested(
+        engine,
+        args.paged_attention,
+        args.block_size,
+        dtype,
+        &device,
+        &raw_config,
+        &arch,
+    )?;
 
     std::thread::Builder::new()
         .name("engine".to_string())
@@ -358,15 +331,7 @@ async fn chat_completions(
         };
 
         if state.engine_tx.send(engine_req).await.is_err() {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: "Engine unavailable".to_string(),
-                        r#type: "server_error".to_string(),
-                    },
-                }),
-            ));
+            return Err(server_error("Engine unavailable"));
         }
 
         let stream = make_sse_stream(token_rx, request_id, model_id, created);
@@ -383,15 +348,7 @@ async fn chat_completions(
         };
 
         if state.engine_tx.send(engine_req).await.is_err() {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: "Engine unavailable".to_string(),
-                        r#type: "server_error".to_string(),
-                    },
-                }),
-            ));
+            return Err(server_error("Engine unavailable"));
         }
 
         match response_rx.await {
@@ -417,15 +374,7 @@ async fn chat_completions(
                 };
                 Ok(Json(response).into_response())
             }
-            Err(_) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: "Engine dropped the request".to_string(),
-                        r#type: "server_error".to_string(),
-                    },
-                }),
-            )),
+            Err(_) => Err(server_error("Engine dropped the request")),
         }
     }
 }
@@ -570,15 +519,7 @@ async fn completions(
     };
 
     if state.engine_tx.send(engine_req).await.is_err() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "Engine unavailable".to_string(),
-                    r#type: "server_error".to_string(),
-                },
-            }),
-        ));
+        return Err(server_error("Engine unavailable"));
     }
 
     match response_rx.await {
@@ -601,15 +542,7 @@ async fn completions(
             };
             Ok(Json(response))
         }
-        Err(_) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "Engine dropped the request".to_string(),
-                    r#type: "server_error".to_string(),
-                },
-            }),
-        )),
+        Err(_) => Err(server_error("Engine dropped the request")),
     }
 }
 
