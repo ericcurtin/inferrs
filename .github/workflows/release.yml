@@ -67,13 +67,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cuda-toolkit-12-6
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          # No GPU on CI runners; set a broadly-compatible compute capability
+          # so bindgen_cuda skips the nvidia-smi probe and nvcc validation.
+          echo "CUDA_COMPUTE_CAP=80" >> "$GITHUB_ENV"
 
       - name: Build CUDA backend plugin
-        env:
-          CUDA_PATH: /usr/local/cuda
-          # No GPU on CI runners; set a broadly-compatible compute capability
-          # so bindgen_cuda skips the nvidia-smi probe.
-          CUDA_COMPUTE_CAP: "80"
         run: |
           cargo build --release --target x86_64-unknown-linux-gnu \
             -p inferrs-backend-cuda
