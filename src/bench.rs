@@ -12,7 +12,6 @@
 
 use anyhow::Result;
 
-use crate::config::RawConfig;
 use crate::engine::{attach_paged_kv_if_requested, Engine};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
@@ -43,32 +42,31 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let device = serve.resolve_device()?;
     let dtype = serve.resolve_dtype()?;
 
-    // Download / load model (same path as `serve`)
-    let model_files = crate::hub::download_model(&serve.model, &serve.revision)?;
-    let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
-    tracing::info!("Detected architecture: {:?}", arch);
-
-    let tokenizer = Tokenizer::from_file(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-    )?;
-
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
+    let loaded = crate::loader::load(
+        &serve.model,
+        &serve.revision,
         dtype,
         &device,
         serve.turbo_quant,
     )?;
+    let crate::loader::LoadedModel {
+        model_files,
+        raw_config,
+        arch,
+        tokenizer,
+        model,
+        max_seq_len,
+    } = loaded;
 
+    // The engine needs its own tokenizer instance for decoding.
+    let engine_tokenizer = Tokenizer::from_file_with_arch(
+        &model_files.tokenizer_path,
+        model_files.tokenizer_config_path.as_deref(),
+        Some(&arch),
+    )?;
     let mut engine = Engine::new(
         model,
-        Tokenizer::from_file(
-            &model_files.tokenizer_path,
-            model_files.tokenizer_config_path.as_deref(),
-        )?,
+        engine_tokenizer,
         device.clone(),
         serve.max_batch_size,
         serve.max_tokens_per_step,
@@ -93,7 +91,6 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // Clamp max_tokens to the model's effective KV-cache capacity so that
     // models with a sliding-window limit (e.g. Gemma3 at 512 tokens) don't
     // crash mid-generation with an opaque tensor error.
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
     let max_tokens = {
         let available = if max_seq_len == usize::MAX {
             serve.max_tokens

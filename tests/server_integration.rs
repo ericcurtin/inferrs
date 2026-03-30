@@ -38,23 +38,28 @@ fn free_port() -> u16 {
 /// `--device auto` is passed, which picks Metal on macOS (always compiled in
 /// via the `[target.cfg(macos)]` dependency block in `Cargo.toml`), CUDA on
 /// Linux/Windows when available, and falls back to CPU otherwise.
-fn spawn_server(model_id: &str, port: u16) -> Child {
+///
+/// Pass extra CLI arguments via `extra_args` (e.g. `&["--turbo-quant=4"]`).
+fn spawn_server(model_id: &str, port: u16, extra_args: &[&str]) -> Child {
     let bin = env!("CARGO_BIN_EXE_inferrs");
+    let port_str = port.to_string();
+    let mut args = vec![
+        "serve",
+        model_id,
+        "--port",
+        &port_str,
+        "--host",
+        "127.0.0.1",
+        "--max-tokens",
+        "128",
+        "--dtype",
+        "bf16",
+        "--device",
+        "auto",
+    ];
+    args.extend_from_slice(extra_args);
     Command::new(bin)
-        .args([
-            "serve",
-            model_id,
-            "--port",
-            &port.to_string(),
-            "--host",
-            "127.0.0.1",
-            "--max-tokens",
-            "128",
-            "--dtype",
-            "bf16",
-            "--device",
-            "auto",
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -93,28 +98,8 @@ fn looks_intelligible(text: &str) -> bool {
 /// instead of the default full-precision cache.  Uses `require_equals` syntax
 /// as defined in the CLI (`--turbo-quant=4` for 4-bit).
 fn spawn_server_turbo(model_id: &str, port: u16, bits: u8) -> Child {
-    let bin = env!("CARGO_BIN_EXE_inferrs");
     let turbo_flag = format!("--turbo-quant={}", bits);
-    Command::new(bin)
-        .args([
-            "serve",
-            model_id,
-            "--port",
-            &port.to_string(),
-            "--host",
-            "127.0.0.1",
-            "--max-tokens",
-            "128",
-            "--dtype",
-            "bf16",
-            "--device",
-            "auto",
-            &turbo_flag,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("failed to spawn inferrs with TurboQuant")
+    spawn_server(model_id, port, &[turbo_flag.as_str()])
 }
 
 /// Send a single chat-completion request and return the assistant's text.

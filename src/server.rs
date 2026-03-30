@@ -18,7 +18,6 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
-use crate::config::RawConfig;
 use crate::engine::{attach_paged_kv_if_requested, EngineRequest, GenerationResult, StreamToken};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Tokenizer};
@@ -190,37 +189,27 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let device = args.resolve_device()?;
     let dtype = args.resolve_dtype()?;
 
-    // Download model
-    let model_files = crate::hub::download_model(&args.model, &args.revision)?;
-
-    // Load config
-    let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
-    tracing::info!("Detected architecture: {:?}", arch);
-
-    // Load tokenizer
-    let tokenizer = Tokenizer::from_file_with_arch(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-        Some(&arch),
-    )?;
-    let tokenizer = Arc::new(tokenizer);
-
-    // Load model
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
+    let loaded = crate::loader::load(
+        &args.model,
+        &args.revision,
         dtype,
         &device,
         args.turbo_quant,
     )?;
+    let crate::loader::LoadedModel {
+        model_files,
+        raw_config,
+        arch,
+        tokenizer,
+        model,
+        max_seq_len,
+    } = loaded;
 
-    // Effective sequence-length cap for this model.
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
     if max_seq_len < usize::MAX {
         tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
     }
+
+    let tokenizer = Arc::new(tokenizer);
 
     // Default sampling params from CLI args
     let default_params = SamplingParams {
@@ -234,15 +223,15 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // Create engine channel
     let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
 
-    // Spawn engine on a dedicated thread
+    // Spawn engine on a dedicated thread (needs its own tokenizer instance for decoding)
+    let engine_tokenizer = Tokenizer::from_file_with_arch(
+        &model_files.tokenizer_path,
+        model_files.tokenizer_config_path.as_deref(),
+        Some(&arch),
+    )?;
     let mut engine = crate::engine::Engine::new(
         model,
-        // The engine needs its own tokenizer for decoding
-        Tokenizer::from_file_with_arch(
-            &model_files.tokenizer_path,
-            model_files.tokenizer_config_path.as_deref(),
-            Some(&arch),
-        )?,
+        engine_tokenizer,
         device.clone(),
         args.max_batch_size,
         args.max_tokens_per_step,
@@ -409,15 +398,67 @@ async fn chat_completions(
     }
 }
 
-fn make_sse_stream(
+/// Build an SSE stream from a token channel.
+///
+/// `make_chunk` is called for each incoming [`StreamToken`] and returns the
+/// JSON string to send.  An optional `preamble_json` is emitted before the
+/// first token (used by chat completions to send the initial role chunk).
+fn make_sse_stream_inner(
     mut token_rx: mpsc::Receiver<StreamToken>,
+    preamble_json: Option<String>,
+    make_chunk: impl Fn(StreamToken) -> Option<String> + Send + 'static,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        if let Some(json) = preamble_json {
+            yield Ok(Event::default().data(json));
+        }
+
+        while let Some(token) = token_rx.recv().await {
+            if let Some(json) = make_chunk(token) {
+                yield Ok(Event::default().data(json));
+            }
+        }
+
+        yield Ok(Event::default().data("[DONE]"));
+    }
+}
+
+fn make_sse_stream(
+    token_rx: mpsc::Receiver<StreamToken>,
     request_id: String,
     model_id: String,
     created: u64,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    async_stream::stream! {
-        // First chunk: role
-        let first_chunk = ChatCompletionStreamResponse {
+    // Initial role chunk
+    let preamble = ChatCompletionStreamResponse {
+        id: request_id.clone(),
+        object: "chat.completion.chunk",
+        created,
+        model: model_id.clone(),
+        choices: vec![ChatCompletionStreamChoice {
+            index: 0,
+            delta: DeltaMessage {
+                role: Some("assistant".to_string()),
+                content: None,
+            },
+            finish_reason: None,
+        }],
+    };
+    let preamble_json = match serde_json::to_string(&preamble) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            tracing::error!("Failed to serialize chat stream role chunk: {e}");
+            None
+        }
+    };
+
+    make_sse_stream_inner(token_rx, preamble_json, move |token| {
+        let content = if token.finish_reason.as_deref() == Some("stop") {
+            None
+        } else {
+            Some(token.text)
+        };
+        let chunk = ChatCompletionStreamResponse {
             id: request_id.clone(),
             object: "chat.completion.chunk",
             created,
@@ -425,55 +466,20 @@ fn make_sse_stream(
             choices: vec![ChatCompletionStreamChoice {
                 index: 0,
                 delta: DeltaMessage {
-                    role: Some("assistant".to_string()),
-                    content: None,
+                    role: None,
+                    content,
                 },
-                finish_reason: None,
+                finish_reason: token.finish_reason,
             }],
         };
-        match serde_json::to_string(&first_chunk) {
-            Ok(json) => yield Ok(Event::default().data(json)),
+        match serde_json::to_string(&chunk) {
+            Ok(j) => Some(j),
             Err(e) => {
-                tracing::error!("Failed to serialize chat stream role chunk: {e}");
-                return;
-            }
-        }
-
-        // Token chunks
-        while let Some(token) = token_rx.recv().await {
-            // Don't send EOS token text
-            let content = if token.finish_reason.as_deref() == Some("stop") {
+                tracing::error!("Failed to serialize chat stream chunk: {e}");
                 None
-            } else {
-                Some(token.text)
-            };
-
-            let chunk = ChatCompletionStreamResponse {
-                id: request_id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_id.clone(),
-                choices: vec![ChatCompletionStreamChoice {
-                    index: 0,
-                    delta: DeltaMessage {
-                        role: None,
-                        content,
-                    },
-                    finish_reason: token.finish_reason,
-                }],
-            };
-            match serde_json::to_string(&chunk) {
-                Ok(json) => yield Ok(Event::default().data(json)),
-                Err(e) => {
-                    tracing::error!("Failed to serialize chat stream chunk: {e}");
-                    break;
-                }
             }
         }
-
-        // Final [DONE]
-        yield Ok(Event::default().data("[DONE]"));
-    }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,43 +634,36 @@ async fn completions(
 }
 
 fn make_completion_sse_stream(
-    mut token_rx: mpsc::Receiver<StreamToken>,
+    token_rx: mpsc::Receiver<StreamToken>,
     request_id: String,
     model_id: String,
     created: u64,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    async_stream::stream! {
-        // Token chunks
-        while let Some(token) = token_rx.recv().await {
-            let text = if token.finish_reason.as_deref() == Some("stop") {
-                String::new()
-            } else {
-                token.text
-            };
-
-            let chunk = CompletionStreamResponse {
-                id: request_id.clone(),
-                object: "text_completion",
-                created,
-                model: model_id.clone(),
-                choices: vec![CompletionStreamChoice {
-                    index: 0,
-                    text,
-                    finish_reason: token.finish_reason,
-                }],
-            };
-            match serde_json::to_string(&chunk) {
-                Ok(json) => yield Ok(Event::default().data(json)),
-                Err(e) => {
-                    tracing::error!("Failed to serialize completion stream chunk: {e}");
-                    break;
-                }
+    make_sse_stream_inner(token_rx, None, move |token| {
+        let text = if token.finish_reason.as_deref() == Some("stop") {
+            String::new()
+        } else {
+            token.text
+        };
+        let chunk = CompletionStreamResponse {
+            id: request_id.clone(),
+            object: "text_completion",
+            created,
+            model: model_id.clone(),
+            choices: vec![CompletionStreamChoice {
+                index: 0,
+                text,
+                finish_reason: token.finish_reason,
+            }],
+        };
+        match serde_json::to_string(&chunk) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                tracing::error!("Failed to serialize completion stream chunk: {e}");
+                None
             }
         }
-
-        // Final [DONE]
-        yield Ok(Event::default().data("[DONE]"));
-    }
+    })
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {

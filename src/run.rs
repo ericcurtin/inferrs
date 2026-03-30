@@ -13,9 +13,7 @@ use crossterm::{
 use std::io::{self, Write};
 use std::sync::mpsc as stdmpsc;
 
-use crate::config::RawConfig;
 use crate::engine::{attach_paged_kv_if_requested, Engine, StreamToken, SyncEngineRequest};
-use crate::hub;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
@@ -128,32 +126,21 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     let device = serve.resolve_device()?;
     let dtype = serve.resolve_dtype()?;
 
-    // Download / locate model files from HuggingFace Hub
-    let model_files = hub::download_model(&args.model, &args.revision)?;
-
-    // Load config and detect architecture
-    let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
-    tracing::info!("Detected architecture: {:?}", arch);
-
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
-
-    // Load tokenizer (used by the REPL to build prompts)
-    let tokenizer = Tokenizer::from_file_with_arch(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-        Some(&arch),
-    )?;
-
-    // Load model weights
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
+    let loaded = crate::loader::load(
+        &args.model,
+        &args.revision,
         dtype,
         &device,
         args.turbo_quant,
     )?;
+    let crate::loader::LoadedModel {
+        model_files,
+        raw_config,
+        arch,
+        tokenizer,
+        model,
+        max_seq_len,
+    } = loaded;
 
     // Engine tokenizer (separate instance — engine runs on its own thread)
     let engine_tokenizer = Tokenizer::from_file_with_arch(
@@ -574,32 +561,18 @@ fn read_line() -> Result<ReadResult> {
 
                     // ── Home / Ctrl+A ─────────────────────────────────────────
                     KeyCode::Home => {
-                        if cursor_pos > 0 {
-                            execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                            cursor_pos = 0;
-                        }
+                        move_to_bol(&mut stdout, &mut cursor_pos)?;
                     }
                     KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        if cursor_pos > 0 {
-                            execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                            cursor_pos = 0;
-                        }
+                        move_to_bol(&mut stdout, &mut cursor_pos)?;
                     }
 
                     // ── End / Ctrl+E ──────────────────────────────────────────
                     KeyCode::End => {
-                        let remaining = buf.len() - cursor_pos;
-                        if remaining > 0 {
-                            execute!(stdout, cursor::MoveRight(remaining as u16))?;
-                            cursor_pos = buf.len();
-                        }
+                        move_to_eol(&mut stdout, &buf, &mut cursor_pos)?;
                     }
                     KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        let remaining = buf.len() - cursor_pos;
-                        if remaining > 0 {
-                            execute!(stdout, cursor::MoveRight(remaining as u16))?;
-                            cursor_pos = buf.len();
-                        }
+                        move_to_eol(&mut stdout, &buf, &mut cursor_pos)?;
                     }
 
                     // ── Kill to EOL (Ctrl+K) ──────────────────────────────────
@@ -693,6 +666,25 @@ fn read_line() -> Result<ReadResult> {
             _ => {}
         }
     }
+}
+
+/// Move the terminal cursor to the beginning of the line (Home / Ctrl+A).
+fn move_to_bol(stdout: &mut io::Stdout, cursor_pos: &mut usize) -> Result<()> {
+    if *cursor_pos > 0 {
+        execute!(stdout, cursor::MoveLeft(*cursor_pos as u16))?;
+        *cursor_pos = 0;
+    }
+    Ok(())
+}
+
+/// Move the terminal cursor to the end of the line (End / Ctrl+E).
+fn move_to_eol(stdout: &mut io::Stdout, buf: &[char], cursor_pos: &mut usize) -> Result<()> {
+    let remaining = buf.len() - *cursor_pos;
+    if remaining > 0 {
+        execute!(stdout, cursor::MoveRight(remaining as u16))?;
+        *cursor_pos = buf.len();
+    }
+    Ok(())
 }
 
 /// Redraw the characters of `buf` starting at logical position `from`,

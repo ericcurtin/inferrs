@@ -710,6 +710,15 @@ impl DecoderLayer {
         })
     }
 
+    /// Shared post-attention residual: `x = x + attn_out`, then MLP block.
+    fn apply_residual_blocks(&self, x: &Tensor, attn_out: Tensor) -> Result<Tensor> {
+        let x = (x + attn_out)?;
+        let residual = x.clone();
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        (residual + mlp_out).map_err(Into::into)
+    }
+
     fn forward(
         &mut self,
         x: &Tensor,
@@ -719,17 +728,11 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.input_layernorm.forward(x)?;
-
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward(&normed, seqlen_offset, cos, sin)?,
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
-
-        let x = (residual + attn_out)?;
-        let residual = x.clone();
-        let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        (residual + mlp_out).map_err(Into::into)
+        self.apply_residual_blocks(&residual, attn_out)
     }
 
     /// Paged-attention forward pass.
@@ -749,18 +752,12 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.input_layernorm.forward(x)?;
-
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward_paged(&normed, seqlen_offset, ctx)?,
             // SSM layers are not paged — use their standard recurrent path.
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
-
-        let x = (residual + attn_out)?;
-        let residual = x.clone();
-        let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        (residual + mlp_out).map_err(Into::into)
+        self.apply_residual_blocks(&residual, attn_out)
     }
 
     fn clear_cache(&mut self) {

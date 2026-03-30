@@ -3,6 +3,7 @@ mod config;
 mod engine;
 mod hub;
 mod kv_cache;
+mod loader;
 mod models;
 mod rm;
 mod run;

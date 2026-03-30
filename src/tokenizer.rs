@@ -97,10 +97,6 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    pub fn from_file(tokenizer_path: &Path, tokenizer_config_path: Option<&Path>) -> Result<Self> {
-        Self::from_file_with_arch(tokenizer_path, tokenizer_config_path, None)
-    }
-
     pub fn from_file_with_arch(
         tokenizer_path: &Path,
         tokenizer_config_path: Option<&Path>,

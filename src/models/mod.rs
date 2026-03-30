@@ -62,64 +62,48 @@ macro_rules! impl_causal_lm_wrapper {
     };
 }
 
+/// Like `impl_causal_lm_wrapper!` but also wires up `forward_paged` for
+/// models that support paged attention.
+macro_rules! impl_causal_lm_wrapper_paged {
+    ($wrapper:ident, $inner_ty:ty) => {
+        struct $wrapper {
+            inner: $inner_ty,
+        }
+
+        impl CausalLM for $wrapper {
+            fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+                self.inner
+                    .forward(input_ids, seqlen_offset)
+                    .map_err(Into::into)
+            }
+
+            fn forward_paged(
+                &mut self,
+                input_ids: &Tensor,
+                seqlen_offset: usize,
+                block_table: &BlockTable,
+                kv_store: &mut PagedKvStore,
+            ) -> Result<Tensor> {
+                self.inner
+                    .forward_paged(input_ids, seqlen_offset, block_table, kv_store)
+                    .map_err(Into::into)
+            }
+
+            fn clear_kv_cache(&mut self) {
+                self.inner.clear_kv_cache();
+            }
+        }
+    };
+}
+
 impl_causal_lm_wrapper!(
     Qwen2Model,
     candle_transformers::models::qwen2::ModelForCausalLM
 );
 impl_causal_lm_wrapper!(Gemma2Model, candle_transformers::models::gemma2::Model);
 impl_causal_lm_wrapper!(Gemma3Model, candle_transformers::models::gemma3::Model);
-
-/// A Qwen3 model wrapper.
-struct Qwen3ModelWrapper {
-    inner: qwen3::Qwen3Model,
-}
-
-impl CausalLM for Qwen3ModelWrapper {
-    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        self.inner.forward(input_ids, seqlen_offset)
-    }
-
-    fn forward_paged(
-        &mut self,
-        input_ids: &Tensor,
-        seqlen_offset: usize,
-        block_table: &BlockTable,
-        kv_store: &mut PagedKvStore,
-    ) -> Result<Tensor> {
-        self.inner
-            .forward_paged(input_ids, seqlen_offset, block_table, kv_store)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.inner.clear_kv_cache();
-    }
-}
-
-/// A Qwen3.5 model wrapper.
-struct Qwen35ModelWrapper {
-    inner: qwen3_5::Qwen35Model,
-}
-
-impl CausalLM for Qwen35ModelWrapper {
-    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        self.inner.forward(input_ids, seqlen_offset)
-    }
-
-    fn forward_paged(
-        &mut self,
-        input_ids: &Tensor,
-        seqlen_offset: usize,
-        block_table: &BlockTable,
-        kv_store: &mut PagedKvStore,
-    ) -> Result<Tensor> {
-        self.inner
-            .forward_paged(input_ids, seqlen_offset, block_table, kv_store)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.inner.clear_kv_cache();
-    }
-}
+impl_causal_lm_wrapper_paged!(Qwen3ModelWrapper, qwen3::Qwen3Model);
+impl_causal_lm_wrapper_paged!(Qwen35ModelWrapper, qwen3_5::Qwen35Model);
 
 /// Load a model from weight files.
 pub fn load_model(
