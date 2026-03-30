@@ -177,31 +177,56 @@ fn apply_repetition_penalty(
     (logits * mult).map_err(Into::into)
 }
 
-/// Simple random float in [0, 1) using thread-local RNG.
+/// Random float in [0, 1) using a thread-local xorshift64* PRNG.
+///
+/// Seeded once per thread from the system clock + thread ID mixed with
+/// a splitmix64 step, giving good statistical properties and uniform coverage
+/// of [0, 1) without clustering.
 fn rand_f32() -> f32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     use std::time::SystemTime;
 
-    // Use a thread-local counter + time for randomness
     thread_local! {
-        static COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static SEEDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    COUNTER.with(|c| {
-        let count = c.get().wrapping_add(1);
-        c.set(count);
+    SEEDED.with(|seeded| {
+        if !seeded.get() {
+            // Seed from nanosecond time + thread ID via splitmix64
+            let t = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            // Mix thread ID in to avoid identical seeds across threads
+            let tid = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                std::thread::current().id().hash(&mut h);
+                h.finish()
+            };
+            let mut seed = t ^ tid;
+            // splitmix64 step to avalanche the seed bits
+            seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+            seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d049bb133111eb);
+            seed ^= seed >> 31;
+            // Ensure non-zero (xorshift requires non-zero state)
+            STATE.with(|s| s.set(if seed == 0 { 0x1234567890abcdef } else { seed }));
+            seeded.set(true);
+        }
+    });
 
-        let mut hasher = DefaultHasher::new();
-        count.hash(&mut hasher);
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .hash(&mut hasher);
-        std::thread::current().id().hash(&mut hasher);
-
-        let hash = hasher.finish();
-        (hash as f32) / (u64::MAX as f32)
+    STATE.with(|s| {
+        // xorshift64* — excellent statistical quality, fast
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        // Multiply by a constant and shift to get a well-distributed u32,
+        // then map to [0, 1)
+        let u = x.wrapping_mul(0x2545f4914f6cdd1d) >> 32;
+        u as f32 / (u32::MAX as f32 + 1.0)
     })
 }

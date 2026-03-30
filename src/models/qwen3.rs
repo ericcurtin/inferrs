@@ -17,7 +17,7 @@ use candle_nn::{
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{apply_rms_norm_heads, causal_mask, repeat_kv, PagedCtx};
-use crate::turbo_quant::{build_codec, TurboQuantConfig, TurboQuantKvCache};
+use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -142,11 +142,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(
-        cfg: &Qwen3Config,
-        vb: VarBuilder,
-        codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>>,
-    ) -> Result<Self> {
+    fn new(cfg: &Qwen3Config, vb: VarBuilder, tq_cfg: Option<&TurboQuantConfig>) -> Result<Self> {
         let q_out = cfg.num_attention_heads * cfg.head_dim;
         let kv_out = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -157,7 +153,7 @@ impl Attention {
         let q_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
 
-        let tq_cache = codec.map(|c| {
+        let tq_cache = tq_cfg.map(|c| {
             TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
         });
 
@@ -213,9 +209,6 @@ impl Attention {
 
         // Append to KV cache (TurboQuant-compressed or plain concat)
         let (k, v) = if let Some(tq) = &mut self.tq_cache {
-            // TurboQuant path: append new tokens first, then dequantize the full
-            // sequence (history + current).  This avoids an extra Tensor::cat here;
-            // `dequantize()` internally cats only the delta onto the cached tensor.
             tq.append(&k, &v)?;
             tq.dequantize()?
         } else {
@@ -380,13 +373,9 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(
-        cfg: &Qwen3Config,
-        vb: VarBuilder,
-        codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>>,
-    ) -> Result<Self> {
+    fn new(cfg: &Qwen3Config, vb: VarBuilder, tq_cfg: Option<&TurboQuantConfig>) -> Result<Self> {
         Ok(Self {
-            attn: Attention::new(cfg, vb.pp("self_attn"), codec)?,
+            attn: Attention::new(cfg, vb.pp("self_attn"), tq_cfg)?,
             mlp: Mlp::new(cfg, vb.pp("mlp"))?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
@@ -455,29 +444,19 @@ impl Qwen3Model {
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, model_vb.pp("embed_tokens"))?;
 
-        // Build a shared TurboQuant codec if requested.
-        let tq_codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>> = cfg
-            .turbo_quant_bits
-            .map(|bits| {
-                let tq_cfg = TurboQuantConfig {
-                    bits,
-                    head_dim: cfg.head_dim,
-                };
-                tracing::info!(
-                    "TurboQuant KV cache enabled: {} bits/coord ({}× compression vs bf16)",
-                    bits,
-                    16 / bits as u32
-                );
-                build_codec(&tq_cfg, &cfg.device)
-            })
-            .transpose()?;
+        // Build TurboQuant config if requested (each layer gets its own cache).
+        let tq_cfg: Option<TurboQuantConfig> = cfg.turbo_quant_bits.map(|bits| {
+            tracing::info!("TurboQuant KV cache enabled: {bits} bits/coord, absmax quantization");
+            TurboQuantConfig {
+                bits,
+                head_dim: cfg.head_dim,
+            }
+        });
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let layer_vb = model_vb.pp("layers").pp(i.to_string());
-            // Each layer gets its own TurboQuantKvCache but they all share the same codec
-            // (same rotation matrix / codebook) — this is the data-oblivious online design.
-            let layer = DecoderLayer::new(cfg, layer_vb, tq_codec.clone())
+            let layer = DecoderLayer::new(cfg, layer_vb, tq_cfg.as_ref())
                 .with_context(|| format!("loading layer {}", i))?;
             layers.push(layer);
         }

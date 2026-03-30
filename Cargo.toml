@@ -53,12 +53,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
-tokio-stream = "0.1"
 async-stream = "0.3"
 anyhow = "1"
-byteorder = "1"
 crossterm = "0.28"
-rayon = "1"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }

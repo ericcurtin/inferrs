@@ -95,6 +95,19 @@ pub fn attach_paged_kv_if_requested(
         return Ok(engine);
     };
 
+    // Warn for architectures that don't implement forward_paged and will silently
+    // fall back to the standard concat-KV forward pass.
+    match arch {
+        ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {} // supported
+        other => {
+            tracing::warn!(
+                "--paged-attention is not supported for {:?} and will fall back to the standard \
+                 concat KV cache. Paged attention is currently only available for Qwen3 and Qwen3.5.",
+                other
+            );
+        }
+    }
+
     let bytes_per_element = match dtype {
         DType::F32 => 4,
         _ => 2, // f16 / bf16

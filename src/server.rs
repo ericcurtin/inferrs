@@ -145,6 +145,34 @@ fn server_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>)
     )
 }
 
+fn prompt_too_long_error(
+    prompt_len: usize,
+    max_seq_len: usize,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message: format!(
+                    "Prompt length ({prompt_len} tokens) exceeds the model's maximum context length ({max_seq_len} tokens)."
+                ),
+                r#type: "invalid_request_error".to_string(),
+            },
+        }),
+    )
+}
+
+/// Return `Err` if the prompt is already at or beyond the model's context window.
+fn check_prompt_length(
+    prompt_len: usize,
+    max_seq_len: usize,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if max_seq_len != usize::MAX && prompt_len >= max_seq_len {
+        return Err(prompt_too_long_error(prompt_len, max_seq_len));
+    }
+    Ok(())
+}
+
 // ─── Server state ───────────────────────────────────────────────────────────
 
 struct AppState {
@@ -301,6 +329,8 @@ async fn chat_completions(
         prompt_tokens.len()
     );
 
+    check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;
+
     // Build sampling params, clamping max_tokens to the model's KV cache capacity.
     let requested_max_tokens = req
         .max_completion_tokens
@@ -401,7 +431,13 @@ fn make_sse_stream(
                 finish_reason: None,
             }],
         };
-        yield Ok(Event::default().data(serde_json::to_string(&first_chunk).unwrap()));
+        match serde_json::to_string(&first_chunk) {
+            Ok(json) => yield Ok(Event::default().data(json)),
+            Err(e) => {
+                tracing::error!("Failed to serialize chat stream role chunk: {e}");
+                return;
+            }
+        }
 
         // Token chunks
         while let Some(token) = token_rx.recv().await {
@@ -426,7 +462,13 @@ fn make_sse_stream(
                     finish_reason: token.finish_reason,
                 }],
             };
-            yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
+            match serde_json::to_string(&chunk) {
+                Ok(json) => yield Ok(Event::default().data(json)),
+                Err(e) => {
+                    tracing::error!("Failed to serialize chat stream chunk: {e}");
+                    break;
+                }
+            }
         }
 
         // Final [DONE]
@@ -446,7 +488,6 @@ pub struct CompletionRequest {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -465,6 +506,22 @@ pub struct CompletionResponse {
 
 #[derive(Debug, Serialize)]
 pub struct CompletionChoice {
+    pub index: u32,
+    pub text: String,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionStreamResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionStreamChoice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionStreamChoice {
     pub index: u32,
     pub text: String,
     pub finish_reason: Option<String>,
@@ -497,6 +554,8 @@ async fn completions(
         }
     };
 
+    check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;
+
     let requested_max_tokens = req.max_tokens.unwrap_or(state.default_params.max_tokens);
     let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
     let params = SamplingParams {
@@ -509,40 +568,102 @@ async fn completions(
         max_tokens,
     };
 
-    let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+    let is_stream = req.stream.unwrap_or(false);
 
-    let engine_req = EngineRequest::Generate {
-        request_id: request_id.clone(),
-        prompt_tokens,
-        sampling_params: params,
-        response_tx,
-    };
+    if is_stream {
+        // Streaming response — send tokens as SSE events.
+        let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
 
-    if state.engine_tx.send(engine_req).await.is_err() {
-        return Err(server_error("Engine unavailable"));
+        let engine_req = EngineRequest::GenerateStream {
+            request_id: request_id.clone(),
+            prompt_tokens,
+            sampling_params: params,
+            token_tx,
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            return Err(server_error("Engine unavailable"));
+        }
+
+        let stream = make_completion_sse_stream(token_rx, request_id, model_id, created);
+        Ok(Sse::new(stream).into_response())
+    } else {
+        // Non-streaming response.
+        let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+
+        let engine_req = EngineRequest::Generate {
+            request_id: request_id.clone(),
+            prompt_tokens,
+            sampling_params: params,
+            response_tx,
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            return Err(server_error("Engine unavailable"));
+        }
+
+        match response_rx.await {
+            Ok(result) => {
+                let response = CompletionResponse {
+                    id: request_id,
+                    object: "text_completion",
+                    created,
+                    model: model_id,
+                    choices: vec![CompletionChoice {
+                        index: 0,
+                        text: result.output_text,
+                        finish_reason: Some(result.finish_reason),
+                    }],
+                    usage: UsageInfo {
+                        prompt_tokens: result.prompt_tokens,
+                        completion_tokens: result.completion_tokens,
+                        total_tokens: result.prompt_tokens + result.completion_tokens,
+                    },
+                };
+                Ok(Json(response).into_response())
+            }
+            Err(_) => Err(server_error("Engine dropped the request")),
+        }
     }
+}
 
-    match response_rx.await {
-        Ok(result) => {
-            let response = CompletionResponse {
-                id: request_id,
+fn make_completion_sse_stream(
+    mut token_rx: mpsc::Receiver<StreamToken>,
+    request_id: String,
+    model_id: String,
+    created: u64,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        // Token chunks
+        while let Some(token) = token_rx.recv().await {
+            let text = if token.finish_reason.as_deref() == Some("stop") {
+                String::new()
+            } else {
+                token.text
+            };
+
+            let chunk = CompletionStreamResponse {
+                id: request_id.clone(),
                 object: "text_completion",
                 created,
-                model: model_id,
-                choices: vec![CompletionChoice {
+                model: model_id.clone(),
+                choices: vec![CompletionStreamChoice {
                     index: 0,
-                    text: result.output_text,
-                    finish_reason: Some(result.finish_reason),
+                    text,
+                    finish_reason: token.finish_reason,
                 }],
-                usage: UsageInfo {
-                    prompt_tokens: result.prompt_tokens,
-                    completion_tokens: result.completion_tokens,
-                    total_tokens: result.prompt_tokens + result.completion_tokens,
-                },
             };
-            Ok(Json(response))
+            match serde_json::to_string(&chunk) {
+                Ok(json) => yield Ok(Event::default().data(json)),
+                Err(e) => {
+                    tracing::error!("Failed to serialize completion stream chunk: {e}");
+                    break;
+                }
+            }
         }
-        Err(_) => Err(server_error("Engine dropped the request")),
+
+        // Final [DONE]
+        yield Ok(Event::default().data("[DONE]"));
     }
 }
 

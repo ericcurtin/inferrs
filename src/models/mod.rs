@@ -156,6 +156,20 @@ pub fn load_model(
     // Load safetensors into a VarBuilder
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? };
 
+    // Warn if --turbo-quant was requested but this architecture doesn't support it.
+    if turbo_quant_bits.is_some() {
+        match arch {
+            ModelArchitecture::Qwen3 => {} // supported
+            other => {
+                tracing::warn!(
+                    "--turbo-quant is not supported for {:?} and will be ignored. \
+                     TurboQuant KV cache compression is currently only available for Qwen3.",
+                    other
+                );
+            }
+        }
+    }
+
     match arch {
         ModelArchitecture::Qwen3 => {
             let config = raw_config.to_qwen3_config(dtype, device.clone(), turbo_quant_bits);
