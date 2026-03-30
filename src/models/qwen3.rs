@@ -17,8 +17,8 @@ use candle_nn::{
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    apply_rms_norm_heads, causal_mask, paged_write_gather_sdpa, precompute_rope, repeat_kv,
-    AttnDims, Mlp, PagedCtx,
+    apply_rms_norm_heads, causal_mask, compute_logits, concat_kv_cache, paged_write_gather_sdpa,
+    precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
 };
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
@@ -155,17 +155,7 @@ impl Attention {
             tq.append(&k, &v)?;
             tq.dequantize()?
         } else {
-            // Standard concat-based KV cache.
-            let (k, v) = match &self.kv_cache {
-                None => (k, v),
-                Some((k_cache, v_cache)) => {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?;
-                    (k, v)
-                }
-            };
-            self.kv_cache = Some((k.clone(), v.clone()));
-            (k, v)
+            concat_kv_cache(k, v, &mut self.kv_cache)?
         };
 
         let kv_len = k.dim(2)?;
@@ -394,7 +384,7 @@ impl Qwen3Model {
 
     /// Forward pass. Returns logits for the last position: [batch, 1, vocab_size]
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let (_b, t) = input_ids.dims2()?;
+        let (_b, _t) = input_ids.dims2()?;
 
         let mut x = self.embed_tokens.forward(input_ids)?;
 
@@ -403,11 +393,7 @@ impl Qwen3Model {
         }
 
         x = self.norm.forward(&x)?;
-
-        let last = x.narrow(1, t - 1, 1)?; // [b, 1, hidden]
-        let last_2d = last.squeeze(1)?.contiguous()?; // [b, hidden]
-        let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
-        logits.unsqueeze(1).map_err(Into::into) // [b, 1, vocab]
+        compute_logits(&x, &self.lm_head_weight)
     }
 
     /// Paged-attention forward pass.
@@ -418,7 +404,7 @@ impl Qwen3Model {
         block_table: &BlockTable,
         kv_store: &mut PagedKvStore,
     ) -> Result<Tensor> {
-        let (_b, t) = input_ids.dims2()?;
+        let (_b, _t) = input_ids.dims2()?;
 
         let mut x = self.embed_tokens.forward(input_ids)?;
 
@@ -434,11 +420,7 @@ impl Qwen3Model {
         }
 
         x = self.norm.forward(&x)?;
-
-        let last = x.narrow(1, t - 1, 1)?;
-        let last_2d = last.squeeze(1)?.contiguous()?;
-        let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?;
-        logits.unsqueeze(1).map_err(Into::into)
+        compute_logits(&x, &self.lm_head_weight)
     }
 
     pub fn clear_kv_cache(&mut self) {

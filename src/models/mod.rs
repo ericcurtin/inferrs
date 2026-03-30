@@ -40,53 +40,34 @@ pub trait CausalLM: Send {
     fn clear_kv_cache(&mut self);
 }
 
-/// A Qwen2 model wrapper.
-struct Qwen2Model {
-    inner: candle_transformers::models::qwen2::ModelForCausalLM,
+/// Implement `CausalLM` for a simple newtype wrapper whose `inner` field
+/// exposes `.forward(input_ids, seqlen_offset)` and `.clear_kv_cache()`.
+macro_rules! impl_causal_lm_wrapper {
+    ($wrapper:ident, $inner_ty:ty) => {
+        struct $wrapper {
+            inner: $inner_ty,
+        }
+
+        impl CausalLM for $wrapper {
+            fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+                self.inner
+                    .forward(input_ids, seqlen_offset)
+                    .map_err(Into::into)
+            }
+
+            fn clear_kv_cache(&mut self) {
+                self.inner.clear_kv_cache();
+            }
+        }
+    };
 }
 
-impl CausalLM for Qwen2Model {
-    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let logits = self.inner.forward(input_ids, seqlen_offset)?;
-        Ok(logits)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.inner.clear_kv_cache();
-    }
-}
-
-/// A Gemma2 model wrapper.
-struct Gemma2Model {
-    inner: candle_transformers::models::gemma2::Model,
-}
-
-impl CausalLM for Gemma2Model {
-    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let logits = self.inner.forward(input_ids, seqlen_offset)?;
-        Ok(logits)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.inner.clear_kv_cache();
-    }
-}
-
-/// A Gemma3 model wrapper.
-struct Gemma3Model {
-    inner: candle_transformers::models::gemma3::Model,
-}
-
-impl CausalLM for Gemma3Model {
-    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let logits = self.inner.forward(input_ids, seqlen_offset)?;
-        Ok(logits)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.inner.clear_kv_cache();
-    }
-}
+impl_causal_lm_wrapper!(
+    Qwen2Model,
+    candle_transformers::models::qwen2::ModelForCausalLM
+);
+impl_causal_lm_wrapper!(Gemma2Model, candle_transformers::models::gemma2::Model);
+impl_causal_lm_wrapper!(Gemma3Model, candle_transformers::models::gemma3::Model);
 
 /// A Qwen3 model wrapper.
 struct Qwen3ModelWrapper {

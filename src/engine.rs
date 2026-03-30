@@ -336,6 +336,38 @@ impl Engine {
         model.forward_paged(&input_ids, seqlen_offset, &ps.block_table, &mut ps.kv_store)
     }
 
+    // ── Shared generation helpers ─────────────────────────────────────────────
+
+    /// Run the prefill forward pass (paged or concat-KV) and return the logits.
+    /// Resets the KV cache and (if paged) the block table before running.
+    fn run_prefill(&mut self, prompt_tokens: &[u32]) -> Result<Tensor> {
+        self.model.clear_kv_cache();
+        if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)
+        } else {
+            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            self.model.forward(&input_ids, 0)
+        }
+    }
+
+    /// Run a single decode step (paged or concat-KV) and return the logits.
+    fn run_decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Tensor> {
+        if let Some(ps) = &mut self.paged {
+            Self::paged_decode_step(&mut self.model, &self.device, token_id, seqlen_offset, ps)
+        } else {
+            let input_ids = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
+            self.model.forward(&input_ids, seqlen_offset)
+        }
+    }
+
+    /// Free all paged KV blocks (no-op when paged attention is not active).
+    fn free_paged_blocks(&mut self) {
+        if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+        }
+    }
+
     // ── Non-streaming generation ──────────────────────────────────────────────
 
     fn generate(
@@ -354,17 +386,7 @@ impl Engine {
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
-        let logits = if let Some(ps) = &mut self.paged {
-            // ── Paged path ────────────────────────────────────────────────────
-            ps.block_table.free_all(&mut ps.block_pool);
-            self.model.clear_kv_cache();
-            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
-        } else {
-            // ── Concat-KV path ────────────────────────────────────────────────
-            self.model.clear_kv_cache();
-            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-            self.model.forward(&input_ids, 0)?
-        };
+        let logits = self.run_prefill(prompt_tokens)?;
 
         let mut token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
@@ -374,12 +396,7 @@ impl Engine {
 
         while finish_reason.is_none() {
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits = if let Some(ps) = &mut self.paged {
-                Self::paged_decode_step(&mut self.model, &self.device, token_id, seqlen_offset, ps)?
-            } else {
-                let input_ids = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
-                self.model.forward(&input_ids, seqlen_offset)?
-            };
+            let logits = self.run_decode_step(token_id, seqlen_offset)?;
 
             token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
@@ -387,9 +404,7 @@ impl Engine {
             finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
         }
 
-        if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-        }
+        self.free_paged_blocks();
 
         let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
         let output_text = self.tokenizer.decode(&output_tokens, true)?;
@@ -454,15 +469,7 @@ impl Engine {
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
         // Prefill
-        let logits = if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-            self.model.clear_kv_cache();
-            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
-        } else {
-            self.model.clear_kv_cache();
-            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-            self.model.forward(&input_ids, 0)?
-        };
+        let logits = self.run_prefill(prompt_tokens)?;
 
         let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
@@ -477,9 +484,7 @@ impl Engine {
             finish_reason: finish_reason.clone(),
         }) || finish_reason.is_some()
         {
-            if let Some(ps) = &mut self.paged {
-                ps.block_table.free_all(&mut ps.block_pool);
-            }
+            self.free_paged_blocks();
             return Ok(());
         }
 
@@ -488,18 +493,7 @@ impl Engine {
             let last_token = *output_tokens.last().unwrap();
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
 
-            let logits = if let Some(ps) = &mut self.paged {
-                Self::paged_decode_step(
-                    &mut self.model,
-                    &self.device,
-                    last_token,
-                    seqlen_offset,
-                    ps,
-                )?
-            } else {
-                let input_ids = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
-                self.model.forward(&input_ids, seqlen_offset)?
-            };
+            let logits = self.run_decode_step(last_token, seqlen_offset)?;
 
             let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
@@ -518,9 +512,7 @@ impl Engine {
             }
         }
 
-        if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-        }
+        self.free_paged_blocks();
 
         Ok(())
     }
@@ -545,15 +537,7 @@ impl Engine {
 
         let prefill_start = Instant::now();
 
-        let logits = if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-            self.model.clear_kv_cache();
-            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
-        } else {
-            self.model.clear_kv_cache();
-            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-            self.model.forward(&input_ids, 0)?
-        };
+        let logits = self.run_prefill(prompt_tokens)?;
 
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -566,12 +550,7 @@ impl Engine {
 
         while finish_reason.is_none() {
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits = if let Some(ps) = &mut self.paged {
-                Self::paged_decode_step(&mut self.model, &self.device, token_id, seqlen_offset, ps)?
-            } else {
-                let input_ids = Tensor::new(&[token_id], &self.device)?.unsqueeze(0)?;
-                self.model.forward(&input_ids, seqlen_offset)?
-            };
+            let logits = self.run_decode_step(token_id, seqlen_offset)?;
             token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
             all_tokens.push(token_id);
@@ -580,9 +559,7 @@ impl Engine {
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-        if let Some(ps) = &mut self.paged {
-            ps.block_table.free_all(&mut ps.block_pool);
-        }
+        self.free_paged_blocks();
 
         let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
         let output_text = self.tokenizer.decode(&output_tokens, true)?;

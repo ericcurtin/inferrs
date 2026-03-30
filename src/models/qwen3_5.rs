@@ -13,8 +13,8 @@ use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm,
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    apply_rms_norm_heads, causal_mask, paged_write_gather_sdpa, precompute_rope, repeat_kv,
-    AttnDims, Mlp, PagedCtx,
+    apply_output_gate, apply_rms_norm_heads, causal_mask, compute_logits, concat_kv_cache,
+    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,15 +197,7 @@ impl FullAttention {
         let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
         // Append to KV cache
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                let k = Tensor::cat(&[k_cache, &k], 2)?;
-                let v = Tensor::cat(&[v_cache, &v], 2)?;
-                (k, v)
-            }
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        let (k, v) = concat_kv_cache(k, v, &mut self.kv_cache)?;
 
         let kv_len = k.dim(2)?;
 
@@ -238,9 +230,8 @@ impl FullAttention {
             .transpose(1, 2)?
             .reshape((b, t, self.num_heads * self.head_dim))?;
 
-        // Apply output gate: sigmoid(gate) * out  (sigmoid = 1/(1+exp(-x)))
-        let gate_sig = (gate.neg()?.exp()? + 1.0)?.recip()?;
-        let out = out.broadcast_mul(&gate_sig)?;
+        // Apply output gate: sigmoid(gate) * out
+        let out = apply_output_gate(&out, &gate)?;
 
         let out = self.o_proj.forward(&out)?;
         Ok(out)
@@ -318,8 +309,7 @@ impl FullAttention {
         )?;
 
         // ── Output gate ───────────────────────────────────────────────────────
-        let gate_sig = (gate.neg()?.exp()? + 1.0)?.recip()?;
-        let out = out.broadcast_mul(&gate_sig)?;
+        let out = apply_output_gate(&out, &gate)?;
 
         self.o_proj.forward(&out).map_err(Into::into)
     }
@@ -702,22 +692,14 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new_full(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Qwen35Config, vb: VarBuilder, is_full_attention: bool) -> Result<Self> {
+        let attn = if is_full_attention {
+            LayerAttn::Full(FullAttention::new(cfg, vb.pp("self_attn"))?)
+        } else {
+            LayerAttn::Linear(LinearAttn::new(cfg, vb.pp("linear_attn"))?)
+        };
         Ok(Self {
-            attn: LayerAttn::Full(FullAttention::new(cfg, vb.pp("self_attn"))?),
-            mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
-            input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_attention_layernorm: rms_norm(
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-                vb.pp("post_attention_layernorm"),
-            )?,
-        })
-    }
-
-    fn new_linear(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            attn: LayerAttn::Linear(LinearAttn::new(cfg, vb.pp("linear_attn"))?),
+            attn,
             mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
@@ -813,12 +795,8 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for (i, layer_type) in cfg.layer_types.iter().enumerate() {
             let layer_vb = lm_vb.pp("layers").pp(i.to_string());
-            let layer = if layer_type.is_full_attention {
-                DecoderLayer::new_full(cfg, layer_vb)
-            } else {
-                DecoderLayer::new_linear(cfg, layer_vb)
-            }
-            .with_context(|| format!("loading layer {}", i))?;
+            let layer = DecoderLayer::new(cfg, layer_vb, layer_type.is_full_attention)
+                .with_context(|| format!("loading layer {}", i))?;
             layers.push(layer);
         }
 
@@ -852,8 +830,6 @@ impl Qwen35Model {
     /// input_ids: [batch, seq_len]
     /// Returns logits for the last position: [batch, 1, vocab_size]
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let (_b, t) = input_ids.dims2()?;
-
         let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
 
         for layer in &mut self.layers {
@@ -861,18 +837,7 @@ impl Qwen35Model {
         }
 
         x = self.norm.forward(&x)?;
-
-        // Take last position only
-        let last = x.narrow(1, t - 1, 1)?; // [b, 1, hidden]
-
-        // Tied embedding: matmul with embed_tokens weight [vocab, hidden]
-        // last is [b, 1, hidden]; flatten to [b, hidden] for 2D matmul then restore
-        // Both operands must be contiguous for Metal matmul.
-        let last_2d = last.squeeze(1)?.contiguous()?; // [b, hidden]
-        let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
-
-        let logits = logits.unsqueeze(1)?; // [b, 1, vocab]
-        Ok(logits)
+        compute_logits(&x, &self.lm_head_weight)
     }
 
     /// Paged-attention forward pass.
@@ -891,7 +856,7 @@ impl Qwen35Model {
         block_table: &BlockTable,
         kv_store: &mut PagedKvStore,
     ) -> Result<Tensor> {
-        let (_b, t) = input_ids.dims2()?;
+        let (_b, _t) = input_ids.dims2()?;
 
         let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
 
@@ -914,11 +879,7 @@ impl Qwen35Model {
         }
 
         x = self.norm.forward(&x)?;
-
-        let last = x.narrow(1, t - 1, 1)?;
-        let last_2d = last.squeeze(1)?.contiguous()?;
-        let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?;
-        logits.unsqueeze(1).map_err(Into::into)
+        compute_logits(&x, &self.lm_head_weight)
     }
 
     pub fn clear_kv_cache(&mut self) {

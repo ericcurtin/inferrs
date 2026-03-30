@@ -245,3 +245,63 @@ pub fn paged_write_gather_sdpa(
         .contiguous()
         .map_err(Into::into)
 }
+
+// ---------------------------------------------------------------------------
+// Shared final-logits extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the last-token hidden state and project it through the LM head.
+///
+/// `x`              : `[b, t, hidden]` — hidden states after the final norm
+/// `lm_head_weight` : `[vocab, hidden]` — the unembedding weight matrix
+///
+/// Returns `[b, 1, vocab]`.
+pub fn compute_logits(x: &Tensor, lm_head_weight: &Tensor) -> Result<Tensor> {
+    let (_b, t, _h) = x.dims3()?;
+    let last = x.narrow(1, t - 1, 1)?; // [b, 1, hidden]
+    let last_2d = last.squeeze(1)?.contiguous()?; // [b, hidden]
+    let logits = last_2d.matmul(&lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
+    logits.unsqueeze(1).map_err(Into::into) // [b, 1, vocab]
+}
+
+// ---------------------------------------------------------------------------
+// Shared KV cache concat-append
+// ---------------------------------------------------------------------------
+
+/// Append new `k` / `v` tensors to `kv_cache` (standard concat strategy).
+///
+/// `k` / `v`  : `[b, num_kv_heads, t, head_dim]` — tensors for the current step
+/// `kv_cache` : mutable reference to the per-layer cache slot
+///
+/// Returns the (possibly extended) `(k, v)` pair to use for attention.
+pub fn concat_kv_cache(
+    k: Tensor,
+    v: Tensor,
+    kv_cache: &mut Option<(Tensor, Tensor)>,
+) -> Result<(Tensor, Tensor)> {
+    let (k, v) = match kv_cache {
+        None => (k, v),
+        Some((k_cache, v_cache)) => {
+            let k = Tensor::cat(&[k_cache as &Tensor, &k], 2)?;
+            let v = Tensor::cat(&[v_cache as &Tensor, &v], 2)?;
+            (k, v)
+        }
+    };
+    *kv_cache = Some((k.clone(), v.clone()));
+    Ok((k, v))
+}
+
+// ---------------------------------------------------------------------------
+// Shared output-gate sigmoid
+// ---------------------------------------------------------------------------
+
+/// Apply the attention output gate: `sigmoid(gate) * out`.
+///
+/// `gate` : `[b, t, num_heads * head_dim]`
+/// `out`  : `[b, t, num_heads * head_dim]`
+///
+/// Returns `[b, t, num_heads * head_dim]`.
+pub fn apply_output_gate(out: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    let gate_sig = ops::sigmoid(gate)?;
+    out.broadcast_mul(&gate_sig).map_err(Into::into)
+}
