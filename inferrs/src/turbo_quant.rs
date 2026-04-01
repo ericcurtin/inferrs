@@ -45,6 +45,28 @@ use candle_core::{DType, Device, Tensor};
 ///
 /// The packed length is always `ceil(indices.len() * bits / 8)`.
 fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
+    // Fast paths for the two most common bit widths.
+    match bits {
+        8 => {
+            // One index per byte — direct copy.
+            return indices.to_vec();
+        }
+        4 => {
+            // Two nibbles per byte (high nibble = even index, low nibble = odd index).
+            let packed_len = indices.len().div_ceil(2);
+            let mut packed = vec![0u8; packed_len];
+            for (i, &idx) in indices.iter().enumerate() {
+                if i % 2 == 0 {
+                    packed[i / 2] = idx << 4;
+                } else {
+                    packed[i / 2] |= idx & 0x0F;
+                }
+            }
+            return packed;
+        }
+        _ => {}
+    }
+    // General path for all other bit widths (1–3, 5–7).
     let bits = bits as usize;
     let packed_len = (indices.len() * bits).div_ceil(8);
     let mut packed = vec![0u8; packed_len];
@@ -67,6 +89,27 @@ fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
 /// Inverse of `pack_indices`.  `total_elements` is the number of indices to
 /// recover (required when the total bit count is not a multiple of 8).
 fn unpack_indices(packed: &[u8], bits: u8, total_elements: usize) -> Vec<u8> {
+    // Fast paths for the two most common bit widths.
+    match bits {
+        8 => {
+            // One index per byte — direct copy.
+            return packed[..total_elements].to_vec();
+        }
+        4 => {
+            // Two nibbles per byte (high nibble = even index, low nibble = odd index).
+            let mut out = Vec::with_capacity(total_elements);
+            for i in 0..total_elements {
+                if i % 2 == 0 {
+                    out.push((packed[i / 2] >> 4) & 0x0F);
+                } else {
+                    out.push(packed[i / 2] & 0x0F);
+                }
+            }
+            return out;
+        }
+        _ => {}
+    }
+    // General path for all other bit widths (1–3, 5–7).
     let bits = bits as usize;
     let mut out = Vec::with_capacity(total_elements);
     let mut bit_pos = 0usize;
