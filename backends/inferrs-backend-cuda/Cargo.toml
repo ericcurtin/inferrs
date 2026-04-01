@@ -11,4 +11,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 candle-core = { workspace = true, features = ["cuda"] }
+candle-nn = { workspace = true, features = ["cuda"] }
+candle-transformers = { workspace = true, features = ["cuda"] }
 anyhow = { workspace = true }
