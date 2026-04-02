@@ -35,7 +35,7 @@ brew install inferrs
 ### Run
 
 ```bash
-inferrs run --turbo-quant Qwen/Qwen3-0.6B 
+inferrs run --turbo-quant google/gemma-4-E2B-it
 ```
 
 ## Architecture

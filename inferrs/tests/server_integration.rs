@@ -140,3 +140,97 @@ fn chat_completion(port: u16, user_message: &str) -> String {
         .unwrap_or("")
         .to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that `gg-hf-gg/gemma-4-E2B-it` returns a coherent (intelligible)
+/// response to a trivial chat message.
+///
+/// The test is marked `#[ignore]` so that it is skipped by the default
+/// `cargo test` run (which has no GPU / big-model download budget).  Run it
+/// explicitly with:
+///
+/// ```
+/// cargo test --test server_integration gemma4_e2b_returns_intelligible_output -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires model download and significant compute; run with --ignored"]
+fn gemma4_e2b_returns_intelligible_output() {
+    let model_id = "gg-hf-gg/gemma-4-E2B-it";
+    let port = free_port();
+
+    let mut server = spawn_server(model_id, port);
+
+    // Give the server up to 5 minutes to download, load weights, and start.
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(300));
+
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+        let body = serde_json::json!({
+            "model": model_id,
+            "messages": [
+                {"role": "user", "content": "What is 2 + 2?"}
+            ],
+            "max_tokens": 64,
+            "temperature": 0.0
+        });
+
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .expect("HTTP request failed");
+
+        assert_eq!(resp.status(), 200, "expected 200 OK from chat completions");
+
+        let json: serde_json::Value = resp.into_json().expect("response is not valid JSON");
+
+        // Validate top-level structure
+        assert_eq!(
+            json["object"].as_str().unwrap_or(""),
+            "chat.completion",
+            "unexpected object type: {}",
+            json
+        );
+
+        let choices = json["choices"]
+            .as_array()
+            .expect("choices must be an array");
+        assert!(!choices.is_empty(), "choices array must not be empty");
+
+        let content = choices[0]["message"]["content"]
+            .as_str()
+            .expect("choices[0].message.content must be a string");
+
+        assert!(
+            !content.is_empty(),
+            "model returned an empty response for 'What is 2 + 2?'"
+        );
+
+        assert!(
+            looks_intelligible(content),
+            "model output does not look intelligible (no ASCII alphabetic chars).\
+             \nGot: {:?}",
+            content
+        );
+
+        // For "2 + 2 = 4", the answer should contain "4" somewhere.
+        assert!(
+            content.contains('4'),
+            "expected the answer '4' to appear in the response to 'What is 2 + 2?'.\
+             \nGot: {:?}",
+            content
+        );
+
+        eprintln!("gemma4 response: {:?}", content);
+    });
+
+    // Always kill the server child process, even on panic.
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

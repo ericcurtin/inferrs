@@ -4,6 +4,7 @@
 //! with a unified trait for the engine to use.
 
 pub mod attention_utils;
+pub mod gemma4;
 pub mod qwen3;
 pub mod qwen3_5;
 
@@ -95,6 +96,21 @@ impl CausalLM for Qwen3ModelWrapper {
     }
 }
 
+/// A Gemma4 model wrapper.
+struct Gemma4ModelWrapper {
+    inner: gemma4::Gemma4Model,
+}
+
+impl CausalLM for Gemma4ModelWrapper {
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        Ok(self.inner.forward(input_ids, seqlen_offset)?)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.inner.clear_kv_cache();
+    }
+}
+
 /// A Qwen3.5 model wrapper.
 struct Qwen35ModelWrapper {
     inner: qwen3_5::Qwen35Model,
@@ -140,11 +156,11 @@ pub fn load_model(
     // Warn if --turbo-quant was requested but this architecture doesn't support it.
     if turbo_quant_bits.is_some() {
         match arch {
-            ModelArchitecture::Qwen3 => {} // supported
+            ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4 => {} // supported
             other => {
                 tracing::warn!(
                     "--turbo-quant is not supported for {:?} and will be ignored. \
-                     TurboQuant KV cache compression is currently only available for Qwen3.",
+                     TurboQuant KV cache compression is currently only available for Qwen3 and Gemma4.",
                     other
                 );
             }
@@ -216,6 +232,19 @@ pub fn load_model(
             );
             Box::new(Qwen35ModelWrapper {
                 inner: qwen3_5::Qwen35Model::new(&config, vb)?,
+            })
+        }
+        ModelArchitecture::Gemma4 => {
+            let config = raw_config.to_gemma4_config(dtype, device.clone(), turbo_quant_bits);
+            tracing::info!(
+                "Gemma4 config: {} layers, {} heads, {} hidden, {} kv_heads",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.num_key_value_heads,
+            );
+            Box::new(Gemma4ModelWrapper {
+                inner: gemma4::Gemma4Model::new(&config, vb)?,
             })
         }
     };
