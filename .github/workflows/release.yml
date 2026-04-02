@@ -230,7 +230,7 @@ jobs:
           class Inferrs < Formula
             desc "A conservative-memory inference engine for LLMs"
             homepage "https://github.com/${REPO}"
-            version "${{ github.sha }}"
+            version "0.0.$(date -u +%Y%m%d%H%M%S)"
             license "Apache-2.0"
 
             on_macos do
