@@ -29,6 +29,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use half::{bf16, f16};
 
 // ---------------------------------------------------------------------------
 // Nibble packing helpers
@@ -228,6 +229,73 @@ fn dequantize_into(
     }
 }
 
+/// Like `dequantize_into` but emits `half::bf16` directly instead of `f32`.
+///
+/// By converting f32→bf16 on the CPU before the device upload we:
+///   1. Eliminate the GPU `to_dtype` kernel call.
+///   2. Halve the CPU→GPU DMA transfer (2 bytes vs 4 per element).
+fn dequantize_into_bf16(
+    packed: &[u8],
+    scales: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    bits: u8,
+    out: &mut Vec<bf16>,
+) {
+    let n_elems = seq_len * head_dim;
+    let n_groups = head_dim / GROUP_SIZE;
+    let n_levels = 1usize << bits;
+    let levels = (n_levels - 1) as f32;
+
+    let idx_u8 = unpack_indices(packed, bits, n_elems);
+
+    for tok in 0..seq_len {
+        for g in 0..n_groups {
+            let absmax = scales[tok * n_groups + g];
+            let base = tok * head_dim + g * GROUP_SIZE;
+            for i in 0..GROUP_SIZE {
+                let idx = idx_u8[base + i] as f32;
+                let v_norm = idx * (2.0 / levels) - 1.0;
+                // Convert f32 → bf16 on the CPU; avoids a GPU dtype-cast kernel.
+                out.push(bf16::from_f32(v_norm * absmax));
+            }
+        }
+    }
+}
+
+/// Like `dequantize_into_bf16` but emits `half::f16` directly instead of `f32`.
+///
+/// F16 models benefit from the same bandwidth reduction as BF16: 2 bytes vs 4
+/// per element on the CPU→GPU upload, and no GPU `to_dtype` kernel needed.
+fn dequantize_into_f16(
+    packed: &[u8],
+    scales: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    bits: u8,
+    out: &mut Vec<f16>,
+) {
+    let n_elems = seq_len * head_dim;
+    let n_groups = head_dim / GROUP_SIZE;
+    let n_levels = 1usize << bits;
+    let levels = (n_levels - 1) as f32;
+
+    let idx_u8 = unpack_indices(packed, bits, n_elems);
+
+    for tok in 0..seq_len {
+        for g in 0..n_groups {
+            let absmax = scales[tok * n_groups + g];
+            let base = tok * head_dim + g * GROUP_SIZE;
+            for i in 0..GROUP_SIZE {
+                let idx = idx_u8[base + i] as f32;
+                let v_norm = idx * (2.0 / levels) - 1.0;
+                // Convert f32 → f16 on the CPU; avoids a GPU dtype-cast kernel.
+                out.push(f16::from_f32(v_norm * absmax));
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TurboQuantKvCache
 // ---------------------------------------------------------------------------
@@ -284,6 +352,30 @@ pub struct TurboQuantKvCache {
     prefill_kv: Option<(Tensor, Tensor)>,
 }
 
+impl Clone for TurboQuantKvCache {
+    fn clone(&self) -> Self {
+        Self {
+            bits: self.bits,
+            orig_dtype: self.orig_dtype,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            device: self.device.clone(),
+            k_packed: self.k_packed.clone(),
+            k_scales: self.k_scales.clone(),
+            v_packed: self.v_packed.clone(),
+            v_scales: self.v_scales.clone(),
+            seq_len: self.seq_len,
+            // Reset buffer state: the cloned cache will re-allocate its own
+            // independent GPU buffer on first dequantize(), avoiding shared
+            // in-place mutation of the original's kv_buffer via slice_set.
+            cached_seq_len: 0,
+            kv_buffer: None,
+            kv_buffer_cap: 0,
+            prefill_kv: self.prefill_kv.clone(),
+        }
+    }
+}
+
 impl TurboQuantKvCache {
     pub fn new(cfg: &TurboQuantConfig, num_kv_heads: usize, dtype: DType, device: Device) -> Self {
         Self {
@@ -313,17 +405,22 @@ impl TurboQuantKvCache {
 
         // Single device→CPU transfer for all heads at once.
         // Layout: [num_kv_heads, new_seq, head_dim] (row-major after contiguous).
+        //
+        // Transfer the tensor as-is (bf16) rather than converting to f32 on the GPU
+        // first.  This halves the GPU→CPU DMA bandwidth (2 bytes vs 4 per element).
+        // The CPU bf16→f32 widening step that follows is a simple bit-manipulation
+        // loop that is essentially free compared to the DMA latency.
         let k_all: Vec<f32> = k
             .squeeze(0)?
-            .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
             .contiguous()?
             .flatten_all()?
             .to_vec1()?;
         let v_all: Vec<f32> = v
             .squeeze(0)?
-            .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
             .contiguous()?
             .flatten_all()?
             .to_vec1()?;
@@ -423,53 +520,135 @@ impl TurboQuantKvCache {
         let bytes_per_token = (self.head_dim * self.bits as usize).div_ceil(8);
         let scales_per_token = self.head_dim / GROUP_SIZE;
 
-        // Build flat f32 buffers for all heads, then do a single device upload.
         let n_new_elems = self.num_kv_heads * delta * self.head_dim;
-        let mut k_new_data = Vec::with_capacity(n_new_elems);
-        let mut v_new_data = Vec::with_capacity(n_new_elems);
+        let shape = (self.num_kv_heads, delta, self.head_dim);
 
-        for h in 0..self.num_kv_heads {
-            // Slice into the per-head packed storage to get only the delta tokens.
-            let k_packed_delta = &self.k_packed[h][self.cached_seq_len * bytes_per_token..];
-            let k_scales_delta = &self.k_scales[h][self.cached_seq_len * scales_per_token..];
-            let v_packed_delta = &self.v_packed[h][self.cached_seq_len * bytes_per_token..];
-            let v_scales_delta = &self.v_scales[h][self.cached_seq_len * scales_per_token..];
+        // For BF16 and F16 models we dequantize directly into the target half-precision
+        // type on the CPU before the device upload.  This avoids a GPU `to_dtype` kernel
+        // call AND halves the CPU→GPU transfer (2 bytes vs 4 per element).
+        // For F32 (and any other dtype) we fall back to the f32 intermediate path.
+        let (k_new, v_new) = match self.orig_dtype {
+            DType::BF16 => {
+                let mut k_new_data: Vec<bf16> = Vec::with_capacity(n_new_elems);
+                let mut v_new_data: Vec<bf16> = Vec::with_capacity(n_new_elems);
 
-            dequantize_into(
-                k_packed_delta,
-                k_scales_delta,
-                delta,
-                self.head_dim,
-                self.bits,
-                &mut k_new_data,
-            );
-            dequantize_into(
-                v_packed_delta,
-                v_scales_delta,
-                delta,
-                self.head_dim,
-                self.bits,
-                &mut v_new_data,
-            );
-        }
+                for h in 0..self.num_kv_heads {
+                    let k_packed_delta = &self.k_packed[h][self.cached_seq_len * bytes_per_token..];
+                    let k_scales_delta =
+                        &self.k_scales[h][self.cached_seq_len * scales_per_token..];
+                    let v_packed_delta = &self.v_packed[h][self.cached_seq_len * bytes_per_token..];
+                    let v_scales_delta =
+                        &self.v_scales[h][self.cached_seq_len * scales_per_token..];
 
-        // Single device upload: [num_kv_heads, delta, head_dim] → [1, num_kv_heads, delta, head_dim]
-        let k_new = Tensor::from_vec(
-            k_new_data,
-            (self.num_kv_heads, delta, self.head_dim),
-            &Device::Cpu,
-        )?
-        .to_device(&self.device)?
-        .to_dtype(self.orig_dtype)?
-        .unsqueeze(0)?;
-        let v_new = Tensor::from_vec(
-            v_new_data,
-            (self.num_kv_heads, delta, self.head_dim),
-            &Device::Cpu,
-        )?
-        .to_device(&self.device)?
-        .to_dtype(self.orig_dtype)?
-        .unsqueeze(0)?;
+                    dequantize_into_bf16(
+                        k_packed_delta,
+                        k_scales_delta,
+                        delta,
+                        self.head_dim,
+                        self.bits,
+                        &mut k_new_data,
+                    );
+                    dequantize_into_bf16(
+                        v_packed_delta,
+                        v_scales_delta,
+                        delta,
+                        self.head_dim,
+                        self.bits,
+                        &mut v_new_data,
+                    );
+                }
+
+                let k = Tensor::from_vec(k_new_data, shape, &Device::Cpu)?
+                    .to_device(&self.device)?
+                    .unsqueeze(0)?;
+                let v = Tensor::from_vec(v_new_data, shape, &Device::Cpu)?
+                    .to_device(&self.device)?
+                    .unsqueeze(0)?;
+                (k, v)
+            }
+            DType::F16 => {
+                let mut k_new_data: Vec<f16> = Vec::with_capacity(n_new_elems);
+                let mut v_new_data: Vec<f16> = Vec::with_capacity(n_new_elems);
+
+                for h in 0..self.num_kv_heads {
+                    let k_packed_delta = &self.k_packed[h][self.cached_seq_len * bytes_per_token..];
+                    let k_scales_delta =
+                        &self.k_scales[h][self.cached_seq_len * scales_per_token..];
+                    let v_packed_delta = &self.v_packed[h][self.cached_seq_len * bytes_per_token..];
+                    let v_scales_delta =
+                        &self.v_scales[h][self.cached_seq_len * scales_per_token..];
+
+                    dequantize_into_f16(
+                        k_packed_delta,
+                        k_scales_delta,
+                        delta,
+                        self.head_dim,
+                        self.bits,
+                        &mut k_new_data,
+                    );
+                    dequantize_into_f16(
+                        v_packed_delta,
+                        v_scales_delta,
+                        delta,
+                        self.head_dim,
+                        self.bits,
+                        &mut v_new_data,
+                    );
+                }
+
+                let k = Tensor::from_vec(k_new_data, shape, &Device::Cpu)?
+                    .to_device(&self.device)?
+                    .unsqueeze(0)?;
+                let v = Tensor::from_vec(v_new_data, shape, &Device::Cpu)?
+                    .to_device(&self.device)?
+                    .unsqueeze(0)?;
+                (k, v)
+            }
+            _ => {
+                // f32 fallback: build f32 on CPU, upload, then convert dtype on GPU.
+                let mut k_new_data = Vec::with_capacity(n_new_elems);
+                let mut v_new_data = Vec::with_capacity(n_new_elems);
+
+                for h in 0..self.num_kv_heads {
+                    let k_packed_delta = &self.k_packed[h][self.cached_seq_len * bytes_per_token..];
+                    let k_scales_delta =
+                        &self.k_scales[h][self.cached_seq_len * scales_per_token..];
+                    let v_packed_delta = &self.v_packed[h][self.cached_seq_len * bytes_per_token..];
+                    let v_scales_delta =
+                        &self.v_scales[h][self.cached_seq_len * scales_per_token..];
+
+                    dequantize_into(
+                        k_packed_delta,
+                        k_scales_delta,
+                        delta,
+                        self.head_dim,
+                        self.bits,
+                        &mut k_new_data,
+                    );
+                    dequantize_into(
+                        v_packed_delta,
+                        v_scales_delta,
+                        delta,
+                        self.head_dim,
+                        self.bits,
+                        &mut v_new_data,
+                    );
+                }
+
+                let k = Tensor::from_vec(k_new_data, shape, &Device::Cpu)?
+                    .to_device(&self.device)?
+                    .to_dtype(self.orig_dtype)?
+                    .unsqueeze(0)?;
+                let v = Tensor::from_vec(v_new_data, shape, &Device::Cpu)?
+                    .to_device(&self.device)?
+                    .to_dtype(self.orig_dtype)?
+                    .unsqueeze(0)?;
+                (k, v)
+            }
+        };
+
+        // k_new and v_new are now fully constructed (either via the bf16 fast path or
+        // the f32 fallback path above).
 
         // Ensure the pre-allocated buffer is large enough for the current sequence.
         // The buffer is grown by doubling (amortised O(1)) to avoid frequent reallocations.

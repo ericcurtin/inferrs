@@ -1613,6 +1613,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "half",
  "hf-hub",
  "libloading",
  "serde",
