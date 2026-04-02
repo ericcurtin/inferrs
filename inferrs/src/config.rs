@@ -13,6 +13,7 @@ pub enum ModelArchitecture {
     Qwen35,
     Gemma2,
     Gemma3,
+    Gemma4,
 }
 
 /// Rope parameters nested object (used in Qwen3.5 text_config).
@@ -22,9 +23,10 @@ pub struct RopeParameters {
     pub partial_rotary_factor: Option<f64>,
 }
 
-/// Shared text_config nested object (used by Qwen3.5).
+/// Shared text_config nested object (used by Qwen3.5 and Gemma4).
 #[derive(Debug, Deserialize)]
 pub struct TextConfig {
+    // Qwen3.5 fields
     pub vocab_size: Option<usize>,
     pub hidden_size: Option<usize>,
     pub intermediate_size: Option<usize>,
@@ -43,6 +45,22 @@ pub struct TextConfig {
     pub layer_types: Option<Vec<String>>,
     #[serde(default)]
     pub rope_parameters: RopeParameters,
+
+    // Gemma4-specific text_config fields
+    pub global_head_dim: Option<usize>,
+    pub sliding_window: Option<usize>,
+    pub sliding_window_pattern: Option<usize>,
+    pub max_position_embeddings: Option<usize>,
+    pub hidden_size_per_layer_input: Option<usize>,
+    pub final_logit_softcapping: Option<f64>,
+    pub attn_logit_softcapping: Option<f64>,
+    pub query_pre_attn_scalar: Option<usize>,
+    pub attention_bias: Option<bool>,
+    pub hidden_activation: Option<String>,
+    #[allow(dead_code)]
+    pub model_type: Option<String>,
+    pub num_kv_shared_layers: Option<usize>,
+    pub use_double_wide_mlp: Option<bool>,
 }
 
 /// Raw config.json from HuggingFace.
@@ -83,6 +101,7 @@ pub struct RawConfig {
     #[allow(dead_code)]
     pub layer_types: Option<Vec<String>>,
 
+    // Qwen3.5/Gemma4-specific (nested text_config)
     pub text_config: Option<TextConfig>,
 }
 
@@ -106,6 +125,9 @@ impl RawConfig {
                 if arch.contains("Qwen2") {
                     return Ok(ModelArchitecture::Qwen2);
                 }
+                if arch.contains("Gemma4") {
+                    return Ok(ModelArchitecture::Gemma4);
+                }
                 if arch.contains("Gemma3") {
                     return Ok(ModelArchitecture::Gemma3);
                 }
@@ -120,6 +142,7 @@ impl RawConfig {
                 "qwen2" | "qwen2_5" => return Ok(ModelArchitecture::Qwen2),
                 "qwen3" => return Ok(ModelArchitecture::Qwen3),
                 "qwen3_5" => return Ok(ModelArchitecture::Qwen35),
+                "gemma4" => return Ok(ModelArchitecture::Gemma4),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
                 "gemma2" => return Ok(ModelArchitecture::Gemma2),
                 _ => {}
@@ -247,6 +270,104 @@ impl RawConfig {
         }
     }
 
+    pub fn to_gemma4_config(
+        &self,
+        dtype: DType,
+        device: Device,
+        turbo_quant_bits: Option<u8>,
+    ) -> crate::models::gemma4::Gemma4Config {
+        use crate::models::gemma4::Gemma4Config;
+
+        // All language-model params live in the nested text_config
+        let tc = self.text_config.as_ref();
+
+        let vocab_size = tc.and_then(|t| t.vocab_size).unwrap_or(262144);
+        let hidden_size = tc.and_then(|t| t.hidden_size).unwrap_or(1536);
+        let intermediate_size = tc.and_then(|t| t.intermediate_size).unwrap_or(6144);
+        let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(35);
+        let num_attention_heads = tc.and_then(|t| t.num_attention_heads).unwrap_or(8);
+        let num_key_value_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(1);
+        let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
+        let global_head_dim = tc.and_then(|t| t.global_head_dim).unwrap_or(512);
+        let hidden_size_per_layer_input = tc
+            .and_then(|t| t.hidden_size_per_layer_input)
+            .unwrap_or(256);
+        let rms_norm_eps = tc.and_then(|t| t.rms_norm_eps).unwrap_or(1e-6);
+        let sliding_window = tc.and_then(|t| t.sliding_window).unwrap_or(512);
+        let sliding_window_pattern = tc.and_then(|t| t.sliding_window_pattern).unwrap_or(5);
+        let max_position_embeddings = tc.and_then(|t| t.max_position_embeddings).unwrap_or(131072);
+        let final_logit_softcapping = tc.and_then(|t| t.final_logit_softcapping).or(Some(30.0));
+        let attn_logit_softcapping = tc.and_then(|t| t.attn_logit_softcapping);
+        let query_pre_attn_scalar = tc.and_then(|t| t.query_pre_attn_scalar).unwrap_or(256);
+        let attention_bias = tc.and_then(|t| t.attention_bias).unwrap_or(false);
+        let hidden_activation = parse_gemma_activation(
+            tc.and_then(|t| t.hidden_activation.as_deref())
+                .unwrap_or("gelu_pytorch_tanh"),
+        );
+        let tie_word_embeddings = tc
+            .and_then(|t| t.tie_word_embeddings)
+            .or(self.tie_word_embeddings)
+            .unwrap_or(true);
+
+        // Build layer_types: "full_attention" layers are global, the rest are sliding
+        let layer_is_full_attention: Vec<bool> =
+            if let Some(types) = tc.and_then(|t| t.layer_types.as_ref()) {
+                types.iter().map(|s| s == "full_attention").collect()
+            } else {
+                // fallback: every sliding_window_pattern-th layer is full
+                (0..num_hidden_layers)
+                    .map(|i| (i + 1) % sliding_window_pattern == 0)
+                    .collect()
+            };
+
+        // double-wide MLP: layers from index (num_hidden_layers - num_kv_shared_layers) onward
+        // use intermediate_size * 2. Only applies when use_double_wide_mlp is true.
+        let use_double_wide_mlp = tc.and_then(|t| t.use_double_wide_mlp).unwrap_or(false);
+        let num_kv_shared_layers = tc
+            .and_then(|t| t.num_kv_shared_layers)
+            .unwrap_or(num_hidden_layers);
+        let double_wide_mlp_start_layer = if use_double_wide_mlp {
+            num_hidden_layers.saturating_sub(num_kv_shared_layers)
+        } else {
+            num_hidden_layers // disabled: never trigger
+        };
+        // KV sharing is independent of double-wide MLP (e.g. E4B has KV sharing
+        // but use_double_wide_mlp=false, so double_wide_mlp_start_layer would be
+        // num_hidden_layers and accidentally disable KV sharing).
+        let first_kv_shared_idx = num_hidden_layers.saturating_sub(num_kv_shared_layers);
+
+        Gemma4Config {
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            global_head_dim,
+            hidden_size_per_layer_input,
+            rms_norm_eps,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1_000_000.0,
+            partial_rotary_factor_global: 0.25,
+            sliding_window,
+            sliding_window_pattern,
+            max_position_embeddings,
+            final_logit_softcapping,
+            attn_logit_softcapping,
+            query_pre_attn_scalar,
+            attention_bias,
+            hidden_activation,
+            tie_word_embeddings,
+            layer_is_full_attention,
+            double_wide_mlp_start_layer,
+            first_kv_shared_idx,
+            turbo_quant_bits,
+            dtype,
+            device,
+        }
+    }
+
     pub fn to_qwen35_config(
         &self,
         dtype: DType,
@@ -347,6 +468,17 @@ impl RawConfig {
                     .map(|_| usize::MAX) // effectively unlimited
                     .unwrap_or(usize::MAX)
             }
+            ModelArchitecture::Gemma4 => {
+                // Gemma4 interleaves local sliding-window layers with global
+                // full-attention layers.  The sliding_window value only limits
+                // the local layers; global layers can attend to the full
+                // context up to max_position_embeddings.  Use
+                // max_position_embeddings so that the KV cache and max_tokens
+                // clamping are sized for the full context, not just the local
+                // window.
+                let tc = self.text_config.as_ref();
+                tc.and_then(|t| t.max_position_embeddings).unwrap_or(8192)
+            }
         }
     }
 
@@ -406,6 +538,25 @@ impl RawConfig {
                 let head_dim = self.head_dim.unwrap_or(256);
                 let num_layers = self.num_hidden_layers.unwrap_or(34);
                 (num_kv_heads, head_dim, num_layers)
+            }
+            ModelArchitecture::Gemma4 => {
+                let tc = self.text_config.as_ref();
+                let num_kv_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(1);
+                let head_dim = tc.and_then(|t| t.global_head_dim).unwrap_or(512);
+                let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(35);
+                let sliding_window_pattern = tc.and_then(|t| t.sliding_window_pattern).unwrap_or(5);
+                // Count full-attention layers (every sliding_window_pattern-th layer).
+                let num_full_attn = if let Some(types) = tc.and_then(|t| t.layer_types.as_ref()) {
+                    types
+                        .iter()
+                        .filter(|s| s.as_str() == "full_attention")
+                        .count()
+                } else {
+                    (0..num_hidden_layers)
+                        .filter(|i| (i + 1) % sliding_window_pattern == 0)
+                        .count()
+                };
+                (num_kv_heads, head_dim, num_full_attn)
             }
         }
     }

@@ -41,6 +41,8 @@ pub enum ChatTemplate {
     Gemma,
     /// Gemma3 format: <start_of_turn>role\ncontent<end_of_turn> without BOS prefix, model turn
     Gemma3,
+    /// Gemma4 format: <bos><|turn>role\ncontent<turn|>\n
+    Gemma4,
     /// Generic format: just concatenate with role markers
     #[allow(dead_code)]
     Generic,
@@ -111,8 +113,11 @@ impl Tokenizer {
 
         let config = tokenizer_config_path.and_then(|p| TokenizerConfig::from_file(p).ok());
 
-        let chat_template = detect_chat_template(&config);
-        let _ = arch_override; // reserved for future architecture-specific overrides
+        // Detect chat template, optionally overriding based on known architecture
+        let chat_template = match arch_override {
+            Some(crate::config::ModelArchitecture::Gemma4) => ChatTemplate::Gemma4,
+            _ => detect_chat_template(&config),
+        };
 
         let eos_token = config.as_ref().and_then(|c| c.eos_token_str());
 
@@ -184,6 +189,7 @@ impl Tokenizer {
             ChatTemplate::Qwen35 => apply_qwen35(messages),
             ChatTemplate::Gemma => apply_gemma(messages, &self.bos_token),
             ChatTemplate::Gemma3 => apply_gemma3(messages),
+            ChatTemplate::Gemma4 => apply_gemma4(messages),
             ChatTemplate::Generic => apply_generic(messages),
         };
         Ok(prompt)
@@ -294,6 +300,27 @@ fn apply_gemma3(messages: &[ChatMessage]) -> String {
     }
     // Add the model turn marker
     prompt.push_str("<start_of_turn>model\n");
+    prompt
+}
+
+/// Gemma4 chat template.
+///
+/// Format: `<bos><|turn>role\ncontent<turn|>\n`
+/// The assistant turn uses "model" as the role label.
+fn apply_gemma4(messages: &[ChatMessage]) -> String {
+    // The Gemma4 jinja template emits `{{ bos_token }}\n` — there is a literal
+    // newline directly after the bos token before the first turn marker.
+    let mut prompt = String::from("<bos>\n");
+    for msg in messages {
+        let role = match msg.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "model",
+        };
+        prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content.trim()));
+    }
+    // Add the model turn marker
+    prompt.push_str("<|turn>model\n");
     prompt
 }
 
