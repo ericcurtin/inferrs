@@ -27,9 +27,17 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 
 ### Install
 
+**macOS / Linux**
+
 ```bash
 brew tap ericcurtin/inferrs
 brew install inferrs
+```
+
+**Windows**
+
+```powershell
+winget install ericcurtin.inferrs
 ```
 
 ### Run

@@ -171,23 +171,92 @@ jobs:
           name: inferrs-aarch64-unknown-linux-gnu
           path: inferrs-aarch64-unknown-linux-gnu.tar.gz
 
+  # ── Windows x86_64 binary ─────────────────────────────────────────────────
+  build-windows-x86:
+    name: Build (x86_64-pc-windows-msvc)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-windows
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc -p inferrs
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "inferrs-windows-x86_64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\inferrs.exe" "$stage\"
+          Compress-Archive -Path "$stage\*" -DestinationPath "inferrs-x86_64-pc-windows-msvc.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferrs-x86_64-pc-windows-msvc
+          path: inferrs-x86_64-pc-windows-msvc.zip
+
+  # ── Windows aarch64 binary ────────────────────────────────────────────────
+  build-windows-arm64:
+    name: Build (aarch64-pc-windows-msvc)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-aarch64-windows
+
+      - name: Build
+        run: cargo build --release --target aarch64-pc-windows-msvc -p inferrs
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "inferrs-windows-aarch64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target\aarch64-pc-windows-msvc\release\inferrs.exe" "$stage\"
+          Compress-Archive -Path "$stage\*" -DestinationPath "inferrs-aarch64-pc-windows-msvc.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferrs-aarch64-pc-windows-msvc
+          path: inferrs-aarch64-pc-windows-msvc.zip
+
   # ── GitHub Release ─────────────────────────────────────────────────────────
   release:
     name: Publish release
-    needs: [build-macos, build-linux-x86, build-linux-arm64]
+    needs: [build-macos, build-linux-x86, build-linux-arm64, build-windows-x86, build-windows-arm64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
+      - name: Compute version
+        id: version
+        run: echo "version=0.0.$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
       - name: Create or update latest release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           SHA="${{ github.sha }}"
           SHORT="${SHA::7}"
@@ -197,18 +266,30 @@ jobs:
           gh api repos/$GH_REPO/git/refs/tags/$TAG \
             --method DELETE 2>/dev/null || true
 
+          # Create both the mutable `latest` tag and an immutable versioned tag.
+          # The versioned tag is what winget manifests reference so their
+          # SHA256s stay valid after subsequent releases.
           gh release create "$TAG" \
             --target "$SHA" \
             --title "latest (${SHORT})" \
             --notes "Built from commit ${SHA}" \
             --prerelease \
-            inferrs-*.tar.gz
+            inferrs-*.tar.gz inferrs-*.zip
+
+          gh release create "$VERSION" \
+            --target "$SHA" \
+            --title "${VERSION} (${SHORT})" \
+            --notes "Built from commit ${SHA}" \
+            --prerelease \
+            inferrs-*.tar.gz inferrs-*.zip
 
   # ── Homebrew formula ───────────────────────────────────────────────────────
   update-formula:
     name: Update Homebrew formula
     needs: release
     runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
 
     steps:
       - uses: actions/download-artifact@v4
@@ -224,13 +305,13 @@ jobs:
           SHA_LINUX_X86=$(sha256sum inferrs-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
           SHA_LINUX_ARM=$(sha256sum inferrs-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
 
-          BASE="https://github.com/${REPO}/releases/download/latest"
+          BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 
           cat > inferrs.rb <<EOF
           class Inferrs < Formula
             desc "A conservative-memory inference engine for LLMs"
             homepage "https://github.com/${REPO}"
-            version "0.0.$(date -u +%Y%m%d%H%M%S)"
+            version "${VERSION}"
             license "Apache-2.0"
 
             on_macos do
@@ -290,3 +371,125 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             "https://api.github.com/repos/ericcurtin/homebrew-inferrs/contents/Formula/inferrs.rb"
+
+  # ── winget manifest ────────────────────────────────────────────────────────
+  update-winget:
+    name: Update winget manifest
+    needs: release
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Compute SHA256s and submit winget PR
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          SHA_WIN_X86=$(sha256sum inferrs-x86_64-pc-windows-msvc.zip | awk '{print $1}')
+          SHA_WIN_ARM=$(sha256sum inferrs-aarch64-pc-windows-msvc.zip | awk '{print $1}')
+
+          PUBLISHER="ericcurtin"
+          PACKAGE_ID="${PUBLISHER}.inferrs"
+          # Use the versioned tag so URLs are immutable and SHA256s stay valid
+          BASE="https://github.com/${REPO}/releases/download/${VERSION}"
+
+          mkdir -p manifests
+
+          # ── version manifest ──────────────────────────────────────────────
+          cat > manifests/${PACKAGE_ID}.yaml <<EOF
+          PackageIdentifier: ${PACKAGE_ID}
+          PackageVersion: ${VERSION}
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.6.0
+          EOF
+
+          # ── locale manifest ───────────────────────────────────────────────
+          cat > manifests/${PACKAGE_ID}.locale.en-US.yaml <<EOF
+          PackageIdentifier: ${PACKAGE_ID}
+          PackageVersion: ${VERSION}
+          PackageLocale: en-US
+          Publisher: ${PUBLISHER}
+          PackageName: inferrs
+          License: Apache-2.0
+          ShortDescription: A conservative-memory inference engine for LLMs
+          PackageUrl: https://github.com/${REPO}
+          ManifestType: defaultLocale
+          ManifestVersion: 1.6.0
+          EOF
+
+          # ── installer manifest ────────────────────────────────────────────
+          # InstallerType: zip requires NestedInstallerType + NestedInstallerFiles
+          # so winget knows the executable path inside the archive.
+          cat > manifests/${PACKAGE_ID}.installer.yaml <<EOF
+          PackageIdentifier: ${PACKAGE_ID}
+          PackageVersion: ${VERSION}
+          InstallerType: zip
+          NestedInstallerType: portable
+          NestedInstallerFiles:
+            - RelativeFilePath: inferrs.exe
+              PortableCommandAlias: inferrs
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${BASE}/inferrs-x86_64-pc-windows-msvc.zip
+              InstallerSha256: ${SHA_WIN_X86}
+            - Architecture: arm64
+              InstallerUrl: ${BASE}/inferrs-aarch64-pc-windows-msvc.zip
+              InstallerSha256: ${SHA_WIN_ARM}
+          ManifestType: installer
+          ManifestVersion: 1.6.0
+          EOF
+
+          DEST_DIR="manifests/e/ericcurtin/inferrs/${VERSION}"
+          BRANCH="inferrs-${VERSION}"
+
+          # ── create branch on fork before pushing files ────────────────────
+          FORK_SHA=$(curl -sf \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/ref/heads/master" \
+            | jq -r '.object.sha')
+
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg ref "refs/heads/${BRANCH}" --arg sha "$FORK_SHA" \
+                 '{ref: $ref, sha: $sha}')" \
+            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/refs"
+
+          # ── push manifest files to the fork branch ────────────────────────
+          for FILE in \
+            "${PACKAGE_ID}.yaml" \
+            "${PACKAGE_ID}.locale.en-US.yaml" \
+            "${PACKAGE_ID}.installer.yaml"; do
+
+            CONTENT=$(base64 -w0 "manifests/${FILE}")
+
+            PAYLOAD=$(jq -n \
+              --arg message "Add inferrs ${VERSION}" \
+              --arg content "$CONTENT" \
+              --arg branch "$BRANCH" \
+              '{message: $message, content: $content, branch: $branch}')
+
+            curl -sf -X PUT \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/contents/${DEST_DIR}/${FILE}"
+          done
+
+          # ── open PR from fork branch → microsoft/winget-pkgs ─────────────
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg title "New package: ${PACKAGE_ID} version ${VERSION}" \
+              --arg body "Automated submission from https://github.com/${REPO}" \
+              --arg head "${PUBLISHER}:${BRANCH}" \
+              --arg base "master" \
+              '{title: $title, body: $body, head: $head, base: $base}')" \
+            "https://api.github.com/repos/microsoft/winget-pkgs/pulls"
