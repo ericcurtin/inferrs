@@ -57,11 +57,13 @@ anyhow = { workspace = true }
 crossterm = "0.28"
 indicatif = "0.17"
 
-# Linux: dynamic backend loading + CUDA device support.
-# Enable the cuda feature so Device::new_cuda() is available at runtime
-# when the CUDA plugin probe succeeds.
+# Linux: dynamic backend loading on all arches.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
+
+# x86_64 Linux only: enable CUDA so Device::new_cuda() is available at
+# runtime when the CUDA plugin probe succeeds. aarch64 Linux has no CUDA.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 candle-core = { workspace = true, features = ["cuda"] }
 candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda"] }
