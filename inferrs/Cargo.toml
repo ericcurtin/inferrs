@@ -2,7 +2,7 @@
 name = "inferrs"
 version = "0.1.0"
 edition = "2021"
-description = "A conservative-memory inference engine for LLMs"
+description = "A TurboQuant inference server"
 license = "Apache-2.0"
 
 [[bin]]
