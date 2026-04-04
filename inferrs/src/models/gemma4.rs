@@ -1980,7 +1980,14 @@ impl Gemma4Model {
             // Embedding lookup on CPU, then transfer result to GPU.
             // The full table is CPU-resident to avoid exhausting VRAM.
             let ids_cpu = input_ids.to_device(&Device::Cpu)?;
-            let pli_embed_cpu = model_pli.embed_tokens_per_layer_cpu.embedding(&ids_cpu)?;
+            let embed_dim = model_pli.embed_tokens_per_layer_cpu.dim(1)?;
+            let mut out_dims = ids_cpu.dims().to_vec();
+            out_dims.push(embed_dim);
+            let ids_flat = ids_cpu.flatten_all()?;
+            let pli_embed_cpu = model_pli
+                .embed_tokens_per_layer_cpu
+                .index_select(&ids_flat, 0)?
+                .reshape(out_dims)?;
             let pli_embed = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
             let pli_embed = (pli_embed * model_pli.embed_combined_scale)?;
             let pli_proj = xs.apply(&model_pli.per_layer_model_projection)?;
