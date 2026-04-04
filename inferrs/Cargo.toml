@@ -15,6 +15,15 @@ candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
 candle-transformers = { workspace = true, features = ["metal"] }
 
+# On Linux, enable CUDA so Device::new_cuda() is available at runtime.
+# The main binary still does not link CUDA at compile time (dynamic loading
+# via the plugin .so handles that); the cuda feature only activates the
+# candle code paths that construct a CudaDevice.
+[target.'cfg(target_os = "linux")'.dependencies]
+candle-core = { workspace = true, features = ["cuda"] }
+candle-nn = { workspace = true, features = ["cuda"] }
+candle-transformers = { workspace = true, features = ["cuda"] }
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
