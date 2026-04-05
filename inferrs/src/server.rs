@@ -132,6 +132,11 @@ pub struct ErrorDetail {
 
 // ─── Anthropic API types ────────────────────────────────────────────────────
 
+/// Anthropic stop-reason value when the model naturally finishes its turn.
+const ANTHROPIC_STOP_END_TURN: &str = "end_turn";
+/// Anthropic stop-reason value when the token budget is exhausted.
+const ANTHROPIC_STOP_MAX_TOKENS: &str = "max_tokens";
+
 /// Role enum for Anthropic messages (only "user" and "assistant" – system
 /// messages are passed at the top level).
 #[derive(Debug, Deserialize)]
@@ -381,8 +386,8 @@ fn anthropic_error(
 /// `"end_turn"` and `"max_tokens"` respectively.
 fn anthropic_stop_reason(engine_reason: &str) -> String {
     match engine_reason {
-        "stop" => "end_turn".to_string(),
-        "length" => "max_tokens".to_string(),
+        "stop" => ANTHROPIC_STOP_END_TURN.to_string(),
+        "length" => ANTHROPIC_STOP_MAX_TOKENS.to_string(),
         other => other.to_string(),
     }
 }
@@ -1024,7 +1029,7 @@ fn make_anthropic_sse_stream(
 
         // 4. content_block_delta events (one per token)
         let mut output_tokens: usize = 0;
-        let mut final_stop_reason = "end_turn".to_string();
+        let mut final_stop_reason = ANTHROPIC_STOP_END_TURN.to_string();
 
         while let Some(token) = token_rx.recv().await {
             output_tokens += 1;
