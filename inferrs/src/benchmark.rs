@@ -528,7 +528,7 @@ fn print_summary(
             inferrs.and_then(|s| s.decode_tps),
         ),
         (
-            "inferrs serve --turbo-quant --quantize google/gemma-4-E2B-it",
+            "inferrs serve --turbo-quant=false --quantize google/gemma-4-E2B-it",
             inferrs_tq.and_then(|s| s.ttft_ms),
             inferrs_tq.and_then(|s| s.prefill_tps),
             inferrs_tq.and_then(|s| s.decode_tps),
