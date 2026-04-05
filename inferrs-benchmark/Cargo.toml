@@ -1,0 +1,16 @@
+[package]
+name = "inferrs-benchmark"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform comparative benchmark: inferrs vs llama-server"
+license = "Apache-2.0"
+
+[[bin]]
+name = "inferrs-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+anyhow = { workspace = true }

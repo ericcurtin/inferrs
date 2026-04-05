@@ -25,7 +25,7 @@ jobs:
         with:
           components: rustfmt
       # Format-check only the packages that don't require GPU toolchains.
-      - run: cargo fmt --check -p inferrs -p inferrs-backend-vulkan
+      - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
 
   clippy:
     name: Clippy
@@ -43,7 +43,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-      - run: cargo clippy -p inferrs -p inferrs-backend-vulkan -- -D warnings
+      - run: cargo clippy -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan -- -D warnings
 
   build:
     name: Build (${{ matrix.target }})
@@ -92,4 +92,4 @@ jobs:
           sudo ln -sfn /usr/local/cuda/lib64/stubs/libcuda.so \
                        /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-      - run: cargo test -p inferrs -p inferrs-backend-vulkan
+      - run: cargo test -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan

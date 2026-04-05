@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "inferrs",
+    "inferrs-benchmark",
     "backends/inferrs-backend-cuda",
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
@@ -11,6 +12,7 @@ members = [
 # explicitly: `cargo build -p inferrs-backend-cuda`
 default-members = [
     "inferrs",
+    "inferrs-benchmark",
     "backends/inferrs-backend-vulkan",
 ]
 resolver = "2"

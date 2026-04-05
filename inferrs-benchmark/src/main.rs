@@ -1,4 +1,4 @@
-//! HTTP-based comparative benchmark runner for `inferrs benchmark`.
+//! HTTP-based comparative benchmark: inferrs vs llama-server.
 //!
 //! Ports `scripts/benchmark.sh` to Rust so that benchmarks are runnable on
 //! macOS, Windows **and** Linux without requiring Bash or Python.
@@ -15,73 +15,76 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use clap::Parser;
 
 // ── CLI arguments ────────────────────────────────────────────────────────────
 
-/// Arguments for the `benchmark` subcommand.
-#[derive(clap::Args, Clone)]
-pub struct BenchmarkArgs {
+/// Cross-platform comparative benchmark: inferrs vs llama-server.
+#[derive(Parser, Clone)]
+#[command(
+    name = "inferrs-benchmark",
+    about = "Compare inferrs vs llama-server over HTTP"
+)]
+struct BenchmarkArgs {
     /// Number of timed benchmark runs per backend.
     #[arg(long, default_value_t = 5)]
-    pub runs: usize,
+    runs: usize,
 
     /// Number of warm-up runs (results discarded).
     #[arg(long, default_value_t = 1)]
-    pub warmup: usize,
+    warmup: usize,
 
     /// Approximate number of prompt tokens to generate synthetically.
     #[arg(long, default_value_t = 128)]
-    pub prompt_len: usize,
+    prompt_len: usize,
 
     /// Maximum tokens to generate per request.
     #[arg(long, default_value_t = 128)]
-    pub max_tokens: usize,
+    max_tokens: usize,
 
     /// Port for the `inferrs serve --quantize` backend.
     #[arg(long, default_value_t = 8080)]
-    pub inferrs_port: u16,
+    inferrs_port: u16,
 
     /// Port for the `inferrs serve --turbo-quant=false --quantize` backend.
     #[arg(long, default_value_t = 8082)]
-    pub inferrs_tq_port: u16,
+    inferrs_tq_port: u16,
 
     /// Port for the `llama-server` backend.
     #[arg(long, default_value_t = 8181)]
-    pub llama_port: u16,
+    llama_port: u16,
 
     /// HuggingFace model ID for inferrs.
     #[arg(long, default_value = "google/gemma-4-E2B-it")]
-    pub inferrs_model: String,
+    inferrs_model: String,
 
     /// GGUF model ID for llama-server.
     #[arg(long, default_value = "ggml-org/gemma-4-E2B-it-GGUF")]
-    pub llama_model: String,
+    llama_model: String,
 
     /// Seconds to wait for a server to become healthy.
     #[arg(long, default_value_t = 120)]
-    pub server_ready_timeout: u64,
+    server_ready_timeout: u64,
 
     /// Override path to the inferrs binary.
     #[arg(long)]
-    pub inferrs_bin: Option<PathBuf>,
+    inferrs_bin: Option<PathBuf>,
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-pub fn run(args: BenchmarkArgs) -> Result<()> {
+fn main() -> Result<()> {
+    let args = BenchmarkArgs::parse();
+
     let inferrs_bin = resolve_inferrs_bin(&args);
     let prompt = generate_synthetic_prompt(args.prompt_len);
-
-    let mut summary_inferrs = None;
-    let mut summary_inferrs_tq = None;
-    let mut summary_llama = None;
 
     // ── 1. inferrs serve --quantize ──────────────────────────────────────────
     log_header(&format!(
         "Benchmark 1/3 — inferrs serve --quantize {}",
         args.inferrs_model
     ));
-    {
+    let summary_inferrs = {
         let mut server = start_inferrs(
             &inferrs_bin,
             &args.inferrs_model,
@@ -100,26 +103,27 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             bail!("server failed to start");
         }
 
-        summary_inferrs = Some(bench_http(
+        let summary = bench_http(
             "127.0.0.1",
             args.inferrs_port,
             args.warmup,
             args.runs,
             args.max_tokens,
             &prompt,
-        )?);
+        )?;
 
         let _ = server.kill();
         let _ = server.wait();
         ok("inferrs serve --quantize stopped");
-    }
+        summary
+    };
 
     // ── 2. inferrs serve --turbo-quant=false --quantize ─────────────────────
     log_header(&format!(
         "Benchmark 2/3 — inferrs serve --turbo-quant=false --quantize {}",
         args.inferrs_model
     ));
-    {
+    let summary_inferrs_tq = {
         let mut server = start_inferrs(
             &inferrs_bin,
             &args.inferrs_model,
@@ -140,26 +144,27 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             bail!("server failed to start");
         }
 
-        summary_inferrs_tq = Some(bench_http(
+        let summary = bench_http(
             "127.0.0.1",
             args.inferrs_tq_port,
             args.warmup,
             args.runs,
             args.max_tokens,
             &prompt,
-        )?);
+        )?;
 
         let _ = server.kill();
         let _ = server.wait();
         ok("inferrs serve --turbo-quant=false --quantize stopped");
-    }
+        summary
+    };
 
     // ── 3. llama-server ─────────────────────────────────────────────────────
     log_header(&format!(
         "Benchmark 3/3 — llama-server -hf {}",
         args.llama_model
     ));
-    {
+    let summary_llama = {
         let mut server = start_llama_server(&args.llama_model, args.llama_port)?;
         ok(&format!("llama-server started (pid {})", server.id()));
 
@@ -170,27 +175,28 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
             bail!("server failed to start");
         }
 
-        summary_llama = Some(bench_http(
+        let summary = bench_http(
             "127.0.0.1",
             args.llama_port,
             args.warmup,
             args.runs,
             args.max_tokens,
             &prompt,
-        )?);
+        )?;
 
         let _ = server.kill();
         let _ = server.wait();
         ok("llama-server stopped");
-    }
+        summary
+    };
 
     // ── Summary table ───────────────────────────────────────────────────────
     log_header("Results");
     print_summary(
         &args,
-        summary_llama.as_ref(),
-        summary_inferrs.as_ref(),
-        summary_inferrs_tq.as_ref(),
+        Some(&summary_llama),
+        Some(&summary_inferrs),
+        Some(&summary_inferrs_tq),
     );
 
     Ok(())
@@ -205,11 +211,18 @@ fn resolve_inferrs_bin(args: &BenchmarkArgs) -> PathBuf {
         return bin.clone();
     }
 
-    // Try `<exe_dir>/../target/release/inferrs` or the exe itself.
+    // Look for an `inferrs` binary next to this executable.
     if let Ok(exe) = std::env::current_exe() {
-        // If we *are* inferrs, use our own path.
-        if exe.file_stem().map(|s| s == "inferrs").unwrap_or(false) {
-            return exe;
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("inferrs");
+            if sibling.is_file() {
+                return sibling;
+            }
+            // Windows: try with .exe extension.
+            let sibling_exe = dir.join("inferrs.exe");
+            if sibling_exe.is_file() {
+                return sibling_exe;
+            }
         }
     }
 
@@ -501,6 +514,8 @@ fn stats(vals: &[f64], unit: &str) -> String {
 
 // ── Summary table ────────────────────────────────────────────────────────────
 
+type SummaryRow<'a> = (&'a str, Option<f64>, Option<f64>, Option<f64>);
+
 fn print_summary(
     args: &BenchmarkArgs,
     llama: Option<&BenchSummary>,
@@ -514,7 +529,7 @@ fn print_summary(
         }
     }
 
-    let rows: Vec<(&str, Option<f64>, Option<f64>, Option<f64>)> = vec![
+    let rows: Vec<SummaryRow> = vec![
         (
             "llama-server -hf ggml-org/gemma-4-E2B-it-GGUF (Q4_K_M)",
             llama.and_then(|s| s.ttft_ms),
