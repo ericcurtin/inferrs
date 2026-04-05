@@ -237,7 +237,6 @@ impl TokenSink {
 
 /// State for a single in-flight sequence in the continuous batching scheduler.
 struct ActiveSequence {
-    #[allow(dead_code)]
     request_id: String,
     prompt_tokens: Vec<u32>,
     output_tokens: Vec<u32>,
@@ -306,6 +305,12 @@ impl ActiveSequence {
         tokenizer: &Tokenizer,
         block_pool: &mut BlockPool,
     ) {
+        tracing::debug!(
+            "Request {} finished: {} output tokens, reason: {}",
+            self.request_id,
+            self.output_tokens.len(),
+            finish_reason,
+        );
         self.block_table.free_all(block_pool);
         self.sink.send_result(GenerationResult {
             output_token_ids: self.output_tokens.clone(),
@@ -321,6 +326,7 @@ impl ActiveSequence {
 
     /// Mark the sequence as failed, free its blocks, and send an error.
     fn finish_error(&mut self, error: anyhow::Error, block_pool: &mut BlockPool) {
+        tracing::warn!("Request {} failed: {}", self.request_id, error);
         self.block_table.free_all(block_pool);
         self.sink.send_error(&error, self.prompt_tokens.len());
         self.finished = true;
@@ -582,7 +588,14 @@ impl Engine {
             while active.len() < max_batch_size {
                 match rx.try_recv() {
                     Ok(req) => {
-                        active.push_back(ActiveSequence::from_engine_request(req, block_size));
+                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        tracing::debug!(
+                            "Accepted request {} ({} prompt tokens, batch_size={})",
+                            seq.request_id,
+                            seq.prompt_tokens.len(),
+                            active.len() + 1,
+                        );
+                        active.push_back(seq);
                     }
                     Err(_) => break,
                 }
@@ -592,7 +605,13 @@ impl Engine {
             if active.is_empty() {
                 match rx.blocking_recv() {
                     Some(req) => {
-                        active.push_back(ActiveSequence::from_engine_request(req, block_size));
+                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        tracing::debug!(
+                            "Accepted request {} ({} prompt tokens)",
+                            seq.request_id,
+                            seq.prompt_tokens.len(),
+                        );
+                        active.push_back(seq);
                     }
                     None => break, // channel closed
                 }
@@ -616,7 +635,19 @@ impl Engine {
                     )
                 } else {
                     // Decode: generate the next token.
-                    let last_token = *seq.output_tokens.last().unwrap();
+                    // Safety: `prefilled` is only set to true after the first
+                    // token has been pushed to `output_tokens`, so this is
+                    // guaranteed to be non-empty.
+                    let last_token = match seq.output_tokens.last() {
+                        Some(&t) => t,
+                        None => {
+                            seq.finish_error(
+                                anyhow::anyhow!("internal error: decode before prefill"),
+                                &mut paged.block_pool,
+                            );
+                            continue;
+                        }
+                    };
                     let seqlen_offset = seq.prompt_tokens.len() + seq.output_tokens.len() - 1;
                     Self::cb_decode_step(
                         &mut model,
