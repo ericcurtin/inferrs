@@ -12,6 +12,8 @@
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -104,6 +106,7 @@ fn main() -> Result<()> {
             bail!("server failed to start");
         }
 
+        let mut tracker = PeakMemoryTracker::start(server.id());
         let summary_res = bench_http(
             "127.0.0.1",
             args.inferrs_port,
@@ -112,11 +115,14 @@ fn main() -> Result<()> {
             args.max_tokens,
             &prompt,
         );
+        let peak_mem_mb = tracker.stop();
 
         let _ = server.kill();
         let _ = server.wait();
         ok("inferrs serve --quantize stopped");
-        summary_res?
+        let mut summary = summary_res?;
+        summary.peak_mem_mb = peak_mem_mb;
+        summary
     };
 
     // ── 2. inferrs serve --turbo-quant=false --quantize ─────────────────────
@@ -146,6 +152,7 @@ fn main() -> Result<()> {
             bail!("server failed to start");
         }
 
+        let mut tracker = PeakMemoryTracker::start(server.id());
         let summary_res = bench_http(
             "127.0.0.1",
             args.inferrs_tq_port,
@@ -154,11 +161,14 @@ fn main() -> Result<()> {
             args.max_tokens,
             &prompt,
         );
+        let peak_mem_mb = tracker.stop();
 
         let _ = server.kill();
         let _ = server.wait();
         ok("inferrs serve --turbo-quant=false --quantize stopped");
-        summary_res?
+        let mut summary = summary_res?;
+        summary.peak_mem_mb = peak_mem_mb;
+        summary
     };
 
     // ── 3. llama-server ─────────────────────────────────────────────────────
@@ -178,6 +188,7 @@ fn main() -> Result<()> {
             bail!("server failed to start");
         }
 
+        let mut tracker = PeakMemoryTracker::start(server.id());
         let summary_res = bench_http(
             "127.0.0.1",
             args.llama_port,
@@ -186,11 +197,14 @@ fn main() -> Result<()> {
             args.max_tokens,
             &prompt,
         );
+        let peak_mem_mb = tracker.stop();
 
         let _ = server.kill();
         let _ = server.wait();
         ok("llama-server stopped");
-        summary_res?
+        let mut summary = summary_res?;
+        summary.peak_mem_mb = peak_mem_mb;
+        summary
     };
 
     // ── Summary table ───────────────────────────────────────────────────────
@@ -345,6 +359,60 @@ struct BenchSummary {
     ttft_ms: Option<f64>,
     prefill_tps: Option<f64>,
     decode_tps: Option<f64>,
+    peak_mem_mb: Option<f64>,
+}
+
+// ── Peak memory tracker ──────────────────────────────────────────────────────
+
+/// Polls the RSS of a process in a background thread and tracks the peak.
+/// Call `stop()` to halt polling and retrieve the peak value in MB.
+struct PeakMemoryTracker {
+    peak_kb: Arc<AtomicU64>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PeakMemoryTracker {
+    fn start(pid: u32) -> Self {
+        let peak_kb = Arc::new(AtomicU64::new(0));
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let peak_kb2 = Arc::clone(&peak_kb);
+        let stop2 = Arc::clone(&stop_flag);
+
+        let thread = std::thread::spawn(move || {
+            use sysinfo::{Pid, System};
+            let mut sys = System::new();
+            let sysinfo_pid = Pid::from_u32(pid);
+            while !stop2.load(Ordering::Relaxed) {
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), true);
+                if let Some(proc) = sys.process(sysinfo_pid) {
+                    let kb = proc.memory() / 1024;
+                    peak_kb2.fetch_max(kb, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        Self {
+            peak_kb,
+            stop_flag,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(&mut self) -> Option<f64> {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        let kb = self.peak_kb.load(Ordering::Relaxed);
+        if kb == 0 {
+            None
+        } else {
+            Some(kb as f64 / 1024.0)
+        }
+    }
 }
 
 /// Run the HTTP benchmark against one server.  Returns aggregated metrics.
@@ -424,6 +492,7 @@ fn bench_http(
         ttft_ms: mean_or_none(&ttfts),
         prefill_tps: mean_or_none(&prefills),
         decode_tps: mean_or_none(&decodes),
+        peak_mem_mb: None,
     })
 }
 
@@ -517,7 +586,7 @@ fn stats(vals: &[f64], unit: &str) -> String {
 
 // ── Summary table ────────────────────────────────────────────────────────────
 
-type SummaryRow = (String, Option<f64>, Option<f64>, Option<f64>);
+type SummaryRow = (String, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
 
 fn print_summary(
     args: &BenchmarkArgs,
@@ -538,12 +607,14 @@ fn print_summary(
             llama.and_then(|s| s.ttft_ms),
             llama.and_then(|s| s.prefill_tps),
             llama.and_then(|s| s.decode_tps),
+            llama.and_then(|s| s.peak_mem_mb),
         ),
         (
             format!("inferrs serve --quantize {}", args.inferrs_model),
             inferrs.and_then(|s| s.ttft_ms),
             inferrs.and_then(|s| s.prefill_tps),
             inferrs.and_then(|s| s.decode_tps),
+            inferrs.and_then(|s| s.peak_mem_mb),
         ),
         (
             format!(
@@ -553,12 +624,13 @@ fn print_summary(
             inferrs_tq.and_then(|s| s.ttft_ms),
             inferrs_tq.and_then(|s| s.prefill_tps),
             inferrs_tq.and_then(|s| s.decode_tps),
+            inferrs_tq.and_then(|s| s.peak_mem_mb),
         ),
     ];
 
     let w = rows
         .iter()
-        .map(|(name, _, _, _)| name.len())
+        .map(|(name, _, _, _, _)| name.len())
         .max()
         .unwrap_or(0)
         .max("Backend".len());
@@ -569,21 +641,23 @@ fn print_summary(
     );
     println!();
     println!(
-        "{:<w$}  {:>12}  {:>14}  {:>13}",
+        "{:<w$}  {:>12}  {:>14}  {:>13}  {:>14}",
         "Backend",
         "TTFT (ms)",
         "Prefill (t/s)",
         "Decode (t/s)",
+        "Peak mem (MB)",
         w = w
     );
-    println!("{}", "-".repeat(w + 45));
-    for (name, ttft, pfill, dec) in &rows {
+    println!("{}", "-".repeat(w + 61));
+    for (name, ttft, pfill, dec, mem) in &rows {
         println!(
-            "{:<w$}  {:>12}  {:>14}  {:>13}",
+            "{:<w$}  {:>12}  {:>14}  {:>13}  {:>14}",
             name,
             fmt(*ttft, "ms"),
             fmt(*pfill, "t/s"),
             fmt(*dec, "t/s"),
+            fmt(*mem, "MB"),
             w = w
         );
     }
@@ -593,21 +667,26 @@ fn print_summary(
     let base_ttft = llama.and_then(|s| s.ttft_ms);
     let base_pfill = llama.and_then(|s| s.prefill_tps);
     let base_dec = llama.and_then(|s| s.decode_tps);
+    let base_mem = llama.and_then(|s| s.peak_mem_mb);
 
     if let (Some(bt), Some(bp), Some(bd)) = (base_ttft, base_pfill, base_dec) {
         println!(
-            "Relative to llama-server (higher prefill/decode is better; lower TTFT is better):"
+            "Relative to llama-server (higher prefill/decode is better; lower TTFT/mem is better):"
         );
-        for (name, ttft, pfill, dec) in &rows[1..] {
+        for (name, ttft, pfill, dec, mem) in &rows[1..] {
             if let (Some(t), Some(p), Some(d)) = (ttft, pfill, dec) {
                 let d_ttft = (t - bt) / bt * 100.0;
                 let d_pfill = (p - bp) / bp * 100.0;
                 let d_dec = (d - bd) / bd * 100.0;
                 let sign = |x: f64| if x >= 0.0 { "+" } else { "" };
                 println!("  {name}");
-                println!("    TTFT:    {}{d_ttft:.1}%", sign(d_ttft));
-                println!("    Prefill: {}{d_pfill:.1}%", sign(d_pfill));
-                println!("    Decode:  {}{d_dec:.1}%", sign(d_dec));
+                println!("    TTFT:     {}{d_ttft:.1}%", sign(d_ttft));
+                println!("    Prefill:  {}{d_pfill:.1}%", sign(d_pfill));
+                println!("    Decode:   {}{d_dec:.1}%", sign(d_dec));
+                if let (Some(m), Some(bm)) = (mem, base_mem) {
+                    let d_mem = (m - bm) / bm * 100.0;
+                    println!("    Peak mem: {}{d_mem:.1}%", sign(d_mem));
+                }
             }
         }
     }

@@ -14,3 +14,4 @@ clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 anyhow = { workspace = true }
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
