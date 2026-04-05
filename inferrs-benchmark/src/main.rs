@@ -514,7 +514,7 @@ fn stats(vals: &[f64], unit: &str) -> String {
 
 // ── Summary table ────────────────────────────────────────────────────────────
 
-type SummaryRow<'a> = (&'a str, Option<f64>, Option<f64>, Option<f64>);
+type SummaryRow = (String, Option<f64>, Option<f64>, Option<f64>);
 
 fn print_summary(
     args: &BenchmarkArgs,
@@ -531,26 +531,34 @@ fn print_summary(
 
     let rows: Vec<SummaryRow> = vec![
         (
-            "llama-server -hf ggml-org/gemma-4-E2B-it-GGUF (Q4_K_M)",
+            format!("llama-server -hf {}", args.llama_model),
             llama.and_then(|s| s.ttft_ms),
             llama.and_then(|s| s.prefill_tps),
             llama.and_then(|s| s.decode_tps),
         ),
         (
-            "inferrs serve --quantize google/gemma-4-E2B-it",
+            format!("inferrs serve --quantize {}", args.inferrs_model),
             inferrs.and_then(|s| s.ttft_ms),
             inferrs.and_then(|s| s.prefill_tps),
             inferrs.and_then(|s| s.decode_tps),
         ),
         (
-            "inferrs serve --turbo-quant=false --quantize google/gemma-4-E2B-it",
+            format!(
+                "inferrs serve --turbo-quant=false --quantize {}",
+                args.inferrs_model
+            ),
             inferrs_tq.and_then(|s| s.ttft_ms),
             inferrs_tq.and_then(|s| s.prefill_tps),
             inferrs_tq.and_then(|s| s.decode_tps),
         ),
     ];
 
-    let w = 56;
+    let w = rows
+        .iter()
+        .map(|(name, _, _, _)| name.len())
+        .max()
+        .unwrap_or(0)
+        .max("Backend".len());
     println!();
     println!(
         "Benchmark settings: prompt_len={} tokens, max_tokens={}, runs={}, warmup={}",
