@@ -49,6 +49,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Half-precision types (bf16 / f16) — same version as candle-core to share the type
 half = { version = "2.5", features = ["num-traits"] }
 
+# HTTP client (for benchmark subcommand)
+ureq = { version = "2", features = ["json"] }
+
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"

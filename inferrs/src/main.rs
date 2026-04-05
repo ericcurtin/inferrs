@@ -1,5 +1,6 @@
 mod backend;
 mod bench;
+mod benchmark;
 mod config;
 mod engine;
 mod hub;
@@ -64,6 +65,8 @@ enum Commands {
     Run(run::RunArgs),
     /// Benchmark inference throughput and latency
     Bench(bench::BenchArgs),
+    /// Compare inferrs vs llama-server over HTTP (cross-platform port of benchmark.sh)
+    Benchmark(benchmark::BenchmarkArgs),
     /// Remove a cached model from local disk
     Rm(rm::RmArgs),
 }
@@ -262,7 +265,7 @@ async fn main() -> Result<()> {
     // writes to stdout and log lines would corrupt the prompt display.
     // Users can still get logs by setting RUST_LOG explicitly (e.g. RUST_LOG=debug).
     let default_log_level = match &cli.command {
-        Commands::Run(_) | Commands::Bench(_) | Commands::Rm(_) => "error",
+        Commands::Run(_) | Commands::Bench(_) | Commands::Benchmark(_) | Commands::Rm(_) => "error",
         _ => "info",
     };
     tracing_subscriber::fmt()
@@ -282,6 +285,9 @@ async fn main() -> Result<()> {
         Commands::Bench(args) => {
             tracing::info!("Running benchmark for model: {}", args.serve.model);
             bench::run(args)?;
+        }
+        Commands::Benchmark(args) => {
+            benchmark::run(args)?;
         }
         Commands::Rm(args) => {
             rm::run(args)?;
