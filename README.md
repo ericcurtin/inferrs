@@ -19,6 +19,7 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`,
   `/v1/models`, `/health`
+- **Anthropic-compatible API** — `/v1/messages` (streaming and non-streaming)
 - **Hardware backends** — CPU, Metal (Apple Silicon), CUDA (NVIDIA), ROCm (AMD),
   Vulkan
 

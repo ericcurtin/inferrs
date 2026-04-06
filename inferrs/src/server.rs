@@ -1,4 +1,4 @@
-//! HTTP server with OpenAI-compatible API endpoints.
+//! HTTP server with OpenAI-compatible and Anthropic-compatible API endpoints.
 
 use anyhow::Result;
 use axum::{
@@ -20,7 +20,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::engine::{load_engine, EngineRequest, GenerationResult, StreamToken};
 use crate::sampler::SamplingParams;
-use crate::tokenizer::{ChatMessage, Tokenizer};
+use crate::tokenizer::{ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
 
 // ─── OpenAI API types ───────────────────────────────────────────────────────
@@ -130,6 +130,172 @@ pub struct ErrorDetail {
     pub r#type: String,
 }
 
+// ─── Anthropic API types ────────────────────────────────────────────────────
+
+/// Anthropic stop-reason value when the model naturally finishes its turn.
+const ANTHROPIC_STOP_END_TURN: &str = "end_turn";
+/// Anthropic stop-reason value when the token budget is exhausted.
+const ANTHROPIC_STOP_MAX_TOKENS: &str = "max_tokens";
+
+/// Role enum for Anthropic messages (only "user" and "assistant" – system
+/// messages are passed at the top level).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicRole {
+    User,
+    Assistant,
+}
+
+/// A single message in an Anthropic Messages request.
+#[derive(Debug, Deserialize)]
+pub struct AnthropicMessage {
+    pub role: AnthropicRole,
+    pub content: String,
+}
+
+/// Request body for `POST /v1/messages` (Anthropic Messages API).
+#[derive(Debug, Deserialize)]
+pub struct AnthropicMessagesRequest {
+    pub model: Option<String>,
+    pub messages: Vec<AnthropicMessage>,
+    pub max_tokens: usize,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub system: Option<String>,
+}
+
+/// Non-streaming response for Anthropic Messages API.
+#[derive(Debug, Serialize)]
+pub struct AnthropicMessagesResponse {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub role: &'static str,
+    pub content: Vec<AnthropicContentBlock>,
+    pub model: String,
+    pub stop_reason: Option<String>,
+    pub stop_sequence: Option<String>,
+    pub usage: AnthropicUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+}
+
+/// Streaming: `message_start` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicMessageStart {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub message: AnthropicMessageStartBody,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicMessageStartBody {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub role: &'static str,
+    pub content: Vec<()>,
+    pub model: String,
+    pub stop_reason: Option<String>,
+    pub stop_sequence: Option<String>,
+    pub usage: AnthropicUsage,
+}
+
+/// Streaming: `content_block_start` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicContentBlockStart {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub index: u32,
+    pub content_block: AnthropicContentBlock,
+}
+
+/// Streaming: `ping` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicPing {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+}
+
+/// Streaming: `content_block_delta` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicContentBlockDelta {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub index: u32,
+    pub delta: AnthropicTextDelta,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicTextDelta {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub text: String,
+}
+
+/// Streaming: `content_block_stop` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicContentBlockStop {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub index: u32,
+}
+
+/// Streaming: `message_delta` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicMessageDelta {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub delta: AnthropicStopDelta,
+    pub usage: AnthropicUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicStopDelta {
+    pub stop_reason: String,
+    pub stop_sequence: Option<String>,
+}
+
+/// Streaming: `message_stop` event payload.
+#[derive(Debug, Serialize)]
+pub struct AnthropicMessageStop {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+}
+
+/// Error response in Anthropic format.
+#[derive(Debug, Serialize)]
+pub struct AnthropicErrorResponse {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub error: AnthropicErrorDetail,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicErrorDetail {
+    #[serde(rename = "type")]
+    pub type_field: String,
+    pub message: String,
+}
+
 // ─── Time helpers ───────────────────────────────────────────────────────────
 
 /// Return the current Unix timestamp in seconds.
@@ -194,6 +360,64 @@ fn check_prompt_length(
     Ok(())
 }
 
+// ─── Anthropic error helpers ────────────────────────────────────────────────
+
+fn anthropic_error(
+    status: StatusCode,
+    error_type: &str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<AnthropicErrorResponse>) {
+    (
+        status,
+        Json(AnthropicErrorResponse {
+            type_field: "error",
+            error: AnthropicErrorDetail {
+                type_field: error_type.to_string(),
+                message: message.into(),
+            },
+        }),
+    )
+}
+
+/// Map an Anthropic `finish_reason` from the engine's stop reason.
+///
+/// The engine emits `"stop"` when an EOS token is hit, `"length"` when the
+/// token budget is exhausted, and `"error"` on failures.  Anthropic uses
+/// `"end_turn"` and `"max_tokens"` respectively.
+fn anthropic_stop_reason(engine_reason: &str) -> String {
+    match engine_reason {
+        "stop" => ANTHROPIC_STOP_END_TURN.to_string(),
+        "length" => ANTHROPIC_STOP_MAX_TOKENS.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Convert [`AnthropicMessage`] list (plus optional system prompt) into the
+/// [`ChatMessage`] list consumed by the tokenizer's chat template.
+fn anthropic_messages_to_chat(
+    system: Option<&str>,
+    messages: &[AnthropicMessage],
+) -> Vec<ChatMessage> {
+    let mut chat_messages: Vec<ChatMessage> = Vec::with_capacity(messages.len() + 1);
+    if let Some(sys) = system {
+        chat_messages.push(ChatMessage {
+            role: Role::System,
+            content: sys.to_string(),
+        });
+    }
+    for msg in messages {
+        let role = match msg.role {
+            AnthropicRole::User => Role::User,
+            AnthropicRole::Assistant => Role::Assistant,
+        };
+        chat_messages.push(ChatMessage {
+            role,
+            content: msg.content.clone(),
+        });
+    }
+    chat_messages
+}
+
 // ─── Server state ───────────────────────────────────────────────────────────
 
 struct AppState {
@@ -247,6 +471,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/messages", post(anthropic_messages))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .layer(CorsLayer::permissive())
@@ -609,6 +834,260 @@ fn make_completion_sse_stream(
 
         // Final [DONE]
         yield Ok(Event::default().data("[DONE]"));
+    }
+}
+
+// ─── Anthropic Messages handler ─────────────────────────────────────────────
+
+async fn anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AnthropicMessagesRequest>,
+) -> impl IntoResponse {
+    let request_id = format!("msg_{}", uuid::Uuid::new_v4());
+    let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
+
+    // Convert Anthropic messages (with optional top-level system) to ChatMessage list.
+    let chat_messages = anthropic_messages_to_chat(req.system.as_deref(), &req.messages);
+
+    // Apply chat template and tokenize.
+    let prompt_tokens = match state
+        .tokenizer
+        .apply_chat_template_and_encode(&chat_messages)
+    {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            return Err(anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Failed to tokenize: {e}"),
+            ));
+        }
+    };
+
+    tracing::info!(
+        "Anthropic request {}: {} messages, {} prompt tokens",
+        request_id,
+        req.messages.len(),
+        prompt_tokens.len()
+    );
+
+    if state.max_seq_len != usize::MAX && prompt_tokens.len() >= state.max_seq_len {
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "Prompt length ({} tokens) exceeds the model's maximum context length ({} tokens).",
+                prompt_tokens.len(),
+                state.max_seq_len
+            ),
+        ));
+    }
+
+    let max_tokens = clamp_max_tokens(req.max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let params = build_sampling_params(
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        None, // Anthropic API does not have repetition_penalty
+        max_tokens,
+        &state.default_params,
+    );
+
+    let is_stream = req.stream.unwrap_or(false);
+
+    if is_stream {
+        let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+
+        let engine_req = EngineRequest::GenerateStream {
+            request_id: request_id.clone(),
+            prompt_tokens: prompt_tokens.clone(),
+            sampling_params: params,
+            token_tx,
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            return Err(anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Engine unavailable",
+            ));
+        }
+
+        let stream = make_anthropic_sse_stream(token_rx, request_id, model_id, prompt_tokens.len());
+        Ok(Sse::new(stream).into_response())
+    } else {
+        let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+
+        let engine_req = EngineRequest::Generate {
+            request_id: request_id.clone(),
+            prompt_tokens: prompt_tokens.clone(),
+            sampling_params: params,
+            response_tx,
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            return Err(anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Engine unavailable",
+            ));
+        }
+
+        match response_rx.await {
+            Ok(result) => {
+                let response = AnthropicMessagesResponse {
+                    id: request_id,
+                    type_field: "message",
+                    role: "assistant",
+                    content: vec![AnthropicContentBlock {
+                        type_field: "text",
+                        text: result.output_text,
+                    }],
+                    model: model_id,
+                    stop_reason: Some(anthropic_stop_reason(&result.finish_reason)),
+                    stop_sequence: None,
+                    usage: AnthropicUsage {
+                        input_tokens: result.prompt_tokens,
+                        output_tokens: result.completion_tokens,
+                    },
+                };
+                Ok(Json(response).into_response())
+            }
+            Err(_) => Err(anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Engine dropped the request",
+            )),
+        }
+    }
+}
+
+/// Serialize `value` to a *named* SSE event for the Anthropic streaming protocol.
+fn to_anthropic_sse_event<T: serde::Serialize>(
+    event_name: &str,
+    value: &T,
+    label: &str,
+) -> Option<Event> {
+    match serde_json::to_string(value) {
+        Ok(json) => Some(Event::default().event(event_name).data(json)),
+        Err(e) => {
+            tracing::error!("Failed to serialize Anthropic {label}: {e}");
+            None
+        }
+    }
+}
+
+fn make_anthropic_sse_stream(
+    mut token_rx: mpsc::Receiver<StreamToken>,
+    request_id: String,
+    model_id: String,
+    input_tokens: usize,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        // 1. message_start
+        let msg_start = AnthropicMessageStart {
+            type_field: "message_start",
+            message: AnthropicMessageStartBody {
+                id: request_id.clone(),
+                type_field: "message",
+                role: "assistant",
+                content: vec![],
+                model: model_id.clone(),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: AnthropicUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+            },
+        };
+        match to_anthropic_sse_event("message_start", &msg_start, "message_start") {
+            Some(event) => yield Ok(event),
+            None => return,
+        }
+
+        // 2. content_block_start
+        let block_start = AnthropicContentBlockStart {
+            type_field: "content_block_start",
+            index: 0,
+            content_block: AnthropicContentBlock {
+                type_field: "text",
+                text: String::new(),
+            },
+        };
+        match to_anthropic_sse_event("content_block_start", &block_start, "content_block_start") {
+            Some(event) => yield Ok(event),
+            None => return,
+        }
+
+        // 3. ping
+        let ping = AnthropicPing { type_field: "ping" };
+        match to_anthropic_sse_event("ping", &ping, "ping") {
+            Some(event) => yield Ok(event),
+            None => return,
+        }
+
+        // 4. content_block_delta events (one per token)
+        let mut output_tokens: usize = 0;
+        let mut final_stop_reason = ANTHROPIC_STOP_END_TURN.to_string();
+
+        while let Some(token) = token_rx.recv().await {
+            output_tokens += 1;
+
+            // Don't send EOS token text as content.
+            if token.finish_reason.as_deref() != Some("stop") {
+                let delta = AnthropicContentBlockDelta {
+                    type_field: "content_block_delta",
+                    index: 0,
+                    delta: AnthropicTextDelta {
+                        type_field: "text_delta",
+                        text: token.text,
+                    },
+                };
+                match to_anthropic_sse_event("content_block_delta", &delta, "content_block_delta") {
+                    Some(event) => yield Ok(event),
+                    None => break,
+                }
+            }
+
+            if let Some(reason) = &token.finish_reason {
+                final_stop_reason = anthropic_stop_reason(reason);
+                break;
+            }
+        }
+
+        // 5. content_block_stop
+        let block_stop = AnthropicContentBlockStop {
+            type_field: "content_block_stop",
+            index: 0,
+        };
+        if let Some(event) = to_anthropic_sse_event("content_block_stop", &block_stop, "content_block_stop") {
+            yield Ok(event);
+        }
+
+        // 6. message_delta
+        let msg_delta = AnthropicMessageDelta {
+            type_field: "message_delta",
+            delta: AnthropicStopDelta {
+                stop_reason: final_stop_reason,
+                stop_sequence: None,
+            },
+            usage: AnthropicUsage {
+                input_tokens: 0,
+                output_tokens,
+            },
+        };
+        if let Some(event) = to_anthropic_sse_event("message_delta", &msg_delta, "message_delta") {
+            yield Ok(event);
+        }
+
+        // 7. message_stop
+        let msg_stop = AnthropicMessageStop {
+            type_field: "message_stop",
+        };
+        if let Some(event) = to_anthropic_sse_event("message_stop", &msg_stop, "message_stop") {
+            yield Ok(event);
+        }
     }
 }
 
