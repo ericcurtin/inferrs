@@ -13,15 +13,54 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tower_http::cors::CorsLayer;
 
-use crate::engine::{load_engine, EngineRequest, GenerationResult, StreamToken};
+use crate::engine::{load_engine, EngineRequest, GenerationResult, OutputBuffer, StreamToken};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
+
+// ---------------------------------------------------------------------------
+// Per-request stream registry
+// ---------------------------------------------------------------------------
+
+/// Maps `request_id` → the `mpsc::Sender` that delivers tokens to the HTTP
+/// SSE handler for that request.  Entries are inserted just before the engine
+/// request is sent and removed once the final token (or an error) is routed.
+type StreamRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<StreamToken>>>>;
+
+/// Spawn a background task that drains the shared [`OutputBuffer`] and routes
+/// each token to the correct per-request channel.
+///
+/// This is the equivalent of vLLM's `output_handler` task: the engine thread
+/// never touches per-client channels, so a slow client cannot stall the
+/// batching loop.
+fn spawn_drain_task(output_buf: OutputBuffer, registry: StreamRegistry) {
+    tokio::spawn(async move {
+        loop {
+            // Wait until the engine signals that new tokens are available.
+            output_buf.notified().await;
+
+            let pending = output_buf.drain();
+            let mut reg = registry.lock().await;
+            for pt in pending {
+                if let Some(tx) = reg.get(&pt.request_id) {
+                    let is_final = pt.token.finish_reason.is_some();
+                    // try_send: if the client channel is full or gone, drop
+                    // the token rather than stalling the drain task.
+                    let _ = tx.try_send(pt.token);
+                    if is_final {
+                        reg.remove(&pt.request_id);
+                    }
+                }
+            }
+        }
+    });
+}
 
 // ─── OpenAI API types ───────────────────────────────────────────────────────
 
@@ -427,6 +466,10 @@ struct AppState {
     default_params: SamplingParams,
     /// Hard upper bound on (prompt_tokens + output_tokens) for this model.
     max_seq_len: usize,
+    /// Shared buffer that the engine writes tokens into.
+    output_buf: OutputBuffer,
+    /// Maps request_id → per-client SSE channel.
+    stream_registry: StreamRegistry,
 }
 
 // ─── Server startup ─────────────────────────────────────────────────────────
@@ -451,6 +494,13 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
+    // Create the shared output buffer and per-request stream registry.
+    let output_buf = OutputBuffer::new();
+    let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn the drain task: wakes on Notify, drains the buffer, routes tokens.
+    spawn_drain_task(output_buf.clone(), stream_registry.clone());
+
     // Create engine channel and spawn engine on a dedicated thread.
     let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
     std::thread::Builder::new()
@@ -465,6 +515,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         tokenizer,
         default_params,
         max_seq_len: ctx.max_seq_len,
+        output_buf,
+        stream_registry,
     });
 
     // Build router
@@ -532,17 +584,23 @@ async fn chat_completions(
     let is_stream = req.stream.unwrap_or(false);
 
     if is_stream {
-        // Streaming response
+        // Streaming response — register per-request channel, then dispatch.
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+        state
+            .stream_registry
+            .lock()
+            .await
+            .insert(request_id.clone(), token_tx);
 
         let engine_req = EngineRequest::GenerateStream {
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
             sampling_params: params,
-            token_tx,
+            output_buf: state.output_buf.clone(),
         };
 
         if state.engine_tx.send(engine_req).await.is_err() {
+            state.stream_registry.lock().await.remove(&request_id);
             return Err(server_error("Engine unavailable"));
         }
 
@@ -744,17 +802,23 @@ async fn completions(
     let is_stream = req.stream.unwrap_or(false);
 
     if is_stream {
-        // Streaming response — send tokens as SSE events.
+        // Streaming response — register per-request channel, then dispatch.
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+        state
+            .stream_registry
+            .lock()
+            .await
+            .insert(request_id.clone(), token_tx);
 
         let engine_req = EngineRequest::GenerateStream {
             request_id: request_id.clone(),
             prompt_tokens,
             sampling_params: params,
-            token_tx,
+            output_buf: state.output_buf.clone(),
         };
 
         if state.engine_tx.send(engine_req).await.is_err() {
+            state.stream_registry.lock().await.remove(&request_id);
             return Err(server_error("Engine unavailable"));
         }
 
@@ -896,16 +960,23 @@ async fn anthropic_messages(
     let is_stream = req.stream.unwrap_or(false);
 
     if is_stream {
+        // Streaming response — register per-request channel, then dispatch.
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+        state
+            .stream_registry
+            .lock()
+            .await
+            .insert(request_id.clone(), token_tx);
 
         let engine_req = EngineRequest::GenerateStream {
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
             sampling_params: params,
-            token_tx,
+            output_buf: state.output_buf.clone(),
         };
 
         if state.engine_tx.send(engine_req).await.is_err() {
+            state.stream_registry.lock().await.remove(&request_id);
             return Err(anthropic_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",

@@ -1,8 +1,25 @@
-//! Inference engine: owns the model and runs the inference loop.
+//! Inference engine: owns the model and runs the continuous-batching loop.
+//!
+//! The engine always uses **continuous batching**: new requests are accepted
+//! between decode steps so that arriving work does not have to wait for
+//! earlier sequences to complete.
+//!
+//! When paged attention is active, multiple in-flight sequences share the
+//! paged KV store and are truly interleaved at the token level (up to
+//! `max_batch_size` concurrent sequences).
+//!
+//! Without paged attention the model's internal concat-KV cache is
+//! single-sequence, so the effective batch size is capped at 1.  The
+//! continuous-batching loop structure is still used so that the engine
+//! thread can accept and queue new requests between decode steps of the
+//! active sequence.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::{ModelArchitecture, RawConfig};
 use crate::hub::ModelFiles;
@@ -11,6 +28,58 @@ use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
 use crate::ServeArgs;
+
+// ---------------------------------------------------------------------------
+// Output buffer — decouples the engine thread from per-client channels
+// ---------------------------------------------------------------------------
+
+/// A pending token that the engine has produced but that has not yet been
+/// routed to the HTTP client.
+pub struct PendingToken {
+    pub request_id: String,
+    pub token: StreamToken,
+}
+
+/// Shared, lock-protected buffer through which the engine thread delivers
+/// tokens without ever blocking on a slow client.
+///
+/// The engine pushes `(request_id, token)` pairs here; a separate async
+/// drain task in the HTTP server routes each entry to the correct per-request
+/// `mpsc::Sender`.
+#[derive(Clone)]
+pub struct OutputBuffer {
+    inner: Arc<Mutex<VecDeque<PendingToken>>>,
+    notify: Arc<Notify>,
+}
+
+impl OutputBuffer {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Push a token (called from the engine thread).
+    pub fn push(&self, request_id: String, token: StreamToken) {
+        self.inner
+            .lock()
+            .expect("output buffer poisoned")
+            .push_back(PendingToken { request_id, token });
+        self.notify.notify_one();
+    }
+
+    /// Drain all pending tokens (called from the async drain task).
+    pub fn drain(&self) -> Vec<PendingToken> {
+        let mut guard = self.inner.lock().expect("output buffer poisoned");
+        guard.drain(..).collect()
+    }
+
+    /// Returns a reference to the [`Notify`] so the drain task can `await` it.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared model-loading entry point
@@ -124,11 +193,15 @@ pub enum EngineRequest {
         response_tx: oneshot::Sender<GenerationResult>,
     },
     /// Generate tokens with streaming.
+    ///
+    /// The engine pushes produced tokens into `output_buf` keyed by
+    /// `request_id`.  A separate async drain task routes them to the
+    /// per-request HTTP channel so the engine never blocks on a slow client.
     GenerateStream {
         request_id: String,
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
-        token_tx: mpsc::Sender<StreamToken>,
+        output_buf: OutputBuffer,
     },
 }
 
@@ -161,6 +234,210 @@ pub struct GenerationResult {
     pub finish_reason: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Continuous batching: per-sequence state
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the response channel for an active sequence.
+///
+/// For streaming requests, tokens are pushed into the shared [`OutputBuffer`]
+/// (the engine never blocks on a slow client).  For non-streaming requests,
+/// the tokens are accumulated and the final result is sent when the sequence
+/// completes.
+enum TokenSink {
+    /// Streaming: push tokens into the shared output buffer.
+    Streaming {
+        request_id: String,
+        output_buf: OutputBuffer,
+    },
+    /// Non-streaming: send the final result via a oneshot channel.
+    OneShot(Option<oneshot::Sender<GenerationResult>>),
+}
+
+impl TokenSink {
+    /// Deliver a streamed token.  Always returns `true` (the engine never
+    /// blocks — the drain task handles client-side back-pressure).
+    fn send_token(&self, token: StreamToken) -> bool {
+        match self {
+            TokenSink::Streaming {
+                request_id,
+                output_buf,
+            } => {
+                output_buf.push(request_id.clone(), token);
+                true
+            }
+            // For non-streaming, tokens are accumulated in ActiveSequence.
+            TokenSink::OneShot(_) => true,
+        }
+    }
+
+    /// Send the final [`GenerationResult`] (non-streaming only).
+    fn send_result(&mut self, result: GenerationResult) {
+        if let TokenSink::OneShot(tx) = self {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(result);
+            }
+        }
+    }
+
+    /// Send an error response appropriate to the channel type.
+    fn send_error(&mut self, error: &anyhow::Error, prompt_len: usize) {
+        match self {
+            TokenSink::Streaming {
+                request_id,
+                output_buf,
+            } => {
+                output_buf.push(
+                    request_id.clone(),
+                    StreamToken {
+                        token_id: 0,
+                        text: format!("Error: {error}"),
+                        finish_reason: Some("error".to_string()),
+                    },
+                );
+            }
+            TokenSink::OneShot(tx) => {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(GenerationResult {
+                        output_token_ids: vec![],
+                        output_text: format!("Error: {error}"),
+                        finish_reason: "error".to_string(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: 0,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// State for a single in-flight sequence in the continuous batching scheduler.
+struct ActiveSequence {
+    request_id: String,
+    prompt_tokens: Vec<u32>,
+    output_tokens: Vec<u32>,
+    all_tokens: Vec<u32>,
+    sampling_params: SamplingParams,
+    sink: TokenSink,
+    /// Per-sequence block table for paged attention.
+    /// `None` when running without paged attention.
+    block_table: Option<BlockTable>,
+    /// `true` once the prefill phase has completed.
+    prefilled: bool,
+    /// `true` once the sequence is done (stop token, max length, error, or
+    /// client disconnect).
+    finished: bool,
+}
+
+impl ActiveSequence {
+    /// Create an [`ActiveSequence`] from an [`EngineRequest`].
+    ///
+    /// When `block_size` is `Some`, a per-sequence [`BlockTable`] is created
+    /// for paged attention.  When `None`, no block table is allocated (the
+    /// non-paged path uses the model's internal concat-KV cache).
+    fn from_engine_request(req: EngineRequest, block_size: Option<usize>) -> Self {
+        match req {
+            EngineRequest::Generate {
+                request_id,
+                prompt_tokens,
+                sampling_params,
+                response_tx,
+            } => {
+                let all_tokens = prompt_tokens.clone();
+                Self {
+                    request_id,
+                    prompt_tokens,
+                    output_tokens: Vec::new(),
+                    all_tokens,
+                    sampling_params,
+                    sink: TokenSink::OneShot(Some(response_tx)),
+                    block_table: block_size.map(BlockTable::new),
+                    prefilled: false,
+                    finished: false,
+                }
+            }
+            EngineRequest::GenerateStream {
+                request_id,
+                prompt_tokens,
+                sampling_params,
+                output_buf,
+            } => {
+                let all_tokens = prompt_tokens.clone();
+                Self {
+                    request_id: request_id.clone(),
+                    prompt_tokens,
+                    output_tokens: Vec::new(),
+                    all_tokens,
+                    sampling_params,
+                    sink: TokenSink::Streaming {
+                        request_id,
+                        output_buf,
+                    },
+                    block_table: block_size.map(BlockTable::new),
+                    prefilled: false,
+                    finished: false,
+                }
+            }
+        }
+    }
+
+    /// Mark the sequence as successfully finished and send the final result
+    /// (for non-streaming requests).
+    fn finish_ok(
+        &mut self,
+        finish_reason: &str,
+        tokenizer: &Tokenizer,
+        block_pool: Option<&mut BlockPool>,
+    ) {
+        tracing::debug!(
+            "Request {} finished: {} output tokens, reason: {}",
+            self.request_id,
+            self.output_tokens.len(),
+            finish_reason,
+        );
+        if let (Some(bt), Some(pool)) = (&mut self.block_table, block_pool) {
+            bt.free_all(pool);
+        }
+        self.sink.send_result(GenerationResult {
+            output_token_ids: self.output_tokens.clone(),
+            output_text: tokenizer
+                .decode(&self.output_tokens, true)
+                .unwrap_or_default(),
+            finish_reason: finish_reason.to_string(),
+            prompt_tokens: self.prompt_tokens.len(),
+            completion_tokens: self.output_tokens.len(),
+        });
+        self.finished = true;
+    }
+
+    /// Mark the sequence as failed, free its blocks, and send an error.
+    fn finish_error(&mut self, error: anyhow::Error, block_pool: Option<&mut BlockPool>) {
+        tracing::warn!("Request {} failed: {}", self.request_id, error);
+        if let (Some(bt), Some(pool)) = (&mut self.block_table, block_pool) {
+            bt.free_all(pool);
+        }
+        self.sink.send_error(&error, self.prompt_tokens.len());
+        self.finished = true;
+    }
+}
+
+/// Check whether generation should stop (free-standing helper for use by the
+/// continuous batching loop where `self` is destructured).
+fn check_stop(
+    token_id: u32,
+    num_output_tokens: usize,
+    params: &SamplingParams,
+    stop_token_ids: &[u32],
+) -> Option<String> {
+    if stop_token_ids.contains(&token_id) {
+        return Some("stop".to_string());
+    }
+    if num_output_tokens >= params.max_tokens {
+        return Some("length".to_string());
+    }
+    None
 }
 
 /// Attach a paged KV store to `engine` if `--paged-attention` was requested.
@@ -241,13 +518,19 @@ pub fn attach_paged_kv_if_requested(
     Ok(engine.with_paged_kv(block_pool, kv_store))
 }
 
-/// The engine runs on a dedicated thread and processes requests sequentially.
+/// The engine runs on a dedicated thread and processes requests using
+/// continuous batching.
+///
+/// With paged attention, multiple sequences share the paged KV store and
+/// run concurrently (up to `max_batch_size`).  Without paged attention the
+/// model's internal concat-KV cache is single-sequence so the effective
+/// batch size is 1, but the continuous-batching loop structure is still
+/// used to accept and queue requests between decode steps.
 pub struct Engine {
     model: Box<dyn CausalLM>,
     tokenizer: Tokenizer,
     device: Device,
     stop_token_ids: Vec<u32>,
-    #[allow(dead_code)]
     max_batch_size: usize,
     #[allow(dead_code)]
     max_tokens_per_step: usize,
@@ -255,11 +538,18 @@ pub struct Engine {
     paged: Option<PagedState>,
 }
 
-/// State needed for paged-attention mode.
+/// Shared state for paged-attention mode.
+///
+/// The block pool and KV store are shared across all in-flight sequences.
+/// Each sequence maintains its own [`BlockTable`] that maps logical blocks
+/// to physical block IDs in the shared pool.
 struct PagedState {
     block_pool: BlockPool,
     kv_store: PagedKvStore,
-    /// Per-request block table, reset at the start of each request.
+    /// Standalone block table used by the non-batching code paths
+    /// (`bench_generate`, `run_sync`) which process a single request at a
+    /// time.  The continuous-batching loop maintains per-sequence block
+    /// tables instead.
     block_table: BlockTable,
 }
 
@@ -295,52 +585,238 @@ impl Engine {
     }
 
     /// Run the engine loop, processing requests from the channel.
-    pub fn run(mut self, mut rx: mpsc::Receiver<EngineRequest>) {
-        tracing::info!("Engine loop started");
+    ///
+    /// Always uses continuous batching.  When paged attention is active,
+    /// multiple sequences can run concurrently.  Without paged attention the
+    /// effective batch size is 1 (the model's internal KV cache is
+    /// single-sequence).
+    pub fn run(self, rx: mpsc::Receiver<EngineRequest>) {
+        self.run_continuous_batching(rx);
+    }
 
-        while let Some(request) = rx.blocking_recv() {
-            match request {
-                EngineRequest::Generate {
-                    request_id,
-                    prompt_tokens,
-                    sampling_params,
-                    response_tx,
-                } => {
-                    let result = self.generate(&request_id, &prompt_tokens, &sampling_params);
-                    let _ = response_tx.send(match result {
-                        Ok(r) => r,
-                        Err(e) => GenerationResult {
-                            output_token_ids: vec![],
-                            output_text: format!("Error: {e}"),
-                            finish_reason: "error".to_string(),
-                            prompt_tokens: prompt_tokens.len(),
-                            completion_tokens: 0,
-                        },
-                    });
-                }
-                EngineRequest::GenerateStream {
-                    request_id,
-                    prompt_tokens,
-                    sampling_params,
-                    token_tx,
-                } => {
-                    if let Err(e) = self.generate_stream(
-                        &request_id,
-                        &prompt_tokens,
-                        &sampling_params,
-                        &token_tx,
-                    ) {
-                        let _ = token_tx.blocking_send(StreamToken {
-                            token_id: 0,
-                            text: format!("Error: {e}"),
-                            finish_reason: Some("error".to_string()),
-                        });
+    /// Continuous batching engine loop.
+    ///
+    /// Each iteration:
+    /// 1. Accept all pending requests from the channel (non-blocking).
+    /// 2. If no sequences are active, block until a request arrives.
+    /// 3. For each active sequence, run one step (prefill or decode).
+    /// 4. Remove completed sequences and free their KV blocks.
+    ///
+    /// Without paged attention the model's concat-KV cache is
+    /// single-sequence, so only one sequence is processed at a time.
+    fn run_continuous_batching(self, mut rx: mpsc::Receiver<EngineRequest>) {
+        // Destructure self so the borrow checker can track disjoint field
+        // borrows (model, paged.block_pool, paged.kv_store, etc.).
+        let Engine {
+            mut model,
+            tokenizer,
+            device,
+            stop_token_ids,
+            max_batch_size,
+            max_tokens_per_step: _,
+            paged,
+        } = self;
+
+        let mut paged = paged;
+        let is_paged = paged.is_some();
+
+        // Without paged attention the model's internal concat-KV cache
+        // supports only one sequence at a time.
+        let effective_batch_size = if is_paged { max_batch_size } else { 1 };
+        // block_size is only needed for creating per-sequence BlockTables.
+        let block_size = paged.as_ref().map(|ps| ps.block_pool.block_size);
+
+        tracing::info!(
+            "Engine loop started (continuous batching, max_batch_size={}, paged={})",
+            effective_batch_size,
+            is_paged,
+        );
+
+        let mut active: VecDeque<ActiveSequence> = VecDeque::new();
+
+        loop {
+            // ── 1. Accept new requests (non-blocking) ─────────────────────
+            while active.len() < effective_batch_size {
+                match rx.try_recv() {
+                    Ok(req) => {
+                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        tracing::debug!(
+                            "Accepted request {} ({} prompt tokens, batch_size={})",
+                            seq.request_id,
+                            seq.prompt_tokens.len(),
+                            active.len() + 1,
+                        );
+                        active.push_back(seq);
                     }
+                    Err(_) => break,
                 }
             }
+
+            // ── 2. If idle, block until the next request arrives ──────────
+            if active.is_empty() {
+                match rx.blocking_recv() {
+                    Some(req) => {
+                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        tracing::debug!(
+                            "Accepted request {} ({} prompt tokens)",
+                            seq.request_id,
+                            seq.prompt_tokens.len(),
+                        );
+                        active.push_back(seq);
+                    }
+                    None => break, // channel closed
+                }
+            }
+
+            // ── 3. Process one step per active sequence ───────────────────
+            for seq in active.iter_mut() {
+                if seq.finished {
+                    continue;
+                }
+
+                let logits_result = if !seq.prefilled {
+                    // Prefill: run all prompt tokens through the model.
+                    Self::cb_prefill(
+                        &mut model,
+                        &device,
+                        &seq.prompt_tokens,
+                        seq.block_table.as_mut(),
+                        paged.as_mut(),
+                    )
+                } else {
+                    // Decode: generate the next token.
+                    // `output_tokens` should be non-empty here (`prefilled` is
+                    // set only after the first token is pushed), but we handle
+                    // `None` defensively to avoid a panic on internal bugs.
+                    let last_token = match seq.output_tokens.last() {
+                        Some(&t) => t,
+                        None => {
+                            seq.finish_error(
+                                anyhow::anyhow!("internal error: decode before prefill"),
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            continue;
+                        }
+                    };
+                    let seqlen_offset = seq.prompt_tokens.len() + seq.output_tokens.len() - 1;
+                    Self::cb_decode_step(
+                        &mut model,
+                        &device,
+                        last_token,
+                        seqlen_offset,
+                        seq.block_table.as_mut(),
+                        paged.as_mut(),
+                    )
+                };
+
+                let logits = match logits_result {
+                    Ok(l) => l,
+                    Err(e) => {
+                        seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                        continue;
+                    }
+                };
+
+                let token_id =
+                    match sampler::sample_token(&logits, &seq.sampling_params, &seq.all_tokens) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                            continue;
+                        }
+                    };
+
+                seq.output_tokens.push(token_id);
+                seq.all_tokens.push(token_id);
+
+                if !seq.prefilled {
+                    seq.prefilled = true;
+                }
+
+                let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+                let finish_reason = check_stop(
+                    token_id,
+                    seq.output_tokens.len(),
+                    &seq.sampling_params,
+                    &stop_token_ids,
+                );
+
+                let client_gone = !seq.sink.send_token(StreamToken {
+                    token_id,
+                    text,
+                    finish_reason: finish_reason.clone(),
+                });
+
+                if finish_reason.is_some() || client_gone {
+                    let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
+                    seq.finish_ok(
+                        &reason,
+                        &tokenizer,
+                        paged.as_mut().map(|ps| &mut ps.block_pool),
+                    );
+                }
+            }
+
+            // ── 4. Remove completed sequences ─────────────────────────────
+            active.retain(|s| !s.finished);
         }
 
-        tracing::info!("Engine loop stopped");
+        tracing::info!("Engine loop stopped (continuous batching)");
+    }
+
+    // ── Continuous-batching helpers ────────────────────────────────────────
+
+    /// Run a prefill forward pass for a single sequence (continuous batching).
+    ///
+    /// When paged attention is active, allocates blocks and calls
+    /// `forward_paged`.  Otherwise clears the model's internal KV cache and
+    /// calls `forward`.
+    fn cb_prefill(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        prompt_tokens: &[u32],
+        block_table: Option<&mut BlockTable>,
+        paged: Option<&mut PagedState>,
+    ) -> Result<Tensor> {
+        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
+        match (block_table, paged) {
+            (Some(bt), Some(ps)) => {
+                for pos in 0..prompt_tokens.len() {
+                    if !bt.ensure_allocated(pos, &mut ps.block_pool) {
+                        anyhow::bail!("paged attention: out of KV blocks at position {pos}");
+                    }
+                }
+                model.forward_paged(&input_ids, 0, bt, &mut ps.kv_store)
+            }
+            _ => {
+                model.clear_kv_cache();
+                model.forward(&input_ids, 0)
+            }
+        }
+    }
+
+    /// Run a single decode step for one sequence (continuous batching).
+    ///
+    /// When paged attention is active, allocates the next block (if needed)
+    /// and calls `forward_paged`.  Otherwise calls `forward`.
+    fn cb_decode_step(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        token_id: u32,
+        seqlen_offset: usize,
+        block_table: Option<&mut BlockTable>,
+        paged: Option<&mut PagedState>,
+    ) -> Result<Tensor> {
+        let input_ids = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
+        match (block_table, paged) {
+            (Some(bt), Some(ps)) => {
+                if !bt.ensure_allocated(seqlen_offset, &mut ps.block_pool) {
+                    anyhow::bail!("paged attention: out of KV blocks at position {seqlen_offset}");
+                }
+                model.forward_paged(&input_ids, seqlen_offset, bt, &mut ps.kv_store)
+            }
+            _ => model.forward(&input_ids, seqlen_offset),
+        }
     }
 
     /// Run the engine loop using only stdlib channels — no Tokio runtime required.
@@ -450,45 +926,7 @@ impl Engine {
         }
     }
 
-    // ── Non-streaming generation ──────────────────────────────────────────────
-
-    fn generate(
-        &mut self,
-        request_id: &str,
-        prompt_tokens: &[u32],
-        sampling_params: &SamplingParams,
-    ) -> Result<GenerationResult> {
-        tracing::debug!(
-            "Generating for request {} ({} prompt tokens, max {} output tokens)",
-            request_id,
-            prompt_tokens.len(),
-            sampling_params.max_tokens
-        );
-
-        let (result, _prefill_ms, _decode_ms) =
-            self.bench_generate(request_id, prompt_tokens, sampling_params)?;
-
-        tracing::debug!(
-            "Request {} finished: {} output tokens, reason: {}",
-            request_id,
-            result.completion_tokens,
-            result.finish_reason
-        );
-
-        Ok(result)
-    }
-
     // ── Streaming generation ──────────────────────────────────────────────────
-
-    fn generate_stream(
-        &mut self,
-        request_id: &str,
-        prompt_tokens: &[u32],
-        sampling_params: &SamplingParams,
-        token_tx: &mpsc::Sender<StreamToken>,
-    ) -> Result<()> {
-        self.generate_stream_inner(request_id, prompt_tokens, sampling_params, token_tx)
-    }
 
     /// Streaming generation using stdlib `SyncSender` — delegates to the
     /// shared `generate_stream_inner` implementation.
