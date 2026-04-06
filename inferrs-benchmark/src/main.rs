@@ -107,6 +107,7 @@ fn main() -> Result<()> {
         }
 
         let mut tracker = PeakMemoryTracker::start(server.id());
+        let t_bench = Instant::now();
         let summary_res = bench_http(
             "127.0.0.1",
             args.inferrs_port,
@@ -115,11 +116,15 @@ fn main() -> Result<()> {
             args.max_tokens,
             &prompt,
         );
+        let elapsed = t_bench.elapsed();
         let peak_mem_mb = tracker.stop();
 
         let _ = server.kill();
         let _ = server.wait();
-        ok("inferrs serve --quantize stopped");
+        ok(&format!(
+            "inferrs serve --quantize stopped  (benchmark took {:.1}s)",
+            elapsed.as_secs_f64()
+        ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
         summary
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
         }
 
         let mut tracker = PeakMemoryTracker::start(server.id());
+        let t_bench = Instant::now();
         let summary_res = bench_http(
             "127.0.0.1",
             args.inferrs_tq_port,
@@ -161,11 +167,15 @@ fn main() -> Result<()> {
             args.max_tokens,
             &prompt,
         );
+        let elapsed = t_bench.elapsed();
         let peak_mem_mb = tracker.stop();
 
         let _ = server.kill();
         let _ = server.wait();
-        ok("inferrs serve --turbo-quant=false --quantize stopped");
+        ok(&format!(
+            "inferrs serve --turbo-quant=false --quantize stopped  (benchmark took {:.1}s)",
+            elapsed.as_secs_f64()
+        ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
         summary
@@ -189,6 +199,7 @@ fn main() -> Result<()> {
         }
 
         let mut tracker = PeakMemoryTracker::start(server.id());
+        let t_bench = Instant::now();
         let summary_res = bench_http(
             "127.0.0.1",
             args.llama_port,
@@ -197,11 +208,15 @@ fn main() -> Result<()> {
             args.max_tokens,
             &prompt,
         );
+        let elapsed = t_bench.elapsed();
         let peak_mem_mb = tracker.stop();
 
         let _ = server.kill();
         let _ = server.wait();
-        ok("llama-server stopped");
+        ok(&format!(
+            "llama-server stopped  (benchmark took {:.1}s)",
+            elapsed.as_secs_f64()
+        ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
         summary
@@ -450,6 +465,17 @@ fn bench_http(
     let mut prefills: Vec<f64> = Vec::with_capacity(runs);
     let mut decodes: Vec<f64> = Vec::with_capacity(runs);
 
+    // Label width: "[warmup W/W]" or "[run R/RR]" — compute once so columns align.
+    let label_w = {
+        let run_label = format!("[run {runs}/{runs}]");
+        let warmup_label = if warmup > 0 {
+            format!("[warmup {warmup}/{warmup}]")
+        } else {
+            String::new()
+        };
+        run_label.len().max(warmup_label.len())
+    };
+
     for i in 0..total {
         let is_warmup = i < warmup;
         let (ttft_ms, total_ms, n_gen) = do_stream(&url, prompt, max_tokens)?;
@@ -467,26 +493,28 @@ fn bench_http(
         };
 
         if is_warmup {
-            println!(
-                "  [warmup] TTFT={ttft_ms:.1}ms  prefill={prefill_tps:.1}t/s  \
-                 decode={decode_tps:.1}t/s  (n_prompt={n_prompt}, n_gen={n_gen})"
+            let label = format!("[warmup {}/{warmup}]", i + 1);
+            eprintln!(
+                "  {label:<label_w$}  TTFT={ttft_ms:>8.1}ms  prefill={prefill_tps:>7.1}t/s  \
+                 decode={decode_tps:>7.1}t/s  (prompt={n_prompt} tok, gen={n_gen} tok)"
             );
         } else {
             let run_num = i - warmup + 1;
             ttfts.push(ttft_ms);
             prefills.push(prefill_tps);
             decodes.push(decode_tps);
-            println!(
-                "  [run {run_num}/{runs}] TTFT={ttft_ms:.1}ms  prefill={prefill_tps:.1}t/s  \
-                 decode={decode_tps:.1}t/s  (n_prompt={n_prompt}, n_gen={n_gen})"
+            let label = format!("[run {run_num}/{runs}]");
+            eprintln!(
+                "  {label:<label_w$}  TTFT={ttft_ms:>8.1}ms  prefill={prefill_tps:>7.1}t/s  \
+                 decode={decode_tps:>7.1}t/s  (prompt={n_prompt} tok, gen={n_gen} tok)"
             );
         }
     }
 
-    println!();
-    println!("  TTFT    : {}", stats(&ttfts, "ms"));
-    println!("  Prefill : {}", stats(&prefills, "tok/s"));
-    println!("  Decode  : {}", stats(&decodes, "tok/s"));
+    eprintln!();
+    eprintln!("  TTFT    : {}", stats(&ttfts, "ms"));
+    eprintln!("  Prefill : {}", stats(&prefills, "tok/s"));
+    eprintln!("  Decode  : {}", stats(&decodes, "tok/s"));
 
     Ok(BenchSummary {
         ttft_ms: mean_or_none(&ttfts),
@@ -628,39 +656,42 @@ fn print_summary(
         ),
     ];
 
+    // Column widths (fixed for numeric columns, dynamic for backend name).
+    const W_TTFT: usize = 12;
+    const W_PFILL: usize = 14;
+    const W_DEC: usize = 13;
+    const W_MEM: usize = 14;
     let w = rows
         .iter()
         .map(|(name, _, _, _, _)| name.len())
         .max()
         .unwrap_or(0)
         .max("Backend".len());
+    let total_w = w + 2 + W_TTFT + 2 + W_PFILL + 2 + W_DEC + 2 + W_MEM;
+
     println!();
     println!(
         "Benchmark settings: prompt_len={} tokens, max_tokens={}, runs={}, warmup={}",
         args.prompt_len, args.max_tokens, args.runs, args.warmup
     );
     println!();
+    println!("{}", "═".repeat(total_w));
     println!(
-        "{:<w$}  {:>12}  {:>14}  {:>13}  {:>14}",
-        "Backend",
-        "TTFT (ms)",
-        "Prefill (t/s)",
-        "Decode (t/s)",
-        "Peak mem (MB)",
-        w = w
+        "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+        "Backend", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
     );
-    println!("{}", "-".repeat(w + 61));
+    println!("{}", "─".repeat(total_w));
     for (name, ttft, pfill, dec, mem) in &rows {
         println!(
-            "{:<w$}  {:>12}  {:>14}  {:>13}  {:>14}",
+            "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
             name,
             fmt(*ttft, "ms"),
             fmt(*pfill, "t/s"),
             fmt(*dec, "t/s"),
             fmt(*mem, "MB"),
-            w = w
         );
     }
+    println!("{}", "═".repeat(total_w));
     println!();
 
     // Relative comparison vs llama-server.
