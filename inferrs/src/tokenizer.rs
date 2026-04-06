@@ -181,6 +181,11 @@ impl Tokenizer {
             .and_then(|t| self.inner.token_to_id(t))
     }
 
+    /// Look up a token string and return its ID, or `None` if not in vocabulary.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
     /// Encode text to token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self

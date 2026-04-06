@@ -7,6 +7,7 @@ mod hub;
 mod kv_cache;
 mod list;
 mod models;
+mod nvfp4;
 mod pull;
 mod quantize;
 mod rm;

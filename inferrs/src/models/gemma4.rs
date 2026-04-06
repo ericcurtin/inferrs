@@ -130,6 +130,8 @@ impl Module for QLinear {
     }
 }
 
+// NVFP4 dequantization is implemented in crate::nvfp4 (shared with quantize.rs).
+
 // ---------------------------------------------------------------------------
 // QGgufVarBuilder: a VarBuilder for quantized GGUF tensors.
 //
@@ -232,7 +234,8 @@ impl QGgufVarBuilder {
 /// Build a bias-free QLinear layer.
 ///
 /// If `qvb` is `Some`, keeps the weight as QTensor (quantized GGUF path).
-/// If `qvb` is `None`, loads the dequantized tensor from `vb`.
+/// If `qvb` is `None`, loads the dequantized tensor from `vb`, with NVFP4
+/// dequantization applied automatically when the weight is stored in that format.
 ///
 /// Both `vb` and `qvb` are already `.pp("layer_name")` scoped.
 fn qlinear_b(
@@ -254,7 +257,16 @@ fn qlinear_b(
         ql.bias = b;
         Ok(ql)
     } else {
-        let weight = vb.get((out_dim, in_dim), "weight")?;
+        // Check for NVFP4 quantized weight (U8 packed FP4 + F8E4M3 block scales).
+        let dtype = vb.dtype();
+        let device = vb.device().clone();
+        let weight = if let Some(w) =
+            crate::nvfp4::try_load_from_varbuilder(&vb, out_dim, in_dim, dtype, &device)?
+        {
+            w
+        } else {
+            vb.get((out_dim, in_dim), "weight")?
+        };
         Ok(QLinear::from_tensor(weight, b))
     }
 }

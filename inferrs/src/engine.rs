@@ -105,7 +105,24 @@ pub struct EngineContext {
 /// [`EngineContext::model_files`] and [`EngineContext::arch`].
 pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
     let device = args.resolve_device()?;
-    let dtype = args.resolve_dtype()?;
+    let dtype = {
+        let requested = args.resolve_dtype()?;
+        // CPU matmul does not support BF16 or F16 — fall back to F32 automatically.
+        if matches!(device, candle_core::Device::Cpu)
+            && matches!(
+                requested,
+                candle_core::DType::BF16 | candle_core::DType::F16
+            )
+        {
+            tracing::warn!(
+                "CPU device does not support {requested:?} matmul — using F32 instead. \
+                 Pass --dtype f32 to suppress this warning."
+            );
+            candle_core::DType::F32
+        } else {
+            requested
+        }
+    };
     let quant_dtype = args.resolve_quant_dtype()?;
 
     let model_files =
@@ -238,6 +255,92 @@ pub struct StreamToken {
     pub finish_reason: Option<String>,
 }
 
+/// Suppresses thinking-block tokens from the output stream.
+///
+/// Some models (e.g. Gemma4, Qwen3.5) emit a `<think>…</think>` reasoning
+/// block before the actual response.  The block is delimited by a dedicated
+/// special token (e.g. `<|think|>` = ID 98 for Gemma4, `<think>` for Qwen).
+/// The filter tracks whether we are currently inside a thinking block and
+/// returns `false` (suppress) for tokens that should not reach the client.
+///
+/// The block delimiter acts as a toggle: the first occurrence opens the block,
+/// the second occurrence closes it.  Both delimiter tokens are suppressed.
+#[derive(Debug, Default)]
+pub struct ThinkFilter {
+    /// Token ID(s) that open a thinking block.  Empty = disabled.
+    think_token_ids: Vec<u32>,
+    /// Token ID(s) that close a thinking block.
+    close_ids: Vec<u32>,
+    /// Whether we are currently inside a thinking block.
+    pub in_think: bool,
+}
+
+impl ThinkFilter {
+    /// Build a filter from the tokenizer's vocabulary.
+    ///
+    /// Looks up common thinking-block delimiter tokens by their string
+    /// representation and records their IDs.  Returns a no-op filter when
+    /// none are found.
+    pub fn from_tokenizer(tokenizer: &Tokenizer) -> Self {
+        // Thinking block delimiters used by different model families:
+        //
+        //   Gemma4 (google):  <|think|> opens and closes (toggle)
+        //   Qwen3/3.5:        <think> opens, </think> closes
+        //   NVIDIA NVFP4:     <|channel> opens, <channel|> closes
+        //
+        // We collect the open and close token IDs separately.
+        // For toggle-style tokens the same ID appears in both lists.
+        let open_candidates = ["<|think|>", "<think>", "<|channel>"];
+        let close_candidates = ["<|think|>", "</think>", "<channel|>"];
+
+        let mut open_ids = Vec::new();
+        let mut close_ids = Vec::new();
+        for name in &open_candidates {
+            if let Some(id) = tokenizer.token_to_id(name) {
+                open_ids.push(id);
+            }
+        }
+        for name in &close_candidates {
+            if let Some(id) = tokenizer.token_to_id(name) {
+                close_ids.push(id);
+            }
+        }
+        // Deduplicate
+        open_ids.dedup();
+        close_ids.dedup();
+
+        if !open_ids.is_empty() {
+            tracing::debug!(
+                "ThinkFilter: open_ids={:?} close_ids={:?}",
+                open_ids,
+                close_ids
+            );
+        }
+        Self {
+            think_token_ids: open_ids, // reused as open_ids
+            in_think: false,
+            close_ids,
+        }
+    }
+
+    /// Process one token.  Returns `true` if the token should be sent to the
+    /// client, or `false` if it is part of the thinking block and should be
+    /// suppressed.
+    pub fn keep(&mut self, token_id: u32) -> bool {
+        // Check close first so toggle-style tokens (same ID in both lists)
+        // correctly exit the thinking block on their second occurrence.
+        if self.in_think && self.close_ids.contains(&token_id) {
+            self.in_think = false;
+            return false;
+        }
+        if !self.in_think && self.think_token_ids.contains(&token_id) {
+            self.in_think = true;
+            return false;
+        }
+        !self.in_think
+    }
+}
+
 /// Result of a non-streaming generation.
 #[derive(Debug)]
 pub struct GenerationResult {
@@ -344,6 +447,8 @@ struct ActiveSequence {
     /// `true` once the sequence is done (stop token, max length, error, or
     /// client disconnect).
     finished: bool,
+    /// Suppresses thinking-block tokens before they reach the client.
+    think_filter: ThinkFilter,
 }
 
 impl ActiveSequence {
@@ -373,6 +478,7 @@ impl ActiveSequence {
                     block_table: block_size.map(BlockTable::new),
                     prefilled: false,
                     finished: false,
+                    think_filter: ThinkFilter::default(),
                 }
             }
             EngineRequest::GenerateStream {
@@ -397,6 +503,7 @@ impl ActiveSequence {
                     block_table: block_size.map(BlockTable::new),
                     prefilled: false,
                     finished: false,
+                    think_filter: ThinkFilter::default(),
                 }
             }
         }
@@ -658,7 +765,8 @@ impl Engine {
             while active.len() < effective_batch_size {
                 match rx.try_recv() {
                     Ok(req) => {
-                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        let mut seq = ActiveSequence::from_engine_request(req, block_size);
+                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens, batch_size={})",
                             seq.request_id,
@@ -675,7 +783,8 @@ impl Engine {
             if active.is_empty() {
                 match rx.blocking_recv() {
                     Some(req) => {
-                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        let mut seq = ActiveSequence::from_engine_request(req, block_size);
+                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens)",
                             seq.request_id,
@@ -767,7 +876,6 @@ impl Engine {
                     seq.prefilled = true;
                 }
 
-                let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
                 let finish_reason = check_stop(
                     token_id,
                     seq.output_tokens.len(),
@@ -775,11 +883,16 @@ impl Engine {
                     &stop_token_ids,
                 );
 
-                let client_gone = !seq.sink.send_token(StreamToken {
-                    token_id,
-                    text,
-                    finish_reason: finish_reason.clone(),
-                });
+                let client_gone = if seq.think_filter.keep(token_id) {
+                    let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+                    !seq.sink.send_token(StreamToken {
+                        token_id,
+                        text,
+                        finish_reason: finish_reason.clone(),
+                    })
+                } else {
+                    false
+                };
 
                 if finish_reason.is_some() || client_gone {
                     let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
@@ -1040,6 +1153,7 @@ impl Engine {
 
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+        let mut think_filter = ThinkFilter::from_tokenizer(&self.tokenizer);
 
         // Prefill
         let logits = self.run_prefill(prompt_tokens)?;
@@ -1048,15 +1162,20 @@ impl Engine {
         output_tokens.push(token_id);
         all_tokens.push(token_id);
 
-        let text = self.tokenizer.decode(&[token_id], true)?;
         let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-        if !token_tx.send_token(StreamToken {
-            token_id,
-            text,
-            finish_reason: finish_reason.clone(),
-        }) || finish_reason.is_some()
-        {
+        if think_filter.keep(token_id) {
+            let text = self.tokenizer.decode(&[token_id], true)?;
+            if !token_tx.send_token(StreamToken {
+                token_id,
+                text,
+                finish_reason: finish_reason.clone(),
+            }) {
+                self.free_paged_blocks();
+                return Ok(());
+            }
+        }
+        if finish_reason.is_some() {
             self.free_paged_blocks();
             return Ok(());
         }
@@ -1072,15 +1191,19 @@ impl Engine {
             output_tokens.push(token_id);
             all_tokens.push(token_id);
 
-            let text = self.tokenizer.decode(&[token_id], true)?;
             let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-            if !token_tx.send_token(StreamToken {
-                token_id,
-                text,
-                finish_reason: finish_reason.clone(),
-            }) || finish_reason.is_some()
-            {
+            if think_filter.keep(token_id) {
+                let text = self.tokenizer.decode(&[token_id], true)?;
+                if !token_tx.send_token(StreamToken {
+                    token_id,
+                    text,
+                    finish_reason: finish_reason.clone(),
+                }) {
+                    break;
+                }
+            }
+            if finish_reason.is_some() {
                 break;
             }
         }

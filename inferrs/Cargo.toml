@@ -54,6 +54,7 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 async-stream = "0.3"
 anyhow = { workspace = true }
+rayon = "1"
 crossterm = "0.28"
 indicatif = "0.17"
 rustfft = "6"

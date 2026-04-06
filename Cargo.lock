@@ -1670,6 +1670,7 @@ dependencies = [
  "hf-hub",
  "indicatif",
  "libloading 0.8.9",
+ "rayon",
  "rustfft",
  "serde",
  "serde_json",

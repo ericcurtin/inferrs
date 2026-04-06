@@ -177,9 +177,33 @@ pub fn convert_to_gguf(
     // Build (name, QTensor) pairs — collected eagerly to pass a slice to the writer.
     let mut qtensors: Vec<(String, QTensor)> = Vec::with_capacity(n as usize);
 
+    // Build a set of all tensor names for NVFP4 detection.
+    // An NVFP4 weight tensor is one whose ".weight" sibling has a ".weight_scale"
+    // present in the file.  We detect this by checking the full name set.
+    let name_set: std::collections::HashSet<&str> =
+        tensor_names.iter().map(|s| s.as_str()).collect();
+
     for name in &tensor_names {
-        // Load tensor on CPU in f32 — quantization requires f32 input.
-        let tensor = st.load(name, &Device::Cpu)?.to_dtype(DType::F32)?;
+        // Skip NVFP4 auxiliary tensors — they are consumed when dequantizing the
+        // corresponding weight tensor and must not appear as independent entries.
+        if crate::nvfp4::is_nvfp4_aux(name) {
+            bar.inc(1);
+            continue;
+        }
+
+        // Detect NVFP4 weight tensors: a ".weight" whose sibling ".weight_scale"
+        // exists in the file.  Dequantize them via the nvfp4 module so that the
+        // resulting GGUF stores the correct full-width float matrix.
+        let tensor = if name.ends_with(".weight")
+            && name_set.contains(format!("{}.weight_scale", &name[..name.len() - 7]).as_str())
+        {
+            let base = &name[..name.len() - 7]; // strip trailing ".weight"
+            tracing::info!("NVFP4 dequantizing {name}");
+            crate::nvfp4::load_from_safetensors(&st, base)?
+        } else {
+            // Load tensor on CPU in f32 — quantization requires f32 input.
+            st.load(name, &Device::Cpu)?.to_dtype(DType::F32)?
+        };
 
         // All GGML quantization formats require a non-scalar shape and a last
         // dimension that is a multiple of the block size (32 for Q8_0, 256 for
