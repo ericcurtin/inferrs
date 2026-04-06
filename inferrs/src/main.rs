@@ -5,6 +5,7 @@ mod config;
 mod engine;
 mod hub;
 mod kv_cache;
+mod list;
 mod models;
 mod pull;
 mod quantize;
@@ -70,6 +71,8 @@ enum Commands {
     Pull(pull::PullArgs),
     /// Remove a cached model from local disk
     Rm(rm::RmArgs),
+    /// List locally cached models
+    List(list::ListArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -262,11 +265,11 @@ impl ServeArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // For `run`, `bench`, and `rm`, suppress info-level logging by default — the interactive REPL
-    // writes to stdout and log lines would corrupt the prompt display.
+    // For `run`, `bench`, `rm`, and `list`, suppress info-level logging by default — the
+    // interactive REPL writes to stdout and log lines would corrupt the prompt display.
     // Users can still get logs by setting RUST_LOG explicitly (e.g. RUST_LOG=debug).
     let default_log_level = match &cli.command {
-        Commands::Run(_) | Commands::Bench(_) | Commands::Rm(_) => "error",
+        Commands::Run(_) | Commands::Bench(_) | Commands::Rm(_) | Commands::List(_) => "error",
         _ => "info", // Pull and Serve both benefit from info-level progress log
     };
     tracing_subscriber::fmt()
@@ -292,6 +295,9 @@ async fn main() -> Result<()> {
         }
         Commands::Rm(args) => {
             rm::run(args)?;
+        }
+        Commands::List(args) => {
+            list::run(args)?;
         }
     }
 
