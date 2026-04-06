@@ -478,7 +478,7 @@ fn bench_http(
 
     for i in 0..total {
         let is_warmup = i < warmup;
-        let (ttft_ms, total_ms, n_gen) = do_stream(&url, prompt, max_tokens)?;
+        let (ttft_ms, total_ms, n_gen, output_text) = do_stream(&url, prompt, max_tokens)?;
 
         let decode_ms = (total_ms - ttft_ms).max(1e-6);
         let prefill_tps = if ttft_ms > 0.0 {
@@ -492,12 +492,15 @@ fn bench_http(
             0.0
         };
 
+        let snippet = truncate_for_display(&output_text, 80);
+
         if is_warmup {
             let label = format!("[warmup {}/{warmup}]", i + 1);
             eprintln!(
                 "  {label:<label_w$}  TTFT={ttft_ms:>8.1}ms  prefill={prefill_tps:>7.1}t/s  \
                  decode={decode_tps:>7.1}t/s  (prompt={n_prompt} tok, gen={n_gen} tok)"
             );
+            eprintln!("  {:<label_w$}  output: {snippet}", "");
         } else {
             let run_num = i - warmup + 1;
             ttfts.push(ttft_ms);
@@ -508,6 +511,7 @@ fn bench_http(
                 "  {label:<label_w$}  TTFT={ttft_ms:>8.1}ms  prefill={prefill_tps:>7.1}t/s  \
                  decode={decode_tps:>7.1}t/s  (prompt={n_prompt} tok, gen={n_gen} tok)"
             );
+            eprintln!("  {:<label_w$}  output: {snippet}", "");
         }
     }
 
@@ -524,8 +528,8 @@ fn bench_http(
     })
 }
 
-/// Stream one chat-completion request; returns (ttft_ms, total_ms, n_gen).
-fn do_stream(url: &str, prompt: &str, max_tokens: usize) -> Result<(f64, f64, usize)> {
+/// Stream one chat-completion request; returns (ttft_ms, total_ms, n_gen, output_text).
+fn do_stream(url: &str, prompt: &str, max_tokens: usize) -> Result<(f64, f64, usize, String)> {
     let body = serde_json::json!({
         "model": "benchmark",
         "messages": [{"role": "user", "content": prompt}],
@@ -542,6 +546,7 @@ fn do_stream(url: &str, prompt: &str, max_tokens: usize) -> Result<(f64, f64, us
     let reader = std::io::BufReader::new(resp.into_reader());
     let mut ttft_ms: Option<f64> = None;
     let mut n_gen: usize = 0;
+    let mut output_text = String::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -579,12 +584,30 @@ fn do_stream(url: &str, prompt: &str, max_tokens: usize) -> Result<(f64, f64, us
                 ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
             }
             n_gen += 1;
+            output_text.push_str(token);
         }
     }
 
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let ttft_ms = ttft_ms.unwrap_or(total_ms);
-    Ok((ttft_ms, total_ms, n_gen))
+    Ok((ttft_ms, total_ms, n_gen, output_text))
+}
+
+/// Truncate `s` to at most `max_chars` characters, replacing newlines with spaces,
+/// and appending "…" when truncated.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    // Collapse whitespace/newlines so the snippet fits on one line.
+    let flat: String = s
+        .chars()
+        .map(|c| if c.is_ascii_whitespace() { ' ' } else { c })
+        .collect();
+    let flat = flat.trim().to_string();
+    if flat.chars().count() <= max_chars {
+        flat
+    } else {
+        let truncated: String = flat.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
 }
 
 // ── Statistics helpers ───────────────────────────────────────────────────────
