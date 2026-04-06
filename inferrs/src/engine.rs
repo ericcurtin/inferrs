@@ -1,13 +1,18 @@
-//! Inference engine: owns the model and runs the inference loop.
+//! Inference engine: owns the model and runs the continuous-batching loop.
 //!
-//! When paged attention is active, the engine uses **continuous batching**:
-//! multiple in-flight sequences share the paged KV store and are interleaved
-//! at the token level.  New requests are accepted between decode steps so that
-//! arriving work does not have to wait for earlier sequences to complete.
+//! The engine always uses **continuous batching**: new requests are accepted
+//! between decode steps so that arriving work does not have to wait for
+//! earlier sequences to complete.
 //!
-//! Without paged attention the engine falls back to sequential processing
-//! (one request at a time) because the model's internal concat-KV cache does
-//! not support multi-sequence interleaving.
+//! When paged attention is active, multiple in-flight sequences share the
+//! paged KV store and are truly interleaved at the token level (up to
+//! `max_batch_size` concurrent sequences).
+//!
+//! Without paged attention the model's internal concat-KV cache is
+//! single-sequence, so the effective batch size is capped at 1.  The
+//! continuous-batching loop structure is still used so that the engine
+//! thread can accept and queue new requests between decode steps of the
+//! active sequence.
 
 use std::collections::VecDeque;
 
@@ -244,7 +249,8 @@ struct ActiveSequence {
     sampling_params: SamplingParams,
     sink: TokenSink,
     /// Per-sequence block table for paged attention.
-    block_table: BlockTable,
+    /// `None` when running without paged attention.
+    block_table: Option<BlockTable>,
     /// `true` once the prefill phase has completed.
     prefilled: bool,
     /// `true` once the sequence is done (stop token, max length, error, or
@@ -254,7 +260,11 @@ struct ActiveSequence {
 
 impl ActiveSequence {
     /// Create an [`ActiveSequence`] from an [`EngineRequest`].
-    fn from_engine_request(req: EngineRequest, block_size: usize) -> Self {
+    ///
+    /// When `block_size` is `Some`, a per-sequence [`BlockTable`] is created
+    /// for paged attention.  When `None`, no block table is allocated (the
+    /// non-paged path uses the model's internal concat-KV cache).
+    fn from_engine_request(req: EngineRequest, block_size: Option<usize>) -> Self {
         match req {
             EngineRequest::Generate {
                 request_id,
@@ -270,7 +280,7 @@ impl ActiveSequence {
                     all_tokens,
                     sampling_params,
                     sink: TokenSink::OneShot(Some(response_tx)),
-                    block_table: BlockTable::new(block_size),
+                    block_table: block_size.map(BlockTable::new),
                     prefilled: false,
                     finished: false,
                 }
@@ -289,7 +299,7 @@ impl ActiveSequence {
                     all_tokens,
                     sampling_params,
                     sink: TokenSink::Stream(token_tx),
-                    block_table: BlockTable::new(block_size),
+                    block_table: block_size.map(BlockTable::new),
                     prefilled: false,
                     finished: false,
                 }
@@ -303,7 +313,7 @@ impl ActiveSequence {
         &mut self,
         finish_reason: &str,
         tokenizer: &Tokenizer,
-        block_pool: &mut BlockPool,
+        block_pool: Option<&mut BlockPool>,
     ) {
         tracing::debug!(
             "Request {} finished: {} output tokens, reason: {}",
@@ -311,7 +321,9 @@ impl ActiveSequence {
             self.output_tokens.len(),
             finish_reason,
         );
-        self.block_table.free_all(block_pool);
+        if let (Some(bt), Some(pool)) = (&mut self.block_table, block_pool) {
+            bt.free_all(pool);
+        }
         self.sink.send_result(GenerationResult {
             output_token_ids: self.output_tokens.clone(),
             output_text: tokenizer
@@ -325,9 +337,11 @@ impl ActiveSequence {
     }
 
     /// Mark the sequence as failed, free its blocks, and send an error.
-    fn finish_error(&mut self, error: anyhow::Error, block_pool: &mut BlockPool) {
+    fn finish_error(&mut self, error: anyhow::Error, block_pool: Option<&mut BlockPool>) {
         tracing::warn!("Request {} failed: {}", self.request_id, error);
-        self.block_table.free_all(block_pool);
+        if let (Some(bt), Some(pool)) = (&mut self.block_table, block_pool) {
+            bt.free_all(pool);
+        }
         self.sink.send_error(&error, self.prompt_tokens.len());
         self.finished = true;
     }
@@ -428,11 +442,14 @@ pub fn attach_paged_kv_if_requested(
     Ok(engine.with_paged_kv(block_pool, kv_store))
 }
 
-/// The engine runs on a dedicated thread and processes requests.
+/// The engine runs on a dedicated thread and processes requests using
+/// continuous batching.
 ///
-/// When paged attention is active the engine uses continuous batching to
-/// interleave multiple sequences.  Otherwise it falls back to sequential
-/// (one request at a time) processing.
+/// With paged attention, multiple sequences share the paged KV store and
+/// run concurrently (up to `max_batch_size`).  Without paged attention the
+/// model's internal concat-KV cache is single-sequence so the effective
+/// batch size is 1, but the continuous-batching loop structure is still
+/// used to accept and queue requests between decode steps.
 pub struct Engine {
     model: Box<dyn CausalLM>,
     tokenizer: Tokenizer,
@@ -492,81 +509,25 @@ impl Engine {
 
     /// Run the engine loop, processing requests from the channel.
     ///
-    /// When paged attention is active, uses continuous batching to interleave
-    /// multiple sequences.  Otherwise processes requests one at a time.
+    /// Always uses continuous batching.  When paged attention is active,
+    /// multiple sequences can run concurrently.  Without paged attention the
+    /// effective batch size is 1 (the model's internal KV cache is
+    /// single-sequence).
     pub fn run(self, rx: mpsc::Receiver<EngineRequest>) {
-        if self.paged.is_some() {
-            self.run_continuous_batching(rx);
-        } else {
-            self.run_sequential(rx);
-        }
+        self.run_continuous_batching(rx);
     }
 
-    /// Sequential engine loop: process one request at a time.
-    ///
-    /// Used when paged attention is not active, since the model's internal
-    /// concat-KV cache does not support multi-sequence interleaving.
-    fn run_sequential(mut self, mut rx: mpsc::Receiver<EngineRequest>) {
-        tracing::info!("Engine loop started (sequential mode)");
-
-        while let Some(request) = rx.blocking_recv() {
-            match request {
-                EngineRequest::Generate {
-                    request_id,
-                    prompt_tokens,
-                    sampling_params,
-                    response_tx,
-                } => {
-                    let result = self.generate(&request_id, &prompt_tokens, &sampling_params);
-                    let _ = response_tx.send(match result {
-                        Ok(r) => r,
-                        Err(e) => GenerationResult {
-                            output_token_ids: vec![],
-                            output_text: format!("Error: {e}"),
-                            finish_reason: "error".to_string(),
-                            prompt_tokens: prompt_tokens.len(),
-                            completion_tokens: 0,
-                        },
-                    });
-                }
-                EngineRequest::GenerateStream {
-                    request_id,
-                    prompt_tokens,
-                    sampling_params,
-                    token_tx,
-                } => {
-                    if let Err(e) = self.generate_stream(
-                        &request_id,
-                        &prompt_tokens,
-                        &sampling_params,
-                        &token_tx,
-                    ) {
-                        let _ = token_tx.blocking_send(StreamToken {
-                            token_id: 0,
-                            text: format!("Error: {e}"),
-                            finish_reason: Some("error".to_string()),
-                        });
-                    }
-                }
-            }
-        }
-
-        tracing::info!("Engine loop stopped (sequential mode)");
-    }
-
-    /// Continuous batching engine loop: interleave multiple sequences.
+    /// Continuous batching engine loop.
     ///
     /// Each iteration:
     /// 1. Accept all pending requests from the channel (non-blocking).
     /// 2. If no sequences are active, block until a request arrives.
     /// 3. For each active sequence, run one step (prefill or decode).
     /// 4. Remove completed sequences and free their KV blocks.
+    ///
+    /// Without paged attention the model's concat-KV cache is
+    /// single-sequence, so only one sequence is processed at a time.
     fn run_continuous_batching(self, mut rx: mpsc::Receiver<EngineRequest>) {
-        tracing::info!(
-            "Engine loop started (continuous batching, max_batch_size={})",
-            self.max_batch_size
-        );
-
         // Destructure self so the borrow checker can track disjoint field
         // borrows (model, paged.block_pool, paged.kv_store, etc.).
         let Engine {
@@ -579,13 +540,26 @@ impl Engine {
             paged,
         } = self;
 
-        let mut paged = paged.expect("continuous batching requires paged attention");
-        let block_size = paged.block_pool.block_size;
+        let mut paged = paged;
+        let is_paged = paged.is_some();
+
+        // Without paged attention the model's internal concat-KV cache
+        // supports only one sequence at a time.
+        let effective_batch_size = if is_paged { max_batch_size } else { 1 };
+        // block_size is only needed for creating per-sequence BlockTables.
+        let block_size = paged.as_ref().map(|ps| ps.block_pool.block_size);
+
+        tracing::info!(
+            "Engine loop started (continuous batching, max_batch_size={}, paged={})",
+            effective_batch_size,
+            is_paged,
+        );
+
         let mut active: VecDeque<ActiveSequence> = VecDeque::new();
 
         loop {
             // ── 1. Accept new requests (non-blocking) ─────────────────────
-            while active.len() < max_batch_size {
+            while active.len() < effective_batch_size {
                 match rx.try_recv() {
                     Ok(req) => {
                         let seq = ActiveSequence::from_engine_request(req, block_size);
@@ -629,9 +603,8 @@ impl Engine {
                         &mut model,
                         &device,
                         &seq.prompt_tokens,
-                        &mut seq.block_table,
-                        &mut paged.block_pool,
-                        &mut paged.kv_store,
+                        seq.block_table.as_mut(),
+                        paged.as_mut(),
                     )
                 } else {
                     // Decode: generate the next token.
@@ -643,7 +616,7 @@ impl Engine {
                         None => {
                             seq.finish_error(
                                 anyhow::anyhow!("internal error: decode before prefill"),
-                                &mut paged.block_pool,
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
                             );
                             continue;
                         }
@@ -654,16 +627,15 @@ impl Engine {
                         &device,
                         last_token,
                         seqlen_offset,
-                        &mut seq.block_table,
-                        &mut paged.block_pool,
-                        &mut paged.kv_store,
+                        seq.block_table.as_mut(),
+                        paged.as_mut(),
                     )
                 };
 
                 let logits = match logits_result {
                     Ok(l) => l,
                     Err(e) => {
-                        seq.finish_error(e, &mut paged.block_pool);
+                        seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
                         continue;
                     }
                 };
@@ -672,7 +644,7 @@ impl Engine {
                     match sampler::sample_token(&logits, &seq.sampling_params, &seq.all_tokens) {
                         Ok(t) => t,
                         Err(e) => {
-                            seq.finish_error(e, &mut paged.block_pool);
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
                             continue;
                         }
                     };
@@ -700,7 +672,11 @@ impl Engine {
 
                 if finish_reason.is_some() || client_gone {
                     let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
-                    seq.finish_ok(&reason, &tokenizer, &mut paged.block_pool);
+                    seq.finish_ok(
+                        &reason,
+                        &tokenizer,
+                        paged.as_mut().map(|ps| &mut ps.block_pool),
+                    );
                 }
             }
 
@@ -711,41 +687,59 @@ impl Engine {
         tracing::info!("Engine loop stopped (continuous batching)");
     }
 
-    // ── Continuous-batching paged helpers ──────────────────────────────────
+    // ── Continuous-batching helpers ────────────────────────────────────────
 
     /// Run a prefill forward pass for a single sequence (continuous batching).
+    ///
+    /// When paged attention is active, allocates blocks and calls
+    /// `forward_paged`.  Otherwise clears the model's internal KV cache and
+    /// calls `forward`.
     fn cb_prefill(
         model: &mut Box<dyn CausalLM>,
         device: &Device,
         prompt_tokens: &[u32],
-        block_table: &mut BlockTable,
-        block_pool: &mut BlockPool,
-        kv_store: &mut PagedKvStore,
+        block_table: Option<&mut BlockTable>,
+        paged: Option<&mut PagedState>,
     ) -> Result<Tensor> {
-        for pos in 0..prompt_tokens.len() {
-            if !block_table.ensure_allocated(pos, block_pool) {
-                anyhow::bail!("paged attention: out of KV blocks at position {pos}");
+        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
+        match (block_table, paged) {
+            (Some(bt), Some(ps)) => {
+                for pos in 0..prompt_tokens.len() {
+                    if !bt.ensure_allocated(pos, &mut ps.block_pool) {
+                        anyhow::bail!("paged attention: out of KV blocks at position {pos}");
+                    }
+                }
+                model.forward_paged(&input_ids, 0, bt, &mut ps.kv_store)
+            }
+            _ => {
+                model.clear_kv_cache();
+                model.forward(&input_ids, 0)
             }
         }
-        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
-        model.forward_paged(&input_ids, 0, block_table, kv_store)
     }
 
     /// Run a single decode step for one sequence (continuous batching).
+    ///
+    /// When paged attention is active, allocates the next block (if needed)
+    /// and calls `forward_paged`.  Otherwise calls `forward`.
     fn cb_decode_step(
         model: &mut Box<dyn CausalLM>,
         device: &Device,
         token_id: u32,
         seqlen_offset: usize,
-        block_table: &mut BlockTable,
-        block_pool: &mut BlockPool,
-        kv_store: &mut PagedKvStore,
+        block_table: Option<&mut BlockTable>,
+        paged: Option<&mut PagedState>,
     ) -> Result<Tensor> {
-        if !block_table.ensure_allocated(seqlen_offset, block_pool) {
-            anyhow::bail!("paged attention: out of KV blocks at position {seqlen_offset}");
-        }
         let input_ids = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
-        model.forward_paged(&input_ids, seqlen_offset, block_table, kv_store)
+        match (block_table, paged) {
+            (Some(bt), Some(ps)) => {
+                if !bt.ensure_allocated(seqlen_offset, &mut ps.block_pool) {
+                    anyhow::bail!("paged attention: out of KV blocks at position {seqlen_offset}");
+                }
+                model.forward_paged(&input_ids, seqlen_offset, bt, &mut ps.kv_store)
+            }
+            _ => model.forward(&input_ids, seqlen_offset),
+        }
     }
 
     /// Run the engine loop using only stdlib channels — no Tokio runtime required.
@@ -855,45 +849,7 @@ impl Engine {
         }
     }
 
-    // ── Non-streaming generation ──────────────────────────────────────────────
-
-    fn generate(
-        &mut self,
-        request_id: &str,
-        prompt_tokens: &[u32],
-        sampling_params: &SamplingParams,
-    ) -> Result<GenerationResult> {
-        tracing::debug!(
-            "Generating for request {} ({} prompt tokens, max {} output tokens)",
-            request_id,
-            prompt_tokens.len(),
-            sampling_params.max_tokens
-        );
-
-        let (result, _prefill_ms, _decode_ms) =
-            self.bench_generate(request_id, prompt_tokens, sampling_params)?;
-
-        tracing::debug!(
-            "Request {} finished: {} output tokens, reason: {}",
-            request_id,
-            result.completion_tokens,
-            result.finish_reason
-        );
-
-        Ok(result)
-    }
-
     // ── Streaming generation ──────────────────────────────────────────────────
-
-    fn generate_stream(
-        &mut self,
-        request_id: &str,
-        prompt_tokens: &[u32],
-        sampling_params: &SamplingParams,
-        token_tx: &mpsc::Sender<StreamToken>,
-    ) -> Result<()> {
-        self.generate_stream_inner(request_id, prompt_tokens, sampling_params, token_tx)
-    }
 
     /// Streaming generation using stdlib `SyncSender` — delegates to the
     /// shared `generate_stream_inner` implementation.
