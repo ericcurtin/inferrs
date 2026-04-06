@@ -470,9 +470,10 @@ pub struct Engine {
 struct PagedState {
     block_pool: BlockPool,
     kv_store: PagedKvStore,
-    /// Standalone block table used only by the sequential code paths
-    /// (`bench_generate`, `run_sync`).  The continuous-batching loop
-    /// maintains per-sequence block tables instead.
+    /// Standalone block table used by the non-batching code paths
+    /// (`bench_generate`, `run_sync`) which process a single request at a
+    /// time.  The continuous-batching loop maintains per-sequence block
+    /// tables instead.
     block_table: BlockTable,
 }
 
@@ -608,9 +609,9 @@ impl Engine {
                     )
                 } else {
                     // Decode: generate the next token.
-                    // Safety: `prefilled` is only set to true after the first
-                    // token has been pushed to `output_tokens`, so this is
-                    // guaranteed to be non-empty.
+                    // `output_tokens` should be non-empty here (`prefilled` is
+                    // set only after the first token is pushed), but we handle
+                    // `None` defensively to avoid a panic on internal bugs.
                     let last_token = match seq.output_tokens.last() {
                         Some(&t) => t,
                         None => {
