@@ -99,7 +99,11 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     println!(
         "Benchmarking {} ({} warm-up + {} timed runs, prompt_len={}, max_tokens={})",
-        serve.model, args.warmup, args.runs, args.prompt_len, max_tokens,
+        serve.model.as_deref().unwrap_or("<no model>"),
+        args.warmup,
+        args.runs,
+        args.prompt_len,
+        max_tokens,
     );
 
     for i in 0..total_runs {

@@ -1,4 +1,5 @@
-//! HTTP server with OpenAI-compatible and Anthropic-compatible API endpoints.
+//! HTTP server with OpenAI-compatible, Anthropic-compatible, and
+//! Ollama-compatible API endpoints.
 
 use anyhow::Result;
 use axum::{
@@ -337,6 +338,177 @@ pub struct AnthropicErrorDetail {
     pub message: String,
 }
 
+// ─── Ollama API types ────────────────────────────────────────────────────────
+
+/// Ollama `POST /api/generate` request.
+#[derive(Debug, Deserialize)]
+pub struct OllamaGenerateRequest {
+    pub model: String,
+    pub prompt: Option<String>,
+    /// Optional system prompt (accepted but not yet forwarded to the engine).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    /// When `true`, the prompt is used as-is without applying a chat template.
+    #[serde(default)]
+    pub raw: Option<bool>,
+    #[serde(default)]
+    pub options: Option<OllamaOptions>,
+}
+
+/// Ollama `POST /api/chat` request.
+#[derive(Debug, Deserialize)]
+pub struct OllamaChatRequest {
+    pub model: String,
+    pub messages: Vec<OllamaChatMessage>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub options: Option<OllamaOptions>,
+}
+
+/// A single message in an Ollama chat request.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct OllamaChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Sampling options passed inside an Ollama request.
+#[derive(Debug, Deserialize, Default)]
+pub struct OllamaOptions {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub num_predict: Option<usize>,
+    pub repeat_penalty: Option<f64>,
+}
+
+/// Non-streaming `POST /api/generate` response.
+#[derive(Debug, Serialize)]
+pub struct OllamaGenerateResponse {
+    pub model: String,
+    pub created_at: String,
+    pub response: String,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_reason: Option<String>,
+    pub prompt_eval_count: usize,
+    pub eval_count: usize,
+}
+
+/// Streaming chunk for `POST /api/generate`.
+#[derive(Debug, Serialize)]
+pub struct OllamaGenerateChunk {
+    pub model: String,
+    pub created_at: String,
+    pub response: String,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_count: Option<usize>,
+}
+
+/// Non-streaming `POST /api/chat` response.
+#[derive(Debug, Serialize)]
+pub struct OllamaChatResponse {
+    pub model: String,
+    pub created_at: String,
+    pub message: OllamaChatMessage,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_reason: Option<String>,
+    pub prompt_eval_count: usize,
+    pub eval_count: usize,
+}
+
+/// Streaming chunk for `POST /api/chat`.
+#[derive(Debug, Serialize)]
+pub struct OllamaChatChunk {
+    pub model: String,
+    pub created_at: String,
+    pub message: OllamaChatMessage,
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_count: Option<usize>,
+}
+
+/// `GET /api/tags` response.
+#[derive(Debug, Serialize)]
+pub struct OllamaListResponse {
+    pub models: Vec<OllamaModelEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OllamaModelEntry {
+    pub name: String,
+    pub model: String,
+    pub modified_at: String,
+    pub size: u64,
+    pub digest: String,
+    pub details: OllamaModelDetails,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OllamaModelDetails {
+    pub format: String,
+    pub family: String,
+    pub parameter_size: String,
+    pub quantization_level: String,
+}
+
+/// `GET /api/ps` response (running models).
+#[derive(Debug, Serialize)]
+pub struct OllamaPsResponse {
+    pub models: Vec<OllamaRunningModel>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OllamaRunningModel {
+    pub name: String,
+    pub model: String,
+    pub size: u64,
+    pub digest: String,
+    pub details: OllamaModelDetails,
+    pub expires_at: String,
+    pub size_vram: u64,
+}
+
+/// `POST /api/show` request.
+#[derive(Debug, Deserialize)]
+pub struct OllamaShowRequest {
+    pub model: String,
+    /// When `true`, include additional model details (accepted but not yet used).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub verbose: Option<bool>,
+}
+
+/// `POST /api/show` response.
+#[derive(Debug, Serialize)]
+pub struct OllamaShowResponse {
+    pub modelfile: String,
+    pub parameters: String,
+    pub template: String,
+    pub details: OllamaModelDetails,
+    pub model_info: serde_json::Value,
+}
+
+/// `GET /api/version` response.
+#[derive(Debug, Serialize)]
+pub struct OllamaVersionResponse {
+    pub version: String,
+}
+
 // ─── Time helpers ───────────────────────────────────────────────────────────
 
 /// Return the current Unix timestamp in seconds.
@@ -464,9 +636,12 @@ fn anthropic_messages_to_chat(
 // ─── Server state ───────────────────────────────────────────────────────────
 
 struct AppState {
-    model_id: String,
+    /// The model ID as known to the server.  `None` when running in
+    /// Ollama-compatible mode with no model pre-loaded.
+    model_id: Option<String>,
     engine_tx: mpsc::Sender<EngineRequest>,
-    tokenizer: Arc<Tokenizer>,
+    /// `None` when no model is loaded (Ollama-compatible mode with no model).
+    tokenizer: Option<Arc<Tokenizer>>,
     default_params: SamplingParams,
     /// Hard upper bound on (prompt_tokens + output_tokens) for this model.
     max_seq_len: usize,
@@ -492,16 +667,67 @@ fn audio_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) 
 
 // ─── Server startup ─────────────────────────────────────────────────────────
 
-pub async fn run(args: ServeArgs) -> Result<()> {
-    // Load model, build engine, attach paged KV.
-    let ctx = load_engine(&args)?;
+/// Default port when a specific model is pre-loaded (OpenAI-style API).
+const DEFAULT_PORT_MODEL: u16 = 8080;
+/// Default port when running in Ollama-compatible mode (no model pre-loaded).
+const DEFAULT_PORT_OLLAMA: u16 = 11434;
 
-    // The server needs its own tokenizer for chat-template encoding.
-    let tokenizer = Arc::new(Tokenizer::from_file_with_arch(
-        &ctx.model_files.tokenizer_path,
-        ctx.model_files.tokenizer_config_path.as_deref(),
-        Some(&ctx.arch),
-    )?);
+pub async fn run(args: ServeArgs) -> Result<()> {
+    // When a model is specified, load it; otherwise run in Ollama-compatible
+    // mode where each request carries its own `model` field.
+    let (model_id, tokenizer, max_seq_len, audio_token_id, engine_tx, output_buf, stream_registry) =
+        if let Some(ref model) = args.model {
+            // ── Model-loaded path ─────────────────────────────────────────────
+            let ctx = load_engine(&args)?;
+
+            let tok = Arc::new(Tokenizer::from_file_with_arch(
+                &ctx.model_files.tokenizer_path,
+                ctx.model_files.tokenizer_config_path.as_deref(),
+                Some(&ctx.arch),
+            )?);
+
+            let max_seq_len = ctx.max_seq_len;
+            let audio_token_id = ctx.raw_config.audio_token_id;
+
+            let output_buf = OutputBuffer::new();
+            let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+            spawn_drain_task(output_buf.clone(), stream_registry.clone());
+
+            let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
+            std::thread::Builder::new()
+                .name("engine".to_string())
+                .spawn(move || ctx.engine.run(engine_rx))
+                .expect("Failed to spawn engine thread");
+
+            (
+                Some(model.clone()),
+                Some(tok),
+                max_seq_len,
+                audio_token_id,
+                engine_tx,
+                output_buf,
+                stream_registry,
+            )
+        } else {
+            // ── Ollama-compatible mode — no model pre-loaded ──────────────────
+            // No tokenizer and no running engine.  The channel is created with
+            // the receiver immediately dropped so any `send()` will fail with
+            // a "engine unavailable" error returned to the client.
+            let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+
+            let output_buf = OutputBuffer::new();
+            let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+            (
+                None,
+                None,
+                usize::MAX,
+                None,
+                engine_tx,
+                output_buf,
+                stream_registry,
+            )
+        };
 
     // Default sampling params from CLI args
     let default_params = SamplingParams {
@@ -512,29 +738,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    // Extract values from ctx before it is moved into the engine thread.
-    let max_seq_len = ctx.max_seq_len;
-    let audio_token_id = ctx.raw_config.audio_token_id;
-
-    // Create the shared output buffer and per-request stream registry.
-    let output_buf = OutputBuffer::new();
-    let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
-
-    // Spawn the drain task: wakes on Notify, drains the buffer, routes tokens.
-    spawn_drain_task(output_buf.clone(), stream_registry.clone());
-
-    // Create engine channel and spawn engine on a dedicated thread.
-    let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
-    std::thread::Builder::new()
-        .name("engine".to_string())
-        .spawn(move || ctx.engine.run(engine_rx))
-        .expect("Failed to spawn engine thread");
-
     // Build app state
     let state = Arc::new(AppState {
-        model_id: args.model.clone(),
+        model_id: model_id.clone(),
         engine_tx,
-        tokenizer,
+        tokenizer, // Option<Arc<Tokenizer>>
         default_params,
         max_seq_len,
         output_buf,
@@ -542,18 +750,37 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         audio_token_id,
     });
 
-    // Build router
+    // Build router — OpenAI/Anthropic routes always present; Ollama routes
+    // are always mounted so that any client expecting the Ollama API works
+    // regardless of whether a model was pre-loaded.
     let app = Router::new()
+        // ── OpenAI-compatible ────────────────────────────────────────────────
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
+        // ── Ollama-compatible ────────────────────────────────────────────────
+        .route("/", get(ollama_root).head(ollama_root))
+        .route("/api/version", get(ollama_version).head(ollama_version))
+        .route("/api/tags", get(ollama_tags).head(ollama_tags))
+        .route("/api/ps", get(ollama_ps))
+        .route("/api/show", post(ollama_show))
+        .route("/api/generate", post(ollama_generate))
+        .route("/api/chat", post(ollama_chat))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64 MiB for audio payloads
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = format!("{}:{}", args.host, args.port);
+    // Choose the default port based on whether a model was pre-loaded.
+    let port = args.port.unwrap_or_else(|| {
+        if model_id.is_some() {
+            DEFAULT_PORT_MODEL
+        } else {
+            DEFAULT_PORT_OLLAMA
+        }
+    });
+    let addr = format!("{}:{}", args.host, port);
     tracing::info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -570,7 +797,11 @@ async fn chat_completions(
 ) -> impl IntoResponse {
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = unix_now();
-    let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .or_else(|| state.model_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // ── Audio preprocessing ──────────────────────────────────────────────────
     // If any message has an audio attachment:
@@ -621,8 +852,11 @@ async fn chat_completions(
 
         // Tokenize with audio soft-token placeholders.
         let prompt = apply_gemma4_with_audio(&req.messages, &[n_audio_tokens]);
-        let tokens = state
+        let tokenizer = state
             .tokenizer
+            .as_deref()
+            .ok_or_else(|| server_error("No model loaded"))?;
+        let tokens = tokenizer
             .encode(&prompt, false)
             .map_err(tokenization_error)?;
 
@@ -643,10 +877,11 @@ async fn chat_completions(
 
         (tokens, Some(audio_ctx))
     } else {
-        let tokens = match state
+        let tokenizer = state
             .tokenizer
-            .apply_chat_template_and_encode(&req.messages)
-        {
+            .as_deref()
+            .ok_or_else(|| server_error("No model loaded"))?;
+        let tokens = match tokenizer.apply_chat_template_and_encode(&req.messages) {
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
         };
@@ -881,10 +1116,18 @@ async fn completions(
 ) -> impl IntoResponse {
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = unix_now();
-    let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .or_else(|| state.model_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Tokenize the prompt directly
-    let prompt_tokens = match state.tokenizer.encode(&req.prompt, true) {
+    let tokenizer = state
+        .tokenizer
+        .as_deref()
+        .ok_or_else(|| server_error("No model loaded"))?;
+    let prompt_tokens = match tokenizer.encode(&req.prompt, true) {
         Ok(tokens) => tokens,
         Err(e) => return Err(tokenization_error(e)),
     };
@@ -1013,16 +1256,24 @@ async fn anthropic_messages(
     Json(req): Json<AnthropicMessagesRequest>,
 ) -> impl IntoResponse {
     let request_id = format!("msg_{}", uuid::Uuid::new_v4());
-    let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .or_else(|| state.model_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Convert Anthropic messages (with optional top-level system) to ChatMessage list.
     let chat_messages = anthropic_messages_to_chat(req.system.as_deref(), &req.messages);
 
     // Apply chat template and tokenize.
-    let prompt_tokens = match state
-        .tokenizer
-        .apply_chat_template_and_encode(&chat_messages)
-    {
+    let tokenizer = state.tokenizer.as_deref().ok_or_else(|| {
+        anthropic_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "No model loaded",
+        )
+    })?;
+    let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&chat_messages) {
         Ok(tokens) => tokens,
         Err(e) => {
             return Err(anthropic_error(
@@ -1272,14 +1523,19 @@ fn make_anthropic_sse_stream(
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
     let created = unix_now();
 
-    Json(ModelListResponse {
-        object: "list",
-        data: vec![ModelInfo {
-            id: state.model_id.clone(),
+    let data = match &state.model_id {
+        Some(id) => vec![ModelInfo {
+            id: id.clone(),
             object: "model",
             created,
             owned_by: "inferrs".to_string(),
         }],
+        None => vec![],
+    };
+
+    Json(ModelListResponse {
+        object: "list",
+        data,
     })
 }
 
@@ -1324,4 +1580,589 @@ fn clamp_max_tokens(requested: usize, prompt_len: usize, max_seq_len: usize) -> 
         );
     }
     requested.min(available)
+}
+
+// ─── Ollama-compatible handlers ─────────────────────────────────────────────
+
+/// `GET /` and `HEAD /` — Ollama running check.
+async fn ollama_root() -> impl IntoResponse {
+    (StatusCode::OK, "Ollama is running")
+}
+
+/// `GET /api/version` — Ollama version endpoint.
+async fn ollama_version() -> Json<OllamaVersionResponse> {
+    Json(OllamaVersionResponse {
+        // Report a recent Ollama version so clients don't reject us.
+        version: "0.9.0".to_string(),
+    })
+}
+
+/// `GET /api/tags` and `HEAD /api/tags` — list locally available models.
+async fn ollama_tags(State(state): State<Arc<AppState>>) -> Json<OllamaListResponse> {
+    let models = match &state.model_id {
+        Some(id) => vec![OllamaModelEntry {
+            name: id.clone(),
+            model: id.clone(),
+            modified_at: "2025-01-01T00:00:00Z".to_string(),
+            size: 0,
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            details: OllamaModelDetails {
+                format: "safetensors".to_string(),
+                family: "".to_string(),
+                parameter_size: "".to_string(),
+                quantization_level: "".to_string(),
+            },
+        }],
+        None => vec![],
+    };
+    Json(OllamaListResponse { models })
+}
+
+/// `GET /api/ps` — list running (currently loaded) models.
+async fn ollama_ps(State(state): State<Arc<AppState>>) -> Json<OllamaPsResponse> {
+    let models = match &state.model_id {
+        Some(id) => vec![OllamaRunningModel {
+            name: id.clone(),
+            model: id.clone(),
+            size: 0,
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            details: OllamaModelDetails {
+                format: "safetensors".to_string(),
+                family: "".to_string(),
+                parameter_size: "".to_string(),
+                quantization_level: "".to_string(),
+            },
+            expires_at: "0001-01-01T00:00:00Z".to_string(),
+            size_vram: 0,
+        }],
+        None => vec![],
+    };
+    Json(OllamaPsResponse { models })
+}
+
+/// `POST /api/show` — return information about a model.
+async fn ollama_show(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OllamaShowRequest>,
+) -> impl IntoResponse {
+    // Check that the requested model matches the loaded model (if any).
+    let model_matches = state
+        .model_id
+        .as_deref()
+        .map(|id| id == req.model)
+        .unwrap_or(false);
+    if !model_matches {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("model '{}' not found", req.model)
+            })),
+        ));
+    }
+
+    Ok(Json(OllamaShowResponse {
+        modelfile: format!("FROM {}", req.model),
+        parameters: String::new(),
+        template: String::new(),
+        details: OllamaModelDetails {
+            format: "safetensors".to_string(),
+            family: "".to_string(),
+            parameter_size: "".to_string(),
+            quantization_level: "".to_string(),
+        },
+        model_info: serde_json::Value::Object(serde_json::Map::new()),
+    }))
+}
+
+/// Return the RFC3339 timestamp for right now (UTC).
+fn rfc3339_now() -> String {
+    // Produce a simple ISO-8601 / RFC-3339 timestamp without pulling in chrono.
+    let secs = unix_now();
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
+/// Minimal UTC date-time decomposition from a Unix timestamp.
+fn secs_to_ymd_hms(mut secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let s = secs % 60;
+    secs /= 60;
+    let mi = secs % 60;
+    secs /= 60;
+    let h = secs % 24;
+    let days = secs / 24;
+
+    // Gregorian calendar — good enough for timestamps after 1970.
+    let mut year = 1970u64;
+    let mut remaining = days;
+    loop {
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days_in_year = if leap { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let month_days = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u64;
+    for &md in &month_days {
+        if remaining < md {
+            break;
+        }
+        remaining -= md;
+        month += 1;
+    }
+    (year, month, remaining + 1, h, mi, s)
+}
+
+/// Extract sampling params from optional [`OllamaOptions`].
+fn ollama_options_to_params(
+    opts: Option<&OllamaOptions>,
+    defaults: &SamplingParams,
+) -> (Option<f64>, Option<f64>, Option<usize>, Option<f64>, usize) {
+    let temperature = opts.and_then(|o| o.temperature);
+    let top_p = opts.and_then(|o| o.top_p);
+    let top_k = opts.and_then(|o| o.top_k);
+    let repetition_penalty = opts.and_then(|o| o.repeat_penalty);
+    let num_predict = opts
+        .and_then(|o| o.num_predict)
+        .unwrap_or(defaults.max_tokens);
+    (temperature, top_p, top_k, repetition_penalty, num_predict)
+}
+
+/// `POST /api/generate` — Ollama text generation endpoint.
+async fn ollama_generate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OllamaGenerateRequest>,
+) -> impl IntoResponse {
+    let request_id = format!("gen-{}", uuid::Uuid::new_v4());
+    let created_at = rfc3339_now();
+
+    // Ensure a model is loaded and the request targets the loaded model.
+    let tokenizer = match state.tokenizer.as_deref() {
+        Some(t) if state.model_id.as_deref() == Some(req.model.as_str()) => t,
+        Some(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("model '{}' not found", req.model)
+                })),
+            ));
+        }
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("model '{}' is not loaded — start inferrs with a model argument", req.model)
+                })),
+            ));
+        }
+    };
+
+    let prompt = req.prompt.as_deref().unwrap_or("");
+    if prompt.is_empty() {
+        // Ollama uses an empty prompt to "warm up" (load) the model.
+        return Ok(Json(serde_json::json!({
+            "model": req.model,
+            "created_at": created_at,
+            "response": "",
+            "done": true,
+            "done_reason": "load",
+        }))
+        .into_response());
+    }
+
+    // Tokenize: apply the chat template by default; skip it only when raw=true.
+    let is_raw = req.raw.unwrap_or(false);
+    let prompt_tokens = if is_raw {
+        match tokenizer.encode(prompt, true) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+                ));
+            }
+        }
+    } else {
+        let msgs = vec![ChatMessage {
+            role: Role::User,
+            content: prompt.to_string(),
+            audio: None,
+        }];
+        match tokenizer.apply_chat_template_and_encode(&msgs) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+                ));
+            }
+        }
+    };
+
+    if let Err((status, _)) = check_prompt_length(prompt_tokens.len(), state.max_seq_len) {
+        return Err((
+            status,
+            Json(serde_json::json!({"error": "prompt too long"})),
+        ));
+    }
+
+    let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
+        ollama_options_to_params(req.options.as_ref(), &state.default_params);
+    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let params = build_sampling_params(
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        max_tokens,
+        &state.default_params,
+    );
+
+    let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
+
+    if is_stream {
+        let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+        state
+            .stream_registry
+            .lock()
+            .await
+            .insert(request_id.clone(), token_tx);
+
+        let engine_req = EngineRequest::GenerateStream {
+            request_id: request_id.clone(),
+            prompt_tokens,
+            audio: None,
+            sampling_params: params,
+            output_buf: state.output_buf.clone(),
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            state.stream_registry.lock().await.remove(&request_id);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "engine unavailable"})),
+            ));
+        }
+
+        let model_name = req.model.clone();
+        let stream = make_ollama_generate_stream(token_rx, model_name, created_at);
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response())
+    } else {
+        let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+
+        let engine_req = EngineRequest::Generate {
+            request_id,
+            prompt_tokens: prompt_tokens.clone(),
+            audio: None,
+            sampling_params: params,
+            response_tx,
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "engine unavailable"})),
+            ));
+        }
+
+        match response_rx.await {
+            Ok(result) => Ok(Json(OllamaGenerateResponse {
+                model: req.model,
+                created_at,
+                response: result.output_text,
+                done: true,
+                done_reason: Some(ollama_done_reason(&result.finish_reason)),
+                prompt_eval_count: result.prompt_tokens,
+                eval_count: result.completion_tokens,
+            })
+            .into_response()),
+            Err(_) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "engine dropped the request"})),
+            )),
+        }
+    }
+}
+
+fn make_ollama_generate_stream(
+    mut token_rx: mpsc::Receiver<StreamToken>,
+    model_name: String,
+    created_at: String,
+) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    async_stream::stream! {
+        let mut eval_count: usize = 0;
+        while let Some(token) = token_rx.recv().await {
+            let is_final = token.finish_reason.is_some();
+            let text = if token.finish_reason.as_deref() == Some("stop") {
+                String::new()
+            } else {
+                eval_count += 1;
+                token.text
+            };
+
+            let chunk = if is_final {
+                OllamaGenerateChunk {
+                    model: model_name.clone(),
+                    created_at: created_at.clone(),
+                    response: text,
+                    done: true,
+                    done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
+                    prompt_eval_count: None,
+                    eval_count: Some(eval_count),
+                }
+            } else {
+                OllamaGenerateChunk {
+                    model: model_name.clone(),
+                    created_at: created_at.clone(),
+                    response: text,
+                    done: false,
+                    done_reason: None,
+                    prompt_eval_count: None,
+                    eval_count: None,
+                }
+            };
+
+            if let Ok(mut json) = serde_json::to_string(&chunk) {
+                json.push('\n');
+                yield Ok(axum::body::Bytes::from(json));
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// `POST /api/chat` — Ollama multi-turn chat endpoint.
+async fn ollama_chat(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OllamaChatRequest>,
+) -> impl IntoResponse {
+    let request_id = format!("chat-{}", uuid::Uuid::new_v4());
+    let created_at = rfc3339_now();
+
+    // Ensure a model is loaded and the request targets the loaded model.
+    let tokenizer = match state.tokenizer.as_deref() {
+        Some(t) if state.model_id.as_deref() == Some(req.model.as_str()) => t,
+        Some(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("model '{}' not found", req.model)
+                })),
+            ));
+        }
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("model '{}' is not loaded — start inferrs with a model argument", req.model)
+                })),
+            ));
+        }
+    };
+
+    // Convert Ollama messages to internal ChatMessage format.
+    let chat_messages: Vec<ChatMessage> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => Role::System,
+                "assistant" => Role::Assistant,
+                _ => Role::User,
+            };
+            ChatMessage {
+                role,
+                content: m.content.clone(),
+                audio: None,
+            }
+        })
+        .collect();
+
+    let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&chat_messages) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+            ));
+        }
+    };
+
+    if let Err((status, _)) = check_prompt_length(prompt_tokens.len(), state.max_seq_len) {
+        return Err((
+            status,
+            Json(serde_json::json!({"error": "prompt too long"})),
+        ));
+    }
+
+    let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
+        ollama_options_to_params(req.options.as_ref(), &state.default_params);
+    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let params = build_sampling_params(
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        max_tokens,
+        &state.default_params,
+    );
+
+    let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
+
+    if is_stream {
+        let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+        state
+            .stream_registry
+            .lock()
+            .await
+            .insert(request_id.clone(), token_tx);
+
+        let engine_req = EngineRequest::GenerateStream {
+            request_id: request_id.clone(),
+            prompt_tokens,
+            audio: None,
+            sampling_params: params,
+            output_buf: state.output_buf.clone(),
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            state.stream_registry.lock().await.remove(&request_id);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "engine unavailable"})),
+            ));
+        }
+
+        let model_name = req.model.clone();
+        let stream = make_ollama_chat_stream(token_rx, model_name, created_at);
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response())
+    } else {
+        let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+
+        let engine_req = EngineRequest::Generate {
+            request_id,
+            prompt_tokens,
+            audio: None,
+            sampling_params: params,
+            response_tx,
+        };
+
+        if state.engine_tx.send(engine_req).await.is_err() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "engine unavailable"})),
+            ));
+        }
+
+        match response_rx.await {
+            Ok(result) => Ok(Json(OllamaChatResponse {
+                model: req.model,
+                created_at,
+                message: OllamaChatMessage {
+                    role: "assistant".to_string(),
+                    content: result.output_text,
+                },
+                done: true,
+                done_reason: Some(ollama_done_reason(&result.finish_reason)),
+                prompt_eval_count: result.prompt_tokens,
+                eval_count: result.completion_tokens,
+            })
+            .into_response()),
+            Err(_) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "engine dropped the request"})),
+            )),
+        }
+    }
+}
+
+fn make_ollama_chat_stream(
+    mut token_rx: mpsc::Receiver<StreamToken>,
+    model_name: String,
+    created_at: String,
+) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    async_stream::stream! {
+        let mut eval_count: usize = 0;
+        while let Some(token) = token_rx.recv().await {
+            let is_final = token.finish_reason.is_some();
+            let text = if token.finish_reason.as_deref() == Some("stop") {
+                String::new()
+            } else {
+                eval_count += 1;
+                token.text
+            };
+
+            let chunk = if is_final {
+                OllamaChatChunk {
+                    model: model_name.clone(),
+                    created_at: created_at.clone(),
+                    message: OllamaChatMessage {
+                        role: "assistant".to_string(),
+                        content: text,
+                    },
+                    done: true,
+                    done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
+                    prompt_eval_count: None,
+                    eval_count: Some(eval_count),
+                }
+            } else {
+                OllamaChatChunk {
+                    model: model_name.clone(),
+                    created_at: created_at.clone(),
+                    message: OllamaChatMessage {
+                        role: "assistant".to_string(),
+                        content: text,
+                    },
+                    done: false,
+                    done_reason: None,
+                    prompt_eval_count: None,
+                    eval_count: None,
+                }
+            };
+
+            if let Ok(mut json) = serde_json::to_string(&chunk) {
+                json.push('\n');
+                yield Ok(axum::body::Bytes::from(json));
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Map an internal finish reason to the Ollama `done_reason` string.
+fn ollama_done_reason(reason: &str) -> String {
+    match reason {
+        "stop" => "stop".to_string(),
+        "length" => "length".to_string(),
+        other => other.to_string(),
+    }
 }
