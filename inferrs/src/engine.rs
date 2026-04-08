@@ -588,14 +588,13 @@ pub fn attach_paged_kv_if_requested(
         return Ok(engine);
     };
 
-    // Warn for architectures that don't implement forward_paged and will silently
-    // fall back to the standard concat-KV forward pass.
+    // Log architectures that don't implement forward_paged and fall back to concat-KV.
     match arch {
-        ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {} // supported
+        ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => {} // paged attention supported
         other => {
             tracing::warn!(
-                "--paged-attention is not supported for {:?} and will fall back to the standard \
-                 concat KV cache. Paged attention is currently only available for Qwen3 and Qwen3.5.",
+                "--paged-attention is not yet supported for {:?} and will fall back to the \
+                 standard concat KV cache.",
                 other
             );
         }
@@ -1099,6 +1098,13 @@ impl Engine {
         let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
         match (block_table, paged) {
             (Some(bt), Some(ps)) => {
+                // Clear the model's internal KV cache so that any model falling
+                // back to the default `forward_paged` (e.g. Gemma4 which uses its
+                // own RetainingKvCache) starts each sequence with a clean slate,
+                // matching the behaviour of the non-paged branch below.
+                // For models that truly use the paged store (Qwen3, Qwen3.5) this
+                // call is harmless — their internal caches are unused anyway.
+                model.clear_kv_cache();
                 for pos in 0..prompt_tokens.len() {
                     if !bt.ensure_allocated(pos, &mut ps.block_pool) {
                         anyhow::bail!("paged attention: out of KV blocks at position {pos}");

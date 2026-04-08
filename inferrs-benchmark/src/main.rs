@@ -1046,7 +1046,7 @@ fn bench_http(
             "stream": false,
         });
         let resp: serde_json::Value = ureq::post(&url)
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(1800))
             .send_json(&body)?
             .into_json()?;
         resp.get("usage")
@@ -1140,7 +1140,7 @@ fn do_stream(
 
     let t0 = Instant::now();
     let resp = ureq::post(url)
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(1800))
         .send_json(&body)?;
 
     let reader = std::io::BufReader::new(resp.into_reader());

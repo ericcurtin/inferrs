@@ -298,6 +298,12 @@ impl QLinear {
             bias,
         }
     }
+
+    /// Returns true when the underlying weight is a quantized QTensor (GGUF path).
+    /// Returns false for the dense BF16 safetensors path (`QMatMul::Tensor`).
+    pub fn is_quantized(&self) -> bool {
+        matches!(self.inner, QMatMul::QTensor(_))
+    }
 }
 
 impl Module for QLinear {
@@ -1606,6 +1612,169 @@ impl Attention {
         }
     }
 
+    /// Paged forward for a **global (full-attention) donor layer**.
+    ///
+    /// Writes the new K/V tokens into the paged KV store at `layer_paged_idx`
+    /// and gathers the full context from it, then runs attention.
+    ///
+    /// Returns `(attn_output, key_states_full, value_states_full)` where the
+    /// last two tensors are the full accumulated K/V for reuse by KV-sharing layers.
+    fn forward_returning_kv_paged(
+        &mut self,
+        xs: &Tensor,
+        seqlen_offset: usize,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+        layer_paged_idx: usize,
+    ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+
+        // Project Q/K/V and apply per-head norms (contiguous before transpose).
+        let q_raw =
+            self.q_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        let k_raw =
+            self.k_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
+        let v_raw =
+            self.v_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
+
+        let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
+        let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
+        let v_norm_w = if v_raw.dtype() == DType::F32 {
+            &self.v_norm_weight_f32
+        } else {
+            &self.v_norm_weight
+        };
+        let value_states =
+            apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?.transpose(1, 2)?;
+
+        // RoPE.
+        let (query_states, key_states) =
+            self.apply_rope_qkv_buffered(&query_states, &key_states, seqlen_offset)?;
+
+        // Write new K/V into paged store and gather full context.
+        let total_tokens = seqlen_offset + q_len;
+        let all_slot_ids: Vec<u32> = (0..total_tokens)
+            .map(|pos| {
+                block_table.slot_for(pos).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "Gemma4 paged attn: no slot for position {pos}"
+                    ))
+                })
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+
+        let new_slot_ids = &all_slot_ids[seqlen_offset..];
+        let new_slots_t = Tensor::new(new_slot_ids, key_states.device())?;
+
+        // k/v: [b=1, num_kv_heads, q_len, head_dim] → [q_len, num_kv_heads, head_dim]
+        let k_new = key_states.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let v_new = value_states.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+
+        kv_store.key_caches[layer_paged_idx] =
+            kv_store.key_caches[layer_paged_idx].index_add(&new_slots_t, &k_new, 0)?;
+        kv_store.value_caches[layer_paged_idx] =
+            kv_store.value_caches[layer_paged_idx].index_add(&new_slots_t, &v_new, 0)?;
+
+        let (k_gathered, v_gathered) = kv_store.gather_slots(layer_paged_idx, &all_slot_ids)?;
+
+        // Reshape gathered: [total_tokens, num_kv_heads, head_dim] → [b, num_kv_heads, total, head_dim]
+        // `.contiguous()` is required: the transpose produces a non-contiguous layout and
+        // `gqa_attention_no_expand` will call `.transpose(2,3)` on k_full again inside matmul,
+        // which requires contiguous input on CUDA.
+        let k_full = k_gathered
+            .reshape((b_sz, total_tokens, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?; // [b, n_kv, total, d] — contiguous for matmul
+        let v_full = v_gathered
+            .reshape((b_sz, total_tokens, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Attention (no sliding-window mask for global layers; apply causal mask for prefill).
+        let attention_mask = if q_len > 1 {
+            use crate::models::attention_utils::causal_mask;
+            let m = causal_mask(q_len, total_tokens, seqlen_offset, xs.device(), xs.dtype())
+                .map_err(candle_core::Error::wrap)?;
+            Some(m)
+        } else {
+            None
+        };
+
+        let attn_output = gqa_attention_no_expand(
+            &query_states,
+            &k_full,
+            &v_full,
+            self.num_kv_groups,
+            self.attn_logit_softcapping,
+            attention_mask.as_ref(),
+        )?;
+
+        let attn_output = if q_len == 1 {
+            attn_output.apply(&self.o_proj)?
+        } else {
+            attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, ()))?
+                .apply(&self.o_proj)?
+        };
+
+        Ok((attn_output, k_full, v_full))
+    }
+
+    /// Paged forward for a **global KV-sharing layer**.
+    ///
+    /// Only computes Q (with RoPE), then attends to the shared K/V from the donor.
+    fn forward_with_shared_kv_paged(
+        &mut self,
+        xs: &Tensor,
+        seqlen_offset: usize,
+        shared_key: &Tensor,
+        shared_value: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+
+        let q_raw =
+            self.q_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
+        let query_states = self.apply_rope_q_buffered(&query_states, seqlen_offset)?;
+
+        let attention_mask = if q_len > 1 {
+            use crate::models::attention_utils::causal_mask;
+            let kv_len = shared_key.dim(2)?;
+            let m = causal_mask(q_len, kv_len, seqlen_offset, xs.device(), xs.dtype())
+                .map_err(candle_core::Error::wrap)?;
+            Some(m)
+        } else {
+            None
+        };
+
+        let attn_out = gqa_attention_no_expand(
+            &query_states,
+            shared_key,
+            shared_value,
+            self.num_kv_groups,
+            self.attn_logit_softcapping,
+            attention_mask.as_ref(),
+        )?;
+
+        if q_len == 1 {
+            attn_out.apply(&self.o_proj)
+        } else {
+            attn_out
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, ()))?
+                .apply(&self.o_proj)
+        }
+    }
+
     fn clear_kv_cache(&mut self) {
         match &mut self.kv_cache {
             KvCache::Normal(c) => c.reset(),
@@ -1918,6 +2087,55 @@ impl DecoderLayer {
         let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
         let xs = (attn_out + residual)?;
 
+        self.apply_mlp_and_pli(xs, per_layer_input)
+    }
+
+    /// Paged forward for a **global donor** layer.
+    ///
+    /// Uses the paged KV store for K/V storage instead of the internal concat cache.
+    fn forward_donor_paged(
+        &mut self,
+        xs: &Tensor,
+        per_layer_input: Option<&Tensor>,
+        seqlen_offset: usize,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+        layer_paged_idx: usize,
+    ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
+        let residual = xs;
+        let normed = self.input_layernorm.forward(xs)?;
+        let (attn_out, k, v) = self.self_attn.forward_returning_kv_paged(
+            &normed,
+            seqlen_offset,
+            block_table,
+            kv_store,
+            layer_paged_idx,
+        )?;
+        let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
+        let xs = (attn_out + residual)?;
+        let xs = self.apply_mlp_and_pli(xs, per_layer_input)?;
+        Ok((xs, k, v))
+    }
+
+    /// Paged forward for a **global KV-sharing** layer.
+    fn forward_shared_paged(
+        &mut self,
+        xs: &Tensor,
+        per_layer_input: Option<&Tensor>,
+        seqlen_offset: usize,
+        shared_key: &Tensor,
+        shared_value: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let residual = xs;
+        let normed = self.input_layernorm.forward(xs)?;
+        let attn_out = self.self_attn.forward_with_shared_kv_paged(
+            &normed,
+            seqlen_offset,
+            shared_key,
+            shared_value,
+        )?;
+        let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
+        let xs = (attn_out + residual)?;
         self.apply_mlp_and_pli(xs, per_layer_input)
     }
 
@@ -2516,34 +2734,23 @@ impl Gemma4Model {
         self.forward_transformer(b_size, seq_len, seqlen_offset, input_ids, None, xs)
     }
 
-    /// Shared transformer body — runs PLI, attention layers, and lm_head.
+    /// Compute per-layer PLI inputs for all transformer layers.
     ///
-    /// `ids_for_pli`: the token IDs used for PLI embedding lookup.  For the
-    /// audio path this is the safe (audio positions zeroed) IDs tensor.
-    fn forward_transformer(
+    /// `b_size` / `seq_len`: batch and sequence dimensions.
+    /// `ids_for_pli`: token IDs used for PLI embedding lookup (audio positions zeroed for audio path).
+    /// `xs_for_pli`: text-only embeddings for `per_layer_model_projection`.  When `Some`, used
+    ///               instead of `xs` so that audio embeddings do not corrupt the PLI projection
+    ///               (matches reference: PLI uses `llm_inputs_embeds` with PAD at audio positions).
+    /// `xs`: the current hidden states (used for projection when `xs_for_pli` is `None`).
+    fn compute_pli_per_layer(
         &mut self,
         b_size: usize,
         seq_len: usize,
-        seqlen_offset: usize,
         ids_for_pli: &Tensor,
-        // Text-only embeddings for PLI projection (PAD at audio positions).
-        // When Some, used for per_layer_model_projection instead of xs.
-        // Matches reference behavior: PLI uses llm_inputs_embeds (PAD at audio).
         xs_for_pli: Option<&Tensor>,
-        mut xs: Tensor,
-    ) -> Result<Tensor> {
-        // Per-layer inputs (PLI) — only for efficient variants.
-        //
-        // `pli_all` has shape [b, seq_len, num_hidden_layers, pli_dim].
-        // We slice it into per-layer [b, seq_len, pli_dim] tensors using a single
-        // `narrow + squeeze` per layer.  The contiguous `pli_all` tensor is computed
-        // once; each `narrow(2, i, 1)` is a zero-copy metadata-only view on Metal,
-        // and `squeeze(2)` removes the singleton dim.
-        //
-        // The previous code applied `pli_proj + pli_embed` then looped
-        // `narrow(...).squeeze(...)` 35 times — identical semantically.  Making the
-        // loop explicit here keeps the rest of the forward pass unchanged.
-        let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &mut self.pli {
+        xs: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        if let Some(model_pli) = &mut self.pli {
             // For the single-token decode path (seq_len == 1, no audio):
             // `pli_all = norm(per_layer_model_projection(embed(token))) + scaled_pli_embed(token)`
             // is a pure function of the token ID.  Cache it by token ID to avoid:
@@ -2564,10 +2771,10 @@ impl Gemma4Model {
 
                 if let Some(cached_layers) = model_pli.pli_all_cache.get(&token_id) {
                     // Cache hit: return clones of the pre-sliced per-layer tensors.
-                    cached_layers
+                    Ok(cached_layers
                         .iter()
                         .map(|t| Some(t.clone()))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>())
                 } else {
                     // Cache miss: compute pli_all and slice into per-layer tensors.
                     // 1. Get pli_embed (from pli_embed_cache or compute)
@@ -2630,7 +2837,7 @@ impl Gemma4Model {
                     model_pli.pli_all_cache.insert(token_id, per_layer.clone());
                     model_pli.pli_all_cache_lru.push_back(token_id);
 
-                    per_layer.into_iter().map(Some).collect::<Vec<_>>()
+                    Ok(per_layer.into_iter().map(Some).collect::<Vec<_>>())
                 }
             } else {
                 // Prefill/audio path: compute from scratch for all tokens.
@@ -2645,7 +2852,7 @@ impl Gemma4Model {
                 let pli_embed_gpu = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
                 let pli_embed = (pli_embed_gpu * model_pli.embed_combined_scale)?;
 
-                let proj_input = xs_for_pli.unwrap_or(&xs);
+                let proj_input = xs_for_pli.unwrap_or(xs);
                 let pli_proj = proj_input.apply(&model_pli.per_layer_model_projection)?;
                 let pli_proj = pli_proj.reshape((
                     b_size,
@@ -2661,13 +2868,44 @@ impl Gemma4Model {
                     model_pli.pli_dim,
                 ))?;
                 let pli_all = (pli_proj + pli_embed)?.contiguous()?;
-                (0..self.num_hidden_layers)
+                Ok((0..self.num_hidden_layers)
                     .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
-                    .collect::<candle_core::Result<_>>()?
+                    .collect::<candle_core::Result<_>>()?)
             }
         } else {
-            vec![None; self.num_hidden_layers]
-        };
+            Ok(vec![None; self.num_hidden_layers])
+        }
+    }
+
+    /// Shared transformer body — runs PLI, attention layers, and lm_head.
+    ///
+    /// `ids_for_pli`: the token IDs used for PLI embedding lookup.  For the
+    /// audio path this is the safe (audio positions zeroed) IDs tensor.
+    fn forward_transformer(
+        &mut self,
+        b_size: usize,
+        seq_len: usize,
+        seqlen_offset: usize,
+        ids_for_pli: &Tensor,
+        // Text-only embeddings for PLI projection (PAD at audio positions).
+        // When Some, used for per_layer_model_projection instead of xs.
+        // Matches reference behavior: PLI uses llm_inputs_embeds (PAD at audio).
+        xs_for_pli: Option<&Tensor>,
+        mut xs: Tensor,
+    ) -> Result<Tensor> {
+        // Per-layer inputs (PLI) — only for efficient variants.
+        //
+        // `pli_all` has shape [b, seq_len, num_hidden_layers, pli_dim].
+        // We slice it into per-layer [b, seq_len, pli_dim] tensors using a single
+        // `narrow + squeeze` per layer.  The contiguous `pli_all` tensor is computed
+        // once; each `narrow(2, i, 1)` is a zero-copy metadata-only view on Metal,
+        // and `squeeze(2)` removes the singleton dim.
+        //
+        // The previous code applied `pli_proj + pli_embed` then looped
+        // `narrow(...).squeeze(...)` 35 times — identical semantically.  Making the
+        // loop explicit here keeps the rest of the forward pass unchanged.
+        let pli_per_layer =
+            self.compute_pli_per_layer(b_size, seq_len, ids_for_pli, xs_for_pli, &xs)?;
 
         // Build attention masks (per attention type)
         let sliding_mask = if seq_len <= 1 {
@@ -2744,10 +2982,18 @@ impl Gemma4Model {
         let greedy = self.skip_final_softcap;
         self.skip_final_softcap = false; // always reset
 
-        // For greedy sampling, keep the lm_head output as F32 (no F32→BF16
-        // conversion needed since argmax works on any numeric dtype).  This saves
-        // one GPU kernel (F32→BF16 over 262K elements = 524 KB) per decode step.
-        let logits = if greedy && matches!(last_hidden.device(), candle_core::Device::Cuda(_)) {
+        // For greedy sampling on CUDA with a quantized (GGUF) lm_head, keep the
+        // output as F32 (no F32→BF16 conversion needed since argmax works on any
+        // numeric dtype).  This saves one GPU kernel per decode step.
+        //
+        // The F32 fast path is only valid when lm_head is a QTensor: the GGUF GEMV
+        // kernel accepts F32 input and outputs F32.  For the dense safetensors path
+        // (QMatMul::Tensor with BF16 weights), xs.matmul(&w) requires matching dtypes
+        // so we must NOT pass F32 — doing so triggers "dtype mismatch in matmul".
+        let logits = if greedy
+            && self.lm_head.is_quantized()
+            && matches!(last_hidden.device(), candle_core::Device::Cuda(_))
+        {
             // Pass F32 input to lm_head to bypass the F32→BF16 output conversion.
             // The lm_head GEMV (quantize_q8_1_bf16 + mul_mat_vec) outputs F32;
             // with F32 input the existing QLinear code keeps it as F32 (no conversion).
@@ -2759,6 +3005,233 @@ impl Gemma4Model {
 
         let logits = if greedy {
             logits // Skip monotonic softcap
+        } else {
+            match self.final_logit_softcapping {
+                None => logits,
+                Some(sc) => ((logits / sc)?.tanh()? * sc)?,
+            }
+        };
+
+        Ok(logits)
+    }
+
+    /// Paged-attention forward pass with pre-computed audio embeddings.
+    ///
+    /// Mirrors `forward_with_audio` but routes through the paged KV store for
+    /// global (full-attention) layers.  Audio embeddings are injected into the
+    /// hidden-state tensor before the transformer body runs, and the text-only
+    /// embeddings are passed to `compute_pli_per_layer` so that PLI projection
+    /// is not corrupted by the audio features (matches reference behaviour).
+    pub fn forward_paged_with_audio(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+        audio_embeds: Tensor,
+        audio_positions: Vec<usize>,
+    ) -> candle_core::Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+
+        // Zero audio soft-token IDs to avoid OOB embedding lookup.
+        let safe_ids = {
+            let ids_data = input_ids.to_vec2::<u32>()?;
+            let mut safe: Vec<u32> = ids_data.into_iter().flatten().collect();
+            for &pos in &audio_positions {
+                if pos < safe.len() {
+                    safe[pos] = 0;
+                }
+            }
+            Tensor::from_vec(safe, (b_size, seq_len), input_ids.device())?
+        };
+
+        let xs = self.embed_tokens.forward(&safe_ids)?;
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+
+        // Save text-only embed for PLI (same rationale as forward_with_audio).
+        let xs_for_pli = xs.clone();
+        let audio_embeds = audio_embeds.to_device(xs.device())?.to_dtype(xs.dtype())?;
+        let h = self.hidden_size;
+        tracing::info!(
+            "forward_paged_with_audio: injecting {} audio embeddings at {} positions",
+            audio_embeds.dim(0).unwrap_or(0),
+            audio_positions.len()
+        );
+        for (audio_idx, &pos) in audio_positions.iter().enumerate() {
+            if audio_idx >= audio_embeds.dim(0)? {
+                break;
+            }
+            let emb = audio_embeds.narrow(0, audio_idx, 1)?.unsqueeze(0)?;
+            xs = xs.slice_assign(&[0..b_size, pos..pos + 1, 0..h], &emb)?;
+        }
+
+        self.forward_paged_inner(
+            b_size,
+            seq_len,
+            seqlen_offset,
+            &safe_ids,
+            Some(&xs_for_pli),
+            xs,
+            block_table,
+            kv_store,
+        )
+    }
+
+    /// Paged-attention forward pass.
+    ///
+    /// Global (full-attention) layers store their K/V in the paged KV store.
+    /// Sliding-window layers continue using their existing rotating concat cache.
+    ///
+    /// This allows long-context serving without pre-allocating contiguous per-sequence
+    /// buffers for the dominant full-attention KV tensors.
+    pub fn forward_paged(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+    ) -> candle_core::Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+
+        // Embed tokens — same as the non-paged path.
+        let xs = self.embed_tokens.forward(input_ids)?;
+        let xs = (xs * (self.hidden_size as f64).sqrt())?;
+
+        self.forward_paged_inner(
+            b_size,
+            seq_len,
+            seqlen_offset,
+            input_ids,
+            None,
+            xs,
+            block_table,
+            kv_store,
+        )
+    }
+
+    /// Shared paged-attention transformer body.
+    ///
+    /// Global layers use the paged KV store; sliding-window layers keep the
+    /// existing rotating concat cache.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged_inner(
+        &mut self,
+        b_size: usize,
+        seq_len: usize,
+        seqlen_offset: usize,
+        ids_for_pli: &Tensor,
+        xs_for_pli: Option<&Tensor>,
+        mut xs: Tensor,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+    ) -> candle_core::Result<Tensor> {
+        let pli_per_layer =
+            self.compute_pli_per_layer(b_size, seq_len, ids_for_pli, xs_for_pli, &xs)?;
+
+        // Sliding-window attention masks (used for sliding layers only).
+        let sliding_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset, true)?)
+        };
+
+        // Clear donor K,V slots for this forward pass.
+        for (slot, sharing) in self.kv_donor_buf.iter_mut().zip(self.kv_sharing_map.iter()) {
+            if sharing.is_none() {
+                *slot = None;
+            }
+        }
+
+        // Track which full-attention donor layer maps to which paged-store slot.
+        // The paged KV store has one entry per non-shared global layer (donor layers only).
+        // KV-sharing layers reuse the donor's gathered K/V from kv_donor_buf.
+        let mut paged_layer_idx: usize = 0;
+
+        for (layer_idx, pli) in pli_per_layer.iter().enumerate() {
+            let is_sliding = self.is_sliding_per_layer[layer_idx];
+
+            match self.kv_sharing_map[layer_idx] {
+                None => {
+                    // Donor layer.
+                    if is_sliding {
+                        // Sliding donor: use existing rotating KV cache.
+                        let mask = sliding_mask.as_ref();
+                        let (new_xs, k, v) = self.layers[layer_idx].forward_donor(
+                            &xs,
+                            pli.as_ref(),
+                            mask,
+                            seqlen_offset,
+                        )?;
+                        xs = new_xs;
+                        self.kv_donor_buf[layer_idx] = Some((k, v));
+                    } else {
+                        // Global donor: use paged KV store.
+                        let (new_xs, k, v) = self.layers[layer_idx].forward_donor_paged(
+                            &xs,
+                            pli.as_ref(),
+                            seqlen_offset,
+                            block_table,
+                            kv_store,
+                            paged_layer_idx,
+                        )?;
+                        xs = new_xs;
+                        self.kv_donor_buf[layer_idx] = Some((k, v));
+                        paged_layer_idx += 1;
+                    }
+                }
+                Some(donor_idx) => {
+                    // KV-sharing layer: use donor's accumulated K/V.
+                    let (shared_k, shared_v) =
+                        self.kv_donor_buf[donor_idx].as_ref().ok_or_else(|| {
+                            candle_core::Error::msg(format!(
+                                "KV sharing (paged): donor layer {} has no K,V for layer {}",
+                                donor_idx, layer_idx
+                            ))
+                        })?;
+                    let (shared_k, shared_v) = (shared_k.clone(), shared_v.clone());
+
+                    if is_sliding {
+                        // Sliding KV-sharing: use non-paged shared-KV path.
+                        let mask = sliding_mask.as_ref();
+                        xs = self.layers[layer_idx].forward_shared(
+                            &xs,
+                            pli.as_ref(),
+                            mask,
+                            seqlen_offset,
+                            &shared_k,
+                            &shared_v,
+                        )?;
+                    } else {
+                        // Global KV-sharing: paged path (only Q is computed here).
+                        xs = self.layers[layer_idx].forward_shared_paged(
+                            &xs,
+                            pli.as_ref(),
+                            seqlen_offset,
+                            &shared_k,
+                            &shared_v,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let last_hidden = xs.narrow(1, seq_len - 1, 1)?.apply(&self.norm)?;
+
+        let greedy = self.skip_final_softcap;
+        self.skip_final_softcap = false;
+
+        let logits = if greedy
+            && self.lm_head.is_quantized()
+            && matches!(last_hidden.device(), candle_core::Device::Cuda(_))
+        {
+            let h_f32 = last_hidden.to_dtype(DType::F32)?;
+            h_f32.apply(&self.lm_head)?
+        } else {
+            last_hidden.apply(&self.lm_head)?
+        };
+
+        let logits = if greedy {
+            logits
         } else {
             match self.final_logit_softcapping {
                 None => logits,

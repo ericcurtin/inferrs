@@ -42,6 +42,11 @@ pub trait CausalLM: Send {
     ///
     /// The default implementation falls back to `forward`, ignoring the paged
     /// store.  Models that support paged attention override this.
+    ///
+    /// The default clears the model's internal KV cache at the start of each
+    /// new sequence (`seqlen_offset == 0`), matching the behaviour of the
+    /// non-paged path in `cb_prefill`.  This prevents stale cache entries from
+    /// a previous sequence from corrupting attention weight shapes.
     fn forward_paged(
         &mut self,
         input_ids: &Tensor,
@@ -50,6 +55,9 @@ pub trait CausalLM: Send {
         kv_store: &mut PagedKvStore,
     ) -> Result<Tensor> {
         let _ = (block_table, kv_store); // unused in default impl
+        if seqlen_offset == 0 {
+            self.clear_kv_cache();
+        }
         self.forward(input_ids, seqlen_offset)
     }
 
@@ -150,6 +158,33 @@ impl CausalLM for Gemma4ModelWrapper {
                 .forward_with_audio(input_ids, seqlen_offset, audio_embeds, positions)?)
         } else {
             Ok(self.inner.forward(input_ids, seqlen_offset)?)
+        }
+    }
+
+    fn forward_paged(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+    ) -> Result<Tensor> {
+        if seqlen_offset == 0 {
+            // Clear the sliding-window concat KV caches at the start of each sequence.
+            self.inner.clear_kv_cache();
+        }
+        if let Some((audio_embeds, positions)) = self.pending_audio.take() {
+            Ok(self.inner.forward_paged_with_audio(
+                input_ids,
+                seqlen_offset,
+                block_table,
+                kv_store,
+                audio_embeds,
+                positions,
+            )?)
+        } else {
+            Ok(self
+                .inner
+                .forward_paged(input_ids, seqlen_offset, block_table, kv_store)?)
         }
     }
 
