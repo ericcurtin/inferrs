@@ -571,6 +571,39 @@ fn check_stop(
     None
 }
 
+/// Query the total memory available on `device`.
+///
+/// Each backend uses its own native API so that `--paged-attention=<fraction>`
+/// is relative to the actual device memory rather than a hardcoded guess.
+///
+/// * **Metal** – `MTLDevice.recommendedMaxWorkingSetSize`, the OS-reported
+///   upper bound for the GPU's working set on Apple Silicon.
+/// * **CUDA**  – `cuDeviceTotalMem` via cudarc's `CudaContext::total_mem()`.
+/// * **CPU**   – 4 GiB conservative fallback (Candle has no RAM query API).
+fn query_device_memory(device: &Device) -> usize {
+    match device {
+        #[cfg(target_os = "macos")]
+        Device::Metal(metal_dev) => metal_dev.metal_device().recommended_max_working_set_size(),
+        #[cfg(any(
+            target_os = "linux",
+            all(target_os = "windows", target_arch = "x86_64")
+        ))]
+        Device::Cuda(cuda_dev) => {
+            // CudaStream::context() returns &Arc<CudaContext>, which has total_mem().
+            match cuda_dev.cuda_stream().context().total_mem() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to query CUDA device memory ({e}); falling back to 8 GiB heuristic"
+                    );
+                    8 * 1024 * 1024 * 1024
+                }
+            }
+        }
+        _ => 4 * 1024 * 1024 * 1024,
+    }
+}
+
 /// Attach a paged KV store to `engine` if `--paged-attention` was requested.
 ///
 /// This consolidates the identical paged-KV setup block that previously appeared
@@ -605,16 +638,17 @@ pub fn attach_paged_kv_if_requested(
         _ => 2, // f16 / bf16
     };
 
-    // Estimate available device memory.  Candle does not expose a device
-    // memory query API, so we use a conservative platform heuristic:
-    //   CUDA / Metal  → 8 GiB
-    //   CPU           → 4 GiB
-    // The user-supplied fraction then scales this down to the actual
-    // allocation, e.g. 0.6 × 8 GiB = 4.8 GiB for KV blocks.
-    let total_memory_bytes: usize = match device {
-        Device::Cuda(_) | Device::Metal(_) => 8 * 1024 * 1024 * 1024,
-        _ => 4 * 1024 * 1024 * 1024,
-    };
+    // Query actual device memory so that `memory_fraction` is relative to the
+    // real total, not a hardcoded guess.  Each backend exposes its own API:
+    //
+    //   Metal  → MTLDevice.recommendedMaxWorkingSetSize  (Apple Silicon unified memory)
+    //   CUDA   → cuMemGetInfo / cuDeviceTotalMem         (via cudarc)
+    //   CPU    → 4 GiB conservative fallback
+    let total_memory_bytes: usize = query_device_memory(device);
+    tracing::info!(
+        "Device total memory: {:.2} GiB",
+        total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
 
     let (num_kv_heads, head_dim, num_kv_layers) = raw_config.kv_cache_params(arch);
 

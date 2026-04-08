@@ -75,7 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install CUDA toolkit (Linux only — needed to build and link candle-core cuda feature)
+      - name: Install CUDA toolkit (Linux — needed to build and link candle-core cuda feature)
         if: runner.os == 'Linux'
         run: |
           ARCH=$(uname -m)
@@ -92,4 +92,40 @@ jobs:
           sudo ln -sfn /usr/local/cuda/lib64/stubs/libcuda.so \
                        /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-      - run: cargo test -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
+
+      # Install CUDA toolkit and set up MSVC environment on Windows x86_64.
+      # Jimver/cuda-toolkit installs nvcc and adds it to PATH; ilammy/msvc-dev-cmd
+      # adds cl.exe to PATH (required by nvcc on Windows to compile CUDA kernels).
+      - name: Install CUDA toolkit (Windows x86_64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: '12.6.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev", "curand", "curand_dev"]'
+
+      - name: Set up MSVC environment (Windows x86_64 — nvcc needs cl.exe)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Git ships its own link.exe in usr/bin which shadows MSVC's link.exe
+      # when bash shells are used. Rename it so the MSVC linker is found first.
+      - name: Remove Git link.exe shadow (Windows x86_64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $gitLink = "C:\Program Files\Git\usr\bin\link.exe"
+          if (Test-Path $gitLink) { Rename-Item $gitLink "link.exe.bak" }
+
+      # On Windows x86_64 the test binary crashes at startup with
+      # STATUS_DLL_NOT_FOUND because nvcuda.dll (the GPU driver DLL) is absent
+      # on GPU-less CI runners. Use --no-run to verify compilation only.
+      # All other platforms run tests normally.
+      - name: Test
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            cargo test --no-run -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
+          else
+            cargo test -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
+          fi

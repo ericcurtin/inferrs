@@ -60,13 +60,21 @@ indicatif = "0.17"
 rustfft = "6"
 base64 = "0.22"
 
-# Linux: dynamic backend loading + CUDA device support.
+# Linux / Windows: dynamic backend loading + CUDA device support.
 # Enable the cuda feature so Device::new_cuda() is available at runtime.
 # candle-core is patched (see [patch.crates-io] in the workspace Cargo.toml)
 # to use cudarc with fallback-dynamic-loading instead of dynamic-linking,
 # so libcuda / libcurand / libcublas are NOT hard-linked into the binary —
-# they are dlopen'd on demand when a CUDA device is first used.
+# they are dlopen'd (LoadLibrary on Windows) on demand when a CUDA device
+# is first used.
 [target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+candle-core = { workspace = true, features = ["cuda"] }
+candle-nn = { workspace = true, features = ["cuda"] }
+candle-transformers = { workspace = true, features = ["cuda"] }
+
+# Windows x86_64 only: CUDA is not available on Windows ARM.
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 libloading = "0.8"
 candle-core = { workspace = true, features = ["cuda"] }
 candle-nn = { workspace = true, features = ["cuda"] }

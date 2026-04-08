@@ -195,10 +195,12 @@ pub struct ServeArgs {
 /// CUDA streams, which is the case for inferrs.
 fn disable_cuda_event_tracking(_device: &candle_core::Device) {
     // disable_event_tracking is only compiled in when candle-core has the
-    // "cuda" feature, which on this project is enabled only on Linux.
-    // Use target_os rather than a Cargo feature flag so the condition
-    // correctly reflects when the CUDA backend is actually compiled in.
-    #[cfg(target_os = "linux")]
+    // "cuda" feature, which on this project is enabled on Linux and Windows
+    // x86_64 (CUDA is not available on Windows ARM).
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
     if let candle_core::Device::Cuda(cuda_dev) = _device {
         unsafe {
             cuda_dev.disable_event_tracking();
@@ -234,11 +236,15 @@ impl ServeArgs {
             }
         }
 
-        // Linux: probe backend plugins via dlopen in priority order.
-        // The main binary is compiled with the cuda feature but candle-core
-        // uses cudarc fallback-dynamic-loading so CUDA libs are dlopen'd on
-        // demand — they are not hard-linked into the binary.
-        #[cfg(target_os = "linux")]
+        // Linux / Windows x86_64: probe backend plugins via dynamic loading in
+        // priority order.  The main binary is compiled with the cuda feature
+        // but candle-core uses cudarc fallback-dynamic-loading so CUDA libs
+        // are opened on demand — they are not hard-linked into the binary.
+        // Windows ARM does not support CUDA and uses CPU only.
+        #[cfg(any(
+            target_os = "linux",
+            all(target_os = "windows", target_arch = "x86_64")
+        ))]
         {
             use crate::backend::BackendKind;
             match crate::backend::detect_backend() {
@@ -248,6 +254,7 @@ impl ServeArgs {
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
+                #[cfg(target_os = "linux")]
                 BackendKind::Rocm => {
                     // ROCm uses the same HIP/CUDA device path in candle.
                     let device = candle_core::Device::new_cuda(0)?;
@@ -267,15 +274,6 @@ impl ServeArgs {
                     );
                 }
                 BackendKind::Cpu => {}
-            }
-        }
-
-        // Windows / fallback: try CUDA (if compiled with the feature), then CPU.
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            if let Ok(device) = candle_core::Device::new_cuda(0) {
-                tracing::info!("Using CUDA device");
-                return Ok(device);
             }
         }
 

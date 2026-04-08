@@ -194,10 +194,12 @@ jobs:
           name: inferrs-aarch64-unknown-linux-gnu
           path: inferrs-aarch64-unknown-linux-gnu.tar.gz
 
-  # ── Windows x86_64 binary ─────────────────────────────────────────────────
+  # ── Windows x86_64 binary (with CUDA support) ────────────────────────────
   build-windows-x86:
     name: Build (x86_64-pc-windows-msvc)
     runs-on: windows-2022
+    env:
+      CUDA_COMPUTE_CAP: "80"
     steps:
       - uses: actions/checkout@v4
 
@@ -209,15 +211,43 @@ jobs:
         with:
           key: release-x86_64-windows
 
-      - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc -p inferrs
+      # ── CUDA toolkit + MSVC environment ─────────────────────────────────
+      # Jimver/cuda-toolkit installs nvcc and adds it to PATH.
+      # ilammy/msvc-dev-cmd adds cl.exe to PATH (required by nvcc on Windows).
+      # The main binary and CUDA backend must be built in the same cargo
+      # invocation so Cargo's feature unification propagates the `cuda`
+      # feature to candle-core inside the main binary.
+      #
+      # candle-core uses cudarc with fallback-dynamic-loading so the
+      # resulting binary calls LoadLibrary for nvcuda.dll / cublas64_*.dll
+      # on demand and has no hard import-table entries for those DLLs.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: '12.6.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev", "curand", "curand_dev"]'
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build main binary + CUDA backend plugin
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc `
+            -p inferrs -p inferrs-backend-cuda
 
       - name: Package
         shell: pwsh
         run: |
+          $releaseDir = "target\x86_64-pc-windows-msvc\release"
           $stage = "inferrs-windows-x86_64"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item "target\x86_64-pc-windows-msvc\release\inferrs.exe" "$stage\"
+          Copy-Item "$releaseDir\inferrs.exe" "$stage\"
+          # Ship the CUDA plugin alongside the binary so the runtime dlopen
+          # search (next to the executable) finds it automatically.
+          if (Test-Path "$releaseDir\inferrs_backend_cuda.dll") {
+            Copy-Item "$releaseDir\inferrs_backend_cuda.dll" "$stage\"
+          }
           Compress-Archive -Path "$stage\*" -DestinationPath "inferrs-x86_64-pc-windows-msvc.zip"
 
       - uses: actions/upload-artifact@v4
