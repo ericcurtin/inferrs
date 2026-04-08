@@ -469,6 +469,16 @@ impl TurboQuantKvCache {
     /// Once the threshold is reached, the entire buffer is flushed to the
     /// quantized store in one shot.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        // `slice_set` requires contiguous src tensors.  K/V arrive here as
+        // post-transpose views (non-contiguous) when the caller has not already
+        // materialised them into a fresh buffer (e.g. the prefill path, or
+        // value_states which never passes through the RoPE pre-alloc buffer).
+        // `.contiguous()` is a no-op when the tensor is already contiguous.
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let k = &k;
+        let v = &v;
+
         let new_seq = k.dim(2)?;
         let head_dim = self.head_dim;
 
