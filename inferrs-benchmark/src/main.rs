@@ -76,7 +76,7 @@ struct BenchmarkArgs {
     llama_model: String,
 
     /// Seconds to wait for a server to become healthy.
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 600)]
     server_ready_timeout: u64,
 
     /// Override path to the inferrs binary.

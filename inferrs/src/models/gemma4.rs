@@ -1072,8 +1072,8 @@ impl RetainingKvCache {
                 if let (Some(kb_old), Some(vb_old)) = (&self.k_buf, &self.v_buf) {
                     let k_valid = kb_old.narrow(2, 0, self.seq_len)?;
                     let v_valid = vb_old.narrow(2, 0, self.seq_len)?;
-                    new_k_buf.slice_set(&k_valid, 2, 0)?;
-                    new_v_buf.slice_set(&v_valid, 2, 0)?;
+                    new_k_buf.slice_set(&k_valid.contiguous()?, 2, 0)?;
+                    new_v_buf.slice_set(&v_valid.contiguous()?, 2, 0)?;
                 }
             }
 
@@ -1085,8 +1085,8 @@ impl RetainingKvCache {
         let kb = self.k_buf.as_mut().expect("k_buf allocated above");
         let vb = self.v_buf.as_mut().expect("v_buf allocated above");
 
-        kb.slice_set(k, 2, self.seq_len)?;
-        vb.slice_set(v, 2, self.seq_len)?;
+        kb.slice_set(&k.contiguous()?, 2, self.seq_len)?;
+        vb.slice_set(&v.contiguous()?, 2, self.seq_len)?;
         self.seq_len += t;
 
         let k_out = kb.narrow(2, 0, self.seq_len)?;

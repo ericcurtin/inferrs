@@ -73,7 +73,7 @@ impl Cache {
             *ad = Tensor::cat(&[&*ad, &next_ad], self.dim)?;
             self.max_seq_len += self.grow_by;
         }
-        ad.slice_set(src, self.dim, self.current_seq_len)?;
+        ad.slice_set(&src.contiguous()?, self.dim, self.current_seq_len)?;
         self.current_seq_len += seq_len;
         Ok(())
     }
