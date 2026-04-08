@@ -91,6 +91,13 @@ pub struct RunArgs {
     /// Path to a WAV audio file to attach to the prompt (Gemma 4 audio models).
     #[arg(long)]
     pub audio: Option<std::path::PathBuf>,
+
+    /// Strip `<think>…</think>` reasoning tokens from the output stream.
+    ///
+    /// Enabled by default for models that emit thinking blocks (Gemma4, Qwen3,
+    /// NVFP4).  Pass `--think-filter=false` to see raw reasoning tokens.
+    #[arg(long, default_value_t = true, require_equals(true))]
+    pub think_filter: bool,
 }
 
 impl RunArgs {
@@ -115,6 +122,7 @@ impl RunArgs {
             paged_attention: self.paged_attention,
             turbo_quant: self.turbo_quant.clone(),
             quantize: self.quantize.clone(),
+            think_filter: self.think_filter,
         }
     }
 }

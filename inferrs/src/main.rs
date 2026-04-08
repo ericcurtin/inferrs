@@ -172,6 +172,14 @@ pub struct ServeArgs {
     #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
           value_name = "FORMAT")]
     pub quantize: Option<String>,
+
+    /// Strip `<think>…</think>` reasoning tokens from the output stream.
+    ///
+    /// Enabled by default for models that emit thinking blocks (Gemma4, Qwen3,
+    /// NVFP4).  Pass `--think-filter=false` to pass those tokens through to the
+    /// client unchanged, matching the behaviour of llama-server.
+    #[arg(long, default_value_t = true, require_equals(true))]
+    pub think_filter: bool,
 }
 
 /// Disable per-tensor CUDA event tracking on a CUDA device.

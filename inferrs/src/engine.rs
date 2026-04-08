@@ -163,7 +163,8 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         device.clone(),
         args.max_batch_size,
         args.max_tokens_per_step,
-    );
+    )
+    .with_think_filter_enabled(args.think_filter);
 
     engine = attach_paged_kv_if_requested(
         engine,
@@ -666,6 +667,10 @@ pub struct Engine {
     max_tokens_per_step: usize,
     /// When `Some`, paged-attention is active.
     paged: Option<PagedState>,
+    /// When `true` (the default), `<think>…</think>` reasoning tokens are
+    /// stripped from the output stream.  Set to `false` via `--think-filter=false`
+    /// to pass them through to the client unchanged (llama-server behaviour).
+    think_filter_enabled: bool,
 }
 
 /// Shared state for paged-attention mode.
@@ -700,7 +705,15 @@ impl Engine {
             max_batch_size,
             max_tokens_per_step,
             paged: None,
+            think_filter_enabled: true,
         }
+    }
+
+    /// Disable the think-block filter so that `<think>…</think>` tokens are
+    /// passed through to the client unchanged.
+    pub fn with_think_filter_enabled(mut self, enabled: bool) -> Self {
+        self.think_filter_enabled = enabled;
+        self
     }
 
     /// Attach a paged KV store to this engine, enabling paged-attention mode.
@@ -853,6 +866,7 @@ impl Engine {
             max_batch_size,
             max_tokens_per_step: _,
             paged,
+            think_filter_enabled,
         } = self;
 
         let mut paged = paged;
@@ -878,7 +892,9 @@ impl Engine {
                 match rx.try_recv() {
                     Ok(req) => {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
-                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        if think_filter_enabled {
+                            seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens, batch_size={})",
                             seq.request_id,
@@ -896,7 +912,9 @@ impl Engine {
                 match rx.blocking_recv() {
                     Some(req) => {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
-                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        if think_filter_enabled {
+                            seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens)",
                             seq.request_id,
@@ -1278,7 +1296,11 @@ impl Engine {
 
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
-        let mut think_filter = ThinkFilter::from_tokenizer(&self.tokenizer);
+        let mut think_filter = if self.think_filter_enabled {
+            ThinkFilter::from_tokenizer(&self.tokenizer)
+        } else {
+            ThinkFilter::default()
+        };
 
         // Prefill
         let logits = self.run_prefill(prompt_tokens)?;
