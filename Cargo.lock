@@ -1715,6 +1715,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inferrs-backend-openvino"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "inferrs-backend-rocm"
 version = "0.1.0"
 dependencies = [

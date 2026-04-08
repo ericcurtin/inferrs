@@ -228,22 +228,42 @@ impl ServeArgs {
 
     fn auto_device() -> Result<candle_core::Device> {
         // macOS: always prefer Metal (linked directly, no plugin needed).
-        // After that, probe for a Vulkan/MoltenVK plugin as a fallback.
+        // After that, probe for Vulkan/MoltenVK and OpenVINO plugins.
         #[cfg(target_os = "macos")]
         {
+            use crate::backend::BackendKind;
             if let Ok(device) = candle_core::Device::new_metal(0) {
                 tracing::info!("Using Metal device");
+                // Still probe for OpenVINO so users know it is (or isn't)
+                // available for a future CPU-only OpenVINO path.
+                if matches!(crate::backend::detect_backend(), BackendKind::OpenVino) {
+                    tracing::info!(
+                        "OpenVINO runtime detected alongside Metal — OpenVINO CPU \
+                         acceleration will be available once candle gains an \
+                         OpenVINO backend."
+                    );
+                }
                 return Ok(device);
             }
 
-            // Metal failed (unlikely). Check whether a Vulkan/MoltenVK plugin
-            // is present so the user gets a helpful log message.
-            use crate::backend::BackendKind;
-            if let BackendKind::Vulkan = crate::backend::detect_backend() {
-                tracing::info!(
-                    "Vulkan/MoltenVK driver detected but candle 0.8 has no \
-                     Vulkan Device yet — falling back to CPU."
-                );
+            // Metal unavailable (e.g. CI VM without GPU): probe for
+            // Vulkan/MoltenVK and OpenVINO and log their availability.
+            match crate::backend::detect_backend() {
+                BackendKind::Vulkan => {
+                    tracing::info!(
+                        "Vulkan/MoltenVK driver detected but candle 0.8 has no \
+                         Vulkan Device yet — falling back to CPU."
+                    );
+                }
+                BackendKind::OpenVino => {
+                    tracing::info!(
+                        "OpenVINO runtime detected (Metal unavailable) — candle \
+                         does not yet have an OpenVINO Device variant; falling \
+                         back to CPU. OpenVINO acceleration will be enabled once \
+                         candle gains the corresponding backend."
+                    );
+                }
+                BackendKind::Cpu => {}
             }
         }
 
@@ -253,11 +273,11 @@ impl ServeArgs {
         // opened on demand — they are not hard-linked into the binary.
         //
         // Platform notes:
-        //   Linux x86_64 / aarch64 : CUDA → ROCm → Hexagon → Vulkan → CPU
-        //   Android aarch64         : Hexagon → CPU
-        //   Windows x86_64          : CUDA → Vulkan → CPU
-        //   Windows aarch64         : Hexagon → Vulkan → CPU
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows",))]
+        //   Linux x86_64 / aarch64 : CUDA → MUSA → ROCm → CANN → Hexagon → Vulkan → OpenVINO → CPU
+        //   Android aarch64         : CANN → Hexagon → OpenVINO → CPU
+        //   Windows x86_64          : CUDA → MUSA → ROCm → Vulkan → OpenVINO → CPU
+        //   Windows aarch64         : Hexagon → Vulkan → OpenVINO → CPU
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
         {
             use crate::backend::BackendKind;
             match crate::backend::detect_backend() {
@@ -334,21 +354,29 @@ impl ServeArgs {
                 }
                 #[cfg(any(target_os = "linux", target_os = "windows",))]
                 BackendKind::Vulkan => {
-                    // Vulkan driver detected. candle 0.8 does not yet have a
+                    // Vulkan driver detected.  candle does not yet have a
                     // Vulkan/wgpu Device variant, so we fall through to CPU.
                     // Vulkan acceleration will be enabled automatically once
                     // candle gains wgpu support and this plugin is updated.
                     tracing::info!(
-                        "Vulkan driver detected but candle 0.8 has no Vulkan \
-                         Device yet — falling back to CPU. Recompile with a \
-                         candle version that supports wgpu to enable Vulkan."
+                        "Vulkan driver detected but candle has no Vulkan Device \
+                         yet — falling back to CPU. Recompile with a candle \
+                         version that supports wgpu to enable Vulkan."
+                    );
+                }
+                BackendKind::OpenVino => {
+                    tracing::info!(
+                        "OpenVINO runtime detected — candle does not yet have an \
+                         OpenVINO Device variant; falling back to CPU. OpenVINO \
+                         CPU/GPU/NPU acceleration will be enabled once candle \
+                         gains the corresponding backend."
                     );
                 }
                 BackendKind::Cpu => {}
             }
         }
 
-        // Android: probe CANN (Huawei Ascend NPU) then Vulkan.
+        // Android: probe CANN, Hexagon, Vulkan, OpenVINO.
         // CUDA and ROCm are not available on Android.
         #[cfg(target_os = "android")]
         {
@@ -356,22 +384,30 @@ impl ServeArgs {
             match crate::backend::detect_backend() {
                 BackendKind::Cann => {
                     tracing::info!(
-                        "Huawei Ascend NPU detected (CANN) on Android but \
-                         candle does not yet have a native CANN Device — \
-                         falling back to CPU."
+                        "Huawei Ascend NPU detected (CANN) but candle does not \
+                         yet have a native CANN Device — falling back to CPU."
+                    );
+                }
+                BackendKind::Hexagon => {
+                    tracing::info!(
+                        "Qualcomm Hexagon HTP detected but candle has no \
+                         Hexagon Device variant yet — falling back to CPU."
                     );
                 }
                 BackendKind::Vulkan => {
                     tracing::info!(
-                        "Vulkan driver detected but candle 0.8 has no Vulkan \
-                         Device yet — falling back to CPU."
+                        "Vulkan driver detected (Android) but candle 0.8 has no \
+                         Vulkan Device yet — falling back to CPU."
                     );
+                }
+                BackendKind::OpenVino => {
+                    tracing::info!("OpenVINO runtime detected (Android) — falling back to CPU.");
                 }
                 BackendKind::Cpu => {}
             }
         }
 
-        // Windows x86_64: CUDA + MUSA + ROCm + Vulkan plugin probing.
+        // Windows x86_64: CUDA + MUSA + ROCm + Vulkan + OpenVINO plugin probing.
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         {
             use crate::backend::BackendKind;
@@ -397,24 +433,39 @@ impl ServeArgs {
                 BackendKind::Vulkan => {
                     tracing::info!(
                         "Vulkan driver detected but candle 0.8 has no Vulkan \
-                         Device yet — falling back to CPU. Recompile with a \
-                         candle version that supports wgpu to enable Vulkan."
+                         Device yet — falling back to CPU."
                     );
+                }
+                BackendKind::OpenVino => {
+                    tracing::info!("OpenVINO runtime detected (Windows) — falling back to CPU.");
                 }
                 BackendKind::Cpu => {}
             }
         }
 
-        // Windows aarch64: Vulkan-only (CUDA unavailable on ARM64 Windows).
+        // Windows aarch64: Hexagon + Vulkan + OpenVINO (CUDA unavailable on ARM64).
         #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
         {
             use crate::backend::BackendKind;
-            if let BackendKind::Vulkan = crate::backend::detect_backend() {
-                tracing::info!(
-                    "Vulkan driver detected but candle 0.8 has no Vulkan \
-                     Device yet — falling back to CPU. Recompile with a \
-                     candle version that supports wgpu to enable Vulkan."
-                );
+            match crate::backend::detect_backend() {
+                BackendKind::Hexagon => {
+                    tracing::info!(
+                        "Qualcomm Hexagon HTP detected but candle has no \
+                         Hexagon Device variant yet — falling back to CPU."
+                    );
+                }
+                BackendKind::Vulkan => {
+                    tracing::info!(
+                        "Vulkan driver detected (Windows ARM64) but candle 0.8 \
+                         has no Vulkan Device yet — falling back to CPU."
+                    );
+                }
+                BackendKind::OpenVino => {
+                    tracing::info!(
+                        "OpenVINO runtime detected (Windows ARM64) — falling back to CPU."
+                    );
+                }
+                BackendKind::Cpu => {}
             }
         }
         tracing::info!("Using CPU device");

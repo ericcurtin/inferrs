@@ -1,0 +1,19 @@
+[package]
+name = "inferrs-backend-openvino"
+version = "0.1.0"
+edition = "2021"
+description = "OpenVINO backend plugin for inferrs (probe-only; detection via dlopen/LoadLibrary)"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_openvino"
+crate-type = ["cdylib"]
+
+[dependencies]
+# libc is used for low-level dlopen on Linux/Android to probe libopenvino
+# without linking against it at compile time.
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# windows-sys is used for LoadLibrary / FreeLibrary on Windows.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }

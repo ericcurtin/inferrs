@@ -10,12 +10,12 @@ name = "inferrs"
 path = "src/main.rs"
 
 # On macOS: always enable Metal, and add libloading to probe for
-# the Vulkan/MoltenVK plugin at runtime.
+# the Vulkan/MoltenVK and OpenVINO plugins at runtime.
 [target.'cfg(target_os = "macos")'.dependencies]
+libloading = "0.8"
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
 candle-transformers = { workspace = true, features = ["metal"] }
-libloading = "0.8"
 
 
 [dependencies]
@@ -74,7 +74,11 @@ candle-core = { workspace = true, features = ["cuda"] }
 candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda"] }
 
-# Windows x86_64: CUDA + ROCm + Vulkan plugin probing.
+# Android: dynamic backend loading (CANN + Hexagon + Vulkan + OpenVINO); no CUDA.
+[target.'cfg(target_os = "android")'.dependencies]
+libloading = "0.8"
+
+# Windows x86_64: CUDA + ROCm + Vulkan + OpenVINO plugin probing.
 # CUDA is not available on Windows ARM, so this block is x86_64-only.
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 libloading = "0.8"
@@ -82,21 +86,16 @@ candle-core = { workspace = true, features = ["cuda"] }
 candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda"] }
 
-# Android aarch64: dynamic backend loading for CANN and Hexagon.
-# No CUDA feature — CUDA is not available on Android.  Both plugins are
-# probed at runtime via libloading.
-[target.'cfg(target_os = "android")'.dependencies]
-libloading = "0.8"
 
 # Linux / Android: libc for low-level dlopen/dlsym used by the CANN HBM
 # memory query in engine.rs (aclrtGetMemInfo via RTLD_NOLOAD).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
-# Windows aarch64 (Snapdragon X / 8cx): no CUDA, but Hexagon + Vulkan probing
-# via the plugin system needs libloading.
+# Windows aarch64: no CUDA, but Hexagon + Vulkan + OpenVINO probes are useful.
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
 libloading = "0.8"
+
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }

@@ -1,5 +1,5 @@
-//! GPU/NPU backend discovery via dynamic loading (`dlopen` on Linux/Android,
-//! `LoadLibraryW` on Windows).
+//! GPU/NPU/accelerator backend discovery via dynamic loading (`dlopen` on POSIX,
+//! `LoadLibrary` on Windows).
 //!
 //! The `inferrs` binary is compiled with the `cuda` feature (so
 //! `Device::new_cuda()` is available) but candle-core is patched to use
@@ -38,25 +38,28 @@
 //! Plugin search order (highest priority first):
 //!
 //! **Linux x86_64 / aarch64:**
-//!   1. CUDA    (`.so`)  → `Device::new_cuda(0)`
-//!   2. MUSA    (`.so`)  → `Device::new_cuda(0)` (Moore Threads)
-//!   3. ROCm    (`.so`)  → `Device::new_cuda(0)` (HIP)
-//!   4. CANN    (`.so`)  → CPU fallback with info log (pending candle CANN Device)
-//!   5. Hexagon (`.so`)  → CPU fallback with info log (pending candle Hexagon Device)
-//!   6. Vulkan  (`.so`)  → CPU fallback with info log
-//!   7. CPU     (always available)
+//!   1. CUDA    (`.so`)   → `Device::new_cuda(0)`
+//!   2. MUSA    (`.so`)   → `Device::new_cuda(0)` (Moore Threads)
+//!   3. ROCm    (`.so`)   → `Device::new_cuda(0)` (HIP)
+//!   4. CANN    (`.so`)   → CPU fallback with info log (pending candle CANN Device)
+//!   5. Hexagon (`.so`)   → CPU fallback with info log (pending candle Hexagon Device)
+//!   6. Vulkan  (`.so`)   → CPU fallback with info log
+//!   7. OpenVINO (`.so`)  → CPU fallback with info log (pending candle OpenVINO Device)
+//!   8. CPU     (always available)
 //!
 //! **Windows x86_64:**
-//!   1. CUDA    (`.dll`) → `Device::new_cuda(0)`
-//!   2. MUSA    (`.dll`) → `Device::new_cuda(0)` (Moore Threads)
-//!   3. ROCm    (`.dll`) → `Device::new_cuda(0)` (HIP SDK for Windows)
-//!   4. Vulkan  (`.dll`) → CPU fallback with info log
-//!   5. CPU     (always available)
+//!   1. CUDA    (`.dll`)  → `Device::new_cuda(0)`
+//!   2. MUSA    (`.dll`)  → `Device::new_cuda(0)` (Moore Threads)
+//!   3. ROCm    (`.dll`)  → `Device::new_cuda(0)` (HIP SDK for Windows)
+//!   4. Vulkan  (`.dll`)  → CPU fallback with info log
+//!   5. OpenVINO (`.dll`) → CPU fallback with info log
+//!   6. CPU     (always available)
 //!
 //! **Windows aarch64:**
-//!   1. Hexagon (`.dll`) → CPU fallback with info log (pending candle Hexagon Device)
-//!   2. Vulkan  (`.dll`) → CPU fallback with info log
-//!   3. CPU     (always available)
+//!   1. Hexagon (`.dll`)  → CPU fallback with info log (pending candle Hexagon Device)
+//!   2. Vulkan  (`.dll`)  → CPU fallback with info log
+//!   3. OpenVINO (`.dll`) → CPU fallback with info log
+//!   4. CPU     (always available)
 //!
 //! **macOS x86_64 / aarch64:**
 //!   Metal is tried first (linked directly).  If Metal fails:
@@ -64,10 +67,17 @@
 //!   2. CPU    (always available)
 //!
 //! **Android aarch64:**
-//!   1. CANN    (`.so`)  → CPU fallback with info log (pending candle CANN Device)
-//!   2. Hexagon (`.so`)  → CPU fallback with info log (pending candle Hexagon Device)
-//!   3. Vulkan  (`.so`)  → CPU fallback with info log
-//!   4. CPU     (always available)
+//!   1. CANN    (`.so`)   → CPU fallback with info log (pending candle CANN Device)
+//!   2. Hexagon (`.so`)   → CPU fallback with info log (pending candle Hexagon Device)
+//!   3. Vulkan  (`.so`)   → CPU fallback with info log
+//!   4. OpenVINO (`.so`)  → CPU fallback with info log
+//!   5. CPU     (always available)
+//!
+//! **macOS x86_64 / aarch64:**
+//!   Metal is tried first (linked directly).  If Metal fails:
+//!   1. Vulkan  (`.dylib`, via MoltenVK) → CPU fallback with info log
+//!   2. OpenVINO (`.dylib`)              → CPU fallback with info log
+//!   3. CPU     (always available)
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 //
@@ -151,7 +161,7 @@ fn exe_dir() -> Option<std::path::PathBuf> {
 mod linux {
     use std::path::PathBuf;
 
-    /// The detected GPU/NPU backend, in priority order.
+    /// The detected hardware/NPU backend, in priority order.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
         Cuda,
@@ -177,6 +187,11 @@ mod linux {
         /// Vulkan is detected but candle 0.8 has no Vulkan Device variant yet.
         /// Falls back to CPU while logging the detection.
         Vulkan,
+        /// OpenVINO runtime was found on the system.  candle does not yet have
+        /// an OpenVINO `Device` variant; detection is logged and the binary
+        /// falls back to CPU.  A future update will enable OpenVINO inference
+        /// once candle gains the corresponding backend.
+        OpenVino,
         Cpu,
     }
 
@@ -184,7 +199,7 @@ mod linux {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → MUSA → ROCm → CANN → Hexagon → Vulkan → CPU.
+        // Priority order: CUDA → MUSA → ROCm → CANN → Hexagon → Vulkan → OpenVINO → CPU.
         // Both x86_64 and aarch64 Linux support CUDA, MUSA, and ROCm.
         //
         // MUSA (Moore Threads) mirrors the CUDA API; its plugin probes
@@ -208,6 +223,7 @@ mod linux {
             ("libinferrs_backend_cann.so", BackendKind::Cann),
             ("libinferrs_backend_hexagon.so", BackendKind::Hexagon),
             ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
+            ("libinferrs_backend_openvino.so", BackendKind::OpenVino),
         ];
 
         for (lib_name, kind) in candidates {
@@ -231,9 +247,9 @@ mod linux {
 pub use linux::{detect_backend, BackendKind};
 
 // ── Android ───────────────────────────────────────────────────────────────────
-// Android aarch64 hosts both Huawei Ascend NPUs (CANN, in some edge devices)
-// and Qualcomm Hexagon NPUs (Snapdragon SoCs).  CUDA and ROCm are unavailable.
-// Vulkan is also available on most Android devices since API 24.
+// Android aarch64 hosts Huawei Ascend NPUs (CANN) and Qualcomm Hexagon NPUs
+// (Snapdragon SoCs).  CUDA and ROCm are unavailable on Android.
+// Vulkan is available on most Android devices since API 24.
 
 #[cfg(target_os = "android")]
 mod android {
@@ -248,20 +264,22 @@ mod android {
         Hexagon,
         /// Vulkan GPU acceleration (available since API 24).
         Vulkan,
+        /// OpenVINO runtime found; falls back to CPU pending candle support.
+        OpenVino,
         Cpu,
     }
 
     pub fn detect_backend() -> BackendKind {
-        // Priority: CANN → Hexagon → Vulkan → CPU.
-        // CANN is probed first; on Snapdragon devices the CANN plugin won't
-        // exist so the probe falls through to Hexagon, then Vulkan.
+        let search_dirs = plugin_search_dirs();
+
+        // Priority: CANN → Hexagon → Vulkan → OpenVINO → CPU.
         let candidates: &[(&str, BackendKind)] = &[
             ("libinferrs_backend_cann.so", BackendKind::Cann),
             ("libinferrs_backend_hexagon.so", BackendKind::Hexagon),
             ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
+            ("libinferrs_backend_openvino.so", BackendKind::OpenVino),
         ];
 
-        let search_dirs = plugin_search_dirs();
         for (lib_name, kind) in candidates {
             if super::probe_plugin(&search_dirs, lib_name) {
                 return *kind;
@@ -287,9 +305,8 @@ pub use android::{detect_backend, BackendKind};
 // ── macOS ─────────────────────────────────────────────────────────────────────
 //
 // Metal is linked directly and is always preferred.  Vulkan is also available
-// via MoltenVK (a Vulkan 1.3 portability layer over Metal).  We probe for it
-// so that the main binary can log its availability and future wgpu/Vulkan code
-// paths can use it.
+// via MoltenVK.  OpenVINO is probed for future CPU acceleration (Intel provides
+// macOS builds for both x86_64 and aarch64).
 //
 // Architectures: x86_64-apple-darwin, aarch64-apple-darwin.
 
@@ -297,19 +314,32 @@ pub use android::{detect_backend, BackendKind};
 mod macos {
     use std::path::PathBuf;
 
-    /// The detected GPU backend on macOS (Metal is handled directly in
+    /// The detected backend on macOS (Metal is handled directly in
     /// `auto_device` before the plugin system is invoked).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
         /// Vulkan via MoltenVK is detected; candle 0.8 has no Vulkan Device yet.
         Vulkan,
+        /// OpenVINO runtime found; the main binary uses Metal for GPU inference
+        /// but will switch to an OpenVINO CPU path once candle supports it.
+        OpenVino,
         Cpu,
     }
 
     pub fn detect_backend() -> BackendKind {
-        if super::probe_plugin(&plugin_search_dirs(), "libinferrs_backend_vulkan.dylib") {
-            return BackendKind::Vulkan;
+        let search_dirs = plugin_search_dirs();
+
+        let candidates: &[(&str, BackendKind)] = &[
+            ("libinferrs_backend_vulkan.dylib", BackendKind::Vulkan),
+            ("libinferrs_backend_openvino.dylib", BackendKind::OpenVino),
+        ];
+
+        for (lib_name, kind) in candidates {
+            if super::probe_plugin(&search_dirs, lib_name) {
+                return *kind;
+            }
         }
+
         BackendKind::Cpu
     }
 
@@ -320,6 +350,8 @@ mod macos {
         dirs.push(PathBuf::from("/usr/local/lib"));
         dirs.push(PathBuf::from("/opt/homebrew/lib")); // Homebrew Apple Silicon
         dirs.push(PathBuf::from("/usr/local/opt/molten-vk/lib")); // Homebrew Intel
+        dirs.push(PathBuf::from("/usr/local/lib/inferrs")); // inferrs install
+        dirs.push(PathBuf::from("/opt/homebrew/lib/inferrs")); // inferrs ARM
         dirs
     }
 }
@@ -327,95 +359,63 @@ mod macos {
 #[cfg(target_os = "macos")]
 pub use macos::{detect_backend, BackendKind};
 
-// ── Windows x86_64 ───────────────────────────────────────────────────────────
-// CUDA and ROCm are available on Windows x86_64 only.  ROCm on Windows is
-// supported from ROCm 5.5+ (HIP SDK for Windows).  Vulkan is available on
-// both x86_64 and aarch64 (see the Windows aarch64 section below).
-// CANN and Hexagon are not supported on Windows x86_64.
+// ── Windows ───────────────────────────────────────────────────────────────────
+// CUDA/ROCm/MUSA are x86_64-only on Windows.  OpenVINO supports both x86_64
+// and aarch64 (since 2024.1).  Hexagon is aarch64-only (Snapdragon devices).
+// CANN is not supported on Windows (Huawei SDK constraint).
 
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-mod windows_x86_64 {
+#[cfg(target_os = "windows")]
+mod windows {
     use std::path::PathBuf;
 
-    /// The detected GPU backend, in priority order.
+    use libloading::{Library, Symbol};
+
+    /// The detected hardware backend, in priority order.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
+        /// CUDA — x86_64 only.
+        #[cfg(target_arch = "x86_64")]
         Cuda,
-        /// Moore Threads GPU (MUSA SDK).  Uses `Device::new_cuda(0)` because
-        /// MUSA mirrors the CUDA API.  The plugin probes `musa.dll` at runtime.
+        /// Moore Threads GPU (MUSA SDK) — x86_64 only on Windows.
+        /// Uses `Device::new_cuda(0)` because MUSA mirrors the CUDA API.
+        #[cfg(target_arch = "x86_64")]
         Musa,
-        /// ROCm/HIP device (AMD GPU via ROCm 5.5+ HIP SDK for Windows).
+        /// ROCm/HIP device (AMD GPU via ROCm 5.5+ HIP SDK) — x86_64 only on Windows.
+        #[cfg(target_arch = "x86_64")]
         Rocm,
+        /// Qualcomm Hexagon HTP NPU — aarch64 (Snapdragon X / 8cx) only.
+        /// Falls back to CPU while candle gains a Hexagon device variant.
+        #[cfg(target_arch = "aarch64")]
+        Hexagon,
         /// Vulkan is detected but candle 0.8 has no Vulkan Device variant yet.
         /// Falls back to CPU while logging the detection.
         Vulkan,
+        /// OpenVINO runtime found — both x86_64 and aarch64 Windows.
+        OpenVino,
         Cpu,
     }
 
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → MUSA → ROCm → Vulkan → CPU.
+        // Priority order (x86_64): CUDA → MUSA → ROCm → Vulkan → OpenVINO → CPU
+        // Priority order (aarch64): Hexagon → Vulkan → OpenVINO → CPU
         // ROCm on Windows x86_64 is supported via AMD's HIP SDK (ROCm 5.5+).
         // MUSA Windows support is announced by Moore Threads.
         // CANN is not supported on Windows (Huawei SDK constraint).
-        // Hexagon does not exist on x86_64.
         let candidates: &[(&str, BackendKind)] = &[
+            #[cfg(target_arch = "x86_64")]
             ("inferrs_backend_cuda.dll", BackendKind::Cuda),
+            #[cfg(target_arch = "x86_64")]
             ("inferrs_backend_musa.dll", BackendKind::Musa),
+            #[cfg(target_arch = "x86_64")]
             ("inferrs_backend_rocm.dll", BackendKind::Rocm),
-            ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
-        ];
-
-        for (lib_name, kind) in candidates {
-            if super::probe_plugin(&search_dirs, lib_name) {
-                return *kind;
-            }
-        }
-
-        BackendKind::Cpu
-    }
-
-    fn plugin_search_dirs() -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = super::exe_dir().into_iter().collect();
-        if let Ok(pf) = std::env::var("ProgramFiles") {
-            dirs.push(PathBuf::from(pf).join("inferrs"));
-        }
-        dirs
-    }
-}
-
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use windows_x86_64::{detect_backend, BackendKind};
-
-// ── Windows aarch64 (Snapdragon X / 8cx) ─────────────────────────────────────
-// Qualcomm ARM64 Windows devices ship a Hexagon NPU and Vulkan-capable GPU,
-// but no CUDA/ROCm/CANN.
-// Priority: Hexagon → Vulkan → CPU.
-
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-mod windows_aarch64 {
-    use std::path::PathBuf;
-
-    /// The detected NPU / GPU backend, in priority order.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum BackendKind {
-        /// Hexagon HTP NPU (Qualcomm).  Falls back to CPU while candle gains
-        /// a Hexagon device variant.
-        Hexagon,
-        /// Vulkan GPU.  Falls back to CPU while candle 0.8 has no Vulkan Device.
-        Vulkan,
-        Cpu,
-    }
-
-    pub fn detect_backend() -> BackendKind {
-        // Priority: Hexagon → Vulkan → CPU  (no CUDA/ROCm/CANN on ARM64 Windows)
-        let candidates: &[(&str, BackendKind)] = &[
+            #[cfg(target_arch = "aarch64")]
             ("inferrs_backend_hexagon.dll", BackendKind::Hexagon),
             ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
+            ("inferrs_backend_openvino.dll", BackendKind::OpenVino),
         ];
 
-        let search_dirs = plugin_search_dirs();
         for (lib_name, kind) in candidates {
             if super::probe_plugin(&search_dirs, lib_name) {
                 return *kind;
@@ -434,17 +434,16 @@ mod windows_aarch64 {
     }
 }
 
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-pub use windows_aarch64::{detect_backend, BackendKind};
+#[cfg(target_os = "windows")]
+pub use windows::{detect_backend, BackendKind};
 
-// ── Any remaining platform (e.g. FreeBSD, bare-metal) ────────────────────────
+// ── Any other platform (FreeBSD, Fuchsia, bare-metal, etc.) ──────────────────
 
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "windows", target_arch = "aarch64"),
+    target_os = "windows",
 )))]
 #[allow(dead_code)]
 pub fn detect_backend() -> BackendKind {
@@ -455,8 +454,7 @@ pub fn detect_backend() -> BackendKind {
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
-    all(target_os = "windows", target_arch = "x86_64"),
-    all(target_os = "windows", target_arch = "aarch64"),
+    target_os = "windows",
 )))]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

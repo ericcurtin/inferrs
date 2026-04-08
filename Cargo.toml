@@ -8,6 +8,7 @@ members = [
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
     "backends/inferrs-backend-hexagon",
+    "backends/inferrs-backend-openvino",
 ]
 # Default members exclude GPU/NPU backends that require vendor-specific toolchains.
 # `cargo build` (no -p flag) builds only the listed members.
@@ -26,6 +27,7 @@ default-members = [
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-vulkan",
     "backends/inferrs-backend-hexagon",
+    "backends/inferrs-backend-openvino",
 ]
 resolver = "2"
 
