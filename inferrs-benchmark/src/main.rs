@@ -274,13 +274,35 @@ fn run_one_backend<F>(
 where
     F: FnOnce() -> Result<Child>,
 {
+    run_one_backend_with_cleanup(args, label, port, model, prompt, move || {
+        Ok((start_fn()?, None))
+    })
+}
+
+/// Like [`run_one_backend`] but also accepts an optional cleanup callback that
+/// is invoked before waiting for the child to exit.  This is used for Docker
+/// backends where killing the client process does not stop the container.
+fn run_one_backend_with_cleanup<F>(
+    args: &BenchmarkArgs,
+    label: &str,
+    port: u16,
+    model: &str,
+    prompt: &str,
+    start_fn: F,
+) -> Result<BenchSummary>
+where
+    F: FnOnce() -> Result<(Child, Option<Box<dyn FnOnce()>>)>,
+{
     log_header(label);
-    let mut server = start_fn()?;
+    let (mut server, cleanup) = start_fn()?;
     ok(&format!("{label} started (pid {})", server.id()));
 
     let health = format!("http://127.0.0.1:{port}/health");
     if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
         err(&format!("{label} failed to start: {e}"));
+        if let Some(f) = cleanup {
+            f();
+        }
         let _ = server.kill();
         let _ = server.wait();
         bail!("server failed to start");
@@ -300,6 +322,13 @@ where
     let elapsed = t_bench.elapsed();
     let peak_mem_mb = tracker.stop();
 
+    // For Docker-based backends the cleanup callback issues `docker stop`,
+    // which terminates the container.  The `--rm` flag on `docker run` ensures
+    // the container is removed once it exits.  We then kill/wait the client
+    // process to reap it.
+    if let Some(f) = cleanup {
+        f();
+    }
     let _ = server.kill();
     let _ = server.wait();
     ok(&format!(
@@ -412,13 +441,17 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
 
     // ── Group 3: vllm 31B google  vs  inferrs --paged-attention 31B google ──
     log_header("DGX Spark group 3/5 — vllm google 31B vs inferrs --paged-attention google 31B");
-    let g3_vllm = run_one_backend(
+    let g3_vllm = run_one_backend_with_cleanup(
         args,
         "vllm serve google/gemma-4-31B-it",
         p_vllm,
         "google/gemma-4-31B-it",
         &prompt,
-        || start_vllm_server("google/gemma-4-31B-it", p_vllm),
+        || {
+            let (child, name) = start_vllm_server("google/gemma-4-31B-it", p_vllm)?;
+            let cleanup: Box<dyn FnOnce()> = Box::new(move || stop_docker_container(&name));
+            Ok((child, Some(cleanup)))
+        },
     )?;
     let g3_inferrs = run_one_backend(
         args,
@@ -453,13 +486,17 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
 
     // ── Group 4: vllm 31B NVFP4  vs  inferrs --paged-attention 31B NVFP4 ───
     log_header("DGX Spark group 4/5 — vllm nvidia 31B vs inferrs --paged-attention nvidia 31B");
-    let g4_vllm = run_one_backend(
+    let g4_vllm = run_one_backend_with_cleanup(
         args,
         "vllm serve nvidia/Gemma-4-31B-IT-NVFP4",
         p_vllm,
         "nvidia/Gemma-4-31B-IT-NVFP4",
         &prompt,
-        || start_vllm_server("nvidia/Gemma-4-31B-IT-NVFP4", p_vllm),
+        || {
+            let (child, name) = start_vllm_server("nvidia/Gemma-4-31B-IT-NVFP4", p_vllm)?;
+            let cleanup: Box<dyn FnOnce()> = Box::new(move || stop_docker_container(&name));
+            Ok((child, Some(cleanup)))
+        },
     )?;
     let g4_inferrs = run_one_backend(
         args,
@@ -494,13 +531,17 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
 
     // ── Group 5: vllm 2B google  vs  inferrs --paged-attention 2B google ────
     log_header("DGX Spark group 5/5 — vllm google 2B vs inferrs --paged-attention google 2B");
-    let g5_vllm = run_one_backend(
+    let g5_vllm = run_one_backend_with_cleanup(
         args,
         "vllm serve google/gemma-4-E2B-it",
         p_vllm,
         "google/gemma-4-E2B-it",
         &prompt,
-        || start_vllm_server("google/gemma-4-E2B-it", p_vllm),
+        || {
+            let (child, name) = start_vllm_server("google/gemma-4-E2B-it", p_vllm)?;
+            let cleanup: Box<dyn FnOnce()> = Box::new(move || stop_docker_container(&name));
+            Ok((child, Some(cleanup)))
+        },
     )?;
     let g5_inferrs = run_one_backend(
         args,
@@ -780,23 +821,42 @@ fn start_llama_server(model: &str, port: u16) -> Result<Child> {
     Ok(child)
 }
 
-fn start_vllm_server(model: &str, port: u16) -> Result<Child> {
+/// Start a vllm container and return the `docker run` child process together
+/// with the container name so the caller can stop the container explicitly.
+///
+/// Killing the `docker run` client process does **not** stop the container;
+/// the caller must run `docker stop <name>` (or call [`stop_docker_container`])
+/// to actually terminate the workload and free GPU memory.
+///
+/// Memory tracking limitation: the Child returned here is the `docker run`
+/// client process (lightweight), not the container workload.
+/// PeakMemoryTracker will therefore report near-zero memory for vllm groups;
+/// the benchmark output notes this explicitly.
+fn start_vllm_server(model: &str, port: u16) -> Result<(Child, String)> {
     // On DGX Spark vllm must run inside its Docker image because the system
     // CUDA stack is too new for the stock vllm wheel.  We mount the host
     // HuggingFace cache read-only so the container uses already-downloaded
     // weights without re-pulling.
-    //
-    // Memory tracking limitation: the Child returned here is the `docker run`
-    // client process (lightweight), not the container workload.
-    // PeakMemoryTracker will therefore report near-zero memory for vllm groups;
-    // the benchmark output notes this explicitly.
     let hf_hub_cache = hf_hub_cache_dir();
     let volume = format!("{hf_hub_cache}:/root/.cache/huggingface/hub");
+
+    // Give the container a unique, predictable name so we can `docker stop` it
+    // by name regardless of what happens to the client process.
+    let container_name = format!("inferrs-bench-vllm-{port}");
+
+    // Pre-emptively remove any stale container with the same name.  If a
+    // previous run crashed before `--rm` could clean up, `docker run --name`
+    // would fail immediately and `wait_for_health` would then spin for the
+    // full server_ready_timeout before giving up.  `docker rm -f` is a no-op
+    // when the container does not exist, so this is always safe.
+    stop_docker_container(&container_name);
 
     let port_mapping = format!("{port}:8000");
     let child = Command::new("docker")
         .arg("run")
         .arg("--rm")
+        .arg("--name")
+        .arg(&container_name)
         .arg("--gpus=all")
         .arg("-p")
         .arg(&port_mapping)
@@ -812,7 +872,20 @@ fn start_vllm_server(model: &str, port: u16) -> Result<Child> {
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start vllm docker container (is docker on PATH?)")?;
-    Ok(child)
+    Ok((child, container_name))
+}
+
+/// Stop a Docker container by name, waiting for it to exit.
+/// This is the correct way to terminate the vllm workload; killing the
+/// `docker run` client process alone leaves the container running.
+fn stop_docker_container(name: &str) {
+    let _ = Command::new("docker")
+        .arg("rm")
+        .arg("-f")
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn wait_for_health(url: &str, timeout_secs: u64) -> Result<()> {
