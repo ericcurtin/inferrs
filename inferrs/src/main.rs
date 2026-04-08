@@ -78,8 +78,10 @@ enum Commands {
 
 #[derive(Parser, Clone)]
 pub struct ServeArgs {
-    /// HuggingFace model ID (e.g. Qwen/Qwen3.5-0.8B)
-    pub model: String,
+    /// HuggingFace model ID (e.g. Qwen/Qwen3.5-0.8B).
+    /// When omitted, inferrs starts without loading a model and exposes the
+    /// Ollama-compatible API on port 11434 (same behaviour as `ollama serve`).
+    pub model: Option<String>,
 
     /// Git branch or tag on HuggingFace Hub
     #[arg(long, default_value = "main")]
@@ -101,9 +103,11 @@ pub struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0")]
     pub host: String,
 
-    /// Port to listen on
-    #[arg(long, default_value_t = 8080)]
-    pub port: u16,
+    /// Port to listen on.
+    /// Defaults to 8080 when a model is specified, or 11434 (Ollama default)
+    /// when no model is specified.
+    #[arg(long)]
+    pub port: Option<u16>,
 
     /// KV cache block size in tokens
     #[arg(long, default_value_t = 16)]
@@ -307,14 +311,25 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve(args) => {
-            tracing::info!("Starting inferrs server for model: {}", args.model);
+            match &args.model {
+                Some(m) => tracing::info!("Starting inferrs server for model: {}", m),
+                None => tracing::info!(
+                    "Starting inferrs server in Ollama-compatible mode (no model preloaded)"
+                ),
+            }
             server::run(args).await?;
         }
         Commands::Run(args) => {
             run::run(args)?;
         }
         Commands::Bench(args) => {
-            tracing::info!("Running benchmark for model: {}", args.serve.model);
+            tracing::info!(
+                "Running benchmark for model: {}",
+                args.serve
+                    .model
+                    .as_deref()
+                    .unwrap_or("<none — model required for bench>")
+            );
             bench::run(args)?;
         }
         Commands::Pull(args) => {

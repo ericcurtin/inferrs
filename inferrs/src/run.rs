@@ -96,13 +96,13 @@ pub struct RunArgs {
 impl RunArgs {
     fn to_serve_args(&self) -> ServeArgs {
         ServeArgs {
-            model: self.model.clone(),
+            model: Some(self.model.clone()),
             revision: self.revision.clone(),
             dtype: self.dtype.clone(),
             max_seq_len: 0,
             device: self.device.clone(),
             host: "0.0.0.0".to_string(),
-            port: 8080,
+            port: Some(8080),
             block_size: 16,
             initial_blocks: 16,
             max_blocks: 0,

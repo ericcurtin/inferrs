@@ -20,6 +20,8 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`,
   `/v1/models`, `/health`
 - **Anthropic-compatible API** — `/v1/messages` (streaming and non-streaming)
+- **Ollama-compatible API** — `/api/generate`, `/api/chat`, `/api/tags`,
+  `/api/ps`, `/api/show`, `/api/version`
 - **Hardware backends** — CPU, Metal (Apple Silicon), CUDA (NVIDIA), ROCm (AMD),
   Vulkan
 
@@ -46,6 +48,24 @@ scoop install inferrs
 ```bash
 inferrs run google/gemma-4-E2B-it
 ```
+
+## Serve
+
+### Serve a specific model (OpenAI/Anthropic/Ollama API on port 8080)
+
+```bash
+inferrs serve google/gemma-4-E2B-it
+```
+
+### Serve without a model (Ollama-compatible mode on port 11434)
+
+```bash
+inferrs serve
+```
+
+This behaves like `ollama serve`: the server starts on `0.0.0.0:11434`, responds
+`"Ollama is running"` at `GET /`, and exposes the full Ollama API. Any Ollama
+client — including the `ollama` CLI — can point at it directly.
 
 ## Architecture
 
