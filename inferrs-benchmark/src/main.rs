@@ -1,13 +1,20 @@
-//! HTTP-based comparative benchmark: inferrs vs llama-server.
+//! HTTP-based comparative benchmark: inferrs vs llama-server / vllm.
 //!
 //! Ports `scripts/benchmark.sh` to Rust so that benchmarks are runnable on
 //! macOS, Windows **and** Linux without requiring Bash or Python.
 //!
-//! The benchmark:
+//! Default benchmark (3 backends):
 //!   1. Starts `inferrs serve --quantize` and sends timed requests.
 //!   2. Starts `inferrs serve --turbo-quant=false --quantize` and sends timed requests.
 //!   3. Starts `llama-server -hf <model>` and sends timed requests.
 //!   4. Prints a summary table comparing all three backends.
+//!
+//! DGX Spark benchmark (`--dgx-spark`), runs 5 groups:
+//!   Group 1: llama-server 31B GGUF  vs  inferrs --quantize nvidia/Gemma-4-31B-IT-NVFP4
+//!   Group 2: llama-server 31B GGUF  vs  inferrs --quantize google/gemma-4-31B-it
+//!   Group 3: vllm google/gemma-4-31B-it  vs  inferrs --paged-attention google/gemma-4-31B-it
+//!   Group 4: vllm nvidia/Gemma-4-31B-IT-NVFP4  vs  inferrs --paged-attention nvidia/Gemma-4-31B-IT-NVFP4
+//!   Group 5: vllm google/gemma-4-E2B-it  vs  inferrs --paged-attention google/gemma-4-E2B-it
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -21,11 +28,11 @@ use clap::Parser;
 
 // ── CLI arguments ────────────────────────────────────────────────────────────
 
-/// Cross-platform comparative benchmark: inferrs vs llama-server.
+/// Cross-platform comparative benchmark: inferrs vs llama-server / vllm.
 #[derive(Parser, Clone)]
 #[command(
     name = "inferrs-benchmark",
-    about = "Compare inferrs vs llama-server over HTTP"
+    about = "Compare inferrs vs llama-server / vllm over HTTP"
 )]
 struct BenchmarkArgs {
     /// Number of timed benchmark runs per backend.
@@ -56,6 +63,10 @@ struct BenchmarkArgs {
     #[arg(long, default_value_t = 8181)]
     llama_port: u16,
 
+    /// Port for the `vllm serve` backend (DGX Spark benchmarks).
+    #[arg(long, default_value_t = 8888)]
+    vllm_port: u16,
+
     /// HuggingFace model ID for inferrs.
     #[arg(long, default_value = "google/gemma-4-E2B-it")]
     inferrs_model: String,
@@ -71,12 +82,21 @@ struct BenchmarkArgs {
     /// Override path to the inferrs binary.
     #[arg(long)]
     inferrs_bin: Option<PathBuf>,
+
+    /// Run the full DGX Spark benchmark suite (5 groups covering 31B and 2B
+    /// models with llama-server, vllm, and inferrs --paged-attention backends).
+    #[arg(long)]
+    dgx_spark: bool,
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let args = BenchmarkArgs::parse();
+
+    if args.dgx_spark {
+        return run_dgx_spark(&args);
+    }
 
     let inferrs_bin = resolve_inferrs_bin(&args);
     let prompt = generate_synthetic_prompt(args.prompt_len);
@@ -234,7 +254,453 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// ── DGX Spark benchmark suite ────────────────────────────────────────────────
+
+/// Run one benchmark backend and return its summary.
+///
+/// `label` is used for log messages only; `start_fn` spawns the server
+/// process; `port` is the port to hit.
+fn run_one_backend<F>(
+    args: &BenchmarkArgs,
+    label: &str,
+    port: u16,
+    prompt: &str,
+    start_fn: F,
+) -> Result<BenchSummary>
+where
+    F: FnOnce() -> Result<Child>,
+{
+    log_header(label);
+    let mut server = start_fn()?;
+    ok(&format!("{label} started (pid {})", server.id()));
+
+    let health = format!("http://127.0.0.1:{port}/health");
+    if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
+        err(&format!("{label} failed to start: {e}"));
+        let _ = server.kill();
+        let _ = server.wait();
+        bail!("server failed to start");
+    }
+
+    let mut tracker = PeakMemoryTracker::start(server.id());
+    let t_bench = Instant::now();
+    let summary_res = bench_http(
+        "127.0.0.1",
+        port,
+        args.warmup,
+        args.runs,
+        args.max_tokens,
+        prompt,
+    );
+    let elapsed = t_bench.elapsed();
+    let peak_mem_mb = tracker.stop();
+
+    let _ = server.kill();
+    let _ = server.wait();
+    ok(&format!(
+        "{label} stopped  (benchmark took {:.1}s)",
+        elapsed.as_secs_f64()
+    ));
+
+    let mut summary = summary_res?;
+    summary.peak_mem_mb = peak_mem_mb;
+    Ok(summary)
+}
+
+/// DGX Spark full benchmark suite.
+///
+/// Runs five groups sequentially. Within each group the reference backend
+/// (llama-server or vllm) is the baseline for relative comparisons.
+fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
+    let inferrs_bin = resolve_inferrs_bin(args);
+    let prompt = generate_synthetic_prompt(args.prompt_len);
+
+    // Ports assigned per group to avoid conflicts. We reuse the same three
+    // slots the default benchmark uses; servers are killed before the next
+    // group starts so there is no overlap.
+    let p_ref = args.llama_port; // reference backend (llama-server, groups 1-2)
+    let p_vllm = args.vllm_port; // reference backend (vllm, groups 3-5)
+    let p_inf = args.inferrs_port; // inferrs (turbo-quant on)
+    let p_tq = args.inferrs_tq_port; // inferrs (turbo-quant off)
+
+    // ── Group 1: llama-server 31B GGUF  vs  inferrs --quantize NVFP4 ────────
+    log_header("DGX Spark group 1/5 — llama-server 31B GGUF vs inferrs --quantize NVFP4");
+    let g1_llama = run_one_backend(
+        args,
+        "llama-server -hf ggml-org/gemma-4-31B-it-GGUF",
+        p_ref,
+        &prompt,
+        || start_llama_server("ggml-org/gemma-4-31B-it-GGUF", p_ref),
+    )?;
+    let g1_inferrs = run_one_backend(
+        args,
+        "inferrs serve --quantize nvidia/Gemma-4-31B-IT-NVFP4",
+        p_inf,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "nvidia/Gemma-4-31B-IT-NVFP4",
+                p_inf,
+                &["--quantize"],
+            )
+        },
+    )?;
+    let g1_inferrs_tq = run_one_backend(
+        args,
+        "inferrs serve --turbo-quant=false --quantize nvidia/Gemma-4-31B-IT-NVFP4",
+        p_tq,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "nvidia/Gemma-4-31B-IT-NVFP4",
+                p_tq,
+                &["--turbo-quant=false", "--quantize"],
+            )
+        },
+    )?;
+
+    // ── Group 2: llama-server 31B GGUF  vs  inferrs --quantize google 31B ───
+    log_header("DGX Spark group 2/5 — llama-server 31B GGUF vs inferrs --quantize google 31B");
+    let g2_llama = run_one_backend(
+        args,
+        "llama-server -hf ggml-org/gemma-4-31B-it-GGUF",
+        p_ref,
+        &prompt,
+        || start_llama_server("ggml-org/gemma-4-31B-it-GGUF", p_ref),
+    )?;
+    let g2_inferrs = run_one_backend(
+        args,
+        "inferrs serve --quantize google/gemma-4-31B-it",
+        p_inf,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-31B-it",
+                p_inf,
+                &["--quantize"],
+            )
+        },
+    )?;
+    let g2_inferrs_tq = run_one_backend(
+        args,
+        "inferrs serve --turbo-quant=false --quantize google/gemma-4-31B-it",
+        p_tq,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-31B-it",
+                p_tq,
+                &["--turbo-quant=false", "--quantize"],
+            )
+        },
+    )?;
+
+    // ── Group 3: vllm 31B google  vs  inferrs --paged-attention 31B google ──
+    log_header("DGX Spark group 3/5 — vllm google 31B vs inferrs --paged-attention google 31B");
+    let g3_vllm = run_one_backend(
+        args,
+        "vllm serve google/gemma-4-31B-it",
+        p_vllm,
+        &prompt,
+        || start_vllm_server("google/gemma-4-31B-it", p_vllm),
+    )?;
+    let g3_inferrs = run_one_backend(
+        args,
+        "inferrs serve --paged-attention google/gemma-4-31B-it",
+        p_inf,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-31B-it",
+                p_inf,
+                &["--paged-attention"],
+            )
+        },
+    )?;
+    let g3_inferrs_tq = run_one_backend(
+        args,
+        "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-31B-it",
+        p_tq,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-31B-it",
+                p_tq,
+                &["--turbo-quant=false", "--paged-attention"],
+            )
+        },
+    )?;
+
+    // ── Group 4: vllm 31B NVFP4  vs  inferrs --paged-attention 31B NVFP4 ───
+    log_header("DGX Spark group 4/5 — vllm nvidia 31B vs inferrs --paged-attention nvidia 31B");
+    let g4_vllm = run_one_backend(
+        args,
+        "vllm serve nvidia/Gemma-4-31B-IT-NVFP4",
+        p_vllm,
+        &prompt,
+        || start_vllm_server("nvidia/Gemma-4-31B-IT-NVFP4", p_vllm),
+    )?;
+    let g4_inferrs = run_one_backend(
+        args,
+        "inferrs serve --paged-attention nvidia/Gemma-4-31B-IT-NVFP4",
+        p_inf,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "nvidia/Gemma-4-31B-IT-NVFP4",
+                p_inf,
+                &["--paged-attention"],
+            )
+        },
+    )?;
+    let g4_inferrs_tq = run_one_backend(
+        args,
+        "inferrs serve --turbo-quant=false --paged-attention nvidia/Gemma-4-31B-IT-NVFP4",
+        p_tq,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "nvidia/Gemma-4-31B-IT-NVFP4",
+                p_tq,
+                &["--turbo-quant=false", "--paged-attention"],
+            )
+        },
+    )?;
+
+    // ── Group 5: vllm 2B google  vs  inferrs --paged-attention 2B google ────
+    log_header("DGX Spark group 5/5 — vllm google 2B vs inferrs --paged-attention google 2B");
+    let g5_vllm = run_one_backend(
+        args,
+        "vllm serve google/gemma-4-E2B-it",
+        p_vllm,
+        &prompt,
+        || start_vllm_server("google/gemma-4-E2B-it", p_vllm),
+    )?;
+    let g5_inferrs = run_one_backend(
+        args,
+        "inferrs serve --paged-attention google/gemma-4-E2B-it",
+        p_inf,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-E2B-it",
+                p_inf,
+                &["--paged-attention"],
+            )
+        },
+    )?;
+    let g5_inferrs_tq = run_one_backend(
+        args,
+        "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-E2B-it",
+        p_tq,
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-E2B-it",
+                p_tq,
+                &["--turbo-quant=false", "--paged-attention"],
+            )
+        },
+    )?;
+
+    // ── Combined results ─────────────────────────────────────────────────────
+    log_header("DGX Spark Results — All Groups");
+    println!(
+        "\nBenchmark settings: prompt_len={} tokens, max_tokens={}, runs={}, warmup={}\n",
+        args.prompt_len, args.max_tokens, args.runs, args.warmup
+    );
+
+    print_dgx_group(
+        "Group 1 — GGUF 31B: llama-server vs inferrs --quantize nvidia NVFP4",
+        "llama-server -hf ggml-org/gemma-4-31B-it-GGUF",
+        &g1_llama,
+        "inferrs serve --quantize nvidia/Gemma-4-31B-IT-NVFP4",
+        &g1_inferrs,
+        "inferrs serve --turbo-quant=false --quantize nvidia/Gemma-4-31B-IT-NVFP4",
+        &g1_inferrs_tq,
+    );
+
+    print_dgx_group(
+        "Group 2 — GGUF 31B: llama-server vs inferrs --quantize google 31B",
+        "llama-server -hf ggml-org/gemma-4-31B-it-GGUF",
+        &g2_llama,
+        "inferrs serve --quantize google/gemma-4-31B-it",
+        &g2_inferrs,
+        "inferrs serve --turbo-quant=false --quantize google/gemma-4-31B-it",
+        &g2_inferrs_tq,
+    );
+
+    print_dgx_group(
+        "Group 3 — Paged attn 31B: vllm vs inferrs google 31B",
+        "vllm serve google/gemma-4-31B-it",
+        &g3_vllm,
+        "inferrs serve --paged-attention google/gemma-4-31B-it",
+        &g3_inferrs,
+        "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-31B-it",
+        &g3_inferrs_tq,
+    );
+    println!("  Note: vllm peak mem reflects the docker client process, not the container.");
+
+    print_dgx_group(
+        "Group 4 — Paged attn 31B: vllm vs inferrs nvidia NVFP4",
+        "vllm serve nvidia/Gemma-4-31B-IT-NVFP4",
+        &g4_vllm,
+        "inferrs serve --paged-attention nvidia/Gemma-4-31B-IT-NVFP4",
+        &g4_inferrs,
+        "inferrs serve --turbo-quant=false --paged-attention nvidia/Gemma-4-31B-IT-NVFP4",
+        &g4_inferrs_tq,
+    );
+    println!("  Note: vllm peak mem reflects the docker client process, not the container.");
+
+    print_dgx_group(
+        "Group 5 — Paged attn 2B: vllm vs inferrs google 2B",
+        "vllm serve google/gemma-4-E2B-it",
+        &g5_vllm,
+        "inferrs serve --paged-attention google/gemma-4-E2B-it",
+        &g5_inferrs,
+        "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-E2B-it",
+        &g5_inferrs_tq,
+    );
+    println!("  Note: vllm peak mem reflects the docker client process, not the container.");
+
+    Ok(())
+}
+
+/// Print a summary table for one DGX Spark group, with relative comparison vs
+/// the reference backend.
+#[allow(clippy::too_many_arguments)]
+fn print_dgx_group(
+    title: &str,
+    ref_name: &str,
+    ref_summary: &BenchSummary,
+    inferrs_name: &str,
+    inferrs_summary: &BenchSummary,
+    inferrs_tq_name: &str,
+    inferrs_tq_summary: &BenchSummary,
+) {
+    fn fmt(v: Option<f64>, unit: &str) -> String {
+        match v {
+            Some(val) => format!("{val:.2} {unit}"),
+            None => "N/A".to_string(),
+        }
+    }
+
+    type Row = (String, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    let rows: Vec<Row> = vec![
+        (
+            ref_name.to_string(),
+            ref_summary.ttft_ms,
+            ref_summary.prefill_tps,
+            ref_summary.decode_tps,
+            ref_summary.peak_mem_mb,
+        ),
+        (
+            inferrs_name.to_string(),
+            inferrs_summary.ttft_ms,
+            inferrs_summary.prefill_tps,
+            inferrs_summary.decode_tps,
+            inferrs_summary.peak_mem_mb,
+        ),
+        (
+            inferrs_tq_name.to_string(),
+            inferrs_tq_summary.ttft_ms,
+            inferrs_tq_summary.prefill_tps,
+            inferrs_tq_summary.decode_tps,
+            inferrs_tq_summary.peak_mem_mb,
+        ),
+    ];
+
+    const W_TTFT: usize = 12;
+    const W_PFILL: usize = 14;
+    const W_DEC: usize = 13;
+    const W_MEM: usize = 14;
+    let w = rows
+        .iter()
+        .map(|(name, _, _, _, _)| name.len())
+        .max()
+        .unwrap_or(0)
+        .max("Backend".len());
+    let total_w = w + 2 + W_TTFT + 2 + W_PFILL + 2 + W_DEC + 2 + W_MEM;
+
+    println!("\n{title}");
+    println!("{}", "═".repeat(total_w));
+    println!(
+        "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+        "Backend", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
+    );
+    println!("{}", "─".repeat(total_w));
+    for (name, ttft, pfill, dec, mem) in &rows {
+        println!(
+            "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+            name,
+            fmt(*ttft, "ms"),
+            fmt(*pfill, "t/s"),
+            fmt(*dec, "t/s"),
+            fmt(*mem, "MB"),
+        );
+    }
+    println!("{}", "═".repeat(total_w));
+
+    // Relative comparison vs reference backend.
+    let base_ttft = ref_summary.ttft_ms;
+    let base_pfill = ref_summary.prefill_tps;
+    let base_dec = ref_summary.decode_tps;
+    let base_mem = ref_summary.peak_mem_mb;
+
+    if let (Some(bt), Some(bp), Some(bd)) = (base_ttft, base_pfill, base_dec) {
+        println!(
+            "\n  Relative to {ref_name} (higher prefill/decode is better; lower TTFT/mem is better):"
+        );
+        for (name, ttft, pfill, dec, mem) in &rows[1..] {
+            if let (Some(t), Some(p), Some(d)) = (ttft, pfill, dec) {
+                let d_ttft = (t - bt) / bt * 100.0;
+                let d_pfill = (p - bp) / bp * 100.0;
+                let d_dec = (d - bd) / bd * 100.0;
+                let sign = |x: f64| if x >= 0.0 { "+" } else { "" };
+                println!("    {name}");
+                println!("      TTFT:     {}{d_ttft:.1}%", sign(d_ttft));
+                println!("      Prefill:  {}{d_pfill:.1}%", sign(d_pfill));
+                println!("      Decode:   {}{d_dec:.1}%", sign(d_dec));
+                if let (Some(m), Some(bm)) = (mem, base_mem) {
+                    let d_mem = (m - bm) / bm * 100.0;
+                    println!("      Peak mem: {}{d_mem:.1}%", sign(d_mem));
+                }
+            }
+        }
+    }
+    println!();
+}
+
 // ── Server management ────────────────────────────────────────────────────────
+
+/// Resolve the HuggingFace hub cache directory using the same precedence as
+/// the HF Python library: `HUGGINGFACE_HUB_CACHE` → `$HF_HOME/hub` →
+/// `$XDG_CACHE_HOME/huggingface/hub` → `~/.cache/huggingface/hub`.
+fn hf_hub_cache_dir() -> String {
+    if let Ok(v) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+        return v;
+    }
+    if let Ok(hf_home) = std::env::var("HF_HOME") {
+        return format!("{hf_home}/hub");
+    }
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        return format!("{xdg}/huggingface/hub");
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/root".to_string());
+    format!("{home}/.cache/huggingface/hub")
+}
 
 /// Resolve the inferrs binary path: explicit override → sibling of the current
 /// executable → `inferrs` on PATH.
@@ -291,6 +757,45 @@ fn start_llama_server(model: &str, port: u16) -> Result<Child> {
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start llama-server (is it on PATH?)")?;
+    Ok(child)
+}
+
+fn start_vllm_server(model: &str, port: u16) -> Result<Child> {
+    // On DGX Spark vllm must run inside its Docker image because the system
+    // CUDA stack is too new for the stock vllm wheel.  We mount the host
+    // HuggingFace cache read-only so the container uses already-downloaded
+    // weights without re-pulling.
+    //
+    // Memory tracking limitation: the Child returned here is the `docker run`
+    // client process (lightweight), not the container workload.
+    // PeakMemoryTracker will therefore report near-zero memory for vllm groups;
+    // the benchmark output notes this explicitly.
+    let hf_hub_cache = hf_hub_cache_dir();
+    let volume = format!("{hf_hub_cache}:/root/.cache/huggingface/hub:ro");
+
+    let child = Command::new("docker")
+        .arg("run")
+        .arg("--rm")
+        .arg("--runtime=nvidia")
+        .arg("--gpus=all")
+        .arg("--network=host")
+        .arg("-v")
+        .arg(&volume)
+        .arg("-e")
+        .arg("HF_TOKEN")
+        .arg("-e")
+        .arg("HUGGING_FACE_HUB_TOKEN")
+        .arg("vllm/vllm-openai:gemma4-cu130")
+        .arg("--model")
+        .arg(model)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start vllm docker container (is docker on PATH?)")?;
     Ok(child)
 }
 
