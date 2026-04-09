@@ -165,7 +165,10 @@ pub fn oci_bundle(reference: &str) -> Option<PathBuf> {
 fn find_oci_helper() -> Result<PathBuf> {
     // 1. Next to our own binary
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap_or(exe.as_ref()).join("inferrs-oci-pull");
+        let sibling = exe
+            .parent()
+            .unwrap_or(exe.as_ref())
+            .join("inferrs-oci-pull");
         if sibling.exists() {
             return Ok(sibling);
         }
@@ -242,7 +245,10 @@ mod tests {
         assert_eq!(classify_reference("llama"), RefKind::Oci);
 
         // org/model → HuggingFace
-        assert_eq!(classify_reference("Qwen/Qwen3.5-0.8B"), RefKind::HuggingFace);
+        assert_eq!(
+            classify_reference("Qwen/Qwen3.5-0.8B"),
+            RefKind::HuggingFace
+        );
         assert_eq!(classify_reference("myorg/mymodel"), RefKind::HuggingFace);
 
         // Explicit HF prefixes → HuggingFace
@@ -253,15 +259,15 @@ mod tests {
         );
 
         // Explicit registry → OCI
-        assert_eq!(classify_reference("docker.io/ai/gemma3:latest"), RefKind::Oci);
+        assert_eq!(
+            classify_reference("docker.io/ai/gemma3:latest"),
+            RefKind::Oci
+        );
         assert_eq!(
             classify_reference("registry.example.com/org/model:v1"),
             RefKind::Oci
         );
-        assert_eq!(
-            classify_reference("docker.io/myorg/mymodel"),
-            RefKind::Oci
-        );
+        assert_eq!(classify_reference("docker.io/myorg/mymodel"), RefKind::Oci);
         assert_eq!(classify_reference("localhost:5000/model"), RefKind::Oci);
     }
 }

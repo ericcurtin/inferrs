@@ -116,7 +116,11 @@ pub fn load_bundle(bundle_path: &Path) -> Result<ModelFiles> {
     // ── Tokenizer config (optional) ─────────────────────────────────────
     let tokenizer_config_path = {
         let p = model_dir.join("tokenizer_config.json");
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     };
 
     // ── Detect weight format ────────────────────────────────────────────
@@ -132,9 +136,19 @@ pub fn load_bundle(bundle_path: &Path) -> Result<ModelFiles> {
     };
 
     if is_gguf {
-        load_gguf_bundle(config_path, tokenizer_path, tokenizer_config_path, &model_dir)
+        load_gguf_bundle(
+            config_path,
+            tokenizer_path,
+            tokenizer_config_path,
+            &model_dir,
+        )
     } else {
-        load_safetensors_bundle(config_path, tokenizer_path, tokenizer_config_path, &model_dir)
+        load_safetensors_bundle(
+            config_path,
+            tokenizer_path,
+            tokenizer_config_path,
+            &model_dir,
+        )
     }
 }
 
