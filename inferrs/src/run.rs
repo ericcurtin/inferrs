@@ -770,3 +770,39 @@ fn print_dim(text: &str) {
     )
     .ok();
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `--think-filter=false` must parse to `false`.
+    ///
+    /// Before the fix (using `default_value_t = true` without `num_args(1)`),
+    /// clap did not consume the `=false` value correctly with `require_equals`,
+    /// causing the flag to always be `true` or the parse to fail.
+    #[test]
+    fn think_filter_false() {
+        let args = RunArgs::try_parse_from(["inferrs", "some-model", "--think-filter=false"])
+            .expect("should parse --think-filter=false");
+        assert!(!args.think_filter, "--think-filter=false should set think_filter to false");
+    }
+
+    /// `--think-filter=true` must parse to `true`.
+    #[test]
+    fn think_filter_true() {
+        let args = RunArgs::try_parse_from(["inferrs", "some-model", "--think-filter=true"])
+            .expect("should parse --think-filter=true");
+        assert!(args.think_filter, "--think-filter=true should set think_filter to true");
+    }
+
+    /// When `--think-filter` is omitted, the default should be `true`.
+    #[test]
+    fn think_filter_default_is_true() {
+        let args = RunArgs::try_parse_from(["inferrs", "some-model"])
+            .expect("should parse without --think-filter");
+        assert!(args.think_filter, "default think_filter should be true");
+    }
+}
