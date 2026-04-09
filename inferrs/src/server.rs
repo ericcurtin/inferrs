@@ -466,6 +466,22 @@ pub struct OllamaModelDetails {
     pub quantization_level: String,
 }
 
+/// Placeholder SHA-256 digest used for Ollama-compat model entries (we don't
+/// track real digests for HuggingFace safetensor weights).
+const OLLAMA_PLACEHOLDER_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+impl Default for OllamaModelDetails {
+    fn default() -> Self {
+        Self {
+            format: "safetensors".to_string(),
+            family: String::new(),
+            parameter_size: String::new(),
+            quantization_level: String::new(),
+        }
+    }
+}
+
 /// `GET /api/ps` response (running models).
 #[derive(Debug, Serialize)]
 pub struct OllamaPsResponse {
@@ -1605,14 +1621,8 @@ async fn ollama_tags(State(state): State<Arc<AppState>>) -> Json<OllamaListRespo
             model: id.clone(),
             modified_at: "2025-01-01T00:00:00Z".to_string(),
             size: 0,
-            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
-            details: OllamaModelDetails {
-                format: "safetensors".to_string(),
-                family: "".to_string(),
-                parameter_size: "".to_string(),
-                quantization_level: "".to_string(),
-            },
+            digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
+            details: OllamaModelDetails::default(),
         }],
         None => vec![],
     };
@@ -1626,14 +1636,8 @@ async fn ollama_ps(State(state): State<Arc<AppState>>) -> Json<OllamaPsResponse>
             name: id.clone(),
             model: id.clone(),
             size: 0,
-            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
-            details: OllamaModelDetails {
-                format: "safetensors".to_string(),
-                family: "".to_string(),
-                parameter_size: "".to_string(),
-                quantization_level: "".to_string(),
-            },
+            digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
+            details: OllamaModelDetails::default(),
             expires_at: "0001-01-01T00:00:00Z".to_string(),
             size_vram: 0,
         }],
@@ -1666,12 +1670,7 @@ async fn ollama_show(
         modelfile: format!("FROM {}", req.model),
         parameters: String::new(),
         template: String::new(),
-        details: OllamaModelDetails {
-            format: "safetensors".to_string(),
-            family: "".to_string(),
-            parameter_size: "".to_string(),
-            quantization_level: "".to_string(),
-        },
+        details: OllamaModelDetails::default(),
         model_info: serde_json::Value::Object(serde_json::Map::new()),
     }))
 }
@@ -1747,34 +1746,125 @@ fn ollama_options_to_params(
     (temperature, top_p, top_k, repetition_penalty, num_predict)
 }
 
+/// Shared Ollama model/tokenizer validation.  Returns the tokenizer when the
+/// requested model matches the loaded model, or the appropriate error response.
+type OllamaError = (StatusCode, Json<serde_json::Value>);
+
+fn require_ollama_tokenizer<'a>(
+    state: &'a AppState,
+    model: &str,
+) -> Result<&'a Tokenizer, OllamaError> {
+    match state.tokenizer.as_deref() {
+        Some(t) if state.model_id.as_deref() == Some(model) => Ok(t),
+        Some(_) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("model '{}' not found", model)
+            })),
+        )),
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("model '{}' is not loaded — start inferrs with a model argument", model)
+            })),
+        )),
+    }
+}
+
+/// Dispatch a streaming Ollama generation request to the engine.
+///
+/// Registers a per-request channel in the stream registry, sends the engine
+/// request, and returns `Ok(token_rx)` on success.
+async fn ollama_dispatch_stream(
+    state: &AppState,
+    request_id: &str,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+) -> Result<mpsc::Receiver<StreamToken>, OllamaError> {
+    let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
+    state
+        .stream_registry
+        .lock()
+        .await
+        .insert(request_id.to_string(), token_tx);
+
+    let engine_req = EngineRequest::GenerateStream {
+        request_id: request_id.to_string(),
+        prompt_tokens,
+        audio: None,
+        sampling_params: params,
+        output_buf: state.output_buf.clone(),
+    };
+
+    if state.engine_tx.send(engine_req).await.is_err() {
+        state
+            .stream_registry
+            .lock()
+            .await
+            .remove(&request_id.to_string());
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "engine unavailable"})),
+        ));
+    }
+
+    Ok(token_rx)
+}
+
+/// Dispatch a non-streaming Ollama generation request to the engine.
+///
+/// Sends the engine request and waits for the result.
+async fn ollama_dispatch_blocking(
+    state: &AppState,
+    request_id: String,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+) -> Result<GenerationResult, OllamaError> {
+    let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+
+    let engine_req = EngineRequest::Generate {
+        request_id,
+        prompt_tokens,
+        audio: None,
+        sampling_params: params,
+        response_tx,
+    };
+
+    if state.engine_tx.send(engine_req).await.is_err() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "engine unavailable"})),
+        ));
+    }
+
+    response_rx.await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "engine dropped the request"})),
+        )
+    })
+}
+
+/// Tokenize a prompt and validate its length for an Ollama request.
+fn ollama_check_prompt(prompt_tokens: &[u32], max_seq_len: usize) -> Result<(), OllamaError> {
+    if let Err((status, _)) = check_prompt_length(prompt_tokens.len(), max_seq_len) {
+        return Err((
+            status,
+            Json(serde_json::json!({"error": "prompt too long"})),
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /api/generate` — Ollama text generation endpoint.
 async fn ollama_generate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OllamaGenerateRequest>,
-) -> impl IntoResponse {
+) -> Result<axum::response::Response, OllamaError> {
     let request_id = format!("gen-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
-    // Ensure a model is loaded and the request targets the loaded model.
-    let tokenizer = match state.tokenizer.as_deref() {
-        Some(t) if state.model_id.as_deref() == Some(req.model.as_str()) => t,
-        Some(_) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("model '{}' not found", req.model)
-                })),
-            ));
-        }
-        None => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": format!("model '{}' is not loaded — start inferrs with a model argument", req.model)
-                })),
-            ));
-        }
-    };
+    let tokenizer = require_ollama_tokenizer(&state, &req.model)?;
 
     let prompt = req.prompt.as_deref().unwrap_or("");
     if prompt.is_empty() {
@@ -1792,38 +1882,23 @@ async fn ollama_generate(
     // Tokenize: apply the chat template by default; skip it only when raw=true.
     let is_raw = req.raw.unwrap_or(false);
     let prompt_tokens = if is_raw {
-        match tokenizer.encode(prompt, true) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
-                ));
-            }
-        }
+        tokenizer.encode(prompt, true)
     } else {
         let msgs = vec![ChatMessage {
             role: Role::User,
             content: prompt.to_string(),
             audio: None,
         }];
-        match tokenizer.apply_chat_template_and_encode(&msgs) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
-                ));
-            }
-        }
-    };
-
-    if let Err((status, _)) = check_prompt_length(prompt_tokens.len(), state.max_seq_len) {
-        return Err((
-            status,
-            Json(serde_json::json!({"error": "prompt too long"})),
-        ));
+        tokenizer.apply_chat_template_and_encode(&msgs)
     }
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+        )
+    })?;
+
+    ollama_check_prompt(&prompt_tokens, state.max_seq_len)?;
 
     let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
         ollama_options_to_params(req.options.as_ref(), &state.default_params);
@@ -1840,28 +1915,7 @@ async fn ollama_generate(
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
     if is_stream {
-        let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
-        state
-            .stream_registry
-            .lock()
-            .await
-            .insert(request_id.clone(), token_tx);
-
-        let engine_req = EngineRequest::GenerateStream {
-            request_id: request_id.clone(),
-            prompt_tokens,
-            audio: None,
-            sampling_params: params,
-            output_buf: state.output_buf.clone(),
-        };
-
-        if state.engine_tx.send(engine_req).await.is_err() {
-            state.stream_registry.lock().await.remove(&request_id);
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "engine unavailable"})),
-            ));
-        }
+        let token_rx = ollama_dispatch_stream(&state, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
         let stream = make_ollama_generate_stream(token_rx, model_name, created_at);
@@ -1871,39 +1925,18 @@ async fn ollama_generate(
         )
             .into_response())
     } else {
-        let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+        let result = ollama_dispatch_blocking(&state, request_id, prompt_tokens, params).await?;
 
-        let engine_req = EngineRequest::Generate {
-            request_id,
-            prompt_tokens: prompt_tokens.clone(),
-            audio: None,
-            sampling_params: params,
-            response_tx,
-        };
-
-        if state.engine_tx.send(engine_req).await.is_err() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "engine unavailable"})),
-            ));
-        }
-
-        match response_rx.await {
-            Ok(result) => Ok(Json(OllamaGenerateResponse {
-                model: req.model,
-                created_at,
-                response: result.output_text,
-                done: true,
-                done_reason: Some(ollama_done_reason(&result.finish_reason)),
-                prompt_eval_count: result.prompt_tokens,
-                eval_count: result.completion_tokens,
-            })
-            .into_response()),
-            Err(_) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "engine dropped the request"})),
-            )),
-        }
+        Ok(Json(OllamaGenerateResponse {
+            model: req.model,
+            created_at,
+            response: result.output_text,
+            done: true,
+            done_reason: Some(ollama_done_reason(&result.finish_reason)),
+            prompt_eval_count: result.prompt_tokens,
+            eval_count: result.completion_tokens,
+        })
+        .into_response())
     }
 }
 
@@ -1959,30 +1992,11 @@ fn make_ollama_generate_stream(
 async fn ollama_chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OllamaChatRequest>,
-) -> impl IntoResponse {
+) -> Result<axum::response::Response, OllamaError> {
     let request_id = format!("chat-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
-    // Ensure a model is loaded and the request targets the loaded model.
-    let tokenizer = match state.tokenizer.as_deref() {
-        Some(t) if state.model_id.as_deref() == Some(req.model.as_str()) => t,
-        Some(_) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("model '{}' not found", req.model)
-                })),
-            ));
-        }
-        None => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": format!("model '{}' is not loaded — start inferrs with a model argument", req.model)
-                })),
-            ));
-        }
-    };
+    let tokenizer = require_ollama_tokenizer(&state, &req.model)?;
 
     // Convert Ollama messages to internal ChatMessage format.
     let chat_messages: Vec<ChatMessage> = req
@@ -2002,22 +2016,16 @@ async fn ollama_chat(
         })
         .collect();
 
-    let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&chat_messages) {
-        Ok(t) => t,
-        Err(e) => {
-            return Err((
+    let prompt_tokens = tokenizer
+        .apply_chat_template_and_encode(&chat_messages)
+        .map_err(|e| {
+            (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
-            ));
-        }
-    };
+            )
+        })?;
 
-    if let Err((status, _)) = check_prompt_length(prompt_tokens.len(), state.max_seq_len) {
-        return Err((
-            status,
-            Json(serde_json::json!({"error": "prompt too long"})),
-        ));
-    }
+    ollama_check_prompt(&prompt_tokens, state.max_seq_len)?;
 
     let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
         ollama_options_to_params(req.options.as_ref(), &state.default_params);
@@ -2034,28 +2042,7 @@ async fn ollama_chat(
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
     if is_stream {
-        let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
-        state
-            .stream_registry
-            .lock()
-            .await
-            .insert(request_id.clone(), token_tx);
-
-        let engine_req = EngineRequest::GenerateStream {
-            request_id: request_id.clone(),
-            prompt_tokens,
-            audio: None,
-            sampling_params: params,
-            output_buf: state.output_buf.clone(),
-        };
-
-        if state.engine_tx.send(engine_req).await.is_err() {
-            state.stream_registry.lock().await.remove(&request_id);
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "engine unavailable"})),
-            ));
-        }
+        let token_rx = ollama_dispatch_stream(&state, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
         let stream = make_ollama_chat_stream(token_rx, model_name, created_at);
@@ -2065,42 +2052,21 @@ async fn ollama_chat(
         )
             .into_response())
     } else {
-        let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
+        let result = ollama_dispatch_blocking(&state, request_id, prompt_tokens, params).await?;
 
-        let engine_req = EngineRequest::Generate {
-            request_id,
-            prompt_tokens,
-            audio: None,
-            sampling_params: params,
-            response_tx,
-        };
-
-        if state.engine_tx.send(engine_req).await.is_err() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "engine unavailable"})),
-            ));
-        }
-
-        match response_rx.await {
-            Ok(result) => Ok(Json(OllamaChatResponse {
-                model: req.model,
-                created_at,
-                message: OllamaChatMessage {
-                    role: "assistant".to_string(),
-                    content: result.output_text,
-                },
-                done: true,
-                done_reason: Some(ollama_done_reason(&result.finish_reason)),
-                prompt_eval_count: result.prompt_tokens,
-                eval_count: result.completion_tokens,
-            })
-            .into_response()),
-            Err(_) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "engine dropped the request"})),
-            )),
-        }
+        Ok(Json(OllamaChatResponse {
+            model: req.model,
+            created_at,
+            message: OllamaChatMessage {
+                role: "assistant".to_string(),
+                content: result.output_text,
+            },
+            done: true,
+            done_reason: Some(ollama_done_reason(&result.finish_reason)),
+            prompt_eval_count: result.prompt_tokens,
+            eval_count: result.completion_tokens,
+        })
+        .into_response())
     }
 }
 
