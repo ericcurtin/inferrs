@@ -1748,12 +1748,13 @@ fn ollama_options_to_params(
 
 /// Shared Ollama model/tokenizer validation.  Returns the tokenizer when the
 /// requested model matches the loaded model, or the appropriate error response.
-type OllamaError = (StatusCode, Json<serde_json::Value>);
+/// HTTP error response type for Ollama-compatible endpoints.
+type OllamaHttpError = (StatusCode, Json<serde_json::Value>);
 
 fn require_ollama_tokenizer<'a>(
     state: &'a AppState,
     model: &str,
-) -> Result<&'a Tokenizer, OllamaError> {
+) -> Result<&'a Tokenizer, OllamaHttpError> {
     match state.tokenizer.as_deref() {
         Some(t) if state.model_id.as_deref() == Some(model) => Ok(t),
         Some(_) => Err((
@@ -1780,7 +1781,7 @@ async fn ollama_dispatch_stream(
     request_id: &str,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
-) -> Result<mpsc::Receiver<StreamToken>, OllamaError> {
+) -> Result<mpsc::Receiver<StreamToken>, OllamaHttpError> {
     let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
     state
         .stream_registry
@@ -1819,7 +1820,7 @@ async fn ollama_dispatch_blocking(
     request_id: String,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
-) -> Result<GenerationResult, OllamaError> {
+) -> Result<GenerationResult, OllamaHttpError> {
     let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
 
     let engine_req = EngineRequest::Generate {
@@ -1845,12 +1846,18 @@ async fn ollama_dispatch_blocking(
     })
 }
 
-/// Tokenize a prompt and validate its length for an Ollama request.
-fn ollama_check_prompt(prompt_tokens: &[u32], max_seq_len: usize) -> Result<(), OllamaError> {
-    if let Err((status, _)) = check_prompt_length(prompt_tokens.len(), max_seq_len) {
+/// Validate prompt length for an Ollama request.
+fn ollama_check_prompt(prompt_tokens: &[u32], max_seq_len: usize) -> Result<(), OllamaHttpError> {
+    if max_seq_len != usize::MAX && prompt_tokens.len() >= max_seq_len {
         return Err((
-            status,
-            Json(serde_json::json!({"error": "prompt too long"})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Prompt length ({} tokens) exceeds the model's maximum context length ({} tokens).",
+                    prompt_tokens.len(),
+                    max_seq_len
+                )
+            })),
         ));
     }
     Ok(())
@@ -1860,7 +1867,7 @@ fn ollama_check_prompt(prompt_tokens: &[u32], max_seq_len: usize) -> Result<(), 
 async fn ollama_generate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OllamaGenerateRequest>,
-) -> Result<axum::response::Response, OllamaError> {
+) -> Result<axum::response::Response, OllamaHttpError> {
     let request_id = format!("gen-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
@@ -1992,7 +1999,7 @@ fn make_ollama_generate_stream(
 async fn ollama_chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OllamaChatRequest>,
-) -> Result<axum::response::Response, OllamaError> {
+) -> Result<axum::response::Response, OllamaHttpError> {
     let request_id = format!("chat-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
