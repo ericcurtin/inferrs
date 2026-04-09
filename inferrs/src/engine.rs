@@ -488,18 +488,17 @@ fn check_stop(
     None
 }
 
-/// Query the total memory available on `device`.
+/// Query the free memory available on `device` after model weights are loaded.
 ///
 /// Each backend uses its own native API so that `--paged-attention=<fraction>`
-/// is relative to the actual device memory rather than a hardcoded guess.
+/// is relative to the **free** memory available for KV blocks, not total memory.
+/// Using free memory ensures the KV block allocation fits in VRAM after the
+/// model weights have already been loaded.
 ///
-/// * **Metal** – `MTLDevice.recommendedMaxWorkingSetSize`, the OS-reported
-///   upper bound for the GPU's working set on Apple Silicon.
-/// * **CUDA**  – `cuDeviceTotalMem` via cudarc's `CudaContext::total_mem()`.
-/// * **CANN**  – `aclrtGetMemInfo(ACL_HBM_MEM, &free, &total)` via dlopen,
-///   querying HBM (High Bandwidth Memory) on the Ascend NPU.  Falls back to
-///   an 8 GiB heuristic when the CANN runtime is not reachable.
-/// * **CPU**   – 4 GiB conservative fallback (Candle has no RAM query API).
+/// * **Metal** – `MTLDevice.recommendedMaxWorkingSetSize` (Apple Silicon).
+/// * **CUDA**  – `cuMemGetInfo` via cudarc runtime, returning free bytes.
+/// * **CANN**  – `aclrtGetMemInfo(ACL_HBM_MEM, &free, &total)` via dlopen.
+/// * **CPU**   – 4 GiB conservative fallback.
 fn query_device_memory(device: &Device) -> usize {
     match device {
         #[cfg(target_os = "macos")]
@@ -508,13 +507,17 @@ fn query_device_memory(device: &Device) -> usize {
             target_os = "linux",
             all(target_os = "windows", target_arch = "x86_64")
         ))]
-        Device::Cuda(cuda_dev) => {
-            // CudaStream::context() returns &Arc<CudaContext>, which has total_mem().
-            match cuda_dev.cuda_stream().context().total_mem() {
-                Ok(bytes) => bytes,
+        Device::Cuda(_cuda_dev) => {
+            // Use cuMemGetInfo to get free memory after model weights are loaded.
+            // This is the correct baseline for --paged-attention=<fraction>: the
+            // fraction should be relative to what is actually free, not total VRAM.
+            // Using total_mem() would try to allocate >100% of VRAM when the model
+            // weights already occupy a significant fraction (e.g. 62 GB of 128 GB).
+            match cudarc::runtime::result::get_mem_info() {
+                Ok((free, _total)) => free,
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to query CUDA device memory ({e}); falling back to 8 GiB heuristic"
+                        "Failed to query CUDA free memory ({e}); falling back to 8 GiB heuristic"
                     );
                     8 * 1024 * 1024 * 1024
                 }
@@ -645,15 +648,13 @@ pub fn attach_paged_kv_if_requested(
         _ => 2, // f16 / bf16
     };
 
-    // Query actual device memory so that `memory_fraction` is relative to the
-    // real total, not a hardcoded guess.  Each backend exposes its own API:
-    //
-    //   Metal  → MTLDevice.recommendedMaxWorkingSetSize  (Apple Silicon unified memory)
-    //   CUDA   → cuMemGetInfo / cuDeviceTotalMem         (via cudarc)
-    //   CPU    → 4 GiB conservative fallback
+    // Query free device memory after model weights are loaded so that
+    // `memory_fraction` is relative to what is actually available for KV
+    // blocks.  Using total memory would try to allocate more than what is
+    // free when the model weights already occupy a large fraction of VRAM.
     let total_memory_bytes: usize = query_device_memory(device);
     tracing::info!(
-        "Device total memory: {:.2} GiB",
+        "Device free memory (post model load): {:.2} GiB",
         total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
