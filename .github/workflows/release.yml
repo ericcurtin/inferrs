@@ -178,25 +178,12 @@ jobs:
           cargo build --release --target aarch64-unknown-linux-gnu \
             -p inferrs -p inferrs-backend-cuda
 
-      # ── ROCm backend plugin (aarch64 supports ROCm on MI300A / Radeon) ──
-      # amdgpu-install does not yet provide a pre-built sbsa ROCm package in
-      # the same DEB form as x86_64, so we install the upstream ROCm apt repo
-      # directly (supported since ROCm 6.0 for sbsa/aarch64).
-      - name: Install ROCm toolkit
-        run: |
-          wget -q https://repo.radeon.com/amdgpu-install/6.3.3/ubuntu/noble/amdgpu-install_6.3.60303-1_all.deb
-          sudo dpkg -i amdgpu-install_6.3.60303-1_all.deb || true
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            rocm-dev hip-dev
-
-      - name: Build ROCm backend plugin
-        env:
-          ROCM_PATH: /opt/rocm
-          HIP_PATH: /opt/rocm
-        run: |
-          cargo build --release --target aarch64-unknown-linux-gnu \
-            -p inferrs-backend-rocm
+      # ── ROCm backend plugin ───────────────────────────────────────────────
+      # AMD's ROCm apt repository only publishes binary-amd64 packages; there
+      # are no pre-built aarch64/sbsa DEB packages available via amdgpu-install
+      # for Ubuntu 24.04.  Skip the ROCm plugin on this platform — the runtime
+      # will simply not find libinferrs_backend_rocm.so and will fall back to
+      # other available backends.
 
       # ── MUSA backend plugin (aarch64: Moore Threads ships SDK for ARM) ──
       - name: Build MUSA backend plugin
@@ -273,24 +260,35 @@ jobs:
           cargo build --release --target x86_64-pc-windows-msvc `
             -p inferrs -p inferrs-backend-cuda
 
-      # ── ROCm backend plugin (Windows x86_64, ROCm 5.5+ HIP SDK) ─────────
-      # AMD provides a native HIP SDK installer for Windows. The choco package
-      # `amd-hip-sdk` wraps the official AMD HIP SDK installer.  The plugin is
-      # built separately from the CUDA steps because hipcc sets conflicting
-      # environment variables (ROCM_PATH vs CUDA_PATH).
+      # ── ROCm backend plugin (Windows x86_64, ROCm HIP SDK) ──────────────
+      # AMD does not publish the HIP SDK on Chocolatey; install via the
+      # official AMD installer downloaded directly from AMD's CDN.
+      # The installer accepts `-install` for a silent, non-interactive run.
+      # Use the WinSvr2022 variant which is sized for server/CI workloads and
+      # matches the windows-2022 runner.
       #
       # The resulting DLL uses the same `inferrs_backend_probe` ABI as the
       # Linux .so, so the Windows runtime LoadLibrary probe finds it using
       # the same logic as on Linux.
       - name: Install AMD HIP SDK (Windows)
         shell: pwsh
-        run: choco install --no-progress -y amd-hip-sdk
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $installer = "$env:RUNNER_TEMP\AMD-HIP-SDK.exe"
+          Invoke-WebRequest `
+            -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-24.Q4-WinSvr2022-For-HIP.exe" `
+            -OutFile $installer
+          $process = Start-Process $installer -ArgumentList '-install' -NoNewWindow -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            Write-Error "AMD HIP SDK installer failed with exit code $($process.ExitCode)"
+            exit $process.ExitCode
+          }
 
       - name: Build ROCm backend plugin
         shell: pwsh
         run: |
           # Resolve the versioned ROCm install path dynamically so the build
-          # does not break when Chocolatey installs a newer HIP SDK version.
+          # does not break when AMD releases a newer HIP SDK version.
           $rocmRoot = "C:\Program Files\AMD\ROCm"
           $rocmPath = Get-ChildItem $rocmRoot -Directory |
                         Sort-Object Name -Descending |
