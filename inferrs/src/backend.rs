@@ -218,12 +218,12 @@ mod linux {
         // so on unsupported architectures the `.so` simply won't exist.
         let candidates: &[(&str, BackendKind)] = &[
             ("libinferrs_backend_cuda.so", BackendKind::Cuda),
-            ("libinferrs_backend_musa.so", BackendKind::Musa),
             ("libinferrs_backend_rocm.so", BackendKind::Rocm),
-            ("libinferrs_backend_cann.so", BackendKind::Cann),
             ("libinferrs_backend_hexagon.so", BackendKind::Hexagon),
-            ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
             ("libinferrs_backend_openvino.so", BackendKind::OpenVino),
+            ("libinferrs_backend_musa.so", BackendKind::Musa),
+            ("libinferrs_backend_cann.so", BackendKind::Cann),
+            ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
         ];
 
         for (lib_name, kind) in candidates {
@@ -272,12 +272,12 @@ mod android {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority: CANN → Hexagon → Vulkan → OpenVINO → CPU.
+        // Priority: Hexagon → OpenVINO → CANN → Vulkan → CPU.
         let candidates: &[(&str, BackendKind)] = &[
-            ("libinferrs_backend_cann.so", BackendKind::Cann),
             ("libinferrs_backend_hexagon.so", BackendKind::Hexagon),
-            ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
             ("libinferrs_backend_openvino.so", BackendKind::OpenVino),
+            ("libinferrs_backend_cann.so", BackendKind::Cann),
+            ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
         ];
 
         for (lib_name, kind) in candidates {
@@ -330,8 +330,8 @@ mod macos {
         let search_dirs = plugin_search_dirs();
 
         let candidates: &[(&str, BackendKind)] = &[
-            ("libinferrs_backend_vulkan.dylib", BackendKind::Vulkan),
             ("libinferrs_backend_openvino.dylib", BackendKind::OpenVino),
+            ("libinferrs_backend_vulkan.dylib", BackendKind::Vulkan),
         ];
 
         for (lib_name, kind) in candidates {
@@ -398,8 +398,8 @@ mod windows {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order (x86_64): CUDA → MUSA → ROCm → Vulkan → OpenVINO → CPU
-        // Priority order (aarch64): Hexagon → Vulkan → OpenVINO → CPU
+        // Priority order (x86_64): CUDA → ROCm → OpenVINO → MUSA → Vulkan → CPU
+        // Priority order (aarch64): Hexagon → OpenVINO → Vulkan → CPU
         // ROCm on Windows x86_64 is supported via AMD's HIP SDK (ROCm 5.5+).
         // MUSA Windows support is announced by Moore Threads.
         // CANN is not supported on Windows (Huawei SDK constraint).
@@ -407,13 +407,13 @@ mod windows {
             #[cfg(target_arch = "x86_64")]
             ("inferrs_backend_cuda.dll", BackendKind::Cuda),
             #[cfg(target_arch = "x86_64")]
-            ("inferrs_backend_musa.dll", BackendKind::Musa),
-            #[cfg(target_arch = "x86_64")]
             ("inferrs_backend_rocm.dll", BackendKind::Rocm),
             #[cfg(target_arch = "aarch64")]
             ("inferrs_backend_hexagon.dll", BackendKind::Hexagon),
-            ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
             ("inferrs_backend_openvino.dll", BackendKind::OpenVino),
+            #[cfg(target_arch = "x86_64")]
+            ("inferrs_backend_musa.dll", BackendKind::Musa),
+            ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
         ];
 
         for (lib_name, kind) in candidates {

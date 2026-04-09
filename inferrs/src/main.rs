@@ -273,10 +273,11 @@ impl ServeArgs {
         // opened on demand — they are not hard-linked into the binary.
         //
         // Platform notes:
-        //   Linux x86_64 / aarch64 : CUDA → MUSA → ROCm → CANN → Hexagon → Vulkan → OpenVINO → CPU
-        //   Android aarch64         : CANN → Hexagon → OpenVINO → CPU
-        //   Windows x86_64          : CUDA → MUSA → ROCm → Vulkan → OpenVINO → CPU
-        //   Windows aarch64         : Hexagon → Vulkan → OpenVINO → CPU
+        //   Linux x86_64 / aarch64 : CUDA → ROCm → Hexagon → OpenVINO → MUSA → CANN → Vulkan → CPU
+        //   Android aarch64         : Hexagon → OpenVINO → CANN → Vulkan → CPU
+        //   macOS                   : Metal → OpenVINO → Vulkan → CPU
+        //   Windows x86_64          : CUDA → ROCm → OpenVINO → MUSA → Vulkan → CPU
+        //   Windows aarch64         : Hexagon → OpenVINO → Vulkan → CPU
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
         {
             use crate::backend::BackendKind;
