@@ -38,11 +38,117 @@ fn default_audio_format() -> String {
     "wav".to_string()
 }
 
+/// A single content part inside an OpenAI structured content array.
+///
+/// OpenAI clients may send `messages[].content` as either a plain string or an
+/// array of content-part objects.  This type covers the text-part case; other
+/// part types (image_url, etc.) are accepted and silently ignored so that
+/// clients do not receive a deserialization error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentPart {
+    /// Content part type — `"text"`, `"image_url"`, etc.
+    #[serde(rename = "type")]
+    pub part_type: String,
+    /// Text payload, present only when `type == "text"`.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// The `content` field of a chat message.
+///
+/// OpenAI-compatible clients may send either:
+/// - a plain JSON string, or
+/// - a JSON array of content-part objects (e.g. `[{"type":"text","text":"…"}]`).
+///
+/// Both forms are accepted and normalised to a plain `String`.  Only `"text"`
+/// parts contribute to the string; all other part types (e.g. `"image_url"`)
+/// are ignored.
+#[derive(Debug, Clone)]
+pub struct MessageContent(pub String);
+
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{self, Visitor};
+        use std::fmt;
+
+        struct MessageContentVisitor;
+
+        impl<'de> Visitor<'de> for MessageContentVisitor {
+            type Value = MessageContent;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string or an array of content parts")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<MessageContent, E> {
+                Ok(MessageContent(v.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<MessageContent, E> {
+                Ok(MessageContent(v))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<MessageContent, A::Error> {
+                let mut text = String::new();
+                while let Some(part) = seq.next_element::<ContentPart>()? {
+                    if part.part_type == "text" {
+                        if let Some(t) = part.text {
+                            text.push_str(&t);
+                        }
+                    }
+                    // Non-text parts (image_url, etc.) are silently ignored.
+                }
+                Ok(MessageContent(text))
+            }
+        }
+
+        deserializer.deserialize_any(MessageContentVisitor)
+    }
+}
+
+impl serde::Serialize for MessageContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for MessageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for MessageContent {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl MessageContent {
+    /// Return the inner string content.
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Construct from a plain string (for tests and internal use).
+    pub fn from_string(s: impl Into<String>) -> Self {
+        MessageContent(s.into())
+    }
+}
+
 /// A chat message (text + optional audio attachment).
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    /// Message content — accepts a plain string or an OpenAI structured
+    /// content-part array (`[{"type":"text","text":"…"},…]`).
+    pub content: MessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioInput>,
 }
@@ -417,7 +523,7 @@ mod tests {
         ChatMessage {
             role: Role::User,
             audio: None,
-            content: content.to_string(),
+            content: MessageContent::from_string(content),
         }
     }
 
@@ -425,7 +531,7 @@ mod tests {
         ChatMessage {
             role: Role::System,
             audio: None,
-            content: content.to_string(),
+            content: MessageContent::from_string(content),
         }
     }
 
@@ -433,7 +539,7 @@ mod tests {
         ChatMessage {
             role: Role::Assistant,
             audio: None,
-            content: content.to_string(),
+            content: MessageContent::from_string(content),
         }
     }
 
@@ -566,5 +672,53 @@ mod tests {
     #[test]
     fn detect_defaults_to_chatml_when_no_config() {
         assert!(matches!(detect_chat_template(&None), ChatTemplate::ChatML));
+    }
+
+    #[test]
+    fn message_content_deserializes_plain_string() {
+        let json = r#""Hello, world!""#;
+        let mc: MessageContent = serde_json::from_str(json).unwrap();
+        assert_eq!(mc.0, "Hello, world!");
+    }
+
+    #[test]
+    fn message_content_deserializes_content_part_array() {
+        let json = r#"[{"type":"text","text":"Hello"},{"type":"text","text":" world"}]"#;
+        let mc: MessageContent = serde_json::from_str(json).unwrap();
+        assert_eq!(mc.0, "Hello world");
+    }
+
+    #[test]
+    fn message_content_ignores_non_text_parts() {
+        let json = r#"[{"type":"image_url","url":"http://example.com/img.png"},{"type":"text","text":"What is this?"}]"#;
+        let mc: MessageContent = serde_json::from_str(json).unwrap();
+        assert_eq!(mc.0, "What is this?");
+    }
+
+    #[test]
+    fn chat_message_accepts_string_content() {
+        let json = r#"{"role":"user","content":"Hello!"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.0, "Hello!");
+    }
+
+    #[test]
+    fn chat_message_accepts_content_part_array() {
+        let json = r#"{"role":"user","content":[{"type":"text","text":"Hello!"}]}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.0, "Hello!");
+    }
+
+    #[test]
+    fn content_part_array_works_in_chatml_template() {
+        // Verify that a ChatMessage built from a content-part array produces
+        // the same ChatML prompt as one built from a plain string.
+        let from_string = user_msg("Hello!");
+        let from_parts: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":[{"type":"text","text":"Hello!"}]}"#)
+                .unwrap();
+        let prompt_string = apply_chatml(&[from_string], &None);
+        let prompt_parts = apply_chatml(&[from_parts], &None);
+        assert_eq!(prompt_string, prompt_parts);
     }
 }

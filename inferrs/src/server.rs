@@ -24,7 +24,9 @@ use crate::engine::{
     load_engine, AudioEmbedContext, EngineRequest, GenerationResult, OutputBuffer, StreamToken,
 };
 use crate::sampler::SamplingParams;
-use crate::tokenizer::{apply_gemma4_with_audio, AudioInput, ChatMessage, Role, Tokenizer};
+use crate::tokenizer::{
+    apply_gemma4_with_audio, AudioInput, ChatMessage, MessageContent, Role, Tokenizer,
+};
 use crate::ServeArgs;
 
 // ---------------------------------------------------------------------------
@@ -631,7 +633,7 @@ fn anthropic_messages_to_chat(
     if let Some(sys) = system {
         chat_messages.push(ChatMessage {
             role: Role::System,
-            content: sys.to_string(),
+            content: MessageContent::from_string(sys),
             audio: None,
         });
     }
@@ -642,7 +644,7 @@ fn anthropic_messages_to_chat(
         };
         chat_messages.push(ChatMessage {
             role,
-            content: msg.content.clone(),
+            content: MessageContent::from_string(&msg.content),
             audio: None,
         });
     }
@@ -1893,7 +1895,7 @@ async fn ollama_generate(
     } else {
         let msgs = vec![ChatMessage {
             role: Role::User,
-            content: prompt.to_string(),
+            content: MessageContent::from_string(prompt),
             audio: None,
         }];
         tokenizer.apply_chat_template_and_encode(&msgs)
@@ -2017,7 +2019,7 @@ async fn ollama_chat(
             };
             ChatMessage {
                 role,
-                content: m.content.clone(),
+                content: MessageContent::from_string(&m.content),
                 audio: None,
             }
         })

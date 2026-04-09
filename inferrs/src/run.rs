@@ -15,7 +15,9 @@ use std::sync::mpsc as stdmpsc;
 
 use crate::engine::{load_engine, AudioEmbedContext, StreamToken, SyncEngineRequest};
 use crate::sampler::SamplingParams;
-use crate::tokenizer::{apply_gemma4_with_audio, AudioInput, ChatMessage, Role, Tokenizer};
+use crate::tokenizer::{
+    apply_gemma4_with_audio, AudioInput, ChatMessage, MessageContent, Role, Tokenizer,
+};
 use crate::ServeArgs;
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
@@ -188,7 +190,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         messages.push(ChatMessage {
             role: Role::System,
             audio: None,
-            content: sys.clone(),
+            content: MessageContent::from_string(sys),
         });
     }
 
@@ -217,7 +219,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
                     data: String::new(),
                     format: "wav".to_string(),
                 }),
-                content: prompt,
+                content: MessageContent::from_string(prompt),
             });
             let prompt_str = apply_gemma4_with_audio(&messages, &[n_audio_tokens]);
             let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
@@ -235,7 +237,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         messages.push(ChatMessage {
             role: Role::User,
             audio: None,
-            content: prompt,
+            content: MessageContent::from_string(prompt),
         });
         let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
         stream_response_collect(&engine_tx, prompt_tokens, audio_ctx, &sampling_params)?;
@@ -344,7 +346,7 @@ fn repl(
 
         messages.push(ChatMessage {
             role: Role::User,
-            content: user_content,
+            content: MessageContent::from_string(user_content),
             audio: None,
         });
 
@@ -375,7 +377,7 @@ fn repl(
         messages.push(ChatMessage {
             role: Role::Assistant,
             audio: None,
-            content: assistant_text,
+            content: MessageContent::from_string(assistant_text),
         });
     }
 
@@ -408,7 +410,7 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
                         0,
                         ChatMessage {
                             role: Role::System,
-                            content: parts[2].to_string(),
+                            content: MessageContent::from_string(parts[2]),
                             audio: None,
                         },
                     );
