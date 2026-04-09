@@ -99,7 +99,7 @@ pub struct RunArgs {
     ///
     /// Enabled by default for models that emit thinking blocks (Gemma4, Qwen3,
     /// NVFP4).  Pass `--think-filter=false` to see raw reasoning tokens.
-    #[arg(long, default_value_t = true, require_equals(true))]
+    #[arg(long, default_value = "true", require_equals(true), num_args(1))]
     pub think_filter: bool,
 }
 
