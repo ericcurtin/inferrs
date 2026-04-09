@@ -1486,15 +1486,59 @@ impl Attention {
 
         // KV cache — TurboQuant-compressed or plain.
         // Returns accumulated K,V (donor layer stores these for KV-sharing layers).
-        let (key_states, value_states) = if let Some(tq) = &mut self.tq_cache {
-            tq.append(&key_states, &value_states)
-                .map_err(candle_core::Error::wrap)?;
-            tq.dequantize().map_err(candle_core::Error::wrap)?
-        } else {
-            match &mut self.kv_cache {
-                KvCache::Normal(c) => c.append(&key_states, &value_states)?,
-                KvCache::Rotating(c) => c.append(&key_states, &value_states)?,
+        //
+        // For global (full-attention) layers with TurboQuant:
+        //   - Prefill (q_len > 1): bypass TQ, use plain RetainingKvCache to avoid
+        //     35×2 extra GPU copies. On the first decode step, flush the plain cache
+        //     into TQ so subsequent decode tokens benefit from KV compression.
+        //   - Decode (q_len == 1): use TQ cache (populated from the plain cache on
+        //     first step, then incremental TQ append on subsequent steps).
+        //
+        // For sliding (rotating) layers: always use the rotating KV cache directly,
+        // never TQ. TQ flush from rotating cache is not supported (rotating cache
+        // may have evicted old tokens). TQ is only applied to global layers.
+        let (key_states, value_states) = match (&mut self.tq_cache, &mut self.kv_cache) {
+            // Global layers with TQ — apply prefill bypass and flush-on-first-decode.
+            (Some(tq), KvCache::Normal(plain)) => {
+                if seqlen_offset == 0 && q_len > 1 {
+                    // Prefill: store in plain cache, skip TQ overhead.
+                    plain.append(&key_states, &value_states)?
+                } else {
+                    // Decode: adopt plain cache into TQ on first step (zero-copy when
+                    // cap == seq_len; one contiguous copy otherwise to get correct shape).
+                    if tq.is_empty() && plain.seq_len > 0 {
+                        if let (Some(kb), Some(vb)) = (&plain.k_buf, &plain.v_buf) {
+                            let seq = plain.seq_len;
+                            let cap = plain.buf_cap;
+                            let (k_adopt, v_adopt) = if cap == seq {
+                                // Buffer exactly sized — adopt as-is (zero-copy).
+                                (kb.clone(), vb.clone())
+                            } else {
+                                // Buffer oversized — narrow+contiguous so adopt_warmup_buffer
+                                // sees shape [1, n_kv, seq, d] with cap == seq.
+                                let k_c = kb
+                                    .narrow(2, 0, seq)
+                                    .and_then(|t| t.contiguous())
+                                    .map_err(candle_core::Error::wrap)?;
+                                let v_c = vb
+                                    .narrow(2, 0, seq)
+                                    .and_then(|t| t.contiguous())
+                                    .map_err(candle_core::Error::wrap)?;
+                                (k_c, v_c)
+                            };
+                            tq.adopt_warmup_buffer(k_adopt, v_adopt)
+                                .map_err(candle_core::Error::wrap)?;
+                        }
+                    }
+                    tq.append(&key_states, &value_states)
+                        .map_err(candle_core::Error::wrap)?;
+                    tq.dequantize().map_err(candle_core::Error::wrap)?
+                }
             }
+            // Sliding layers: always use rotating KV cache (TQ not applied).
+            (_, KvCache::Rotating(c)) => c.append(&key_states, &value_states)?,
+            // No TQ: plain cache for both types.
+            (None, KvCache::Normal(c)) => c.append(&key_states, &value_states)?,
         };
 
         // Attention computation.
@@ -1792,6 +1836,25 @@ impl Attention {
         }
         if let Some(tq) = &mut self.tq_cache {
             tq.clear();
+        }
+    }
+
+    /// Return the current K/V tensors from the internal cache, if any.
+    /// Returns `None` for rotating (sliding) layers or if no prefill has been run.
+    /// Returns `Some((k, v))` where each has shape `[1, n_kv_heads, seq_len, head_dim]`.
+    fn kv_cache_tensors(&self) -> Option<(candle_core::Tensor, candle_core::Tensor)> {
+        match &self.kv_cache {
+            KvCache::Normal(c) => {
+                if c.seq_len == 0 {
+                    return None;
+                }
+                let kb = c.k_buf.as_ref()?;
+                let vb = c.v_buf.as_ref()?;
+                let k = kb.narrow(2, 0, c.seq_len).ok()?;
+                let v = vb.narrow(2, 0, c.seq_len).ok()?;
+                Some((k, v))
+            }
+            KvCache::Rotating(_) => None, // Sliding layers: not used for paged store
         }
     }
 }
@@ -3268,6 +3331,67 @@ impl Gemma4Model {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Copy K/V tensors from the internal KV cache of global (non-sliding) donor
+    /// attention layers into the paged KV store after a non-paged prefill.
+    ///
+    /// This enables "hybrid prefill" for Gemma4: run the fast standard `forward`
+    /// for the prompt, then populate the paged store so that decode steps can
+    /// use `forward_paged`.
+    ///
+    /// Only global attention donor layers participate in the paged store; sliding
+    /// layers use their own rotating KV cache for both prefill and decode and are
+    /// unaffected.
+    pub fn populate_paged_from_cache(
+        &self,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+        prompt_len: usize,
+    ) -> candle_core::Result<()> {
+        // Resolve slot IDs once for all paged layers.
+        let slot_ids: Vec<u32> = (0..prompt_len)
+            .filter_map(|pos| block_table.slot_for(pos))
+            .collect();
+        if slot_ids.len() != prompt_len {
+            candle_core::bail!("populate_paged: not all positions have slots allocated");
+        }
+        let device = kv_store.key_caches[0].device();
+        let slots_t = candle_core::Tensor::new(slot_ids.as_slice(), device)?;
+
+        let mut paged_layer_idx = 0usize;
+        for (layer_idx, (is_sliding, sharing)) in self
+            .is_sliding_per_layer
+            .iter()
+            .zip(self.kv_sharing_map.iter())
+            .enumerate()
+        {
+            // Only global donor layers use the paged store.
+            if *is_sliding || sharing.is_some() {
+                continue;
+            }
+
+            let (k, v) = match self.layers[layer_idx].self_attn.kv_cache_tensors() {
+                Some(kv) => kv,
+                None => candle_core::bail!(
+                    "populate_paged: global layer {} has no KV cache (prefill not run?)",
+                    layer_idx
+                ),
+            };
+            // k, v: [1, n_kv_heads, prompt_len, head_dim]
+            let k_flat = k.squeeze(0)?.transpose(0, 1)?.contiguous()?; // [prompt_len, n_kv_heads, head_dim]
+            let v_flat = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+
+            // Zero then write K/V into the paged store at the allocated slots.
+            kv_store.zero_slots(&slot_ids)?;
+            kv_store.key_caches[paged_layer_idx] =
+                kv_store.key_caches[paged_layer_idx].index_add(&slots_t, &k_flat, 0)?;
+            kv_store.value_caches[paged_layer_idx] =
+                kv_store.value_caches[paged_layer_idx].index_add(&slots_t, &v_flat, 0)?;
+
+            paged_layer_idx += 1;
+        }
+        Ok(())
     }
 
     /// Hint that the next `forward()` call is a single-token decode for `token_id`.

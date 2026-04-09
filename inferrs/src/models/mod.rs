@@ -85,6 +85,29 @@ pub trait CausalLM: Send {
     /// `embeds`:    `[N, lm_hidden_size]` — output of `encode_audio`
     /// `positions`: indices in the upcoming `input_ids` that hold audio soft tokens
     fn set_pending_audio(&mut self, _embeds: Tensor, _positions: Vec<usize>) {}
+
+    /// Populate the paged KV store from the model's internal KV cache after a
+    /// non-paged prefill.
+    ///
+    /// This is the key to "hybrid prefill": run `forward` (fast, contiguous, no
+    /// scatter overhead) for the prompt, then copy the resulting K/V tensors
+    /// from the internal cache into the paged store before decode begins.
+    /// Decode steps then use `forward_paged` as usual.
+    ///
+    /// The default implementation is a no-op; models that support paged
+    /// attention should override this.
+    ///
+    /// `block_table`: maps logical positions to physical paged slots for this sequence.
+    /// `kv_store`: the physical paged KV store to populate.
+    /// `prompt_len`: number of prompt tokens (positions 0..prompt_len to write).
+    fn populate_paged_from_cache(
+        &mut self,
+        _block_table: &BlockTable,
+        _kv_store: &mut PagedKvStore,
+        _prompt_len: usize,
+    ) -> Result<()> {
+        Ok(()) // default: no-op (model does not support hybrid prefill)
+    }
 }
 
 /// Implement `CausalLM` for a simple newtype wrapper whose `inner` field
@@ -139,6 +162,16 @@ impl CausalLM for Qwen3ModelWrapper {
 
     fn clear_kv_cache(&mut self) {
         self.inner.clear_kv_cache();
+    }
+
+    fn populate_paged_from_cache(
+        &mut self,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+        prompt_len: usize,
+    ) -> Result<()> {
+        self.inner
+            .populate_paged_from_cache(block_table, kv_store, prompt_len)
     }
 }
 
@@ -214,6 +247,17 @@ impl CausalLM for Gemma4ModelWrapper {
 
     fn set_pending_audio(&mut self, embeds: Tensor, positions: Vec<usize>) {
         self.pending_audio = Some((embeds, positions));
+    }
+
+    fn populate_paged_from_cache(
+        &mut self,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+        prompt_len: usize,
+    ) -> Result<()> {
+        self.inner
+            .populate_paged_from_cache(block_table, kv_store, prompt_len)
+            .map_err(Into::into)
     }
 }
 

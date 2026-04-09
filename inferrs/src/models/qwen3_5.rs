@@ -15,6 +15,7 @@ use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
     apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
     concat_kv_cache, paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
+    PagedPassCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -809,9 +810,15 @@ impl Qwen35Model {
         block_table: &BlockTable,
         kv_store: &mut PagedKvStore,
     ) -> Result<Tensor> {
-        let (_b, _t) = input_ids.dims2()?;
+        let (_b, t) = input_ids.dims2()?;
 
         let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
+
+        // Build per-pass cache once: resolves slot IDs and computes causal mask.
+        // This eliminates O(L × N) per-layer CPU slot resolution and O(L × N²)
+        // mask construction that previously happened inside paged_write_gather_sdpa.
+        let pass_cache =
+            PagedPassCache::build(block_table, seqlen_offset, t, x.device(), x.dtype())?;
 
         // Track which full-attention layer we are visiting so we index the
         // correct slice of kv_store.
@@ -821,8 +828,8 @@ impl Qwen35Model {
             let mut ctx = PagedCtx {
                 cos: &self.cos,
                 sin: &self.sin,
-                block_table,
                 kv_store,
+                pass_cache: &pass_cache,
                 layer_idx: full_attn_idx,
             };
             x = layer.forward_paged(&x, seqlen_offset, &mut ctx)?;

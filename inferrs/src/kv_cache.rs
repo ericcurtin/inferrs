@@ -288,39 +288,48 @@ impl PagedKvStore {
         Ok((k, v))
     }
 
-    /// Zero out the given slots in all layers so that `index_add` writes
-    /// don't accumulate stale values from a previous sequence.
+    /// Zero out the given slots in all layers so that writes don't accumulate
+    /// stale values from a previous sequence.
     ///
     /// This must be called once per new sequence (at `seqlen_offset == 0`)
     /// after blocks have been allocated for the prompt.  Without it, reused
-    /// physical blocks carry K/V data from the previous occupant, and the
-    /// `index_add` writes in `forward_returning_kv_paged` would add the new
-    /// values on top of the old ones instead of replacing them.
+    /// physical blocks carry K/V data from the previous occupant, and
+    /// `scatter_add_set` writes in `forward_returning_kv_paged` would add the
+    /// new values on top of the old ones instead of replacing them.
+    ///
+    /// Implementation: uses `scatter_set` (direct assign) with a zeros source
+    /// tensor, which requires only **2 GPU kernels per layer** (vs the previous
+    /// 6-kernel read-negate-index_add approach).  A single expanded index
+    /// tensor is built once and reused across all layers.
     pub fn zero_slots(&mut self, slot_ids: &[u32]) -> candle_core::Result<()> {
         if slot_ids.is_empty() {
             return Ok(());
         }
         let n_slots = slot_ids.len();
-        // All layers share the same device; build the index tensor once.
+        let num_kv_heads = self.cfg.num_kv_heads;
+        let head_dim = self.cfg.head_dim;
+        // All layers share the same device; build the index and zeros tensors once.
         let device = self.key_caches[0].device().clone();
-        let idx_t = Tensor::new(slot_ids, &device)?;
+        let dtype = self.key_caches[0].dtype();
+
+        // Build expanded index: [n_slots, num_kv_heads, head_dim]
+        // indexes[i, j, k] = slot_ids[i] for all j, k.
+        // scatter_set requires indexes.shape() == source.shape().
+        let idx_1d = Tensor::new(slot_ids, &device)?.to_dtype(candle_core::DType::U32)?;
+        let idx_expanded = idx_1d
+            .reshape((n_slots, 1, 1))?
+            .expand((n_slots, num_kv_heads, head_dim))?
+            .contiguous()?;
+
+        // Zeros source to scatter into the slots.
+        let zeros = Tensor::zeros((n_slots, num_kv_heads, head_dim), dtype, &device)?;
 
         for layer_idx in 0..self.key_caches.len() {
-            // Read current values at those slots, negate, and add back to zero them.
-            // This is equivalent to: kv_cache[slot] = 0 for each slot.
-            // We use index_add(idx, -current_values) which sets:
-            //   kv_cache[slot] += (-kv_cache[slot]) = 0
-            //
-            // candle-core does not expose a direct index_set (scatter-assign) on
-            // the Tensor API, so this read-negate-add pattern is the cleanest
-            // available approach without adding a new kernel.
-            let (cur_k, cur_v) = self.gather_slots(layer_idx, slot_ids)?;
-            debug_assert_eq!(cur_k.dim(0).unwrap_or(0), n_slots);
-            let neg_k = cur_k.neg()?;
-            let neg_v = cur_v.neg()?;
-            self.key_caches[layer_idx] = self.key_caches[layer_idx].index_add(&idx_t, &neg_k, 0)?;
-            self.value_caches[layer_idx] =
-                self.value_caches[layer_idx].index_add(&idx_t, &neg_v, 0)?;
+            // Direct scatter-assign: cache[slot_ids[i], j, k] = 0
+            // This is 2 GPU kernels per layer instead of the previous 6
+            // (gather + neg + index_add for each of K and V).
+            self.key_caches[layer_idx].scatter_set(&idx_expanded, &zeros, 0)?;
+            self.value_caches[layer_idx].scatter_set(&idx_expanded, &zeros, 0)?;
         }
         Ok(())
     }

@@ -16,7 +16,7 @@ use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm,
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
     apply_rms_norm_heads, apply_rope, causal_mask, compute_logits, concat_kv_cache,
-    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
+    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
 };
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
@@ -134,8 +134,26 @@ impl Attention {
         let q = apply_rope(&q, &cos_slice, &sin_slice)?;
         let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
-        // Append to KV cache (TurboQuant-compressed or plain concat)
-        let (k, v) = if let Some(tq) = &mut self.tq_cache {
+        // Append to KV cache.
+        //
+        // During prefill (seqlen_offset == 0, t > 1) bypass TurboQuant entirely:
+        // use the plain concat cache to avoid the extra contiguous() + slice_set
+        // overhead per layer (35 × 2 GPU copies vs 0 for the plain path).
+        // On the first decode step (seqlen_offset == prompt_len, t == 1), adopt
+        // the plain cache tensors directly into TQ's warmup buffer (zero-copy)
+        // so that subsequent decode steps benefit from KV compression.
+        let (k, v) = if seqlen_offset == 0 && t > 1 {
+            // Prefill: always use plain concat, even when TQ is enabled.
+            concat_kv_cache(k, v, &mut self.kv_cache)?
+        } else if let Some(tq) = &mut self.tq_cache {
+            // First decode step: adopt the plain cache into TQ's warmup buffer.
+            // Zero-copy: TQ takes ownership of the prefill tensors without any
+            // GPU allocation or data movement.
+            if tq.is_empty() {
+                if let Some((k_cache, v_cache)) = self.kv_cache.take() {
+                    tq.adopt_warmup_buffer(k_cache, v_cache)?;
+                }
+            }
             tq.append(&k, &v)?;
             tq.dequantize()?
         } else {
@@ -181,6 +199,12 @@ impl Attention {
         if let Some(tq) = &mut self.tq_cache {
             tq.clear();
         }
+    }
+
+    /// Borrow the current KV cache tensors (post-prefill).
+    /// Returns `None` if no prefill has been run yet.
+    fn kv_cache(&self) -> Option<&(Tensor, Tensor)> {
+        self.kv_cache.as_ref()
     }
 
     fn forward_paged(
@@ -229,7 +253,6 @@ impl Attention {
             },
             ctx,
         )?;
-
         self.o_proj.forward(&out).map_err(Into::into)
     }
 }
@@ -294,6 +317,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.attn.clear_kv_cache();
+    }
+
+    fn kv_cache(&self) -> Option<&(Tensor, Tensor)> {
+        self.attn.kv_cache()
     }
 }
 
@@ -368,8 +395,6 @@ impl Qwen3Model {
 
     /// Forward pass. Returns logits for the last position: [batch, 1, vocab_size]
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let (_b, _t) = input_ids.dims2()?;
-
         let mut x = self.embed_tokens.forward(input_ids)?;
 
         for layer in &mut self.layers {
@@ -388,16 +413,22 @@ impl Qwen3Model {
         block_table: &BlockTable,
         kv_store: &mut PagedKvStore,
     ) -> Result<Tensor> {
-        let (_b, _t) = input_ids.dims2()?;
+        let (_b, t) = input_ids.dims2()?;
 
         let mut x = self.embed_tokens.forward(input_ids)?;
+
+        // Build per-pass cache once: resolves slot IDs and computes causal mask.
+        // This eliminates O(L × N) per-layer CPU slot resolution and O(L × N²)
+        // mask construction that previously happened inside paged_write_gather_sdpa.
+        let pass_cache =
+            PagedPassCache::build(block_table, seqlen_offset, t, x.device(), x.dtype())?;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let mut ctx = PagedCtx {
                 cos: &self.cos,
                 sin: &self.sin,
-                block_table,
                 kv_store,
+                pass_cache: &pass_cache,
                 layer_idx,
             };
             x = layer.forward_paged(&x, seqlen_offset, &mut ctx)?;
@@ -411,5 +442,49 @@ impl Qwen3Model {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Copy K/V from the model's internal concat cache into the paged KV store.
+    ///
+    /// Call after a non-paged prefill (via `forward`) so that decode steps
+    /// can use `forward_paged`.  This "hybrid prefill" approach avoids the
+    /// scatter overhead of paged attention during prefill (which would repeat
+    /// index_add/gather operations per layer × per token).
+    pub fn populate_paged_from_cache(
+        &self,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+        prompt_len: usize,
+    ) -> Result<()> {
+        // Resolve slot IDs for all prompt positions (done once for all layers).
+        let slot_ids: Vec<u32> = (0..prompt_len)
+            .filter_map(|pos| block_table.slot_for(pos))
+            .collect();
+        if slot_ids.len() != prompt_len {
+            anyhow::bail!("populate_paged: not all positions have slots allocated");
+        }
+        let device = kv_store.key_caches[0].device();
+        let slots_t = Tensor::new(slot_ids.as_slice(), device)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let (k, v) = match layer.kv_cache() {
+                Some(kv) => kv,
+                None => anyhow::bail!(
+                    "populate_paged: layer {layer_idx} has no KV cache (prefill not run?)"
+                ),
+            };
+            // k, v: [1, n_kv_heads, prompt_len, head_dim]
+            // Reshape to [prompt_len, n_kv_heads, head_dim] for index_add
+            let k_flat = k.squeeze(0)?.transpose(0, 1)?.contiguous()?; // [prompt_len, n_kv_heads, head_dim]
+            let v_flat = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+            // Zero the slots first (reused blocks have stale data)
+            kv_store.zero_slots(&slot_ids)?;
+            // Scatter K/V into the paged store
+            kv_store.key_caches[layer_idx] =
+                kv_store.key_caches[layer_idx].index_add(&slots_t, &k_flat, 0)?;
+            kv_store.value_caches[layer_idx] =
+                kv_store.value_caches[layer_idx].index_add(&slots_t, &v_flat, 0)?;
+        }
+        Ok(())
     }
 }

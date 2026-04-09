@@ -10,11 +10,17 @@ use crate::kv_cache::{BlockTable, PagedKvStore};
 ///
 /// Grouping these together keeps individual method signatures within clippy's
 /// argument-count limit and makes call sites cleaner.
+///
+/// `block_table` is **not** included here because slot IDs are now resolved
+/// once per forward pass in [`PagedPassCache`] and reused across all layers,
+/// rather than being re-resolved per layer.
 pub struct PagedCtx<'a> {
     pub cos: &'a Tensor,
     pub sin: &'a Tensor,
-    pub block_table: &'a BlockTable,
     pub kv_store: &'a mut PagedKvStore,
+    /// Pre-computed per-forward-pass data (slot IDs, causal mask).
+    /// Built once before the layer loop and passed to every layer.
+    pub pass_cache: &'a PagedPassCache,
     /// Index into the paged KV store (counts only full-attention layers).
     pub layer_idx: usize,
 }
@@ -25,16 +31,18 @@ pub struct PagedCtx<'a> {
 ///   [kv0, kv0, kv1, kv1, ..., kv7, kv7]
 /// so that query head h maps to kv_head h // n_rep.
 ///
-/// This matches the HF `repeat_kv` implementation.
+/// Uses unsqueeze + expand + reshape for zero-copy broadcast instead of
+/// materializing n_rep full copies with `Tensor::cat`.  The resulting tensor
+/// shares storage with the input until a write forces a copy.
 pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(xs);
     }
     let (b, n_kv_heads, seq_len, head_dim) = xs.dims4()?;
-    // Concatenate along the seq_len dimension, then reshape so that
-    // each kv_head appears n_rep times consecutively in the head dimension.
-    let xs_cat = Tensor::cat(&vec![&xs; n_rep], 2)?; // [b, n_kv, seq*n_rep, d]
-    xs_cat
+    // [b, n_kv, 1, seq_len, head_dim] -> broadcast to [b, n_kv, n_rep, seq_len, head_dim]
+    // -> reshape to [b, n_kv*n_rep, seq_len, head_dim]
+    xs.unsqueeze(2)?
+        .expand((b, n_kv_heads, n_rep, seq_len, head_dim))?
         .reshape((b, n_kv_heads * n_rep, seq_len, head_dim))
         .map_err(Into::into)
 }
@@ -218,11 +226,72 @@ pub struct AttnDims {
     pub seqlen_offset: usize,
 }
 
+/// Per-forward-pass context shared across all paged attention layers to avoid
+/// redundant per-layer computation.
+///
+/// The caller (model's `forward_paged` method) builds this once before the
+/// layer loop and passes it to each `paged_write_gather_sdpa` call.
+pub struct PagedPassCache {
+    /// Resolved slot IDs for all token positions [0..seqlen_offset+t].
+    /// Index [pos] gives the physical KV cache slot for that position.
+    pub all_slot_ids: Vec<u32>,
+    /// Pre-built causal mask `[1, 1, t, kv_len]` for prefill (t > 1).
+    /// `None` during decode (t == 1) where no mask is needed.
+    pub causal_mask: Option<Tensor>,
+    /// GPU tensor version of the new slot IDs (slot_ids[seqlen_offset..]).
+    /// Built once and reused for the write step of every layer.
+    pub new_slots_tensor: Tensor,
+}
+
+impl PagedPassCache {
+    /// Build the per-pass cache from the block table and sequence dimensions.
+    ///
+    /// `seqlen_offset`: number of tokens already in the KV cache (0 for prefill).
+    /// `t`: number of new tokens being processed this pass.
+    pub fn build(
+        block_table: &BlockTable,
+        seqlen_offset: usize,
+        t: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let total_tokens = seqlen_offset + t;
+        // Resolve all slot IDs in one CPU pass — shared across all layers.
+        let all_slot_ids: Vec<u32> = (0..total_tokens)
+            .map(|pos| {
+                block_table
+                    .slot_for(pos)
+                    .ok_or_else(|| anyhow::anyhow!("paged attention: no slot for position {pos}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let new_slot_ids = &all_slot_ids[seqlen_offset..];
+        let new_slots_tensor = Tensor::new(new_slot_ids, device)?;
+
+        // Build causal mask once for the whole forward pass (only needed for prefill).
+        let causal_mask = if t > 1 {
+            Some(causal_mask(t, total_tokens, seqlen_offset, device, dtype)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            all_slot_ids,
+            causal_mask,
+            new_slots_tensor,
+        })
+    }
+}
+
 /// Write new K/V tokens into the paged store, then gather the full K/V context
 /// and run scaled dot-product attention.
 ///
 /// `q`      : query,  `[b, num_heads,    t, head_dim]`
 /// `k` / `v`: key/value, `[b, num_kv_heads, t, head_dim]`
+///
+/// Uses `ctx.pass_cache` for pre-computed slot IDs and causal mask — these are
+/// built once per forward pass by [`PagedPassCache::build`] and reused across
+/// all layers, eliminating O(L × N) per-layer CPU slot resolution and O(N²)
+/// per-layer mask construction.
 ///
 /// Returns the attention output `[b, t, num_heads * head_dim]` (already
 /// transposed/reshaped, ready for the output projection).
@@ -241,31 +310,29 @@ pub fn paged_write_gather_sdpa(
     } = *dims;
     let (b, _nh, t, _hd) = q.dims4()?;
 
-    // Resolve slot IDs for the new tokens and for the full context in one pass.
-    let total_tokens = seqlen_offset + t;
-    let all_slot_ids: Vec<u32> = (0..total_tokens)
-        .map(|pos| {
-            ctx.block_table
-                .slot_for(pos)
-                .ok_or_else(|| anyhow::anyhow!("paged attention: no slot for position {pos}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // Use precomputed slot IDs from the pass cache — no per-layer CPU slot resolution.
+    let pass_cache = &ctx.pass_cache;
+    let all_slot_ids = &pass_cache.all_slot_ids;
+    let kv_len = seqlen_offset + t;
 
     // Batch-write all new K/V tokens with a single index_add per tensor,
     // reducing kernel launches from 2*t to 2.
     // k/v: [b=1, num_kv_heads, t, head_dim] -> [t, num_kv_heads, head_dim]
-    let new_slot_ids = &all_slot_ids[seqlen_offset..];
-    let new_slots_tensor = Tensor::new(new_slot_ids, k.device())?;
     let k_new = k.squeeze(0)?.transpose(0, 1)?.contiguous()?; // [t, num_kv_heads, head_dim]
     let v_new = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-    ctx.kv_store.key_caches[ctx.layer_idx] =
-        ctx.kv_store.key_caches[ctx.layer_idx].index_add(&new_slots_tensor, &k_new, 0)?;
-    ctx.kv_store.value_caches[ctx.layer_idx] =
-        ctx.kv_store.value_caches[ctx.layer_idx].index_add(&new_slots_tensor, &v_new, 0)?;
+    ctx.kv_store.key_caches[ctx.layer_idx] = ctx.kv_store.key_caches[ctx.layer_idx].index_add(
+        &pass_cache.new_slots_tensor,
+        &k_new,
+        0,
+    )?;
+    ctx.kv_store.value_caches[ctx.layer_idx] = ctx.kv_store.value_caches[ctx.layer_idx].index_add(
+        &pass_cache.new_slots_tensor,
+        &v_new,
+        0,
+    )?;
 
-    let (k_full, v_full) = ctx.kv_store.gather_slots(ctx.layer_idx, &all_slot_ids)?;
+    let (k_full, v_full) = ctx.kv_store.gather_slots(ctx.layer_idx, all_slot_ids)?;
 
-    let kv_len = total_tokens;
     let k_full = k_full
         .reshape((b, kv_len, num_kv_heads, head_dim))?
         .transpose(1, 2)?;
@@ -273,7 +340,7 @@ pub fn paged_write_gather_sdpa(
         .reshape((b, kv_len, num_kv_heads, head_dim))?
         .transpose(1, 2)?;
 
-    // GQA expand
+    // GQA expand (zero-copy broadcast via unsqueeze+expand+reshape)
     let groups = num_heads / num_kv_heads;
     let k_full = repeat_kv(k_full, groups)?;
     let v_full = repeat_kv(v_full, groups)?;
@@ -285,9 +352,9 @@ pub fn paged_write_gather_sdpa(
         .matmul(&k_full.transpose(2, 3)?.contiguous()?)?
         .affine(1.0 / scale, 0.0)?;
 
-    let attn = if t > 1 {
-        let mask = causal_mask(t, kv_len, seqlen_offset, attn.device(), attn.dtype())?;
-        attn.broadcast_add(&mask)?
+    // Use the precomputed causal mask from the pass cache (built once for all layers).
+    let attn = if let Some(mask) = &pass_cache.causal_mask {
+        attn.broadcast_add(mask)?
     } else {
         attn
     };

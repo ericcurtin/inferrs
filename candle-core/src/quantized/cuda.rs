@@ -1144,8 +1144,63 @@ impl QCudaStorage {
             let data_f32 = self.dequantize(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
+        } else if matches!(storage.dtype(), crate::DType::BF16 | crate::DType::F16)
+            && matches!(
+                self.dtype,
+                GgmlDType::Q4_0
+                    | GgmlDType::Q4_1
+                    | GgmlDType::Q5_0
+                    | GgmlDType::Q5_1
+                    | GgmlDType::Q8_0
+                    | GgmlDType::Q2K
+                    | GgmlDType::Q3K
+                    | GgmlDType::Q4K
+                    | GgmlDType::Q5K
+                    | GgmlDType::Q6K
+                    | GgmlDType::Q8K
+            )
+        {
+            // F16 cuBLAS GEMM fast path: dequantize weights to F16 on-device, then
+            // use cuBLAS F16 GEMM.  This is ~2× faster than the Q8_1-quantized GEMM
+            // path on CUDA for batched prefill (b*m > 8 tokens) because:
+            //   1. cuBLAS F16 GEMM uses tensor cores (16×16 tiles) vs the custom
+            //      Q4K+Q8_1 GEMM kernel which runs on CUDA cores.
+            //   2. The dequantize_f16 kernel is a single fast GPU-side pass with no
+            //      PCIe transfer; its overhead is negligible relative to the GEMM.
+            //   3. We avoid the BF16→F32 conversion kernel that the Q8_1 path needs.
+            //
+            // The F16 weight buffer is temporary (not cached) — at 31B model scale
+            // each projection is ~100 MB but is freed immediately after the GEMM,
+            // so peak extra VRAM is one projection weight at a time (amortised).
+            let in_dtype = storage.dtype();
+            // Dequantize weight to F16 on device.
+            let data_f16 = self.dequantize_f16(n * k)?;
+            // Weights are stored transposed [n, k]; we need [k, n] for the GEMM.
+            // Build layout: contiguous [n, k], then transpose to [k, n].
+            let w_layout = crate::Layout::contiguous(crate::Shape::from((n, k)));
+            let w_t_layout = w_layout.transpose(0, 1)?;
+            // Convert activation to F16 if it is BF16.
+            let (act_f16_cow, act_layout_cow);
+            let (act_f16, act_layout) = if in_dtype == crate::DType::F16 {
+                (storage, layout)
+            } else {
+                act_f16_cow = storage.to_dtype(layout, crate::DType::F16)?;
+                act_layout_cow = crate::Layout::contiguous(layout.shape());
+                (&act_f16_cow, &act_layout_cow)
+            };
+            let out_f16 = act_f16.matmul(&data_f16, (b, m, n, k), act_layout, &w_t_layout)?;
+            // Convert output back to the original activation dtype if needed.
+            // Note: matmul always returns a (b, m, n) shaped result, so we need a
+            // contiguous layout covering all b*m*n elements for the dtype conversion.
+            if in_dtype == crate::DType::F16 {
+                out_f16
+            } else {
+                let out_elem_count = b * m * n;
+                let flat_layout = crate::Layout::contiguous(crate::Shape::from(out_elem_count));
+                out_f16.to_dtype(&flat_layout, in_dtype)?
+            }
         } else {
-            // Convert BF16→F32 if needed before the GEMM kernel (which requires F32 input).
+            // Fallback: Convert BF16→F32 if needed before the GEMM kernel.
             let (storage_f32_cow, layout_f32_cow);
             let (storage, layout) = if storage.dtype() == crate::DType::BF16 {
                 storage_f32_cow = storage.to_dtype(layout, crate::DType::F32)?;

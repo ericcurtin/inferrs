@@ -412,6 +412,30 @@ impl TurboQuantKvCache {
         }
     }
 
+    /// Return `true` when the cache has no stored tokens (not yet populated).
+    pub fn is_empty(&self) -> bool {
+        self.seq_len == 0 && self.warmup_kv_buf_len == 0
+    }
+
+    /// Adopt an existing (k, v) pair as the warmup buffer without copying.
+    ///
+    /// Used for "TQ prefill bypass": after a non-TQ prefill that stored K/V in
+    /// a plain cache, call this to make TQ own those tensors directly as its
+    /// warmup buffer on the first decode step — no `contiguous()` + `slice_set`
+    /// copy required.
+    ///
+    /// `k` and `v` must have shape `[1, num_kv_heads, seq_len, head_dim]` and
+    /// be contiguous.  The tensors are adopted as-is; no allocation is performed.
+    pub fn adopt_warmup_buffer(&mut self, k: Tensor, v: Tensor) -> Result<()> {
+        let seq_len = k.dim(2)?;
+        // Set cap == seq_len so that dequantize() knows the buffer is exactly
+        // the right size and returns it directly (contiguous, no extra copy).
+        self.warmup_kv_buf = Some((k, v));
+        self.warmup_kv_buf_cap = seq_len;
+        self.warmup_kv_buf_len = seq_len;
+        Ok(())
+    }
+
     /// Compress a pair of on-device tensors `[1, num_kv_heads, t, head_dim]`
     /// into the packed quantized store.  Used both by `append` (decode path)
     /// and by the prefill-flush in `dequantize`.
@@ -495,25 +519,33 @@ impl TurboQuantKvCache {
         // Check whether we're in the warmup phase for this token.
         let total_buffered = self.warmup_kv_buf_len + self.seq_len;
         let needed = self.warmup_kv_buf_len + new_seq;
-        // Stay in warmup only if the resulting buffer would still fit within
-        // the warmup budget.  A prefill larger than `warmup_seq_len` must go
-        // directly to the quantized path; allowing it into the warmup path
-        // would cap the buffer at `warmup_seq_len` and cause a `slice_set`
-        // shape-mismatch panic (dst: 256, src: N + 0) for N > warmup_seq_len.
-        let in_warmup = self.warmup_seq_len > 0
-            && total_buffered < self.warmup_seq_len
-            && needed <= self.warmup_seq_len;
+        // Always keep prefill tokens (new_seq > 1) on-device unquantized,
+        // deferring compression to the first decode step.  This eliminates
+        // the per-layer GPU→CPU transfer + CPU quantization during prefill,
+        // which was the dominant source of TTFT overhead with TurboQuant.
+        //
+        // For decode (new_seq == 1), stay in the warmup buffer until the
+        // total buffered length reaches warmup_seq_len, then flush and
+        // compress all at once.
+        //
+        // The warmup buffer cap is grown dynamically in the in_warmup branch,
+        // so there is no longer a fixed ceiling of warmup_seq_len on
+        // what can be buffered unquantized.
+        let in_warmup = new_seq > 1
+            || (self.warmup_seq_len > 0
+                && total_buffered < self.warmup_seq_len
+                && needed <= self.warmup_seq_len);
 
         if in_warmup {
             // Warmup path (decode only once past prefill): write into the
             // pre-allocated warmup buffer via `slice_set`.  This avoids
             // `Tensor::cat` on every decode step (128+ allocations per request).
             if needed > self.warmup_kv_buf_cap {
-                // Grow the buffer by doubling, capped at the warmup threshold.
-                let new_cap = needed
-                    .next_power_of_two()
-                    .max(MIN_KV_BUFFER_CAP)
-                    .min(self.warmup_seq_len);
+                // Grow the buffer to hold at least `needed` tokens (round up
+                // to the next power of two for amortised growth).  There is no
+                // cap: prefill sequences larger than warmup_seq_len must still
+                // fit in the buffer.
+                let new_cap = needed.next_power_of_two().max(MIN_KV_BUFFER_CAP);
                 let mut k_shape = k.dims().to_vec();
                 k_shape[2] = new_cap;
                 let new_k_buf = Tensor::zeros(k_shape.as_slice(), k.dtype(), k.device())?;
@@ -600,14 +632,34 @@ impl TurboQuantKvCache {
     /// decode step.
     pub fn dequantize(&mut self) -> Result<(Tensor, Tensor)> {
         // Warmup path: KV data is stored unquantized in the pre-allocated buffer.
-        // Return a zero-copy narrow view — no allocation.
+        //
+        // The warmup buffer is allocated with capacity `warmup_kv_buf_cap` but
+        // contains only `warmup_kv_buf_len` valid tokens.  A `narrow` view along
+        // dim 2 produces a NON-CONTIGUOUS tensor (the stride for dim 1 still
+        // reflects the full buffer capacity, not the valid token count).
+        // Non-contiguous K/V causes cuBLAS matmul to force an implicit copy at
+        // each attention layer, which at 35 layers × 2 tensors × ~150-300KB is
+        // a significant overhead.
+        //
+        // Use `slice_set` into a fresh contiguous buffer when the buffer has
+        // excess capacity, and a direct return otherwise (if cap == len,
+        // narrow IS contiguous because stride[1] == len * head_dim == shape[2] * stride[2]).
         if self.warmup_kv_buf_len > 0 {
             let (kb, vb) = self
                 .warmup_kv_buf
                 .as_ref()
                 .expect("warmup_kv_buf must be set when warmup_kv_buf_len > 0");
-            let k = kb.narrow(2, 0, self.warmup_kv_buf_len)?;
-            let v = vb.narrow(2, 0, self.warmup_kv_buf_len)?;
+            let len = self.warmup_kv_buf_len;
+            let cap = self.warmup_kv_buf_cap;
+            if cap == len {
+                // Buffer exactly fits valid tokens — narrow is contiguous.
+                return Ok((kb.clone(), vb.clone()));
+            }
+            // Cap > len: narrow would be non-contiguous. Return a contiguous copy.
+            // This costs one GPU copy per dequantize call during prefill, but
+            // saves 35 implicit cuBLAS copies during the attention matmuls.
+            let k = kb.narrow(2, 0, len)?.contiguous()?;
+            let v = vb.narrow(2, 0, len)?.contiguous()?;
             return Ok((k, v));
         }
 

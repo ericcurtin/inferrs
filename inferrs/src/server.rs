@@ -185,6 +185,11 @@ pub struct DeltaMessage {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Thinking/reasoning content — populated when the model is inside a
+    /// `<think>…</think>` block.  Matches vllm's `delta.reasoning_content`
+    /// and llama-server's default `reasoning_content_delta` behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1121,6 +1126,7 @@ fn make_sse_stream(
                 delta: DeltaMessage {
                     role: Some("assistant".to_string()),
                     content: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
             }],
@@ -1132,12 +1138,23 @@ fn make_sse_stream(
 
         // Token chunks
         while let Some(token) = token_rx.recv().await {
-            // Don't send EOS token text
-            let content = if token.finish_reason.as_deref() == Some("stop") {
+            // Don't send EOS token text as content.
+            let is_stop = token.finish_reason.as_deref() == Some("stop");
+            let content = if is_stop || token.text.is_empty() {
                 None
             } else {
                 Some(token.text)
             };
+            let reasoning_content = if token.reasoning_content.is_empty() {
+                None
+            } else {
+                Some(token.reasoning_content)
+            };
+
+            // Skip chunks that carry no text and no finish signal.
+            if content.is_none() && reasoning_content.is_none() && token.finish_reason.is_none() {
+                continue;
+            }
 
             let chunk = ChatCompletionStreamResponse {
                 id: request_id.clone(),
@@ -1149,6 +1166,7 @@ fn make_sse_stream(
                     delta: DeltaMessage {
                         role: None,
                         content,
+                        reasoning_content,
                     },
                     finish_reason: token.finish_reason,
                 }],
@@ -1324,13 +1342,18 @@ fn make_completion_sse_stream(
     created: u64,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
-        // Token chunks
+        // Token chunks — completions API only exposes content, not reasoning.
         while let Some(token) = token_rx.recv().await {
             let text = if token.finish_reason.as_deref() == Some("stop") {
                 String::new()
             } else {
                 token.text
             };
+
+            // Skip delimiter-only chunks that carry no text and no finish signal.
+            if text.is_empty() && token.finish_reason.is_none() {
+                continue;
+            }
 
             let chunk = CompletionStreamResponse {
                 id: request_id.clone(),
