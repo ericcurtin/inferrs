@@ -191,6 +191,8 @@ fn run_blocking(args: RunArgs) -> Result<()> {
             role: Role::System,
             audio: None,
             content: MessageContent::from_string(sys),
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
 
@@ -220,6 +222,8 @@ fn run_blocking(args: RunArgs) -> Result<()> {
                     format: "wav".to_string(),
                 }),
                 content: MessageContent::from_string(prompt),
+                tool_calls: None,
+                tool_call_id: None,
             });
             let prompt_str = apply_gemma4_with_audio(&messages, &[n_audio_tokens]);
             let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
@@ -238,6 +242,8 @@ fn run_blocking(args: RunArgs) -> Result<()> {
             role: Role::User,
             audio: None,
             content: MessageContent::from_string(prompt),
+            tool_calls: None,
+            tool_call_id: None,
         });
         let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
         stream_response_collect(&engine_tx, prompt_tokens, audio_ctx, &sampling_params)?;
@@ -348,6 +354,8 @@ fn repl(
             role: Role::User,
             content: MessageContent::from_string(user_content),
             audio: None,
+            tool_calls: None,
+            tool_call_id: None,
         });
 
         // Encode the full conversation with the chat template
@@ -378,6 +386,8 @@ fn repl(
             role: Role::Assistant,
             audio: None,
             content: MessageContent::from_string(assistant_text),
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
 
@@ -412,6 +422,8 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
                             role: Role::System,
                             content: MessageContent::from_string(parts[2]),
                             audio: None,
+                            tool_calls: None,
+                            tool_call_id: None,
                         },
                     );
                     println!("System prompt set.");

@@ -556,6 +556,12 @@ impl ActiveSequence {
 
 /// Check whether generation should stop (free-standing helper for use by the
 /// continuous batching loop where `self` is destructured).
+///
+/// Checks in order:
+/// 1. Model-wide EOS / end-of-turn token IDs (`stop_token_ids`).
+/// 2. Per-request extra stop token IDs derived from the `stop` field of an
+///    OpenAI-compatible request (`params.extra_stop_token_ids`).
+/// 3. Token budget exhausted (`max_tokens`).
 fn check_stop(
     token_id: u32,
     num_output_tokens: usize,
@@ -563,6 +569,9 @@ fn check_stop(
     stop_token_ids: &[u32],
 ) -> Option<String> {
     if stop_token_ids.contains(&token_id) {
+        return Some("stop".to_string());
+    }
+    if params.extra_stop_token_ids.contains(&token_id) {
         return Some("stop".to_string());
     }
     if num_output_tokens >= params.max_tokens {
@@ -1575,6 +1584,9 @@ impl Engine {
         params: &SamplingParams,
     ) -> Option<String> {
         if self.stop_token_ids.contains(&token_id) {
+            return Some("stop".to_string());
+        }
+        if params.extra_stop_token_ids.contains(&token_id) {
             return Some("stop".to_string());
         }
         if num_output_tokens >= params.max_tokens {

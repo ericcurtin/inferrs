@@ -69,6 +69,29 @@ fn spawn_drain_task(output_buf: OutputBuffer, registry: StreamRegistry) {
 
 // ─── OpenAI API types ───────────────────────────────────────────────────────
 
+/// Stop sequences sent by the client.
+///
+/// The OpenAI spec allows `stop` to be a string or an array of strings.
+/// Both forms are normalised to `Vec<String>`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(untagged)]
+pub enum StopSequences {
+    #[default]
+    None,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSequences {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StopSequences::None => vec![],
+            StopSequences::One(s) => vec![s],
+            StopSequences::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
@@ -88,6 +111,19 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub repetition_penalty: Option<f64>,
+    /// Stop sequences: generation halts when any of these strings is produced.
+    /// Accepts a single string or an array of strings (OpenAI-compatible).
+    #[serde(default)]
+    pub stop: StopSequences,
+    /// Tool definitions forwarded by agent runtimes (e.g. OpenClaw).
+    /// Accepted but not used: this backend does not execute tool calls.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tools: Option<serde_json::Value>,
+    /// Tool-choice directive from agent runtimes.  Accepted but not used.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -635,6 +671,8 @@ fn anthropic_messages_to_chat(
             role: Role::System,
             content: MessageContent::from_string(sys),
             audio: None,
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
     for msg in messages {
@@ -646,6 +684,8 @@ fn anthropic_messages_to_chat(
             role,
             content: MessageContent::from_string(&msg.content),
             audio: None,
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
     chat_messages
@@ -926,7 +966,7 @@ async fn chat_completions(
         .or(req.max_tokens)
         .unwrap_or(state.default_params.max_tokens);
     let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
-    let params = build_sampling_params(
+    let mut params = build_sampling_params(
         req.temperature,
         req.top_p,
         req.top_k,
@@ -934,6 +974,14 @@ async fn chat_completions(
         max_tokens,
         &state.default_params,
     );
+
+    // Resolve per-request stop strings into token IDs.
+    let stop_strings = req.stop.into_vec();
+    if !stop_strings.is_empty() {
+        if let Some(tokenizer) = state.tokenizer.as_deref() {
+            params.extra_stop_token_ids = resolve_stop_token_ids(stop_strings, tokenizer);
+        }
+    }
 
     let is_stream = req.stream.unwrap_or(false);
 
@@ -1563,6 +1611,12 @@ async fn health() -> Json<HealthResponse> {
 
 /// Build [`SamplingParams`] by overlaying per-request values on top of the
 /// server's default params.  Any `None` field falls back to the default.
+///
+/// `extra_stop_token_ids` is derived from the request's `stop` field: each
+/// stop string is looked up in the tokenizer vocabulary and, when it maps to a
+/// single token, that token ID is added to the per-request stop set.
+/// Multi-token stop strings are logged as a warning and skipped; full
+/// multi-token stop-sequence matching is not yet supported.
 fn build_sampling_params(
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -1577,7 +1631,50 @@ fn build_sampling_params(
         top_k: top_k.unwrap_or(defaults.top_k),
         repetition_penalty: repetition_penalty.unwrap_or(defaults.repetition_penalty),
         max_tokens,
+        extra_stop_token_ids: vec![],
     }
+}
+
+/// Resolve stop strings from an OpenAI-compatible request into per-request
+/// stop token IDs.
+///
+/// Each stop string is looked up directly in the tokenizer vocabulary
+/// (single-token strings such as `"</s>"` or `"<|eot_id|>"`).  Multi-token
+/// strings require buffered output matching which is not yet supported; they
+/// are logged as a warning and skipped.
+fn resolve_stop_token_ids(
+    stop_strings: Vec<String>,
+    tokenizer: &crate::tokenizer::Tokenizer,
+) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for s in stop_strings {
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(id) = tokenizer.token_to_id(&s) {
+            ids.push(id);
+        } else {
+            // Try tokenizing the string; if it encodes to a single token we
+            // can still use it as a stop token ID.
+            match tokenizer.encode(&s, false) {
+                Ok(tokens) if tokens.len() == 1 => {
+                    ids.push(tokens[0]);
+                }
+                Ok(tokens) => {
+                    tracing::warn!(
+                        "Stop string {:?} encodes to {} tokens — \
+                         multi-token stop sequences are not yet supported and will be ignored",
+                        s,
+                        tokens.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to tokenize stop string {:?}: {}", s, e);
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// Clamp `requested` so that `prompt_len + result <= max_seq_len`.
@@ -1897,6 +1994,8 @@ async fn ollama_generate(
             role: Role::User,
             content: MessageContent::from_string(prompt),
             audio: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         tokenizer.apply_chat_template_and_encode(&msgs)
     }
@@ -2021,6 +2120,8 @@ async fn ollama_chat(
                 role,
                 content: MessageContent::from_string(&m.content),
                 audio: None,
+                tool_calls: None,
+                tool_call_id: None,
             }
         })
         .collect();

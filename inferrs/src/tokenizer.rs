@@ -5,12 +5,25 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Chat message role.
+///
+/// OpenAI agent runtimes also send `"tool"` role messages (tool-call results)
+/// and `"function"` role messages (legacy function-calling).  Neither role is
+/// meaningful for a text-generation backend that doesn't execute tools, but
+/// deserialisation must not fail when they appear — they are folded into the
+/// `User` role so the prompt template still renders them as context.
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
     Assistant,
+    /// Tool-call result messages (`role: "tool"`) sent by OpenAI-compatible
+    /// agent runtimes after a tool has been executed.  Folded into `User`
+    /// context at template-application time.
+    Tool,
+    /// Legacy function-calling result messages (`role: "function"`).  Treated
+    /// the same as `Tool` for template purposes.
+    Function,
 }
 
 impl std::fmt::Display for Role {
@@ -19,6 +32,10 @@ impl std::fmt::Display for Role {
             Role::System => write!(f, "system"),
             Role::User => write!(f, "user"),
             Role::Assistant => write!(f, "assistant"),
+            // Tool / function result messages are surfaced as user context in
+            // the rendered prompt; the model sees the content but not the role
+            // label.
+            Role::Tool | Role::Function => write!(f, "user"),
         }
     }
 }
@@ -56,14 +73,16 @@ pub struct ContentPart {
 
 /// The `content` field of a chat message.
 ///
-/// OpenAI-compatible clients may send either:
-/// - a plain JSON string, or
-/// - a JSON array of content-part objects (e.g. `[{"type":"text","text":"…"}]`).
+/// OpenAI-compatible clients may send:
+/// - a plain JSON string,
+/// - a JSON array of content-part objects (e.g. `[{"type":"text","text":"…"}]`), or
+/// - JSON `null` (assistant messages that carry only `tool_calls` have no text
+///   content and set `content` to `null`).
 ///
-/// Both forms are accepted and normalised to a plain `String`.  Only `"text"`
-/// parts contribute to the string; all other part types (e.g. `"image_url"`)
-/// are ignored.
-#[derive(Debug, Clone)]
+/// All forms are accepted and normalised to a plain `String`.  Null content
+/// becomes an empty string.  Only `"text"` parts contribute to the string;
+/// all other part types (e.g. `"image_url"`, `"tool_use"`) are ignored.
+#[derive(Debug, Clone, Default)]
 pub struct MessageContent(pub String);
 
 impl<'de> Deserialize<'de> for MessageContent {
@@ -77,7 +96,23 @@ impl<'de> Deserialize<'de> for MessageContent {
             type Value = MessageContent;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a string or an array of content parts")
+                f.write_str("a string, an array of content parts, or null")
+            }
+
+            /// `null` content — assistant messages with tool_calls carry no text.
+            fn visit_unit<E: de::Error>(self) -> Result<MessageContent, E> {
+                Ok(MessageContent(String::new()))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<MessageContent, E> {
+                Ok(MessageContent(String::new()))
+            }
+
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<MessageContent, D2::Error> {
+                Deserialize::deserialize(deserializer)
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<MessageContent, E> {
@@ -99,7 +134,7 @@ impl<'de> Deserialize<'de> for MessageContent {
                             text.push_str(&t);
                         }
                     }
-                    // Non-text parts (image_url, etc.) are silently ignored.
+                    // Non-text parts (image_url, tool_use, etc.) are silently ignored.
                 }
                 Ok(MessageContent(text))
             }
@@ -146,11 +181,22 @@ impl MessageContent {
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
-    /// Message content — accepts a plain string or an OpenAI structured
-    /// content-part array (`[{"type":"text","text":"…"},…]`).
+    /// Message content — accepts a plain string, an OpenAI structured
+    /// content-part array (`[{"type":"text","text":"…"},…]`), or JSON `null`
+    /// (which arises in assistant messages that carry only `tool_calls`).
+    #[serde(default)]
     pub content: MessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioInput>,
+    /// Tool calls requested by the assistant — present in assistant messages
+    /// that invoke tools.  Accepted but not used: this backend does not
+    /// execute tool calls, it only renders them as context in the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Tool call ID — present in `role: "tool"` result messages.
+    /// Accepted and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Chat template format detected from the model.
@@ -449,7 +495,7 @@ fn apply_gemma3(messages: &[ChatMessage]) -> String {
         "<end_of_turn>\n",
         "<start_of_turn>model\n",
         |role| match role {
-            Role::System | Role::User => "user",
+            Role::System | Role::User | Role::Tool | Role::Function => "user",
             Role::Assistant => "model",
         },
         |s| s,
@@ -483,7 +529,7 @@ fn apply_gemma4_inner(messages: &[ChatMessage], audio_token_counts: &[usize]) ->
     for msg in messages {
         let role = match msg.role {
             Role::System => "system",
-            Role::User => "user",
+            Role::User | Role::Tool | Role::Function => "user",
             Role::Assistant => "model",
         };
         // Build the content, inserting audio tokens if this message has audio.
@@ -524,6 +570,8 @@ mod tests {
             role: Role::User,
             audio: None,
             content: MessageContent::from_string(content),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -532,6 +580,8 @@ mod tests {
             role: Role::System,
             audio: None,
             content: MessageContent::from_string(content),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -540,6 +590,8 @@ mod tests {
             role: Role::Assistant,
             audio: None,
             content: MessageContent::from_string(content),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -720,5 +772,66 @@ mod tests {
         let prompt_string = apply_chatml(&[from_string], &None);
         let prompt_parts = apply_chatml(&[from_parts], &None);
         assert_eq!(prompt_string, prompt_parts);
+    }
+
+    // ── New tests for tool-role and null-content handling ─────────────────
+
+    #[test]
+    fn message_content_deserializes_null_as_empty_string() {
+        // Assistant messages that carry only tool_calls have `content: null`.
+        let mc: MessageContent = serde_json::from_str("null").unwrap();
+        assert_eq!(mc.0, "");
+    }
+
+    #[test]
+    fn chat_message_accepts_null_content() {
+        // OpenAI agent runtimes send `{"role":"assistant","content":null,"tool_calls":[…]}`.
+        let json = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.0, "");
+        assert!(msg.tool_calls.is_some());
+    }
+
+    #[test]
+    fn chat_message_accepts_tool_role() {
+        // Tool-result messages use `role: "tool"`.
+        let json = r#"{"role":"tool","tool_call_id":"call_1","content":"72°F and sunny"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg.role, Role::Tool));
+        assert_eq!(msg.content.0, "72°F and sunny");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn tool_role_renders_as_user_in_chatml() {
+        // When rendered into a prompt, tool messages appear under the "user" turn.
+        let tool_result: ChatMessage =
+            serde_json::from_str(r#"{"role":"tool","tool_call_id":"call_1","content":"42"}"#)
+                .unwrap();
+        let prompt = apply_chatml(&[tool_result], &None);
+        assert!(prompt.contains("<|im_start|>user\n42<|im_end|>"));
+        assert!(!prompt.contains("<|im_start|>tool"));
+    }
+
+    #[test]
+    fn full_agent_turn_with_tool_call_does_not_crash() {
+        // Simulate a full OpenClaw agent turn:
+        //   1. User asks a question.
+        //   2. Assistant responds with a tool call (null content).
+        //   3. Tool result is provided (role: "tool").
+        //   4. Another user message follows.
+        let json = r#"[
+            {"role":"user","content":"What is the weather?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"weather","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"72°F"},
+            {"role":"user","content":"Thanks!"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        assert_eq!(messages.len(), 4);
+        // Must not panic when a template is applied.
+        let prompt = apply_chatml(&messages, &None);
+        assert!(prompt.contains("What is the weather?"));
+        assert!(prompt.contains("72°F"));
+        assert!(prompt.contains("Thanks!"));
     }
 }

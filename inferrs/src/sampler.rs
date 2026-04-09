@@ -11,6 +11,10 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub repetition_penalty: f64,
     pub max_tokens: usize,
+    /// Per-request extra stop token IDs derived from the `stop` field of an
+    /// OpenAI-compatible request.  These are checked in addition to the
+    /// model-wide stop token IDs held by the engine.
+    pub extra_stop_token_ids: Vec<u32>,
 }
 
 impl Default for SamplingParams {
@@ -21,6 +25,7 @@ impl Default for SamplingParams {
             top_k: 50,
             repetition_penalty: 1.0,
             max_tokens: 2048,
+            extra_stop_token_ids: vec![],
         }
     }
 }
