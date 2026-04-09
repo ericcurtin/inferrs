@@ -85,8 +85,8 @@ pub mod sys {
 pub mod sys {
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::HMODULE;
-    use windows_sys::Win32::System::LibraryLoader::{FreeLibrary, GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
     /// RAII wrapper around a `LoadLibraryW` handle.
     pub struct DlHandle(HMODULE);
@@ -97,7 +97,7 @@ pub mod sys {
 
     impl Drop for DlHandle {
         fn drop(&mut self) {
-            if self.0 != 0 {
+            if !self.0.is_null() {
                 // SAFETY: handle is valid and non-zero.
                 unsafe { FreeLibrary(self.0) };
             }
@@ -125,7 +125,7 @@ pub mod sys {
         // (libdl.h) is unnecessary here because we check the return value and
         // handle failure gracefully via the Option return type.
         let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
-        if handle == 0 {
+        if handle.is_null() {
             None
         } else {
             Some(DlHandle(handle))

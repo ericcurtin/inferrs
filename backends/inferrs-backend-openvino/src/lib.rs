@@ -152,8 +152,8 @@ mod windows_probe {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::Foundation::HMODULE;
-    use windows_sys::Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryW};
+    use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
     /// Candidate DLL names on Windows.
     const CANDIDATES: &[&str] = &[
@@ -175,7 +175,7 @@ mod windows_probe {
             // null-terminated wide string.  We immediately `FreeLibrary` the
             // handle — we only need to know whether the DLL can be found.
             let handle: HMODULE = unsafe { LoadLibraryW(wide.as_ptr()) };
-            if handle != 0 {
+            if !handle.is_null() {
                 unsafe { FreeLibrary(handle) };
                 return true;
             }

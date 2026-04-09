@@ -239,12 +239,12 @@ fn windows_driver_path() -> Option<String> {
             std::ptr::null(),
             SC_MANAGER_CONNECT as u32,
         );
-        if scm == 0 {
+        if scm.is_null() {
             return None;
         }
 
         let svc = OpenServiceW(scm, SERVICE_NAME.as_ptr(), SERVICE_QUERY_CONFIG as u32);
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return None;
         }
