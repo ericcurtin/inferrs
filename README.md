@@ -69,15 +69,15 @@ inferrs serve --paged-attention google/gemma-4-E2B-it
 inferrs serve --quantize google/gemma-4-E2B-it
 ```
 
-#### Serve without a model (Ollama-compatible mode on port 11434)
+#### Serve without a model (Ollama-compatible mode on port 17434)
 
 ```bash
 inferrs serve
 ```
 
-This behaves like `ollama serve`: the server starts on `0.0.0.0:11434`, responds
-`"Ollama is running"` at `GET /`, and exposes the full Ollama API. Any Ollama
-client — including the `ollama` CLI — can point at it directly.
+This behaves like `ollama serve` the server starts on `0.0.0.0:17434` and
+exposes the full Ollama API. Any Ollama client — including the `ollama`
+CLI — can point at it directly.
 
 ## Architecture
 

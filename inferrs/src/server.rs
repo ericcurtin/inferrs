@@ -772,7 +772,7 @@ fn image_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) 
 /// Default port when a specific model is pre-loaded (OpenAI-style API).
 const DEFAULT_PORT_MODEL: u16 = 8080;
 /// Default port when running in Ollama-compatible mode (no model pre-loaded).
-const DEFAULT_PORT_OLLAMA: u16 = 11434;
+const DEFAULT_PORT_OLLAMA: u16 = 17434;
 
 pub async fn run(args: ServeArgs) -> Result<()> {
     // When a model is specified, load it; otherwise run in Ollama-compatible
@@ -2161,7 +2161,7 @@ fn inject_tools_into_messages(messages: &[ChatMessage], tool_summary: &str) -> V
 
 /// `GET /` and `HEAD /` — Ollama running check.
 async fn ollama_root() -> impl IntoResponse {
-    (StatusCode::OK, "Ollama is running")
+    (StatusCode::OK, "inferrs is running")
 }
 
 /// `GET /api/version` — Ollama version endpoint.

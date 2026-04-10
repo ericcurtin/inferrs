@@ -80,7 +80,7 @@ enum Commands {
 pub struct ServeArgs {
     /// HuggingFace model ID (e.g. Qwen/Qwen3.5-0.8B).
     /// When omitted, inferrs starts without loading a model and exposes the
-    /// Ollama-compatible API on port 11434 (same behaviour as `ollama serve`).
+    /// Ollama-compatible API on port 17434 (same behaviour as `ollama serve`).
     pub model: Option<String>,
 
     /// Git branch or tag on HuggingFace Hub
@@ -104,7 +104,7 @@ pub struct ServeArgs {
     pub host: String,
 
     /// Port to listen on.
-    /// Defaults to 8080 when a model is specified, or 11434 (Ollama default)
+    /// Defaults to 8080 when a model is specified, or 17434 (Ollama default)
     /// when no model is specified.
     #[arg(long)]
     pub port: Option<u16>,
