@@ -13,11 +13,15 @@ use crossterm::{
 use std::io::{self, Write};
 use std::sync::mpsc as stdmpsc;
 
-use crate::engine::{load_engine, AudioEmbedContext, StreamToken, SyncEngineRequest};
+use crate::engine::{
+    load_engine, AudioEmbedContext, StreamToken, SyncEngineRequest, SyncMemorySnapshot,
+};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{
     apply_gemma4_with_audio, AudioInput, ChatMessage, MessageContent, Role, Tokenizer,
 };
+use crate::turbo_quant::GROUP_SIZE;
+use crate::util::format_bytes;
 use crate::ServeArgs;
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
@@ -147,6 +151,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
 
     // Load model, build engine, attach paged KV.
     let ctx = load_engine(&serve)?;
+    let memory_config = RunMemoryConfig::from_loaded_context(&args, &ctx);
 
     // Extract fields needed before ctx is partially moved.
     let audio_token_id = ctx.raw_config.audio_token_id;
@@ -244,7 +249,13 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     }
 
     // Interactive REPL
-    repl(tokenizer, engine_tx, sampling_params, messages)
+    repl(
+        tokenizer,
+        engine_tx,
+        sampling_params,
+        messages,
+        memory_config,
+    )
 }
 
 // ─── Interactive REPL ────────────────────────────────────────────────────────
@@ -261,6 +272,7 @@ fn repl(
     engine_tx: stdmpsc::SyncSender<SyncEngineRequest>,
     sampling_params: SamplingParams,
     mut messages: Vec<ChatMessage>,
+    memory_config: RunMemoryConfig,
 ) -> Result<()> {
     let mut multiline = MultilineState::None;
     let mut buf = String::new(); // current multi-line accumulation buffer
@@ -325,7 +337,13 @@ fn repl(
                 // Slash commands
                 let trimmed = buf.trim();
                 if trimmed.starts_with('/') {
-                    handle_command(trimmed, &mut messages, &sampling_params);
+                    handle_command(
+                        trimmed,
+                        &mut messages,
+                        &sampling_params,
+                        &engine_tx,
+                        &memory_config,
+                    );
                     buf.clear();
                     continue;
                 }
@@ -388,7 +406,13 @@ fn repl(
 
 // ─── Slash command handler ────────────────────────────────────────────────────
 
-fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingParams) {
+fn handle_command(
+    cmd: &str,
+    messages: &mut Vec<ChatMessage>,
+    params: &SamplingParams,
+    engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
+    memory_config: &RunMemoryConfig,
+) {
     let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
     match parts[0] {
         "/bye" | "/exit" | "/quit" => {
@@ -435,6 +459,11 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
                     params.temperature, params.top_p, params.top_k, params.max_tokens
                 );
             }
+            "memory" => {
+                if let Err(e) = show_memory(engine_tx, memory_config) {
+                    eprintln!("Memory query error: {e}");
+                }
+            }
             _ => println!("Unknown /show option: {}", parts[1]),
         },
         "/help" | "/?" => {
@@ -443,6 +472,7 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
             println!("  /clear                 Clear conversation history");
             println!("  /set system <text>     Set a system prompt");
             println!("  /show history          Print conversation history");
+            println!("  /show memory           Print KV cache and paged-pool usage");
             println!("  /show params           Print sampling parameters");
             println!("  /help, /?              Show this help");
             println!();
@@ -456,6 +486,161 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
         }
         other => println!("Unknown command: {other}"),
     }
+}
+
+#[derive(Clone)]
+struct RunMemoryConfig {
+    dtype: String,
+    arch: String,
+    turbo_quant: Option<u8>,
+    turbo_quant_note: Option<String>,
+    kv_estimate_mode: &'static str,
+    weight_source: &'static str,
+    weight_quantization: Option<String>,
+    weight_bytes: Option<u64>,
+    max_seq_len: Option<usize>,
+    max_kv_cache_bytes: Option<u64>,
+}
+
+impl RunMemoryConfig {
+    fn from_loaded_context(args: &RunArgs, ctx: &crate::engine::EngineContext) -> Self {
+        let (num_kv_heads, head_dim, num_layers) = ctx.raw_config.kv_cache_params(&ctx.arch);
+        let max_seq_len = (ctx.max_seq_len != usize::MAX).then_some(ctx.max_seq_len);
+        let turbo_quant_supported = matches!(
+            ctx.arch,
+            crate::config::ModelArchitecture::Qwen3 | crate::config::ModelArchitecture::Gemma4
+        );
+        let effective_turbo_quant = if args.paged_attention.is_some() || !turbo_quant_supported {
+            None
+        } else {
+            args.turbo_quant.0
+        };
+        let turbo_quant_note = match args.turbo_quant.0 {
+            Some(bits) if args.paged_attention.is_some() => Some(format!(
+                "{bits}bit requested, but paged attention reserves plain {dtype:?} KV blocks",
+                dtype = ctx.dtype
+            )),
+            Some(bits) if !turbo_quant_supported => Some(format!(
+                "{bits}bit requested, but {:?} ignores TurboQuant KV compression",
+                ctx.arch
+            )),
+            _ => None,
+        };
+        let kv_estimate_mode = if args.paged_attention.is_some() {
+            "paged-dtype"
+        } else if effective_turbo_quant.is_some() {
+            "turbo-quant"
+        } else {
+            "plain-dtype"
+        };
+        let max_kv_cache_bytes = max_seq_len.map(|seq_len| {
+            let bytes_per_token: usize = if let Some(bits) = effective_turbo_quant {
+                let index_bytes = if bits <= 4 {
+                    head_dim.div_ceil(2)
+                } else {
+                    head_dim
+                };
+                let n_groups = head_dim.div_ceil(GROUP_SIZE);
+                let scale_bytes = n_groups * 4;
+                (index_bytes + scale_bytes) * 2 * num_kv_heads * num_layers
+            } else {
+                head_dim * 2 * num_kv_heads * num_layers * ctx.dtype.size_in_bytes()
+            };
+            (bytes_per_token * seq_len) as u64
+        });
+        let (weight_source, weight_paths): (&'static str, Vec<&std::path::PathBuf>) =
+            if let Some(gguf) = &ctx.model_files.gguf_path {
+                ("gguf", vec![gguf])
+            } else {
+                ("safetensors", ctx.model_files.weight_paths.iter().collect())
+            };
+        let weight_bytes = weight_paths
+            .iter()
+            .try_fold(0u64, |acc, path| {
+                Ok::<u64, std::io::Error>(acc + path.metadata()?.len())
+            })
+            .ok();
+
+        Self {
+            dtype: format!("{:?}", ctx.dtype),
+            arch: format!("{:?}", ctx.arch),
+            turbo_quant: args.turbo_quant.0,
+            turbo_quant_note,
+            kv_estimate_mode,
+            weight_source,
+            weight_quantization: args.quantize.as_ref().map(|q| q.to_uppercase()),
+            weight_bytes,
+            max_seq_len,
+            max_kv_cache_bytes,
+        }
+    }
+}
+
+fn show_memory(
+    engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
+    memory_config: &RunMemoryConfig,
+) -> Result<()> {
+    let (response_tx, response_rx) = stdmpsc::channel::<SyncMemorySnapshot>();
+    engine_tx.send(SyncEngineRequest::MemorySnapshot { response_tx })?;
+    let snapshot = response_rx.recv()?;
+
+    println!(
+        "device={} dtype={} arch={}",
+        snapshot.device, memory_config.dtype, memory_config.arch
+    );
+    match memory_config.turbo_quant {
+        Some(bits) => println!("turbo_quant={}bit", bits),
+        None => println!("turbo_quant=disabled"),
+    }
+    if let Some(note) = &memory_config.turbo_quant_note {
+        println!("turbo_quant_note={note}");
+    }
+    println!("kv_estimate_mode={}", memory_config.kv_estimate_mode);
+    match &memory_config.weight_quantization {
+        Some(format) => println!("weight_format={} ({})", format, memory_config.weight_source),
+        None => println!(
+            "weight_format=full precision ({})",
+            memory_config.weight_source
+        ),
+    }
+    if let Some(weight_bytes) = memory_config.weight_bytes {
+        println!("model_weight_estimate={}", format_bytes(weight_bytes));
+    }
+    match memory_config.max_seq_len {
+        Some(max_seq_len) => println!("model_kv_capacity={} tokens", max_seq_len),
+        None => println!("model_kv_capacity=unknown"),
+    }
+    if let Some(max_bytes) = memory_config.max_kv_cache_bytes {
+        println!("max_kv_cache_estimate={}", format_bytes(max_bytes));
+        if let Some(weight_bytes) = memory_config.weight_bytes {
+            println!(
+                "model_plus_max_kv_estimate={}",
+                format_bytes(weight_bytes.saturating_add(max_bytes))
+            );
+        }
+    }
+
+    if let Some(paged) = snapshot.paged {
+        println!(
+            "paged_pool={} blocks x {} tokens = {} slots",
+            paged.total_blocks, paged.block_size, paged.total_slots
+        );
+        println!(
+            "paged_blocks_used={} free={} allocated_tokens={}",
+            paged.used_blocks, paged.free_blocks, paged.allocated_tokens
+        );
+        println!(
+            "paged_memory_reserved={} active_estimate={} bytes_per_block={}",
+            format_bytes(paged.reserved_bytes as u64),
+            format_bytes(paged.allocated_bytes as u64),
+            format_bytes(paged.bytes_per_block as u64),
+        );
+    } else {
+        println!("paged_attention=disabled");
+        println!("live_kv_usage=not tracked in concat-KV mode");
+    }
+
+    Ok(())
 }
 
 // ─── Streaming helpers ────────────────────────────────────────────────────────

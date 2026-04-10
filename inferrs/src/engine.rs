@@ -161,6 +161,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         model,
         engine_tokenizer,
         device.clone(),
+        dtype,
         args.max_batch_size,
         args.max_tokens_per_step,
     );
@@ -248,6 +249,29 @@ pub enum SyncEngineRequest {
         sampling_params: SamplingParams,
         token_tx: std::sync::mpsc::SyncSender<StreamToken>,
     },
+    /// Return a snapshot of the engine's current memory-related state.
+    MemorySnapshot {
+        response_tx: std::sync::mpsc::Sender<SyncMemorySnapshot>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncMemorySnapshot {
+    pub device: &'static str,
+    pub paged: Option<PagedMemorySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PagedMemorySnapshot {
+    pub block_size: usize,
+    pub total_blocks: usize,
+    pub free_blocks: usize,
+    pub used_blocks: usize,
+    pub allocated_tokens: usize,
+    pub total_slots: usize,
+    pub bytes_per_block: usize,
+    pub reserved_bytes: usize,
+    pub allocated_bytes: usize,
 }
 
 /// A single streamed token.
@@ -970,6 +994,7 @@ pub struct Engine {
     model: Box<dyn CausalLM>,
     tokenizer: Tokenizer,
     device: Device,
+    kv_cache_dtype: DType,
     stop_token_ids: Vec<u32>,
     max_batch_size: usize,
     #[allow(dead_code)]
@@ -998,6 +1023,7 @@ impl Engine {
         model: Box<dyn CausalLM>,
         tokenizer: Tokenizer,
         device: Device,
+        kv_cache_dtype: DType,
         max_batch_size: usize,
         max_tokens_per_step: usize,
     ) -> Self {
@@ -1006,6 +1032,7 @@ impl Engine {
             model,
             tokenizer,
             device,
+            kv_cache_dtype,
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step,
@@ -1022,6 +1049,43 @@ impl Engine {
             block_table: BlockTable::new(block_size),
         });
         self
+    }
+
+    fn sync_memory_snapshot(&self) -> SyncMemorySnapshot {
+        let device = match &self.device {
+            Device::Cpu => "cpu",
+            Device::Cuda(_) => "cuda",
+            Device::Metal(_) => "metal",
+        };
+
+        let paged = self.paged.as_ref().map(|ps| {
+            let cfg = &ps.kv_store.cfg;
+            let bytes_per_block = cfg.block_size
+                * cfg.num_kv_heads
+                * cfg.head_dim
+                * 2
+                * cfg.num_layers
+                * self.kv_cache_dtype.size_in_bytes();
+            let total_blocks = ps.block_pool.num_blocks();
+            let free_blocks = ps.block_pool.num_free_blocks();
+            let used_blocks = total_blocks.saturating_sub(free_blocks);
+            let total_slots = cfg.num_blocks * cfg.block_size;
+            let reserved_bytes = cfg.num_blocks * bytes_per_block;
+            let allocated_bytes = used_blocks * bytes_per_block;
+            PagedMemorySnapshot {
+                block_size: cfg.block_size,
+                total_blocks,
+                free_blocks,
+                used_blocks,
+                allocated_tokens: ps.block_table.num_tokens(),
+                total_slots,
+                bytes_per_block,
+                reserved_bytes,
+                allocated_bytes,
+            }
+        });
+
+        SyncMemorySnapshot { device, paged }
     }
 
     /// Run the engine loop, processing requests from the channel.
@@ -1159,6 +1223,7 @@ impl Engine {
             mut model,
             tokenizer,
             device,
+            kv_cache_dtype: _,
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step: _,
@@ -1521,6 +1586,9 @@ impl Engine {
                             finish_reason: Some("error".to_string()),
                         });
                     }
+                }
+                SyncEngineRequest::MemorySnapshot { response_tx } => {
+                    let _ = response_tx.send(self.sync_memory_snapshot());
                 }
             }
         }

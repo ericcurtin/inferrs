@@ -109,6 +109,12 @@ impl BlockPool {
         self.free_list.len()
     }
 
+    /// Total number of physical blocks managed by the pool.
+    #[allow(dead_code)]
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Allocate `n` blocks.  Returns `None` if there are not enough free blocks.
     pub fn allocate(&mut self, n: usize) -> Option<Vec<u32>> {
         if self.free_list.len() < n {
