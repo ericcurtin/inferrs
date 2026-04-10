@@ -94,6 +94,10 @@ pub struct RunArgs {
     /// Path to a WAV audio file to attach to the prompt (Gemma 4 audio models).
     #[arg(long)]
     pub audio: Option<std::path::PathBuf>,
+
+    /// Maximum sequence length (0 = model default)
+    #[arg(long, default_value_t = 0)]
+    pub max_seq_len: usize,
 }
 
 impl RunArgs {
@@ -102,7 +106,7 @@ impl RunArgs {
             model: Some(self.model.clone()),
             revision: self.revision.clone(),
             dtype: self.dtype.clone(),
-            max_seq_len: 0,
+            max_seq_len: self.max_seq_len,
             device: self.device.clone(),
             host: "0.0.0.0".to_string(),
             port: Some(8080),

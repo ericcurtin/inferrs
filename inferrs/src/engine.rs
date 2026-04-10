@@ -136,7 +136,11 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
     let arch = raw_config.detect_architecture()?;
     tracing::info!("Detected architecture: {:?}", arch);
 
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
+    let max_seq_len = if args.max_seq_len > 0 {
+        args.max_seq_len
+    } else {
+        raw_config.effective_max_seq_len(&arch)
+    };
     if max_seq_len < usize::MAX {
         tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
     }
