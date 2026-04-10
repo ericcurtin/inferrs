@@ -860,12 +860,65 @@ fn conv2d_grad(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Depthwise conv1d (groups == c_in) with ones kernel and zero padding.
+/// Expected values computed analytically: each output element is the sum of
+/// the 3 nearest input values (with zero-padding on boundaries).
+///
+/// Input x: arange(20).reshape(1, 4, 5) — channel c has values [c*5, c*5+1, ..., c*5+4]
+/// Kernel w: ones(4, 1, 3)
+/// Conv1d(x, w, padding=1, stride=1, groups=4) → shape [1, 4, 5]
+fn conv1d_depthwise(dev: &Device) -> Result<()> {
+    let x = Tensor::arange(0f32, 20f32, dev)?.reshape((1usize, 4usize, 5usize))?;
+    let w = Tensor::ones((4usize, 1usize, 3usize), candle_core::DType::F32, dev)?;
+    let out = x.conv1d(
+        &w, /*padding=*/ 1, /*stride=*/ 1, /*dilation=*/ 1, /*groups=*/ 4,
+    )?;
+    assert_eq!(out.dims(), [1, 4, 5]);
+    assert_eq!(
+        test_utils::to_vec1_round(&out.flatten_all()?, 4)?,
+        [
+            1., 3., 6., 9., 7., 11., 18., 21., 24., 17., 21., 33., 36., 39., 27., 31., 48., 51.,
+            54., 37.,
+        ]
+    );
+    Ok(())
+}
+
+/// Same as above but with stride=2.
+/// Input x: arange(24).reshape(1, 4, 6), w: ones(4, 1, 3)
+/// Conv1d(x, w, padding=1, stride=2, groups=4) → shape [1, 4, 3]
+fn conv1d_depthwise_stride2(dev: &Device) -> Result<()> {
+    let x = Tensor::arange(0f32, 24f32, dev)?.reshape((1usize, 4usize, 6usize))?;
+    let w = Tensor::ones((4usize, 1usize, 3usize), candle_core::DType::F32, dev)?;
+    let out = x.conv1d(
+        &w, /*padding=*/ 1, /*stride=*/ 2, /*dilation=*/ 1, /*groups=*/ 4,
+    )?;
+    assert_eq!(out.dims(), [1, 4, 3]);
+    assert_eq!(
+        test_utils::to_vec1_round(&out.flatten_all()?, 4)?,
+        [1., 6., 12., 13., 24., 30., 25., 42., 48., 37., 60., 66.,]
+    );
+    Ok(())
+}
+
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
 test_device!(
     conv1d_small,
     conv1d_small_cpu,
     conv1d_small_gpu,
     conv1d_small_metal
+);
+test_device!(
+    conv1d_depthwise,
+    conv1d_depthwise_cpu,
+    conv1d_depthwise_gpu,
+    conv1d_depthwise_metal
+);
+test_device!(
+    conv1d_depthwise_stride2,
+    conv1d_depthwise_stride2_cpu,
+    conv1d_depthwise_stride2_gpu,
+    conv1d_depthwise_stride2_metal
 );
 test_device!(conv2d, conv2d_cpu, conv2d_gpu, conv2d_metal);
 test_device!(

@@ -55,6 +55,30 @@ impl ParamsConvTranspose1D {
     }
 }
 
+/// Parameters for depthwise conv1d (groups == c_in, c_in_k == 1).
+/// Stored separately from `ParamsConv1D` to avoid threading `groups` through the
+/// generic single-group path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamsConv1DDepthwise {
+    pub(crate) b_size: usize,
+    pub(crate) c_size: usize, // total channels (== groups)
+    pub(crate) l_in: usize,
+    pub(crate) k_size: usize,
+    pub(crate) padding: usize,
+    pub(crate) stride: usize,
+    pub(crate) dilation: usize,
+}
+
+impl ParamsConv1DDepthwise {
+    pub(crate) fn l_out(&self) -> usize {
+        (self.l_in + 2 * self.padding - self.dilation * (self.k_size - 1) - 1) / self.stride + 1
+    }
+
+    pub(crate) fn out_dims(&self) -> Vec<usize> {
+        vec![self.b_size, self.c_size, self.l_out()]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CudnnFwdAlgo {
     ImplicitGemm,
@@ -129,6 +153,26 @@ impl ParamsConvTranspose2D {
 }
 
 impl Tensor {
+    fn conv1d_depthwise_path(&self, kernel: &Self, params: &ParamsConv1DDepthwise) -> Result<Self> {
+        // Squeeze kernel from [c, 1, k] to [c, k] so the CUDA backend receives a
+        // contiguous 2-D layout and doesn't need to reason about the extra dim.
+        let kernel_sq = kernel.squeeze(1)?.contiguous()?;
+        let storage = self.storage().conv1d_depthwise(
+            self.layout(),
+            &kernel_sq.storage(),
+            kernel_sq.layout(),
+            params,
+        )?;
+        // TODO: Op::Conv1D does not carry a `groups` field, so the existing
+        // backprop path would reconstruct the input gradient with groups=1,
+        // producing shape [b, 1, l_in] instead of [b, c, l_in].  Until
+        // Op::Conv1D is extended and backprop.rs updated accordingly, we
+        // disable autograd for this path to avoid silently wrong gradients.
+        let op = BackpropOp::none();
+        let out_dims = params.out_dims();
+        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+    }
+
     fn conv1d_single_group(&self, kernel: &Self, params: &ParamsConv1D) -> Result<Self> {
         let storage =
             self.storage()
@@ -192,6 +236,21 @@ impl Tensor {
         };
         if groups == 1 {
             self.conv1d_single_group(kernel, &params)
+        } else if c_in_k == 1 && c_out == groups && matches!(self.device(), crate::Device::Cuda(_))
+        {
+            // Depthwise case on CUDA: groups == c_in == c_out, one weight per channel.
+            // A single CUDA kernel handles all channels; avoids N_groups serial launches.
+            // CPU and Metal keep the existing chunk-loop path below (no regression).
+            let dw_params = ParamsConv1DDepthwise {
+                b_size,
+                c_size: c_in,
+                l_in,
+                k_size,
+                padding,
+                stride,
+                dilation,
+            };
+            self.conv1d_depthwise_path(kernel, &dw_params)
         } else {
             let blocks = self.chunk(groups, 1)?;
             let kernel = kernel.chunk(groups, 0)?;

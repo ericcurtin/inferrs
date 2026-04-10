@@ -51,6 +51,49 @@ __device__ void conv1d(
   dst[dst_i] = static_cast<T>(d);
 }
 
+// Depthwise conv1d: one thread per output element (b, c, l_out).
+// Input  [b, c, l_in]  — strides passed explicitly to support non-contiguous layouts.
+// Kernel [c, k_size]   — contiguous (squeezed from [c, 1, k_size] at Rust level).
+// Output [b, c, l_out] — contiguous.
+// Replaces N_groups sequential single-channel launches with a single kernel.
+template <typename T, typename A>
+__device__ void conv1d_depthwise(
+    const size_t b_size,
+    const size_t c_size,
+    const size_t l_in,
+    const size_t l_out,
+    const size_t k_size,
+    const size_t stride,
+    const size_t padding,
+    const size_t dilation,
+    const size_t src_b_stride,
+    const size_t src_c_stride,
+    const size_t src_l_stride,
+    const T *src,
+    const T *kernel,
+    T *dst
+) {
+    const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dst_i >= b_size * c_size * l_out) return;
+
+    const size_t l_idx = dst_i % l_out;
+    const size_t c_idx = (dst_i / l_out) % c_size;
+    const size_t b_idx = dst_i / (l_out * c_size);
+
+    A d = 0;
+    for (size_t k = 0; k < k_size; k++) {
+        const size_t src_l_raw = l_idx * stride + k * dilation;
+        if (src_l_raw < padding || src_l_raw >= padding + l_in) continue;
+        const size_t src_l = src_l_raw - padding;
+        const size_t src_idx = b_idx * src_b_stride
+                             + c_idx * src_c_stride
+                             + src_l * src_l_stride;
+        const size_t k_idx = c_idx * k_size + k;
+        d += static_cast<A>(src[src_idx]) * static_cast<A>(kernel[k_idx]);
+    }
+    dst[dst_i] = static_cast<T>(d);
+}
+
 template <typename T>
 __device__ void im2col1d(
     const size_t numel,
@@ -648,6 +691,28 @@ extern "C" __global__ void FN_NAME(  \
   conv1d<TYPENAME, TYPEACC>(src_numel, num_dims, stride, padding, dilation, info, src, kernel, dst); \
 } \
 
+#define CONV1D_DEPTHWISE_OP(TYPENAME, TYPEACC, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const size_t b_size, \
+    const size_t c_size, \
+    const size_t l_in, \
+    const size_t l_out, \
+    const size_t k_size, \
+    const size_t stride, \
+    const size_t padding, \
+    const size_t dilation, \
+    const size_t src_b_stride, \
+    const size_t src_c_stride, \
+    const size_t src_l_stride, \
+    const TYPENAME *src, \
+    const TYPENAME *kernel, \
+    TYPENAME *dst \
+) { \
+  conv1d_depthwise<TYPENAME, TYPEACC>( \
+    b_size, c_size, l_in, l_out, k_size, stride, padding, dilation, \
+    src_b_stride, src_c_stride, src_l_stride, src, kernel, dst); \
+} \
+
 #define CONV2D_OP(TYPENAME, TYPEACC, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t src_numel, \
@@ -802,6 +867,7 @@ extern "C" __global__ void FN_NAME(  \
 
 #if __CUDA_ARCH__ >= 800
 CONV1D_OP(__nv_bfloat16, float, conv1d_bf16)
+CONV1D_DEPTHWISE_OP(__nv_bfloat16, float, conv1d_depthwise_bf16)
 CONV2D_OP(__nv_bfloat16, float, conv2d_bf16)
 CONVT1D_OP(__nv_bfloat16, float, conv_transpose1d_bf16)
 CONVT2D_OP(__nv_bfloat16, float, conv_transpose2d_bf16)
@@ -828,6 +894,7 @@ COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 
 #if __CUDA_ARCH__ >= 530
 CONV1D_OP(__half, float, conv1d_f16)
+CONV1D_DEPTHWISE_OP(__half, float, conv1d_depthwise_f16)
 CONV2D_OP(__half, float, conv2d_f16)
 CONVT1D_OP(__half, float, conv_transpose1d_f16)
 CONVT2D_OP(__half, float, conv_transpose2d_f16)
@@ -841,9 +908,13 @@ COL2IM1D_OP(__half, col2im1d_f16)
 #endif
 
 CONV1D_OP(float, float, conv1d_f32)
+CONV1D_DEPTHWISE_OP(float, float, conv1d_depthwise_f32)
 CONV1D_OP(double, double, conv1d_f64)
+CONV1D_DEPTHWISE_OP(double, double, conv1d_depthwise_f64)
 CONV1D_OP(uint8_t, uint8_t, conv1d_u8)
+CONV1D_DEPTHWISE_OP(uint8_t, uint8_t, conv1d_depthwise_u8)
 CONV1D_OP(uint32_t, uint32_t, conv1d_u32)
+CONV1D_DEPTHWISE_OP(uint32_t, uint32_t, conv1d_depthwise_u32)
 
 CONV2D_OP(float, float, conv2d_f32)
 CONV2D_OP(double, double, conv2d_f64)

@@ -1,6 +1,7 @@
 pub(crate) mod affine;
 pub(crate) mod binary;
 pub(crate) mod broadcast;
+pub(crate) mod conv1d_depthwise;
 pub(crate) mod conv_transpose2d;
 pub(crate) mod copy;
 pub(crate) mod matmul;

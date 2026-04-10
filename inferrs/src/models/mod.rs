@@ -586,7 +586,7 @@ pub fn load_model(
             })
         }
         ModelArchitecture::Qwen35 => {
-            let config = raw_config.to_qwen35_config(dtype, device.clone());
+            let config = raw_config.to_qwen35_config(dtype, device.clone(), turbo_quant_bits);
             tracing::info!(
                 "Qwen3.5 config: {} layers, {} attn heads, {} hidden, {} kv_heads",
                 config.num_hidden_layers,
