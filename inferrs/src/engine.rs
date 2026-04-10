@@ -188,6 +188,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
 /// Abstraction over the two streaming channel flavours:
 /// - `tokio::sync::mpsc::Sender` (used by the HTTP server)
 /// - `std::sync::mpsc::SyncSender` (used by `inferrs run` on a plain OS thread)
+#[allow(dead_code)]
 trait TokenSender: Send {
     fn send_token(&self, token: StreamToken) -> bool;
 }
@@ -254,6 +255,7 @@ pub enum EngineRequest {
 }
 
 /// Request to the engine using only stdlib channels (no Tokio, used by `inferrs run`).
+#[allow(dead_code)]
 pub enum SyncEngineRequest {
     /// Generate tokens with streaming, sending each token over a stdlib channel.
     GenerateStream {
@@ -1570,6 +1572,7 @@ impl Engine {
 
     /// Run the engine loop using only stdlib channels — no Tokio runtime required.
     /// Used by `inferrs run` so that blocking sends/recvs work on a plain OS thread.
+    #[allow(dead_code)]
     pub fn run_sync(mut self, rx: std::sync::mpsc::Receiver<SyncEngineRequest>) {
         tracing::info!("Engine loop started (sync)");
 

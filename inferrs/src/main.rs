@@ -511,7 +511,7 @@ async fn main() -> Result<()> {
             server::run(args).await?;
         }
         Commands::Run(args) => {
-            run::run(args)?;
+            run::run(args).await?;
         }
         Commands::Bench(args) => {
             tracing::info!(

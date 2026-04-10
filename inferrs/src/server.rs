@@ -75,7 +75,7 @@ fn spawn_drain_task(output_buf: OutputBuffer, registry: StreamRegistry) {
 ///
 /// The OpenAI spec allows `stop` to be a string or an array of strings.
 /// Both forms are normalised to `Vec<String>`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum StopSequences {
     #[default]
@@ -94,7 +94,7 @@ impl StopSequences {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
@@ -240,7 +240,7 @@ const ANTHROPIC_STOP_MAX_TOKENS: &str = "max_tokens";
 
 /// Role enum for Anthropic messages (only "user" and "assistant" – system
 /// messages are passed at the top level).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AnthropicRole {
     User,
@@ -248,14 +248,14 @@ pub enum AnthropicRole {
 }
 
 /// A single message in an Anthropic Messages request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicMessage {
     pub role: AnthropicRole,
     pub content: String,
 }
 
 /// Request body for `POST /v1/messages` (Anthropic Messages API).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicMessagesRequest {
     pub model: Option<String>,
     pub messages: Vec<AnthropicMessage>,
@@ -400,7 +400,7 @@ pub struct AnthropicErrorDetail {
 // ─── Ollama API types ────────────────────────────────────────────────────────
 
 /// Ollama `POST /api/generate` request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OllamaGenerateRequest {
     pub model: String,
     pub prompt: Option<String>,
@@ -418,7 +418,7 @@ pub struct OllamaGenerateRequest {
 }
 
 /// Ollama `POST /api/chat` request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OllamaChatRequest {
     pub model: String,
     pub messages: Vec<OllamaChatMessage>,
@@ -436,13 +436,33 @@ pub struct OllamaChatMessage {
 }
 
 /// Sampling options passed inside an Ollama request.
-#[derive(Debug, Deserialize, Default)]
+///
+/// In addition to the standard Ollama sampling fields, inferrs extends this
+/// struct with model-loading fields (`dtype`, `device`, `revision`, etc.).
+/// These are read by the daemon when spawning a worker process and are ignored
+/// by worker processes themselves (which are already serving a loaded model).
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct OllamaOptions {
+    // ── Standard Ollama sampling fields ──────────────────────────────────────
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
     pub num_predict: Option<usize>,
     pub repeat_penalty: Option<f64>,
+
+    // ── inferrs model-loading extensions ─────────────────────────────────────
+    /// Weight data type: f32, f16, bf16
+    pub dtype: Option<String>,
+    /// Device: cpu, cuda, metal, auto
+    pub device: Option<String>,
+    /// Git revision/branch/tag on HuggingFace Hub
+    pub revision: Option<String>,
+    /// Fraction of memory for paged-attention KV blocks
+    pub paged_attention: Option<f64>,
+    /// TurboQuant KV cache bit-width (stringified so "false" disables it)
+    pub turbo_quant: Option<String>,
+    /// GGUF quantization format, e.g. "Q4K"
+    pub quantize: Option<String>,
 }
 
 /// Non-streaming `POST /api/generate` response.
@@ -714,33 +734,85 @@ fn anthropic_messages_to_chat(
 
 // ─── Server state ───────────────────────────────────────────────────────────
 
+/// A running model worker.  In daemon mode (no model arg) the daemon spawns
+/// `inferrs serve --port <N> <model>` as a child process and stores a reference
+/// to it here so it can proxy requests and keep the child alive.
+/// In direct/worker mode (model arg given) this struct holds the in-process
+/// engine state instead.
+struct LoadedModel {
+    model_id: String,
+    /// How this model is served.
+    backend: ModelBackend,
+}
+
+/// Two operating modes, mirroring Ollama's daemon↔runner split:
+///
+/// - `Worker`: this process IS the model server — engine runs in-process.
+/// - `Proxy`: this process is the daemon — it spawned a worker child and
+///   forwards all inference requests to it over HTTP.
 #[allow(dead_code)]
+enum ModelBackend {
+    /// In-process engine (used when `inferrs serve <model>` is run directly).
+    Worker {
+        engine_tx: mpsc::Sender<EngineRequest>,
+        tokenizer: Arc<Tokenizer>,
+        max_seq_len: usize,
+        output_buf: OutputBuffer,
+        stream_registry: StreamRegistry,
+        audio_token_id: Option<u32>,
+        image_token_id: Option<u32>,
+        boi_token_id: Option<u32>,
+        eoi_token_id: Option<u32>,
+        vision_patch_size: Option<usize>,
+        vision_pooling_kernel: Option<usize>,
+        vision_default_output_length: Option<usize>,
+    },
+    /// HTTP proxy to a worker child process.
+    Proxy {
+        /// Base URL of the worker, e.g. `http://127.0.0.1:34821`.
+        worker_url: String,
+        /// Worker process — killed when this variant is dropped.
+        child: std::process::Child,
+    },
+}
+
+impl Drop for ModelBackend {
+    fn drop(&mut self) {
+        if let ModelBackend::Proxy { child, .. } = self {
+            let _ = child.kill();
+            let _ = child.wait(); // reap the zombie
+        }
+    }
+}
+
+/// The loading state of the model slot.
+///
+/// The write lock on `AppState::slot` is held only for the instant needed to
+/// transition between variants — never across I/O.  Concurrent requests that
+/// arrive while a load is in progress receive a clone of the watch receiver and
+/// await the result outside the lock.
+enum ModelSlot {
+    /// No model loaded yet.
+    Empty,
+    /// A load is in progress.  Callers clone the receiver and wait on it.
+    Loading {
+        model_id: String,
+        /// Receives `Ok(lm)` when loading succeeds or `Err(msg)` on failure.
+        rx: tokio::sync::watch::Receiver<Option<Result<Arc<LoadedModel>, String>>>,
+    },
+    /// A model is loaded and ready.
+    Ready(Arc<LoadedModel>),
+}
+
 struct AppState {
-    /// The model ID as known to the server.  `None` when running in
-    /// Ollama-compatible mode with no model pre-loaded.
-    model_id: Option<String>,
-    engine_tx: mpsc::Sender<EngineRequest>,
-    /// `None` when no model is loaded (Ollama-compatible mode with no model).
-    tokenizer: Option<Arc<Tokenizer>>,
+    /// The current model slot — empty, loading, or ready.
+    slot: tokio::sync::RwLock<ModelSlot>,
+    /// Server-level sampling defaults (from CLI flags).
     default_params: SamplingParams,
-    /// Hard upper bound on (prompt_tokens + output_tokens) for this model.
-    max_seq_len: usize,
-    /// Shared buffer that the engine writes tokens into.
-    output_buf: OutputBuffer,
-    /// Maps request_id → per-client SSE channel.
-    stream_registry: StreamRegistry,
-    /// Token ID for `<|audio|>` soft tokens, present when model supports audio.
-    audio_token_id: Option<u32>,
-    /// Token ID for `<|image|>` soft tokens, present when model supports vision.
-    image_token_id: Option<u32>,
-    /// Token ID for `<|image>` (begin-of-image).
-    boi_token_id: Option<u32>,
-    /// Token ID for `<image|>` (end-of-image).
-    eoi_token_id: Option<u32>,
-    /// Vision config: patch_size and pooling_kernel_size, when available.
-    vision_patch_size: Option<usize>,
-    vision_pooling_kernel: Option<usize>,
-    vision_default_output_length: Option<usize>,
+    /// `ServeArgs` snapshot; `model` field is `None` in daemon mode.
+    serve_args: crate::ServeArgs,
+    /// HTTP client used by the daemon to proxy requests to workers.
+    http_client: reqwest::Client,
 }
 
 fn audio_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
@@ -774,63 +846,51 @@ const DEFAULT_PORT_MODEL: u16 = 8080;
 /// Default port when running in Ollama-compatible mode (no model pre-loaded).
 const DEFAULT_PORT_OLLAMA: u16 = 17434;
 
-pub async fn run(args: ServeArgs) -> Result<()> {
-    // When a model is specified, load it; otherwise run in Ollama-compatible
-    // mode where each request carries its own `model` field.
-    let (
+/// Build an in-process `Worker` `LoadedModel` from an `EngineContext`.
+fn loaded_model_from_ctx(
+    model_id: String,
+    ctx: crate::engine::EngineContext,
+) -> Result<LoadedModel> {
+    let tok = Arc::new(Tokenizer::from_file_with_arch(
+        &ctx.model_files.tokenizer_path,
+        ctx.model_files.tokenizer_config_path.as_deref(),
+        Some(&ctx.arch),
+    )?);
+
+    let max_seq_len = ctx.max_seq_len;
+    let audio_token_id = ctx.raw_config.audio_token_id;
+    let image_token_id = ctx.raw_config.image_token_id;
+    let boi_token_id = ctx.raw_config.boi_token_id;
+    let eoi_token_id = ctx.raw_config.eoi_token_id;
+    let (vision_patch_size, vision_pooling_kernel, vision_default_output_length) =
+        if let Some(vc) = &ctx.raw_config.vision_config {
+            (
+                Some(vc.patch_size),
+                Some(vc.pooling_kernel_size),
+                Some(vc.default_output_length),
+            )
+        } else {
+            (None, None, None)
+        };
+
+    let output_buf = OutputBuffer::new();
+    let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+    spawn_drain_task(output_buf.clone(), stream_registry.clone());
+
+    let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
+    std::thread::Builder::new()
+        .name("engine".to_string())
+        .spawn(move || ctx.engine.run(engine_rx))
+        .expect("Failed to spawn engine thread");
+
+    Ok(LoadedModel {
         model_id,
-        tokenizer,
-        max_seq_len,
-        audio_token_id,
-        image_token_id,
-        boi_token_id,
-        eoi_token_id,
-        vision_patch_size,
-        vision_pooling_kernel,
-        vision_default_output_length,
-        engine_tx,
-        output_buf,
-        stream_registry,
-    ) = if let Some(ref model) = args.model {
-        // ── Model-loaded path ─────────────────────────────────────────────
-        let ctx = load_engine(&args)?;
-
-        let tok = Arc::new(Tokenizer::from_file_with_arch(
-            &ctx.model_files.tokenizer_path,
-            ctx.model_files.tokenizer_config_path.as_deref(),
-            Some(&ctx.arch),
-        )?);
-
-        let max_seq_len = ctx.max_seq_len;
-        let audio_token_id = ctx.raw_config.audio_token_id;
-        let image_token_id = ctx.raw_config.image_token_id;
-        let boi_token_id = ctx.raw_config.boi_token_id;
-        let eoi_token_id = ctx.raw_config.eoi_token_id;
-        let (vision_patch_size, vision_pooling_kernel, vision_default_output_length) =
-            if let Some(vc) = &ctx.raw_config.vision_config {
-                (
-                    Some(vc.patch_size),
-                    Some(vc.pooling_kernel_size),
-                    Some(vc.default_output_length),
-                )
-            } else {
-                (None, None, None)
-            };
-
-        let output_buf = OutputBuffer::new();
-        let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
-        spawn_drain_task(output_buf.clone(), stream_registry.clone());
-
-        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
-        std::thread::Builder::new()
-            .name("engine".to_string())
-            .spawn(move || ctx.engine.run(engine_rx))
-            .expect("Failed to spawn engine thread");
-
-        (
-            Some(model.clone()),
-            Some(tok),
+        backend: ModelBackend::Worker {
+            engine_tx,
+            tokenizer: tok,
             max_seq_len,
+            output_buf,
+            stream_registry,
             audio_token_id,
             image_token_id,
             boi_token_id,
@@ -838,35 +898,261 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             vision_patch_size,
             vision_pooling_kernel,
             vision_default_output_length,
-            engine_tx,
-            output_buf,
-            stream_registry,
-        )
-    } else {
-        // ── Ollama-compatible mode — no model pre-loaded ──────────────────
-        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        },
+    })
+}
 
-        let output_buf = OutputBuffer::new();
-        let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+/// Pick a free TCP port on localhost by binding to port 0.
+fn pick_free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind to an ephemeral port")
+        .local_addr()
+        .unwrap()
+        .port()
+}
 
+/// Spawn `inferrs serve --port <N> <model>` as a child process (the worker),
+/// wait for its heartbeat, and return a `Proxy` `LoadedModel`.
+///
+/// This mirrors `ollama serve`'s `StartRunner` + scheduler pattern: the daemon
+/// (no-model `inferrs serve`) never loads weights itself; it delegates to a
+/// child worker process and proxies HTTP traffic to it.
+async fn spawn_worker(
+    model_id: &str,
+    opts: Option<&OllamaOptions>,
+    http_client: &reqwest::Client,
+) -> Result<LoadedModel, OllamaHttpError> {
+    let port = pick_free_port();
+    let worker_url = format!("http://127.0.0.1:{port}");
+
+    let exe = std::env::current_exe().map_err(|e| {
         (
-            None,
-            None,
-            usize::MAX,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            engine_tx,
-            output_buf,
-            stream_registry,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("cannot find executable: {e}")})),
         )
+    })?;
+
+    // Build args: flags first, then the positional model arg — same ordering
+    // as ServeArgs so clap parses them correctly.
+    let mut args: Vec<String> = vec!["serve".to_string()];
+
+    // Apply model-loading fields from the request options (sent by `inferrs run`
+    // in the warm-up request), falling back to inferrs defaults when absent.
+    if let Some(o) = opts {
+        if let Some(ref rev) = o.revision {
+            args.extend(["--revision".into(), rev.clone()]);
+        }
+        if let Some(ref dt) = o.dtype {
+            args.extend(["--dtype".into(), dt.clone()]);
+        }
+        if let Some(ref dev) = o.device {
+            args.extend(["--device".into(), dev.clone()]);
+        }
+        if let Some(pa) = o.paged_attention {
+            args.push(format!("--paged-attention={pa}"));
+        }
+        if let Some(ref tq) = o.turbo_quant {
+            args.push(format!("--turbo-quant={tq}"));
+        }
+        if let Some(ref q) = o.quantize {
+            args.push(format!("--quantize={q}"));
+        }
+    }
+
+    // Worker binds on an ephemeral port, accessible only on loopback.
+    args.extend(["--host".into(), "127.0.0.1".into()]);
+    args.extend(["--port".into(), port.to_string()]);
+
+    // `--` ensures a model name that starts with `-` is not parsed as a flag.
+    args.push("--".into());
+    args.push(model_id.to_string());
+
+    tracing::info!("Spawning worker: inferrs {}", args.join(" "));
+
+    let mut child = std::process::Command::new(&exe)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to spawn worker: {e}")})),
+            )
+        })?;
+
+    // Poll until the worker's heartbeat responds (up to 120 s for large models).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if http_client
+            .head(format!("{worker_url}/"))
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill(); // best-effort; ignore errors
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": format!("worker for '{}' did not become ready within 120 s", model_id)
+                })),
+            ));
+        }
+    }
+
+    tracing::info!("Worker for '{}' ready at {}", model_id, worker_url);
+
+    Ok(LoadedModel {
+        model_id: model_id.to_string(),
+        backend: ModelBackend::Proxy { worker_url, child },
+    })
+}
+
+/// Ensure a model is loaded and return a handle to it.
+///
+/// The write lock on `state.slot` is held only for the instant needed to read
+/// the current state and install a `Loading` sentinel.  All I/O (spawning a
+/// worker or loading the engine) happens outside the lock, so the server
+/// remains responsive to heartbeats, `/api/tags`, and other read-only requests
+/// while a model is loading.  Concurrent callers for the same model share a
+/// single in-flight load via a `watch` channel.
+async fn load_model_on_demand(
+    state: &AppState,
+    model_id: &str,
+    opts: Option<&OllamaOptions>,
+) -> Result<Arc<LoadedModel>, OllamaHttpError> {
+    // ── Fast read path ────────────────────────────────────────────────────────
+    {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) if model_matches_id(&lm.model_id, model_id) => {
+                return Ok(Arc::clone(lm));
+            }
+            ModelSlot::Loading {
+                model_id: loading_id,
+                rx,
+            } if model_matches_id(loading_id, model_id) => {
+                // Another task is already loading this model — wait on its result.
+                let mut rx = rx.clone();
+                drop(guard); // release read lock before awaiting
+                return wait_for_slot_load(&mut rx).await;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Slow path: become the loader ─────────────────────────────────────────
+    // Install a Loading sentinel under a brief write lock, then drop it.
+    let (tx, rx) = tokio::sync::watch::channel::<Option<Result<Arc<LoadedModel>, String>>>(None);
+    {
+        let mut guard = state.slot.write().await;
+        // Double-check: another task may have loaded while we waited for the lock.
+        match &*guard {
+            ModelSlot::Ready(lm) if model_matches_id(&lm.model_id, model_id) => {
+                return Ok(Arc::clone(lm));
+            }
+            ModelSlot::Loading {
+                model_id: loading_id,
+                rx: existing_rx,
+            } if model_matches_id(loading_id, model_id) => {
+                let mut rx = existing_rx.clone();
+                drop(guard);
+                return wait_for_slot_load(&mut rx).await;
+            }
+            _ => {}
+        }
+        *guard = ModelSlot::Loading {
+            model_id: model_id.to_string(),
+            rx: rx.clone(),
+        };
+        // Write lock released here — all other tasks can now proceed concurrently.
+    }
+
+    tracing::info!("Loading model on demand: {}", model_id);
+
+    // ── Perform the actual load outside any lock ──────────────────────────────
+    let load_result: Result<LoadedModel, OllamaHttpError> = if state.serve_args.model.is_none() {
+        spawn_worker(model_id, opts, &state.http_client).await
+    } else {
+        let mut serve_args = state.serve_args.clone();
+        serve_args.model = Some(model_id.to_string());
+        let model_id_owned = model_id.to_string();
+        let ctx = tokio::task::spawn_blocking(move || load_engine(&serve_args))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("model load panicked: {e}")}))))?
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("failed to load '{}': {e}", model_id_owned)}))))?;
+        loaded_model_from_ctx(model_id_owned, ctx).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("engine init failed: {e}")})),
+            )
+        })
     };
 
-    // Default sampling params from CLI args
+    // ── Publish result and update slot ────────────────────────────────────────
+    match load_result {
+        Ok(lm) => {
+            let lm = Arc::new(lm);
+            {
+                let mut guard = state.slot.write().await;
+                *guard = ModelSlot::Ready(Arc::clone(&lm));
+            }
+            let _ = tx.send(Some(Ok(Arc::clone(&lm))));
+            Ok(lm)
+        }
+        Err((status, json)) => {
+            {
+                let mut guard = state.slot.write().await;
+                *guard = ModelSlot::Empty;
+            }
+            let msg = json
+                .0
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("load failed")
+                .to_string();
+            let _ = tx.send(Some(Err(msg)));
+            Err((status, json))
+        }
+    }
+}
+
+/// Wait for a `Loading` slot to resolve, returning the `Arc<LoadedModel>` or
+/// an error.  Called by concurrent requests that arrive while a load is already
+/// in progress.
+async fn wait_for_slot_load(
+    rx: &mut tokio::sync::watch::Receiver<Option<Result<Arc<LoadedModel>, String>>>,
+) -> Result<Arc<LoadedModel>, OllamaHttpError> {
+    loop {
+        // Wait for a value to be published.
+        if rx.changed().await.is_err() {
+            // Sender dropped without publishing — treat as error.
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "model load abandoned"})),
+            ));
+        }
+        match rx.borrow().as_ref() {
+            None => continue, // spurious wake
+            Some(Ok(lm)) => return Ok(Arc::clone(lm)),
+            Some(Err(msg)) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": msg.clone()})),
+                ))
+            }
+        }
+    }
+}
+
+pub async fn run(args: ServeArgs) -> Result<()> {
     let default_params = SamplingParams {
         temperature: args.temperature,
         top_p: args.top_p,
@@ -875,27 +1161,24 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    // Build app state
+    // If a model was specified on the CLI, pre-load it eagerly.
+    let initial_slot = if let Some(ref model) = args.model {
+        let ctx = load_engine(&args)?;
+        let lm = Arc::new(loaded_model_from_ctx(model.clone(), ctx)?);
+        ModelSlot::Ready(lm)
+    } else {
+        ModelSlot::Empty
+    };
+
+    let model_id_hint = args.model.clone();
+
     let state = Arc::new(AppState {
-        model_id: model_id.clone(),
-        engine_tx,
-        tokenizer, // Option<Arc<Tokenizer>>
+        slot: tokio::sync::RwLock::new(initial_slot),
         default_params,
-        max_seq_len,
-        output_buf,
-        stream_registry,
-        audio_token_id,
-        image_token_id,
-        boi_token_id,
-        eoi_token_id,
-        vision_patch_size,
-        vision_pooling_kernel,
-        vision_default_output_length,
+        serve_args: args.clone(),
+        http_client: reqwest::Client::new(),
     });
 
-    // Build router — OpenAI/Anthropic routes always present; Ollama routes
-    // are always mounted so that any client expecting the Ollama API works
-    // regardless of whether a model was pre-loaded.
     let app = Router::new()
         // ── OpenAI-compatible ────────────────────────────────────────────────
         .route("/v1/chat/completions", post(chat_completions))
@@ -915,9 +1198,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    // Choose the default port based on whether a model was pre-loaded.
     let port = args.port.unwrap_or_else(|| {
-        if model_id.is_some() {
+        if model_id_hint.is_some() {
             DEFAULT_PORT_MODEL
         } else {
             DEFAULT_PORT_OLLAMA
@@ -934,26 +1216,91 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
+/// Resolve the model name for an OpenAI-format request: use the name from the
+/// request body if present, otherwise fall back to whatever model is currently
+/// loaded.  Returns an error if no model is named and none is loaded.
+async fn resolve_openai_model(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<Arc<LoadedModel>, (StatusCode, Json<ErrorResponse>)> {
+    let model_name = if let Some(m) = requested {
+        m.to_string()
+    } else {
+        // No model in request — use whatever is already loaded.
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => lm.model_id.clone(),
+            _ => return Err(server_error("No model specified and no model is loaded")),
+        }
+    };
+    load_model_on_demand(state, &model_name, None)
+        .await
+        .map_err(|(status, json)| {
+            // Convert OllamaHttpError → standard ErrorResponse
+            let msg = json
+                .0
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("model load failed")
+                .to_string();
+            (
+                status,
+                Json(ErrorResponse {
+                    error: ErrorDetail {
+                        message: msg,
+                        r#type: "server_error".to_string(),
+                    },
+                }),
+            )
+        })
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = unix_now();
-    let model_id = req
-        .model
-        .clone()
-        .or_else(|| state.model_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+
+    let lm = resolve_openai_model(&state, req.model.as_deref()).await?;
+    let model_id = lm.model_id.clone();
+
+    // Proxy mode: forward to the worker.
+    if let ModelBackend::Proxy { worker_url, .. } = &lm.backend {
+        return proxy_to_worker(&state.http_client, worker_url, "/v1/chat/completions", &req)
+            .await
+            .map_err(|(s, j)| {
+                let msg =
+                    j.0.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("proxy error")
+                        .to_string();
+                (
+                    s,
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: msg,
+                            r#type: "server_error".to_string(),
+                        },
+                    }),
+                )
+            });
+    }
+
+    let (
+        engine_tx,
+        tokenizer,
+        max_seq_len,
+        output_buf,
+        stream_registry,
+        audio_token_id_opt,
+        image_token_id_opt,
+        vision_patch_size,
+        vision_pooling_kernel,
+        vision_default_output_length,
+    ) = worker_fields(&lm)?;
 
     // ── Audio preprocessing ──────────────────────────────────────────────────
-    // If any message has an audio attachment:
-    //   1. Decode audio bytes → PCM samples
-    //   2. Compute log-mel spectrogram → Tensor [1, T, 128]
-    //   3. Determine N = T / 4 (audio soft tokens after 4× subsampling)
-    //   4. Tokenize the prompt with N audio soft-token placeholders
-    //   5. Build AudioEmbedContext carrying the mel tensor (encoding happens on
-    //      the engine thread which owns the model weights)
     let has_audio = req.messages.iter().any(|m| m.audio.is_some());
 
     // When the caller provides tool definitions (e.g. from an OpenClaw agent
@@ -983,7 +1330,7 @@ async fn chat_completions(
     let has_images = req.messages.iter().any(|m| !m.content.images.is_empty());
 
     let (prompt_tokens, audio_ctx, image_ctx) = if has_audio {
-        let audio_token_id = state.audio_token_id.ok_or_else(|| {
+        let audio_token_id = audio_token_id_opt.ok_or_else(|| {
             audio_error("This model does not support audio input (no audio_token_id in config)")
         })?;
 
@@ -1021,13 +1368,12 @@ async fn chat_completions(
 
         // Tokenize with audio soft-token placeholders.
         let prompt = apply_gemma4_with_audio(messages, &[n_audio_tokens]);
-        let tokenizer = state
-            .tokenizer
-            .as_deref()
-            .ok_or_else(|| server_error("No model loaded"))?;
-        let tokens = tokenizer
-            .encode(&prompt, false)
-            .map_err(tokenization_error)?;
+        let tokenizer = tokenizer.as_ref();
+
+        let tokens = match tokenizer.encode(&prompt, false) {
+            Ok(t) => t,
+            Err(e) => return Err(tokenization_error(e)),
+        };
 
         // Build mel tensor on CPU (engine thread moves it to device).
         let mel_tensor = candle_core::Tensor::from_vec(
@@ -1047,20 +1393,12 @@ async fn chat_completions(
         (tokens, Some(audio_ctx), None)
     } else if has_images {
         // ── Vision preprocessing ──────────────────────────────────────────────
-        // For each image_url content part across all messages:
-        //   1. Decode base64 data URL or reject HTTP URLs
-        //   2. Decode JPEG/PNG → RGB DynamicImage
-        //   3. Aspect-ratio-preserving resize to patch grid dimensions
-        //   4. Rescale [0,255] → [0,1] and patchify
-        //   5. Build pixel_values [N_patches, patch_pixels] and position_ids [N_patches, 2]
-        //   6. Count soft tokens = N_patches / pooling_kernel²
-        //   7. Tokenize with image soft-token placeholders
-        let image_token_id = state.image_token_id.ok_or_else(|| {
+        let image_token_id = image_token_id_opt.ok_or_else(|| {
             image_error("This model does not support vision input (no image_token_id in config)")
         })?;
-        let patch_size = state.vision_patch_size.unwrap_or(16);
-        let pooling_kernel = state.vision_pooling_kernel.unwrap_or(3);
-        let default_output_length = state.vision_default_output_length.unwrap_or(280);
+        let patch_size = vision_patch_size.unwrap_or(16);
+        let pooling_kernel = vision_pooling_kernel.unwrap_or(3);
+        let default_output_length = vision_default_output_length.unwrap_or(280);
 
         // Collect all images in message order.
         let mut all_images: Vec<&ImageInput> = Vec::new();
@@ -1089,10 +1427,6 @@ async fn chat_completions(
 
         // Tokenize with image soft-token placeholders.
         let prompt = apply_gemma4_with_images(messages, &image_token_counts);
-        let tokenizer = state
-            .tokenizer
-            .as_deref()
-            .ok_or_else(|| server_error("No model loaded"))?;
         let tokens = tokenizer
             .encode(&prompt, false)
             .map_err(tokenization_error)?;
@@ -1124,11 +1458,6 @@ async fn chat_completions(
 
         (tokens, None, Some(image_ctx))
     } else {
-        let tokenizer = state
-            .tokenizer
-            .as_deref()
-            .ok_or_else(|| server_error("No model loaded"))?;
-
         let tokens = match tokenizer.apply_chat_template_and_encode(messages) {
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
@@ -1151,14 +1480,14 @@ async fn chat_completions(
         modality_note
     );
 
-    check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;
+    check_prompt_length(prompt_tokens.len(), max_seq_len)?;
 
     // Build sampling params, clamping max_tokens to the model's KV cache capacity.
     let requested_max_tokens = req
         .max_completion_tokens
         .or(req.max_tokens)
         .unwrap_or(state.default_params.max_tokens);
-    let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), max_seq_len);
     let mut params = build_sampling_params(
         req.temperature,
         req.top_p,
@@ -1171,9 +1500,7 @@ async fn chat_completions(
     // Resolve per-request stop strings into token IDs.
     let stop_strings = req.stop.into_vec();
     if !stop_strings.is_empty() {
-        if let Some(tokenizer) = state.tokenizer.as_deref() {
-            params.extra_stop_token_ids = resolve_stop_token_ids(stop_strings, tokenizer);
-        }
+        params.extra_stop_token_ids = resolve_stop_token_ids(stop_strings, tokenizer);
     }
 
     let is_stream = req.stream.unwrap_or(false);
@@ -1181,8 +1508,7 @@ async fn chat_completions(
     if is_stream {
         // Streaming response — register per-request channel, then dispatch.
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
-        state
-            .stream_registry
+        stream_registry
             .lock()
             .await
             .insert(request_id.clone(), token_tx);
@@ -1193,11 +1519,11 @@ async fn chat_completions(
             audio: audio_ctx,
             image: image_ctx,
             sampling_params: params,
-            output_buf: state.output_buf.clone(),
+            output_buf: output_buf.clone(),
         };
 
-        if state.engine_tx.send(engine_req).await.is_err() {
-            state.stream_registry.lock().await.remove(&request_id);
+        if engine_tx.send(engine_req).await.is_err() {
+            stream_registry.lock().await.remove(&request_id);
             return Err(server_error("Engine unavailable"));
         }
 
@@ -1216,7 +1542,7 @@ async fn chat_completions(
             response_tx,
         };
 
-        if state.engine_tx.send(engine_req).await.is_err() {
+        if engine_tx.send(engine_req).await.is_err() {
             return Err(server_error("Engine unavailable"));
         }
 
@@ -1333,7 +1659,7 @@ fn make_sse_stream(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompletionRequest {
     pub model: Option<String>,
     pub prompt: String,
@@ -1390,26 +1716,43 @@ async fn completions(
 ) -> impl IntoResponse {
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = unix_now();
-    let model_id = req
-        .model
-        .clone()
-        .or_else(|| state.model_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
 
-    // Tokenize the prompt directly
-    let tokenizer = state
-        .tokenizer
-        .as_deref()
-        .ok_or_else(|| server_error("No model loaded"))?;
+    let lm = resolve_openai_model(&state, req.model.as_deref()).await?;
+    let model_id = lm.model_id.clone();
+
+    // Proxy mode.
+    if let ModelBackend::Proxy { worker_url, .. } = &lm.backend {
+        return proxy_to_worker(&state.http_client, worker_url, "/v1/completions", &req)
+            .await
+            .map_err(|(s, j)| {
+                let msg =
+                    j.0.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("proxy error")
+                        .to_string();
+                (
+                    s,
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: msg,
+                            r#type: "server_error".to_string(),
+                        },
+                    }),
+                )
+            });
+    }
+
+    let (engine_tx, tokenizer, max_seq_len, output_buf, stream_registry, ..) = worker_fields(&lm)?;
+
     let prompt_tokens = match tokenizer.encode(&req.prompt, true) {
         Ok(tokens) => tokens,
         Err(e) => return Err(tokenization_error(e)),
     };
 
-    check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;
+    check_prompt_length(prompt_tokens.len(), max_seq_len)?;
 
     let requested_max_tokens = req.max_tokens.unwrap_or(state.default_params.max_tokens);
-    let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), max_seq_len);
     let params = build_sampling_params(
         req.temperature,
         req.top_p,
@@ -1422,10 +1765,8 @@ async fn completions(
     let is_stream = req.stream.unwrap_or(false);
 
     if is_stream {
-        // Streaming response — register per-request channel, then dispatch.
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
-        state
-            .stream_registry
+        stream_registry
             .lock()
             .await
             .insert(request_id.clone(), token_tx);
@@ -1436,18 +1777,17 @@ async fn completions(
             audio: None,
             image: None,
             sampling_params: params,
-            output_buf: state.output_buf.clone(),
+            output_buf: output_buf.clone(),
         };
 
-        if state.engine_tx.send(engine_req).await.is_err() {
-            state.stream_registry.lock().await.remove(&request_id);
+        if engine_tx.send(engine_req).await.is_err() {
+            stream_registry.lock().await.remove(&request_id);
             return Err(server_error("Engine unavailable"));
         }
 
         let stream = make_completion_sse_stream(token_rx, request_id, model_id, created);
         Ok(Sse::new(stream).into_response())
     } else {
-        // Non-streaming response.
         let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
 
         let engine_req = EngineRequest::Generate {
@@ -1459,7 +1799,7 @@ async fn completions(
             response_tx,
         };
 
-        if state.engine_tx.send(engine_req).await.is_err() {
+        if engine_tx.send(engine_req).await.is_err() {
             return Err(server_error("Engine unavailable"));
         }
 
@@ -1537,23 +1877,32 @@ async fn anthropic_messages(
     Json(req): Json<AnthropicMessagesRequest>,
 ) -> impl IntoResponse {
     let request_id = format!("msg_{}", uuid::Uuid::new_v4());
-    let model_id = req
-        .model
-        .clone()
-        .or_else(|| state.model_id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+
+    let lm = resolve_openai_model(&state, req.model.as_deref())
+        .await
+        .map_err(|(status, json)| anthropic_error(status, "api_error", json.0.error.message))?;
+    let model_id = lm.model_id.clone();
+
+    // Proxy mode.
+    if let ModelBackend::Proxy { worker_url, .. } = &lm.backend {
+        return proxy_to_worker(&state.http_client, worker_url, "/v1/messages", &req)
+            .await
+            .map_err(|(s, j)| {
+                let msg =
+                    j.0.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("proxy error")
+                        .to_string();
+                anthropic_error(s, "api_error", msg)
+            });
+    }
+
+    let (engine_tx, tokenizer, max_seq_len, output_buf, stream_registry, ..) =
+        worker_fields(&lm).map_err(|(s, j)| anthropic_error(s, "api_error", j.0.error.message))?;
 
     // Convert Anthropic messages (with optional top-level system) to ChatMessage list.
     let chat_messages = anthropic_messages_to_chat(req.system.as_deref(), &req.messages);
 
-    // Apply chat template and tokenize.
-    let tokenizer = state.tokenizer.as_deref().ok_or_else(|| {
-        anthropic_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
-            "No model loaded",
-        )
-    })?;
     let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&chat_messages) {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -1572,24 +1921,24 @@ async fn anthropic_messages(
         prompt_tokens.len()
     );
 
-    if state.max_seq_len != usize::MAX && prompt_tokens.len() >= state.max_seq_len {
+    if max_seq_len != usize::MAX && prompt_tokens.len() >= max_seq_len {
         return Err(anthropic_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!(
                 "Prompt length ({} tokens) exceeds the model's maximum context length ({} tokens).",
                 prompt_tokens.len(),
-                state.max_seq_len
+                max_seq_len
             ),
         ));
     }
 
-    let max_tokens = clamp_max_tokens(req.max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let max_tokens = clamp_max_tokens(req.max_tokens, prompt_tokens.len(), max_seq_len);
     let params = build_sampling_params(
         req.temperature,
         req.top_p,
         req.top_k,
-        None, // Anthropic API does not have repetition_penalty
+        None,
         max_tokens,
         &state.default_params,
     );
@@ -1597,10 +1946,8 @@ async fn anthropic_messages(
     let is_stream = req.stream.unwrap_or(false);
 
     if is_stream {
-        // Streaming response — register per-request channel, then dispatch.
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
-        state
-            .stream_registry
+        stream_registry
             .lock()
             .await
             .insert(request_id.clone(), token_tx);
@@ -1611,11 +1958,11 @@ async fn anthropic_messages(
             audio: None,
             image: None,
             sampling_params: params,
-            output_buf: state.output_buf.clone(),
+            output_buf: output_buf.clone(),
         };
 
-        if state.engine_tx.send(engine_req).await.is_err() {
-            state.stream_registry.lock().await.remove(&request_id);
+        if engine_tx.send(engine_req).await.is_err() {
+            stream_registry.lock().await.remove(&request_id);
             return Err(anthropic_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
@@ -1637,7 +1984,7 @@ async fn anthropic_messages(
             response_tx,
         };
 
-        if state.engine_tx.send(engine_req).await.is_err() {
+        if engine_tx.send(engine_req).await.is_err() {
             return Err(anthropic_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
@@ -1805,17 +2152,16 @@ fn make_anthropic_sse_stream(
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
     let created = unix_now();
-
-    let data = match &state.model_id {
-        Some(id) => vec![ModelInfo {
-            id: id.clone(),
+    let guard = state.slot.read().await;
+    let data = match &*guard {
+        ModelSlot::Ready(lm) => vec![ModelInfo {
+            id: lm.model_id.clone(),
             object: "model",
             created,
             owned_by: "inferrs".to_string(),
         }],
-        None => vec![],
+        _ => vec![],
     };
-
     Json(ModelListResponse {
         object: "list",
         data,
@@ -2174,51 +2520,48 @@ async fn ollama_version() -> Json<OllamaVersionResponse> {
 
 /// `GET /api/tags` and `HEAD /api/tags` — list locally available models.
 async fn ollama_tags(State(state): State<Arc<AppState>>) -> Json<OllamaListResponse> {
-    let models = match &state.model_id {
-        Some(id) => vec![OllamaModelEntry {
-            name: id.clone(),
-            model: id.clone(),
+    let guard = state.slot.read().await;
+    let models = match &*guard {
+        ModelSlot::Ready(lm) => vec![OllamaModelEntry {
+            name: lm.model_id.clone(),
+            model: lm.model_id.clone(),
             modified_at: "2025-01-01T00:00:00Z".to_string(),
             size: 0,
             digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
             details: OllamaModelDetails::default(),
         }],
-        None => vec![],
+        _ => vec![],
     };
     Json(OllamaListResponse { models })
 }
 
 /// `GET /api/ps` — list running (currently loaded) models.
 async fn ollama_ps(State(state): State<Arc<AppState>>) -> Json<OllamaPsResponse> {
-    let models = match &state.model_id {
-        Some(id) => vec![OllamaRunningModel {
-            name: id.clone(),
-            model: id.clone(),
+    let guard = state.slot.read().await;
+    let models = match &*guard {
+        ModelSlot::Ready(lm) => vec![OllamaRunningModel {
+            name: lm.model_id.clone(),
+            model: lm.model_id.clone(),
             size: 0,
             digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
             details: OllamaModelDetails::default(),
             expires_at: "0001-01-01T00:00:00Z".to_string(),
             size_vram: 0,
         }],
-        None => vec![],
+        _ => vec![],
     };
     Json(OllamaPsResponse { models })
 }
 
 /// `POST /api/show` — return information about a model.
+///
+/// Triggers on-demand loading so the response contains accurate model info.
 async fn ollama_show(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OllamaShowRequest>,
 ) -> impl IntoResponse {
-    // Check that the requested model matches the loaded model (if any).
-    // Uses flexible matching so clients that omit the org prefix (e.g.
-    // "gemma-4-E2B-it" vs "google/gemma-4-E2B-it") are not rejected.
-    let model_matches = state
-        .model_id
-        .as_deref()
-        .map(|id| model_matches_id(id, &req.model))
-        .unwrap_or(false);
-    if !model_matches {
+    let lm = load_model_on_demand(&state, &req.model, None).await?;
+    if !model_matches_id(&lm.model_id, &req.model) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -2334,47 +2677,128 @@ fn model_matches_id(loaded_id: &str, requested: &str) -> bool {
     false
 }
 
-fn require_ollama_tokenizer<'a>(
-    state: &'a AppState,
-    model: &str,
-) -> Result<&'a Tokenizer, OllamaHttpError> {
-    match state.tokenizer.as_deref() {
-        Some(t)
-            if state
-                .model_id
-                .as_deref()
-                .is_some_and(|id| model_matches_id(id, model)) =>
-        {
-            Ok(t)
+/// Forward a JSON-serialisable request body to the worker at `worker_url/<path>`
+/// and stream the response back as a raw byte-body axum response.
+/// Content-Type from the worker is preserved so NDJSON and SSE both work.
+async fn proxy_to_worker<B: serde::Serialize>(
+    http_client: &reqwest::Client,
+    worker_url: &str,
+    path: &str,
+    body: &B,
+) -> Result<axum::response::Response, OllamaHttpError> {
+    use futures::StreamExt;
+
+    let url = format!("{worker_url}{path}");
+    let resp = http_client
+        .post(&url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("worker unreachable: {e}")})),
+            )
+        })?;
+
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Preserve Content-Type so the client gets the right streaming format.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+
+    let byte_stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(std::io::Error::other));
+
+    Ok((
+        status,
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        axum::body::Body::from_stream(byte_stream),
+    )
+        .into_response())
+}
+
+/// Extract the worker fields from a `LoadedModel`, returning an error if it is
+/// in proxy mode.  Used after a proxy-branch guard has been passed.
+#[allow(clippy::type_complexity)]
+fn worker_fields(
+    lm: &LoadedModel,
+) -> Result<
+    (
+        &mpsc::Sender<EngineRequest>,
+        &Arc<Tokenizer>,
+        usize,
+        &OutputBuffer,
+        &StreamRegistry,
+        Option<u32>,   // audio_token_id
+        Option<u32>,   // image_token_id
+        Option<usize>, // vision_patch_size
+        Option<usize>, // vision_pooling_kernel
+        Option<usize>, // vision_default_output_length
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    match &lm.backend {
+        ModelBackend::Worker {
+            engine_tx,
+            tokenizer,
+            max_seq_len,
+            output_buf,
+            stream_registry,
+            audio_token_id,
+            image_token_id,
+            vision_patch_size,
+            vision_pooling_kernel,
+            vision_default_output_length,
+            ..
+        } => Ok((
+            engine_tx,
+            tokenizer,
+            *max_seq_len,
+            output_buf,
+            stream_registry,
+            *audio_token_id,
+            *image_token_id,
+            *vision_patch_size,
+            *vision_pooling_kernel,
+            *vision_default_output_length,
+        )),
+        ModelBackend::Proxy { .. } => {
+            Err(server_error("unexpected proxy backend in worker context"))
         }
-        Some(_) => Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!("model '{}' not found", model)
-            })),
-        )),
-        None => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": format!("model '{}' is not loaded — start inferrs with a model argument", model)
-            })),
-        )),
     }
 }
 
-/// Dispatch a streaming Ollama generation request to the engine.
-///
-/// Registers a per-request channel in the stream registry, sends the engine
-/// request, and returns `Ok(token_rx)` on success.
+/// Dispatch a streaming Ollama generation request to the in-process engine.
 async fn ollama_dispatch_stream(
-    state: &AppState,
+    backend: &ModelBackend,
     request_id: &str,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
 ) -> Result<mpsc::Receiver<StreamToken>, OllamaHttpError> {
+    let (engine_tx, output_buf, stream_registry) = match backend {
+        ModelBackend::Worker {
+            engine_tx,
+            output_buf,
+            stream_registry,
+            ..
+        } => (engine_tx, output_buf, stream_registry),
+        ModelBackend::Proxy { .. } => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "dispatch called on proxy backend"})),
+            ))
+        }
+    };
+
     let (token_tx, token_rx) = mpsc::channel::<StreamToken>(256);
-    state
-        .stream_registry
+    stream_registry
         .lock()
         .await
         .insert(request_id.to_string(), token_tx);
@@ -2385,15 +2809,11 @@ async fn ollama_dispatch_stream(
         audio: None,
         image: None,
         sampling_params: params,
-        output_buf: state.output_buf.clone(),
+        output_buf: output_buf.clone(),
     };
 
-    if state.engine_tx.send(engine_req).await.is_err() {
-        state
-            .stream_registry
-            .lock()
-            .await
-            .remove(&request_id.to_string());
+    if engine_tx.send(engine_req).await.is_err() {
+        stream_registry.lock().await.remove(request_id);
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "engine unavailable"})),
@@ -2403,15 +2823,23 @@ async fn ollama_dispatch_stream(
     Ok(token_rx)
 }
 
-/// Dispatch a non-streaming Ollama generation request to the engine.
-///
-/// Sends the engine request and waits for the result.
+/// Dispatch a non-streaming Ollama generation request to the in-process engine.
 async fn ollama_dispatch_blocking(
-    state: &AppState,
+    backend: &ModelBackend,
     request_id: String,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
 ) -> Result<GenerationResult, OllamaHttpError> {
+    let engine_tx = match backend {
+        ModelBackend::Worker { engine_tx, .. } => engine_tx,
+        ModelBackend::Proxy { .. } => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "dispatch called on proxy backend"})),
+            ))
+        }
+    };
+
     let (response_tx, response_rx) = oneshot::channel::<GenerationResult>();
 
     let engine_req = EngineRequest::Generate {
@@ -2423,7 +2851,7 @@ async fn ollama_dispatch_blocking(
         response_tx,
     };
 
-    if state.engine_tx.send(engine_req).await.is_err() {
+    if engine_tx.send(engine_req).await.is_err() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "engine unavailable"})),
@@ -2463,7 +2891,12 @@ async fn ollama_generate(
     let request_id = format!("gen-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
-    let tokenizer = require_ollama_tokenizer(&state, &req.model)?;
+    let lm = load_model_on_demand(&state, &req.model, req.options.as_ref()).await?;
+
+    // Proxy mode: forward the request to the worker.
+    if let ModelBackend::Proxy { worker_url, .. } = &lm.backend {
+        return proxy_to_worker(&state.http_client, worker_url, "/api/generate", &req).await;
+    }
 
     let prompt = req.prompt.as_deref().unwrap_or("");
     if prompt.is_empty() {
@@ -2477,6 +2910,9 @@ async fn ollama_generate(
         }))
         .into_response());
     }
+
+    let (_, tokenizer, max_seq_len, _, _, _, _, _, _, _) = worker_fields(&lm)
+        .map_err(|(s, j)| (s, Json(serde_json::json!({"error": j.0.error.message}))))?;
 
     // Tokenize: apply the chat template by default; skip it only when raw=true.
     let is_raw = req.raw.unwrap_or(false);
@@ -2512,11 +2948,11 @@ async fn ollama_generate(
         )
     })?;
 
-    ollama_check_prompt(&prompt_tokens, state.max_seq_len)?;
+    ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
     let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
         ollama_options_to_params(req.options.as_ref(), &state.default_params);
-    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), max_seq_len);
     let params = build_sampling_params(
         temperature,
         top_p,
@@ -2529,7 +2965,8 @@ async fn ollama_generate(
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
     if is_stream {
-        let token_rx = ollama_dispatch_stream(&state, &request_id, prompt_tokens, params).await?;
+        let token_rx =
+            ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
         let stream = make_ollama_generate_stream(token_rx, model_name, created_at);
@@ -2539,7 +2976,8 @@ async fn ollama_generate(
         )
             .into_response())
     } else {
-        let result = ollama_dispatch_blocking(&state, request_id, prompt_tokens, params).await?;
+        let result =
+            ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, params).await?;
 
         Ok(Json(OllamaGenerateResponse {
             model: req.model,
@@ -2610,7 +3048,15 @@ async fn ollama_chat(
     let request_id = format!("chat-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
-    let tokenizer = require_ollama_tokenizer(&state, &req.model)?;
+    let lm = load_model_on_demand(&state, &req.model, req.options.as_ref()).await?;
+
+    // Proxy mode: forward to the worker.
+    if let ModelBackend::Proxy { worker_url, .. } = &lm.backend {
+        return proxy_to_worker(&state.http_client, worker_url, "/api/chat", &req).await;
+    }
+
+    let (_, tokenizer, max_seq_len, _, _, _, _, _, _, _) = worker_fields(&lm)
+        .map_err(|(s, j)| (s, Json(serde_json::json!({"error": j.0.error.message}))))?;
 
     // Convert Ollama messages to internal ChatMessage format.
     let chat_messages: Vec<ChatMessage> = req
@@ -2641,11 +3087,11 @@ async fn ollama_chat(
             )
         })?;
 
-    ollama_check_prompt(&prompt_tokens, state.max_seq_len)?;
+    ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
     let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
         ollama_options_to_params(req.options.as_ref(), &state.default_params);
-    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), state.max_seq_len);
+    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), max_seq_len);
     let params = build_sampling_params(
         temperature,
         top_p,
@@ -2658,7 +3104,8 @@ async fn ollama_chat(
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
     if is_stream {
-        let token_rx = ollama_dispatch_stream(&state, &request_id, prompt_tokens, params).await?;
+        let token_rx =
+            ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
         let stream = make_ollama_chat_stream(token_rx, model_name, created_at);
@@ -2668,7 +3115,8 @@ async fn ollama_chat(
         )
             .into_response())
     } else {
-        let result = ollama_dispatch_blocking(&state, request_id, prompt_tokens, params).await?;
+        let result =
+            ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, params).await?;
 
         Ok(Json(OllamaChatResponse {
             model: req.model,
