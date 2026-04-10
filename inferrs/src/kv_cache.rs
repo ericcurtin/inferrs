@@ -104,13 +104,11 @@ impl BlockPool {
     }
 
     /// Number of blocks currently available for allocation.
-    #[allow(dead_code)]
     pub fn num_free_blocks(&self) -> usize {
         self.free_list.len()
     }
 
     /// Total number of physical blocks managed by the pool.
-    #[allow(dead_code)]
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
     }

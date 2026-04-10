@@ -1069,8 +1069,8 @@ impl Engine {
             let total_blocks = ps.block_pool.num_blocks();
             let free_blocks = ps.block_pool.num_free_blocks();
             let used_blocks = total_blocks.saturating_sub(free_blocks);
-            let total_slots = cfg.num_blocks * cfg.block_size;
-            let reserved_bytes = cfg.num_blocks * bytes_per_block;
+            let total_slots = total_blocks * cfg.block_size;
+            let reserved_bytes = total_blocks * bytes_per_block;
             let allocated_bytes = used_blocks * bytes_per_block;
             PagedMemorySnapshot {
                 block_size: cfg.block_size,
