@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, Embedding, Init, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
@@ -17,6 +17,12 @@ use crate::models::attention_utils::{
     paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
 };
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
+
+fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
+    let weight = vb.get_with_hints(size, "weight", Init::Const(0.0))?;
+    let adjusted = weight.affine(1.0, offset)?;
+    Ok(RmsNorm::new(adjusted, eps))
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -90,8 +96,8 @@ impl FullAttention {
         let k_proj = linear_no_bias(cfg.hidden_size, kv_out, vb.pp("k_proj"))?;
         let v_proj = linear_no_bias(cfg.hidden_size, kv_out, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(attn_out, cfg.hidden_size, vb.pp("o_proj"))?;
-        let q_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let q_norm = rms_norm_with_offset(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"), 1.0)?;
+        let k_norm = rms_norm_with_offset(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"), 1.0)?;
 
         let tq_cache = tq_cfg.map(|c| {
             TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
@@ -681,11 +687,17 @@ impl DecoderLayer {
         Ok(Self {
             attn,
             mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
-            input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_attention_layernorm: rms_norm(
+            input_layernorm: rms_norm_with_offset(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("input_layernorm"),
+                1.0,
+            )?,
+            post_attention_layernorm: rms_norm_with_offset(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
+                1.0,
             )?,
         })
     }
@@ -789,7 +801,7 @@ impl Qwen35Model {
             layers.push(layer);
         }
 
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"))?;
+        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"), 1.0)?;
 
         // Tied weights: lm_head = embed_tokens.weight transposed
         let lm_head_weight = embed_tokens.embeddings().clone();
