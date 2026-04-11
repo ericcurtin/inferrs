@@ -460,6 +460,8 @@ fn var_builder_from_gguf(
         content.tensor_infos.len(),
         gguf_path.display()
     );
+    let top_keys = content.tensor_infos.keys().take(10).collect::<Vec<_>>();
+    tracing::info!("Top 10 GGUF keys: {:?}", top_keys);
 
     let backend = GgufBackend {
         content,
@@ -491,7 +493,47 @@ pub fn load_model(
     // When a GGUF is present, load weights from it (dequantizing each tensor
     // to `dtype`).  Otherwise fall back to the standard mmap'd safetensors path.
     let vb: VarBuilder<'static> = if let Some(gguf) = gguf_path {
-        var_builder_from_gguf(gguf, dtype, device)?
+        let mut base_vb = var_builder_from_gguf(gguf, dtype, device)?;
+
+        // Map safetensors names (expected by candle-transformers) back to
+        // Llama.cpp GGUF names if the user downloaded an external GGUF file.
+        if matches!(arch, ModelArchitecture::Phi3)
+            && base_vb.contains_tensor("token_embd.weight")
+            && !base_vb.contains_tensor("model.embed_tokens.weight")
+        {
+            tracing::info!(
+                "Detected external GGUF format: applying Llama.cpp tensor name mappings for Phi3"
+            );
+            base_vb = base_vb.rename_f(|n: &str| {
+                if n == "model.embed_tokens.weight" {
+                    return "token_embd.weight".to_string();
+                }
+                if n == "model.norm.weight" {
+                    return "output_norm.weight".to_string();
+                }
+                if n == "lm_head.weight" {
+                    return "output.weight".to_string();
+                }
+
+                if let Some(rest) = n.strip_prefix("model.layers.") {
+                    if let Some((idx, suffix)) = rest.split_once('.') {
+                        let replacement = match suffix {
+                            "input_layernorm.weight" => "attn_norm.weight",
+                            "post_attention_layernorm.weight" => "ffn_norm.weight",
+                            "self_attn.qkv_proj.weight" => "attn_qkv.weight",
+                            "self_attn.o_proj.weight" => "attn_output.weight",
+                            "mlp.gate_up_proj.weight" => "ffn_up.weight",
+                            "mlp.down_proj.weight" => "ffn_down.weight",
+                            _ => return n.to_string(),
+                        };
+                        return format!("blk.{idx}.{replacement}");
+                    }
+                }
+                n.to_string()
+            });
+        }
+
+        base_vb
     } else {
         let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
         // SAFETY: the mmap lifetime is extended to 'static by the unsafe block.
