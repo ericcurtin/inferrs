@@ -676,7 +676,15 @@ impl RawConfig {
                 let tc = self.text_config.as_ref();
                 tc.and_then(|t| t.max_position_embeddings).unwrap_or(8192)
             }
-            ModelArchitecture::Phi3 => self.max_position_embeddings.unwrap_or(131072),
+            ModelArchitecture::Phi3 => {
+                // Phi-3/Phi-4 configs always carry `max_position_embeddings`
+                // in practice (e.g. 131072 for LongRoPE variants, 16384 for
+                // Phi-4).  The fallback below is intentionally conservative
+                // (matches the original Phi-3-mini-4k context) so a
+                // malformed config cannot accidentally trigger a very large
+                // KV-cache allocation when the field is missing.
+                self.max_position_embeddings.unwrap_or(4096)
+            }
         }
     }
 
@@ -760,10 +768,22 @@ impl RawConfig {
                 (num_kv_heads, head_dim, num_full_attn)
             }
             ModelArchitecture::Phi3 => {
+                // Defaults below match `microsoft/Phi-4-mini-instruct` (the
+                // primary tested Phi3 target) and are only used as a
+                // last-resort fallback when the corresponding field is
+                // absent from `config.json`.  The authoritative config used
+                // by the model itself is the `phi3::Config` parsed directly
+                // in `load_model`; these values are just for KV-cache
+                // sizing when RawConfig fields are missing.  Prefer the
+                // explicit `head_dim` field over `hidden_size /
+                // num_attention_heads` to avoid silent integer truncation
+                // when `hidden_size` isn't divisible by the head count.
                 let num_kv_heads = self.num_key_value_heads.unwrap_or(8);
                 let num_attention_heads = self.num_attention_heads.unwrap_or(24);
                 let hidden_size = self.hidden_size.unwrap_or(3072);
-                let head_dim = hidden_size / num_attention_heads;
+                let head_dim = self
+                    .head_dim
+                    .unwrap_or(hidden_size / num_attention_heads);
                 let num_layers = self.num_hidden_layers.unwrap_or(32);
                 (num_kv_heads, head_dim, num_layers)
             }

@@ -715,16 +715,34 @@ fn apply_gemma4_inner(
 }
 
 fn apply_phi(messages: &[ChatMessage]) -> String {
+    // Official Phi-3 / Phi-4 template:
+    //   <|{role}|>\n{content}<|end|>\n...<|assistant|>\n
+    // The newline after the role marker and at the end of the assistant cue is
+    // required by the spec.  Phi-4 tokenizers happen to strip the leading
+    // newline so earlier revisions of this function omitted them, but adding
+    // them is strictly more correct and harmless.
     let normalized = normalize_messages(messages, |role| match role {
         Role::System => "system",
         Role::User | Role::Tool | Role::Function => "user",
         Role::Assistant => "assistant",
     });
-    let mut prompt = String::new();
+    // Pre-reserve a rough upper bound for the final prompt so we avoid
+    // repeated String reallocations for long chat histories.  Each turn adds
+    // `<|role|>\n` + content + `<|end|>\n` (~14 bytes of fixed overhead).
+    let cap: usize = normalized
+        .iter()
+        .map(|(role, content)| role.len() + content.len() + 14)
+        .sum::<usize>()
+        + "<|assistant|>\n".len();
+    let mut prompt = String::with_capacity(cap);
     for (role, content) in &normalized {
-        prompt.push_str(&format!("<|{role}|>{content}<|end|>\n"));
+        prompt.push_str("<|");
+        prompt.push_str(role);
+        prompt.push_str("|>\n");
+        prompt.push_str(content);
+        prompt.push_str("<|end|>\n");
     }
-    prompt.push_str("<|assistant|>");
+    prompt.push_str("<|assistant|>\n");
     prompt
 }
 
@@ -1244,8 +1262,8 @@ mod tests {
     fn phi_template_basic() {
         let msgs = vec![user_msg("Hello!")];
         let prompt = apply_phi(&msgs);
-        assert!(prompt.contains("<|user|>Hello!<|end|>"));
-        assert!(prompt.ends_with("<|assistant|>"));
+        assert!(prompt.contains("<|user|>\nHello!<|end|>\n"));
+        assert!(prompt.ends_with("<|assistant|>\n"));
     }
 
     #[test]
@@ -1257,11 +1275,11 @@ mod tests {
             user_msg("How are you?"),
         ];
         let prompt = apply_phi(&msgs);
-        assert!(prompt.contains("<|system|>You are helpful.<|end|>"));
-        assert!(prompt.contains("<|user|>Hi<|end|>"));
-        assert!(prompt.contains("<|assistant|>Hello!<|end|>"));
-        assert!(prompt.contains("<|user|>How are you?<|end|>"));
-        assert!(prompt.ends_with("<|assistant|>"));
+        assert!(prompt.contains("<|system|>\nYou are helpful.<|end|>\n"));
+        assert!(prompt.contains("<|user|>\nHi<|end|>\n"));
+        assert!(prompt.contains("<|assistant|>\nHello!<|end|>\n"));
+        assert!(prompt.contains("<|user|>\nHow are you?<|end|>\n"));
+        assert!(prompt.ends_with("<|assistant|>\n"));
     }
 
     #[test]
@@ -1272,6 +1290,6 @@ mod tests {
         let sys_pos = prompt.find("<|system|>").unwrap();
         let user_pos = prompt.find("<|user|>").unwrap();
         assert!(sys_pos < user_pos, "system must come before user");
-        assert!(prompt.ends_with("<|assistant|>"));
+        assert!(prompt.ends_with("<|assistant|>\n"));
     }
 }

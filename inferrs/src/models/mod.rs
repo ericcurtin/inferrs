@@ -474,6 +474,7 @@ fn var_builder_from_gguf(
 }
 
 /// Load a model from weight files.
+#[allow(clippy::too_many_arguments)]
 pub fn load_model(
     raw_config: &RawConfig,
     arch: &ModelArchitecture,
