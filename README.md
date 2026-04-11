@@ -27,7 +27,7 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 
 ## Capability Matrix
 
-| Feature | Qwen3 | Gemma4 | Other architectures |
+| Feature | Qwen3 / Qwen3.5 | Gemma4 | Other architectures |
 |---|---|---|---|
 | `--turbo-quant` KV compression | Yes | Yes | Falls back to regular KV |
 | `--paged-attention` block pool | Yes | Yes | Allocates paged KV pool but decode may use concat-KV fallback |
@@ -36,7 +36,7 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 ## Memory Semantics
 
 - `--quantize` reduces **model weight** size by converting weights to a cached GGUF file.
-- `--turbo-quant` reduces **KV cache** size for supported models only. It does not change model weights.
+- `--turbo-quant` reduces **KV cache** size for supported models only (`Qwen3`, `Qwen3.5`, `Gemma4`). It does not change model weights.
 - `--paged-attention` reserves a paged KV pool from the runtime device/dtype budget. In paged mode, TurboQuant does not reduce the reserved pool size.
 - `--quantize` and `--turbo-quant` can be combined: one affects weights, the other affects KV cache.
 
@@ -49,7 +49,7 @@ inferrs serve --quantize --turbo-quant=4 google/gemma-4-E2B-it
 inferrs serve --paged-attention google/gemma-4-E2B-it
 ```
 
-In `inferrs run`, `/show memory` reports model weights, KV estimates, and live paged-KV usage separately so you can see which setting changed which part of memory.
+In `inferrs run`, `/show memory` queries the server and reports model weights, KV estimates, live paged-KV usage, and the last completed paged allocation snapshot separately so you can see which setting changed which part of memory.
 
 ## Quick start
 
