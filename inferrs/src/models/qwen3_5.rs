@@ -470,7 +470,7 @@ impl LinearAttn {
         // ── beta = sigmoid(b_input) ───────────────────────────────────────────
         let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_heads]
                                                    // sigmoid(x) = 1 / (1 + exp(-x))
-        let beta = (b_f32.neg()?.exp()? + 1.0)?.recip()?; // [b, t, n_heads]
+        let beta = candle_nn::ops::sigmoid(&b_f32)?;
 
         // ── Cast q, k, v to F32 for the recurrence ────────────────────────────
         let q_f32 = q.to_dtype(DType::F32)?; // [b, t, n_heads, head_k_dim]
@@ -544,7 +544,7 @@ impl LinearAttn {
             .reshape((b * t * self.n_heads, self.head_v_dim))?; // F32
 
         // RMSNorm over head_v_dim
-        let out_normed = rms_norm_tensor(&out_flat, &self.norm_weight, 1e-6)?; // F32
+        let out_normed = candle_nn::ops::rms_norm(&out_flat, &self.norm_weight, 1e-6)?;
 
         // z gate: [b, t, value_dim] -> [b*t*n_heads, head_v_dim], then silu
         // z is in model dtype; cast to F32 for the gate multiply
@@ -630,26 +630,6 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     // max(x, 0) = (x + |x|) / 2
     let pos_part = ((x + &abs_x)? / 2.0)?;
     (pos_part + log_term).map_err(Into::into)
-}
-
-/// Manual RMSNorm over the last dimension.
-/// x: [..., head_dim], weight: [head_dim]
-/// Operates in the same dtype as x to avoid round-trip casts on Metal.
-fn rms_norm_tensor(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-    let dtype = x.dtype();
-    let w = weight.to_dtype(dtype)?;
-
-    let rms = (x.sqr()?.mean_keepdim(candle_core::D::Minus1)? + eps)?.sqrt()?;
-    let normed = x.broadcast_div(&rms)?; // [..., head_dim]
-
-    // Reshape weight to [1, ..., 1, head_dim] to broadcast over all leading dims
-    let w_shape: Vec<usize> = {
-        let mut s = vec![1usize; x.rank() - 1];
-        s.push(w.dim(0)?);
-        s
-    };
-    let w_bc = w.reshape(w_shape)?;
-    normed.broadcast_mul(&w_bc).map_err(Into::into)
 }
 
 // ---------------------------------------------------------------------------

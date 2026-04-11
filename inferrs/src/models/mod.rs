@@ -519,11 +519,11 @@ pub fn load_model(
     // TurboQuant is on by default; warn if this architecture doesn't support it.
     if turbo_quant_bits.is_some() {
         match arch {
-            ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4 => {} // supported
+            ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => {}
             other => {
                 tracing::warn!(
                     "--turbo-quant is not supported for {:?} and will be ignored. \
-                     TurboQuant KV cache compression is currently only available for Qwen3 and Gemma4. \
+                     TurboQuant KV cache compression is currently only available for Qwen3, Qwen3.5, and Gemma4. \
                      Pass --turbo-quant=false to suppress this warning.",
                     other
                 );
