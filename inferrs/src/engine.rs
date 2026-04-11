@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::{ModelArchitecture, RawConfig};
@@ -171,6 +172,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         model,
         engine_tokenizer,
         device.clone(),
+        dtype,
         args.max_batch_size,
         args.max_tokens_per_step,
     );
@@ -270,6 +272,10 @@ pub enum EngineRequest {
     Embed {
         prompt_tokens: Vec<u32>,
         response_tx: oneshot::Sender<Result<EmbedResult>>,
+    },
+    /// Return a snapshot of the engine's current memory state.
+    MemorySnapshot {
+        response_tx: oneshot::Sender<SyncMemorySnapshot>,
     },
 }
 
@@ -481,6 +487,37 @@ pub struct EmbedResult {
     pub embedding: Vec<f32>,
     #[allow(dead_code)]
     pub prompt_tokens: usize,
+}
+
+/// Memory usage snapshot returned by the live engine thread.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncMemorySnapshot {
+    pub device: &'static str,
+    pub paged: Option<PagedMemorySnapshot>,
+}
+
+/// Paged KV usage derived from the actual engine state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PagedMemorySnapshot {
+    pub block_size: usize,
+    pub total_blocks: usize,
+    pub free_blocks: usize,
+    pub used_blocks: usize,
+    pub allocated_tokens: usize,
+    pub total_slots: usize,
+    pub bytes_per_block: usize,
+    pub reserved_bytes: usize,
+    pub allocated_bytes: usize,
+    pub last_generation_used_blocks: Option<usize>,
+    pub last_generation_allocated_tokens: Option<usize>,
+    pub last_generation_allocated_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletedPagedUsage {
+    used_blocks: usize,
+    allocated_tokens: usize,
+    allocated_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +752,27 @@ impl ActiveSequence {
             EngineRequest::Embed { .. } => {
                 panic!("Embed requests must not be converted to ActiveSequence")
             }
+            EngineRequest::MemorySnapshot { .. } => {
+                panic!("MemorySnapshot requests must not be converted to ActiveSequence")
+            }
         }
+    }
+
+    fn snapshot_paged_usage(
+        &self,
+        paged: &PagedState,
+        kv_cache_dtype: DType,
+    ) -> Option<CompletedPagedUsage> {
+        let bt = self.block_table.as_ref()?;
+        if bt.num_blocks() == 0 && bt.num_tokens() == 0 {
+            return None;
+        }
+        let bytes_per_block = paged_bytes_per_block(paged, kv_cache_dtype);
+        Some(CompletedPagedUsage {
+            used_blocks: bt.num_blocks(),
+            allocated_tokens: bt.num_tokens(),
+            allocated_bytes: bt.num_blocks() * bytes_per_block,
+        })
     }
 
     /// Mark the sequence as successfully finished and send the final result
@@ -1274,6 +1331,7 @@ pub struct Engine {
     model: Box<dyn CausalLM>,
     tokenizer: Tokenizer,
     device: Device,
+    kv_cache_dtype: DType,
     stop_token_ids: Vec<u32>,
     max_batch_size: usize,
     #[allow(dead_code)]
@@ -1300,6 +1358,7 @@ struct PagedState {
     /// time.  The continuous-batching loop maintains per-sequence block
     /// tables instead.
     block_table: BlockTable,
+    last_generation_usage: Option<CompletedPagedUsage>,
 }
 
 impl Engine {
@@ -1307,6 +1366,7 @@ impl Engine {
         model: Box<dyn CausalLM>,
         tokenizer: Tokenizer,
         device: Device,
+        kv_cache_dtype: DType,
         max_batch_size: usize,
         max_tokens_per_step: usize,
     ) -> Self {
@@ -1338,6 +1398,7 @@ impl Engine {
             model,
             tokenizer,
             device,
+            kv_cache_dtype,
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step,
@@ -1353,6 +1414,7 @@ impl Engine {
             block_pool,
             kv_store,
             block_table: BlockTable::new(block_size),
+            last_generation_usage: None,
         });
         self
     }
@@ -1492,6 +1554,7 @@ impl Engine {
             mut model,
             tokenizer,
             device,
+            kv_cache_dtype,
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step: _,
@@ -1532,6 +1595,14 @@ impl Engine {
                             let _ = response_tx.send(result);
                             continue;
                         }
+                        if let EngineRequest::MemorySnapshot { response_tx } = req {
+                            let _ = response_tx.send(Self::build_memory_snapshot(
+                                &device,
+                                kv_cache_dtype,
+                                paged.as_ref(),
+                            ));
+                            continue;
+                        }
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         // If the prompt ends with a thinking delimiter (e.g. the
@@ -1569,6 +1640,14 @@ impl Engine {
                             let _ = response_tx.send(result);
                             continue;
                         }
+                        if let EngineRequest::MemorySnapshot { response_tx } = req {
+                            let _ = response_tx.send(Self::build_memory_snapshot(
+                                &device,
+                                kv_cache_dtype,
+                                paged.as_ref(),
+                            ));
+                            continue;
+                        }
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         if let Some(&last) = seq.prompt_tokens.last() {
@@ -1602,6 +1681,10 @@ impl Engine {
                             &seq.prompt_tokens,
                             audio_ctx,
                         ) {
+                            if let Some(ps) = paged.as_mut() {
+                                ps.last_generation_usage =
+                                    seq.snapshot_paged_usage(ps, kv_cache_dtype);
+                            }
                             seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
                             continue;
                         }
@@ -1614,6 +1697,10 @@ impl Engine {
                             &seq.prompt_tokens,
                             image_ctx,
                         ) {
+                            if let Some(ps) = paged.as_mut() {
+                                ps.last_generation_usage =
+                                    seq.snapshot_paged_usage(ps, kv_cache_dtype);
+                            }
                             seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
                             continue;
                         }
@@ -1637,6 +1724,10 @@ impl Engine {
                     let last_token = match seq.output_tokens.last() {
                         Some(&t) => t,
                         None => {
+                            if let Some(ps) = paged.as_mut() {
+                                ps.last_generation_usage =
+                                    seq.snapshot_paged_usage(ps, kv_cache_dtype);
+                            }
                             seq.finish_error(
                                 anyhow::anyhow!("internal error: decode before prefill"),
                                 paged.as_mut().map(|ps| &mut ps.block_pool),
@@ -1659,6 +1750,9 @@ impl Engine {
                 let logits = match logits_result {
                     Ok(l) => l,
                     Err(e) => {
+                        if let Some(ps) = paged.as_mut() {
+                            ps.last_generation_usage = seq.snapshot_paged_usage(ps, kv_cache_dtype);
+                        }
                         seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
                         continue;
                     }
@@ -1687,6 +1781,10 @@ impl Engine {
                     match sampler::sample_token(&logits, &seq.sampling_params, &seq.all_tokens) {
                         Ok(t) => t,
                         Err(e) => {
+                            if let Some(ps) = paged.as_mut() {
+                                ps.last_generation_usage =
+                                    seq.snapshot_paged_usage(ps, kv_cache_dtype);
+                            }
                             seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
                             continue;
                         }
@@ -1833,6 +1931,9 @@ impl Engine {
 
                 if finish_reason.is_some() || client_gone {
                     let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
+                    if let Some(ps) = paged.as_mut() {
+                        ps.last_generation_usage = seq.snapshot_paged_usage(ps, kv_cache_dtype);
+                    }
                     seq.finish_ok(
                         &reason,
                         &tokenizer,
@@ -2208,8 +2309,66 @@ impl Engine {
     /// Free all paged KV blocks (no-op when paged attention is not active).
     fn free_paged_blocks(&mut self) {
         if let Some(ps) = &mut self.paged {
+            ps.last_generation_usage =
+                Self::snapshot_block_table_usage(&ps.block_table, ps, self.kv_cache_dtype);
             ps.block_table.free_all(&mut ps.block_pool);
         }
+    }
+
+    fn build_memory_snapshot(
+        device: &Device,
+        kv_cache_dtype: DType,
+        paged: Option<&PagedState>,
+    ) -> SyncMemorySnapshot {
+        SyncMemorySnapshot {
+            device: device_name(device),
+            paged: paged.map(|ps| {
+                let block_size = ps.block_pool.block_size;
+                let total_blocks = ps.block_pool.num_blocks();
+                let free_blocks = ps.block_pool.num_free_blocks();
+                let used_blocks = total_blocks.saturating_sub(free_blocks);
+                let total_slots = total_blocks * block_size;
+                let bytes_per_block = paged_bytes_per_block(ps, kv_cache_dtype);
+                let reserved_bytes = total_blocks * bytes_per_block;
+                let allocated_bytes = used_blocks * bytes_per_block;
+                PagedMemorySnapshot {
+                    block_size,
+                    total_blocks,
+                    free_blocks,
+                    used_blocks,
+                    allocated_tokens: ps.block_table.num_tokens(),
+                    total_slots,
+                    bytes_per_block,
+                    reserved_bytes,
+                    allocated_bytes,
+                    last_generation_used_blocks: ps
+                        .last_generation_usage
+                        .map(|usage| usage.used_blocks),
+                    last_generation_allocated_tokens: ps
+                        .last_generation_usage
+                        .map(|usage| usage.allocated_tokens),
+                    last_generation_allocated_bytes: ps
+                        .last_generation_usage
+                        .map(|usage| usage.allocated_bytes),
+                }
+            }),
+        }
+    }
+
+    fn snapshot_block_table_usage(
+        block_table: &BlockTable,
+        paged: &PagedState,
+        kv_cache_dtype: DType,
+    ) -> Option<CompletedPagedUsage> {
+        if block_table.num_blocks() == 0 && block_table.num_tokens() == 0 {
+            return None;
+        }
+        let bytes_per_block = paged_bytes_per_block(paged, kv_cache_dtype);
+        Some(CompletedPagedUsage {
+            used_blocks: block_table.num_blocks(),
+            allocated_tokens: block_table.num_tokens(),
+            allocated_bytes: block_table.num_blocks() * bytes_per_block,
+        })
     }
 
     // ── Streaming generation ──────────────────────────────────────────────────
@@ -2468,5 +2627,23 @@ impl Engine {
             return Some("length".to_string());
         }
         None
+    }
+}
+
+fn paged_bytes_per_block(paged: &PagedState, kv_cache_dtype: DType) -> usize {
+    let cfg = &paged.kv_store.cfg;
+    cfg.block_size
+        * cfg.num_kv_heads
+        * cfg.head_dim
+        * 2
+        * cfg.num_layers
+        * kv_cache_dtype.size_in_bytes()
+}
+
+fn device_name(device: &Device) -> &'static str {
+    match device {
+        Device::Cpu => "cpu",
+        Device::Cuda(_) => "cuda",
+        Device::Metal(_) => "metal",
     }
 }

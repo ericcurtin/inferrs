@@ -20,15 +20,17 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tower_http::cors::CorsLayer;
 
+use crate::config::ModelArchitecture;
 use crate::engine::{
     load_engine, AudioEmbedContext, EngineRequest, GenerationResult, ImageEmbedContext,
-    OutputBuffer, StreamToken,
+    OutputBuffer, StreamToken, SyncMemorySnapshot,
 };
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{
     apply_gemma4_with_audio, apply_gemma4_with_images, AudioInput, ChatMessage, ImageInput,
     MessageContent, Role, Tokenizer,
 };
+use crate::turbo_quant::GROUP_SIZE;
 use crate::ServeArgs;
 
 // ---------------------------------------------------------------------------
@@ -39,6 +41,36 @@ use crate::ServeArgs;
 /// SSE handler for that request.  Entries are inserted just before the engine
 /// request is sent and removed once the final token (or an error) is routed.
 type StreamRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<StreamToken>>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MemoryReportResponse {
+    device: String,
+    dtype: String,
+    arch: String,
+    turbo_quant: Option<u8>,
+    turbo_quant_note: Option<String>,
+    kv_estimate_mode: String,
+    weight_source: String,
+    weight_quantization: Option<String>,
+    weight_bytes: Option<u64>,
+    max_seq_len: Option<usize>,
+    max_kv_cache_bytes: Option<u64>,
+    paged: Option<crate::engine::PagedMemorySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ServeMemoryConfig {
+    dtype: String,
+    arch: String,
+    turbo_quant: Option<u8>,
+    turbo_quant_note: Option<String>,
+    kv_estimate_mode: String,
+    weight_source: String,
+    weight_quantization: Option<String>,
+    weight_bytes: Option<u64>,
+    max_seq_len: Option<usize>,
+    max_kv_cache_bytes: Option<u64>,
+}
 
 /// Spawn a background task that drains the shared [`OutputBuffer`] and routes
 /// each token to the correct per-request channel.
@@ -959,6 +991,7 @@ enum ModelBackend {
         engine_tx: mpsc::Sender<EngineRequest>,
         tokenizer: Arc<Tokenizer>,
         max_seq_len: usize,
+        memory_config: ServeMemoryConfig,
         output_buf: OutputBuffer,
         stream_registry: StreamRegistry,
         audio_token_id: Option<u32>,
@@ -1094,8 +1127,10 @@ const DEFAULT_PORT_OLLAMA: u16 = 17434;
 /// Build an in-process `Worker` `LoadedModel` from an `EngineContext`.
 fn loaded_model_from_ctx(
     model_id: String,
+    serve_args: &ServeArgs,
     ctx: crate::engine::EngineContext,
 ) -> Result<LoadedModel> {
+    let memory_config = build_memory_config(serve_args, &ctx);
     let tok = Arc::new(Tokenizer::from_file_with_arch(
         &ctx.model_files.tokenizer_path,
         ctx.model_files.tokenizer_config_path.as_deref(),
@@ -1135,6 +1170,7 @@ fn loaded_model_from_ctx(
             engine_tx,
             tokenizer: tok,
             max_seq_len,
+            memory_config,
             output_buf,
             stream_registry,
             audio_token_id,
@@ -1146,6 +1182,98 @@ fn loaded_model_from_ctx(
             vision_default_output_length,
         },
     })
+}
+
+fn turbo_quant_index_bytes(head_dim: usize, bits: u8) -> usize {
+    (head_dim * bits as usize).div_ceil(8)
+}
+
+fn build_memory_config(args: &ServeArgs, ctx: &crate::engine::EngineContext) -> ServeMemoryConfig {
+    let arch = format!("{:?}", ctx.arch);
+    let dtype = format!("{:?}", ctx.dtype);
+    let max_seq_len = (ctx.max_seq_len != usize::MAX).then_some(ctx.max_seq_len);
+    let weight_source = if ctx.model_files.gguf_path.is_some() {
+        "gguf".to_string()
+    } else {
+        "safetensors".to_string()
+    };
+    let weight_bytes = if let Some(path) = &ctx.model_files.gguf_path {
+        std::fs::metadata(path).ok().map(|m| m.len())
+    } else {
+        let total = ctx
+            .model_files
+            .weight_paths
+            .iter()
+            .try_fold(0u64, |acc, path| {
+                Ok::<u64, std::io::Error>(acc + std::fs::metadata(path)?.len())
+            });
+        total.ok()
+    };
+    let weight_quantization = ctx.model_files.gguf_path.as_ref().map(|path| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit('.').next())
+            .unwrap_or("GGUF")
+            .to_uppercase()
+    });
+
+    let (num_kv_heads, head_dim, num_layers) = ctx.raw_config.kv_cache_params(&ctx.arch);
+    let turbo_quant_supported = matches!(
+        ctx.arch,
+        ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4
+    );
+    let turbo_quant = if args.paged_attention.is_some() || !turbo_quant_supported {
+        None
+    } else {
+        args.turbo_quant.0
+    };
+    let turbo_quant_note = if args.paged_attention.is_some() && args.turbo_quant.0.is_some() {
+        Some("paged attention reserves KV from runtime dtype; TurboQuant does not reduce the paged pool".to_string())
+    } else if args.turbo_quant.0.is_some() && !turbo_quant_supported {
+        Some(format!(
+            "TurboQuant is not active for {arch}; KV uses runtime dtype sizing"
+        ))
+    } else {
+        None
+    };
+    let (kv_estimate_mode, max_kv_cache_bytes) = if args.paged_attention.is_some() {
+        let bytes_per_token = head_dim * 2 * num_kv_heads * num_layers * ctx.dtype.size_in_bytes();
+        (
+            "paged-dtype".to_string(),
+            max_seq_len.map(|seq_len| (bytes_per_token * seq_len) as u64),
+        )
+    } else if let Some(bits) = turbo_quant {
+        let index_bytes = turbo_quant_index_bytes(head_dim, bits);
+        let scale_bytes = head_dim.div_ceil(GROUP_SIZE) * 4;
+        let bytes_per_token = (index_bytes + scale_bytes) * 2 * num_kv_heads * num_layers;
+        (
+            "turbo-quant".to_string(),
+            max_seq_len.map(|seq_len| (bytes_per_token * seq_len) as u64),
+        )
+    } else {
+        let bytes_per_token = head_dim * 2 * num_kv_heads * num_layers * ctx.dtype.size_in_bytes();
+        (
+            "plain-dtype".to_string(),
+            max_seq_len.map(|seq_len| (bytes_per_token * seq_len) as u64),
+        )
+    };
+
+    ServeMemoryConfig {
+        dtype,
+        arch,
+        turbo_quant,
+        turbo_quant_note,
+        kv_estimate_mode,
+        weight_source,
+        weight_quantization: args
+            .quantize
+            .as_ref()
+            .map(|q| q.to_uppercase())
+            .or(weight_quantization),
+        weight_bytes,
+        max_seq_len,
+        max_kv_cache_bytes,
+    }
 }
 
 /// Pick a free TCP port on localhost by binding to port 0.
@@ -1331,13 +1459,14 @@ async fn load_model_on_demand(
         let mut serve_args = state.serve_args.clone();
         serve_args.model = Some(model_id.to_string());
         let model_id_owned = model_id.to_string();
-        let ctx = tokio::task::spawn_blocking(move || load_engine(&serve_args))
+        let load_args = serve_args.clone();
+        let ctx = tokio::task::spawn_blocking(move || load_engine(&load_args))
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("model load panicked: {e}")}))))?
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("failed to load '{}': {e}", model_id_owned)}))))?;
-        loaded_model_from_ctx(model_id_owned, ctx).map_err(|e| {
+        loaded_model_from_ctx(model_id_owned, &serve_args, ctx).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("engine init failed: {e}")})),
@@ -1413,7 +1542,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // If a model was specified on the CLI, pre-load it eagerly.
     let initial_slot = if let Some(ref model) = args.model {
         let ctx = load_engine(&args)?;
-        let lm = Arc::new(loaded_model_from_ctx(model.clone(), ctx)?);
+        let lm = Arc::new(loaded_model_from_ctx(model.clone(), &args, ctx)?);
         ModelSlot::Ready(lm)
     } else {
         ModelSlot::Empty
@@ -1452,6 +1581,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/api/tags", get(ollama_tags).head(ollama_tags))
         .route("/api/ps", get(ollama_ps))
         .route("/api/show", post(ollama_show))
+        .route("/api/inferrs/memory", get(inferrs_memory))
         .route("/api/generate", post(ollama_generate))
         .route("/api/chat", post(ollama_chat))
         .route("/api/embed", post(ollama_embed))
@@ -3273,6 +3403,97 @@ async fn ollama_show(
         details: OllamaModelDetails::default(),
         model_info: serde_json::Value::Object(serde_json::Map::new()),
     }))
+}
+
+async fn inferrs_memory(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<MemoryReportResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let lm = {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => Arc::clone(lm),
+            _ => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "memory reporting requires a loaded model"})),
+                ))
+            }
+        }
+    };
+
+    match &lm.backend {
+        ModelBackend::Worker {
+            engine_tx,
+            memory_config,
+            ..
+        } => {
+            let (response_tx, response_rx) = oneshot::channel::<SyncMemorySnapshot>();
+            engine_tx
+                .send(EngineRequest::MemorySnapshot { response_tx })
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("failed to request memory snapshot: {e}")})),
+                    )
+                })?;
+            let snapshot = response_rx.await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("memory snapshot response dropped: {e}")})),
+                )
+            })?;
+            let max_kv_cache_bytes = snapshot
+                .paged
+                .as_ref()
+                .map(|paged| paged.reserved_bytes as u64)
+                .or(memory_config.max_kv_cache_bytes);
+
+            Ok(Json(MemoryReportResponse {
+                device: snapshot.device.to_string(),
+                dtype: memory_config.dtype.clone(),
+                arch: memory_config.arch.clone(),
+                turbo_quant: memory_config.turbo_quant,
+                turbo_quant_note: memory_config.turbo_quant_note.clone(),
+                kv_estimate_mode: memory_config.kv_estimate_mode.clone(),
+                weight_source: memory_config.weight_source.clone(),
+                weight_quantization: memory_config.weight_quantization.clone(),
+                weight_bytes: memory_config.weight_bytes,
+                max_seq_len: memory_config.max_seq_len,
+                max_kv_cache_bytes,
+                paged: snapshot.paged,
+            }))
+        }
+        ModelBackend::Proxy { worker_url, .. } => {
+            let url = format!("{worker_url}/api/inferrs/memory");
+            let response = state.http_client.get(&url).send().await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(
+                        serde_json::json!({"error": format!("worker memory request failed: {e}")}),
+                    ),
+                )
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "worker returned an error".to_string());
+                return Err((
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(serde_json::json!({"error": body})),
+                ));
+            }
+            let report = response.json::<MemoryReportResponse>().await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("invalid worker memory response: {e}")})),
+                )
+            })?;
+            Ok(Json(report))
+        }
+    }
 }
 
 /// Return the RFC3339 timestamp for right now (UTC).

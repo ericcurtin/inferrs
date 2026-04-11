@@ -24,6 +24,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
+use crate::util::format_bytes;
+
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
 /// Default port for the Ollama-compatible API (matches `inferrs serve` default
@@ -230,6 +232,38 @@ struct OaiDelta {
 #[derive(Debug, Deserialize)]
 struct OaiChunk {
     choices: Vec<OaiChunkChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryReportResponse {
+    device: String,
+    dtype: String,
+    arch: String,
+    turbo_quant: Option<u8>,
+    turbo_quant_note: Option<String>,
+    kv_estimate_mode: String,
+    weight_source: String,
+    weight_quantization: Option<String>,
+    weight_bytes: Option<u64>,
+    max_seq_len: Option<usize>,
+    max_kv_cache_bytes: Option<u64>,
+    paged: Option<PagedMemoryResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PagedMemoryResponse {
+    block_size: usize,
+    total_blocks: usize,
+    free_blocks: usize,
+    used_blocks: usize,
+    allocated_tokens: usize,
+    total_slots: usize,
+    bytes_per_block: usize,
+    reserved_bytes: usize,
+    allocated_bytes: usize,
+    last_generation_used_blocks: Option<usize>,
+    last_generation_allocated_tokens: Option<usize>,
+    last_generation_allocated_bytes: Option<usize>,
 }
 
 // ─── HTTP client helpers ─────────────────────────────────────────────────────
@@ -651,6 +685,92 @@ fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+async fn show_memory(client: &Client, base_url: &str) -> Result<()> {
+    let url = format!("{base_url}/api/inferrs/memory");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Server returned {status}: {text}");
+    }
+
+    let report: MemoryReportResponse = response.json().await.context("invalid memory response")?;
+
+    println!(
+        "device={} dtype={} arch={}",
+        report.device, report.dtype, report.arch
+    );
+    match report.turbo_quant {
+        Some(bits) => println!("turbo_quant={}bit", bits),
+        None => println!("turbo_quant=disabled"),
+    }
+    if let Some(note) = &report.turbo_quant_note {
+        println!("turbo_quant_note={note}");
+    }
+    println!("kv_estimate_mode={}", report.kv_estimate_mode);
+    match &report.weight_quantization {
+        Some(format) => println!("weight_format={} ({})", format, report.weight_source),
+        None => println!("weight_format=full precision ({})", report.weight_source),
+    }
+    if let Some(weight_bytes) = report.weight_bytes {
+        println!("model_weight_estimate={}", format_bytes(weight_bytes));
+    }
+    match report.max_seq_len {
+        Some(max_seq_len) => println!("model_kv_capacity={} tokens", max_seq_len),
+        None => println!("model_kv_capacity=unknown"),
+    }
+    if let Some(max_bytes) = report.max_kv_cache_bytes {
+        println!("max_kv_cache_estimate={}", format_bytes(max_bytes));
+        if let Some(weight_bytes) = report.weight_bytes {
+            println!(
+                "model_plus_max_kv_estimate={}",
+                format_bytes(weight_bytes.saturating_add(max_bytes))
+            );
+        }
+    }
+
+    if let Some(paged) = report.paged {
+        println!(
+            "paged_pool={} blocks x {} tokens = {} slots",
+            paged.total_blocks, paged.block_size, paged.total_slots
+        );
+        println!(
+            "paged_blocks_used={} free={} allocated_tokens={}",
+            paged.used_blocks, paged.free_blocks, paged.allocated_tokens
+        );
+        println!(
+            "paged_memory_reserved={} active_estimate={} bytes_per_block={}",
+            format_bytes(paged.reserved_bytes as u64),
+            format_bytes(paged.allocated_bytes as u64),
+            format_bytes(paged.bytes_per_block as u64),
+        );
+        if let (Some(last_used_blocks), Some(last_allocated_tokens), Some(last_allocated_bytes)) = (
+            paged.last_generation_used_blocks,
+            paged.last_generation_allocated_tokens,
+            paged.last_generation_allocated_bytes,
+        ) {
+            println!(
+                "last_generation_paged_blocks_used={} allocated_tokens={}",
+                last_used_blocks, last_allocated_tokens
+            );
+            println!(
+                "last_generation_paged_memory_estimate={}",
+                format_bytes(last_allocated_bytes as u64)
+            );
+        }
+    } else {
+        println!("paged_attention=disabled");
+        println!("live_kv_usage=not tracked in concat-KV mode");
+    }
+
+    Ok(())
+}
+
 // ─── Interactive REPL ────────────────────────────────────────────────────────
 
 /// Multiline input state.
@@ -738,11 +858,15 @@ async fn repl(
                     handle_command(
                         &trimmed,
                         &mut messages,
+                        &client,
+                        &base_url,
+                        &mut load_rx,
                         &mut temperature,
                         &mut top_p,
                         &mut top_k,
                         &mut max_tokens,
-                    );
+                    )
+                    .await;
                     buf.clear();
                     continue;
                 }
@@ -814,9 +938,12 @@ async fn repl(
 
 // ─── Slash command handler ────────────────────────────────────────────────────
 
-fn handle_command(
+async fn handle_command(
     cmd: &str,
     messages: &mut Vec<ApiMessage>,
+    client: &Client,
+    base_url: &str,
+    load_rx: &mut tokio::sync::watch::Receiver<LoadState>,
     temperature: &mut f64,
     top_p: &mut f64,
     top_k: &mut usize,
@@ -885,6 +1012,17 @@ fn handle_command(
                     println!("[{}] {}: {}", i, m.role, m.content);
                 }
             }
+            "memory" => {
+                if matches!(*load_rx.borrow(), LoadState::Loading) {
+                    if let Err(e) = wait_for_load(load_rx).await {
+                        eprintln!("{e}");
+                        return;
+                    }
+                }
+                if let Err(e) = show_memory(client, base_url).await {
+                    eprintln!("Memory query error: {e}");
+                }
+            }
             "params" => {
                 println!(
                     "temperature={temperature} top_p={top_p} top_k={top_k} max_tokens={max_tokens}"
@@ -902,6 +1040,7 @@ fn handle_command(
             println!("  /set top_k <n>               Set top-k sampling");
             println!("  /set max_tokens <n>          Set max tokens per response");
             println!("  /show history                Print conversation history");
+            println!("  /show memory                 Print runtime memory information");
             println!("  /show params                 Print sampling parameters");
             println!("  /help, /?                    Show this help");
             println!();

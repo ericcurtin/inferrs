@@ -183,14 +183,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
         let (num_kv_heads, head_dim, num_layers) = raw_config.kv_cache_params(&arch);
         // bytes consumed per token across all layers (K + V combined)
         let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant.0 {
-            // TurboQuant: nibble-packed indices + f32 per-group absmax scales
-            let index_bytes = if bits <= 4 {
-                // two indices packed per byte
-                head_dim.div_ceil(2)
-            } else {
-                // one index per byte
-                head_dim
-            };
+            // TurboQuant: dense bit-packed indices + f32 per-group absmax scales.
+            let index_bytes = (head_dim * bits as usize).div_ceil(8);
             let n_groups = head_dim.div_ceil(GROUP_SIZE);
             let scale_bytes = n_groups * 4; // f32 per group
                                             // K and V each have index_bytes + scale_bytes, times num_kv_heads, times num_layers
