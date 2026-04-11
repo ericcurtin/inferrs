@@ -130,8 +130,12 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         .model
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No model specified; pass a HuggingFace model ID"))?;
-    let model_files =
-        crate::hub::download_and_maybe_quantize(model_id, &args.revision, quant_dtype)?;
+    let model_files = crate::hub::download_and_maybe_quantize(
+        model_id,
+        &args.revision,
+        args.gguf_file.as_deref(),
+        quant_dtype,
+    )?;
 
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
     let arch = raw_config.detect_architecture()?;

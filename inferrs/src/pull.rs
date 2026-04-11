@@ -5,12 +5,22 @@ use clap::Parser;
 
 #[derive(Parser, Clone)]
 pub struct PullArgs {
-    /// HuggingFace model ID (e.g. Qwen/Qwen3.5-0.8B)
+    /// HuggingFace model ID (e.g. Qwen/Qwen3.5-0.8B) or a GGUF-only repo
+    /// (e.g. ggml-org/gemma-4-E2B-it-GGUF).
     pub model: String,
 
     /// Git branch or tag on HuggingFace Hub
     #[arg(long, default_value = "main")]
     pub revision: String,
+
+    /// Specific GGUF filename to download from a GGUF-only repo.
+    ///
+    /// Only used when the repo contains GGUF files but no safetensors weights
+    /// (e.g. ggml-org/gemma-4-E2B-it-GGUF).  When omitted, inferrs picks the
+    /// best available quantization automatically (preferring Q4K, then Q8_0,
+    /// then the first .gguf file found).
+    #[arg(long, value_name = "FILENAME")]
+    pub gguf_file: Option<String>,
 
     /// Quantize weights and cache the result as a GGUF file.
     ///
@@ -30,7 +40,12 @@ pub fn run(args: PullArgs) -> Result<()> {
         .map(crate::quantize::parse_format)
         .transpose()?;
 
-    let files = crate::hub::download_and_maybe_quantize(&args.model, &args.revision, quant_dtype)?;
+    let files = crate::hub::download_and_maybe_quantize(
+        &args.model,
+        &args.revision,
+        args.gguf_file.as_deref(),
+        quant_dtype,
+    )?;
 
     println!("Pulled {}", args.model);
     println!("  config:    {}", files.config_path.display());

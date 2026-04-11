@@ -97,6 +97,14 @@ pub struct RunArgs {
     #[arg(long, default_value = "8", require_equals(true))]
     pub turbo_quant: crate::TurboQuantArg,
 
+    /// Specific GGUF filename to load from a GGUF-only repo.
+    ///
+    /// Only used when the repo contains GGUF files but no safetensors weights
+    /// (e.g. ggml-org/gemma-4-E2B-it-GGUF).  When omitted, inferrs picks the
+    /// best available quantization automatically.
+    #[arg(long, value_name = "FILENAME")]
+    pub gguf_file: Option<String>,
+
     /// Quantize model weights on first use and cache as GGUF.
     /// Accepted formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K.
     /// Plain `--quantize` defaults to Q4K.
@@ -499,6 +507,9 @@ async fn warm_up_model(client: &Client, base_url: &str, args: &RunArgs) -> Resul
     }
     if let Some(ref q) = args.quantize {
         options.insert("quantize".into(), q.clone().into());
+    }
+    if let Some(ref f) = args.gguf_file {
+        options.insert("gguf_file".into(), f.clone().into());
     }
 
     let mut body = serde_json::json!({

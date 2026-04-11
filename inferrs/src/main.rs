@@ -75,6 +75,9 @@ enum Commands {
     Rm(rm::RmArgs),
     /// List locally cached models
     List(list::ListArgs),
+    /// List locally cached models (alias for list)
+    #[command(name = "ls")]
+    Ls(list::ListArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -161,6 +164,15 @@ pub struct ServeArgs {
     /// Disable entirely with `--turbo-quant=false`.
     #[arg(long, default_value = "8", require_equals(true))]
     pub turbo_quant: TurboQuantArg,
+
+    /// Specific GGUF filename to load from a GGUF-only repo.
+    ///
+    /// Only used when the repo contains GGUF files but no safetensors weights
+    /// (e.g. ggml-org/gemma-4-E2B-it-GGUF).  When omitted, inferrs picks the
+    /// best available quantization automatically (preferring Q4K, then Q8_0,
+    /// then the first .gguf file found).
+    #[arg(long, value_name = "FILENAME")]
+    pub gguf_file: Option<String>,
 
     /// Quantize model weights and cache the result on disk as a GGUF file.
     /// On first use the weights are quantized and saved next to the HuggingFace cache;
@@ -492,7 +504,11 @@ async fn main() -> Result<()> {
     // interactive REPL writes to stdout and log lines would corrupt the prompt display.
     // Users can still get logs by setting RUST_LOG explicitly (e.g. RUST_LOG=debug).
     let default_log_level = match &cli.command {
-        Commands::Run(_) | Commands::Bench(_) | Commands::Rm(_) | Commands::List(_) => "error",
+        Commands::Run(_)
+        | Commands::Bench(_)
+        | Commands::Rm(_)
+        | Commands::List(_)
+        | Commands::Ls(_) => "error",
         _ => "info", // Pull and Serve both benefit from info-level progress log
     };
     tracing_subscriber::fmt()
@@ -530,7 +546,7 @@ async fn main() -> Result<()> {
         Commands::Rm(args) => {
             rm::run(args)?;
         }
-        Commands::List(args) => {
+        Commands::List(args) | Commands::Ls(args) => {
             list::run(args)?;
         }
     }

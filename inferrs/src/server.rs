@@ -621,6 +621,8 @@ pub struct OllamaOptions {
     pub turbo_quant: Option<String>,
     /// GGUF quantization format, e.g. "Q4K"
     pub quantize: Option<String>,
+    /// Specific GGUF filename to load from a GGUF-only repo
+    pub gguf_file: Option<String>,
 
     // ── Extended sampling fields ──────────────────────────────────────────────
     pub seed: Option<i64>,
@@ -1158,6 +1160,9 @@ async fn spawn_worker(
         }
         if let Some(ref q) = o.quantize {
             args.push(format!("--quantize={q}"));
+        }
+        if let Some(ref f) = o.gguf_file {
+            args.extend(["--gguf-file".into(), f.clone()]);
         }
     }
 
