@@ -1600,6 +1600,7 @@ impl Engine {
                                 &device,
                                 kv_cache_dtype,
                                 paged.as_ref(),
+                                &active,
                             ));
                             continue;
                         }
@@ -1645,6 +1646,7 @@ impl Engine {
                                 &device,
                                 kv_cache_dtype,
                                 paged.as_ref(),
+                                &active,
                             ));
                             continue;
                         }
@@ -2319,6 +2321,7 @@ impl Engine {
         device: &Device,
         kv_cache_dtype: DType,
         paged: Option<&PagedState>,
+        active: &VecDeque<ActiveSequence>,
     ) -> SyncMemorySnapshot {
         SyncMemorySnapshot {
             device: device_name(device),
@@ -2331,12 +2334,17 @@ impl Engine {
                 let bytes_per_block = paged_bytes_per_block(ps, kv_cache_dtype);
                 let reserved_bytes = total_blocks * bytes_per_block;
                 let allocated_bytes = used_blocks * bytes_per_block;
+                let active_allocated_tokens: usize = active
+                    .iter()
+                    .filter_map(|seq| seq.block_table.as_ref())
+                    .map(BlockTable::num_tokens)
+                    .sum();
                 PagedMemorySnapshot {
                     block_size,
                     total_blocks,
                     free_blocks,
                     used_blocks,
-                    allocated_tokens: ps.block_table.num_tokens(),
+                    allocated_tokens: active_allocated_tokens + ps.block_table.num_tokens(),
                     total_slots,
                     bytes_per_block,
                     reserved_bytes,

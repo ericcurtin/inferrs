@@ -1220,7 +1220,7 @@ fn build_memory_config(args: &ServeArgs, ctx: &crate::engine::EngineContext) -> 
     let (num_kv_heads, head_dim, num_layers) = ctx.raw_config.kv_cache_params(&ctx.arch);
     let turbo_quant_supported = matches!(
         ctx.arch,
-        ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4
+        ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4
     );
     let turbo_quant = if args.paged_attention.is_some() || !turbo_quant_supported {
         None
