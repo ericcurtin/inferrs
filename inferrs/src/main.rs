@@ -39,8 +39,8 @@ impl std::str::FromStr for QuantizeArg {
         if s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("none") {
             return Ok(QuantizeArg(None));
         }
-        // Validate the format by delegating to the existing parser, but store
-        // the original string for later resolution.
+        // Store the format string — actual validation happens later in
+        // resolve_quant_dtype() via quantize::parse_format().
         Ok(QuantizeArg(Some(s.to_string())))
     }
 }
@@ -209,7 +209,7 @@ pub struct ServeArgs {
     /// On first use the weights are quantized and saved next to the HuggingFace cache;
     /// subsequent runs reuse the cached GGUF, so the slow conversion only happens once.
     ///
-    /// Enabled by default at Q4_K_M (= Q4K) for fast model loading.
+    /// Enabled by default at Q4K for fast model loading.
     /// Pass an explicit format (`--quantize=FMT`) to change it.
     /// Accepted formats (case-insensitive): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
     /// Q2K, Q3K, Q4K (Q4_K_M), Q5K, Q6K.
