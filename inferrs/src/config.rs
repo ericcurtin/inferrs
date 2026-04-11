@@ -560,6 +560,7 @@ impl RawConfig {
         &self,
         dtype: DType,
         device: Device,
+        turbo_quant_bits: Option<u8>,
     ) -> crate::models::qwen3_5::Qwen35Config {
         use crate::models::qwen3_5::{LayerType, Qwen35Config};
 
@@ -630,6 +631,7 @@ impl RawConfig {
             tie_word_embeddings,
             dtype,
             device,
+            turbo_quant_bits,
         }
     }
 

@@ -556,8 +556,8 @@ impl TurboQuantKvCache {
                 // Copy existing valid tokens into the new buffer.
                 if self.warmup_kv_buf_len > 0 {
                     if let Some((kb_old, vb_old)) = &self.warmup_kv_buf {
-                        let k_valid = kb_old.narrow(2, 0, self.warmup_kv_buf_len)?;
-                        let v_valid = vb_old.narrow(2, 0, self.warmup_kv_buf_len)?;
+                        let k_valid = kb_old.narrow(2, 0, self.warmup_kv_buf_len)?.contiguous()?;
+                        let v_valid = vb_old.narrow(2, 0, self.warmup_kv_buf_len)?.contiguous()?;
                         new_k_buf.slice_set(&k_valid, 2, 0)?;
                         new_v_buf.slice_set(&v_valid, 2, 0)?;
                     }
@@ -769,8 +769,8 @@ impl TurboQuantKvCache {
             // Copy existing valid data into the new (larger) buffer.
             if self.cached_seq_len > 0 {
                 if let Some((k_old, v_old)) = &self.kv_buffer {
-                    k_buf.slice_set(k_old, 2, 0)?;
-                    v_buf.slice_set(v_old, 2, 0)?;
+                    k_buf.slice_set(&k_old.contiguous()?, 2, 0)?;
+                    v_buf.slice_set(&v_old.contiguous()?, 2, 0)?;
                 }
             }
             self.kv_buffer = Some((k_buf, v_buf));
@@ -780,8 +780,8 @@ impl TurboQuantKvCache {
         // Write the new delta tokens into the buffer at position `cached_seq_len`.
         // `slice_set` is an in-place write — no allocation, no copy of previous data.
         let (k_buf, v_buf) = self.kv_buffer.as_mut().expect("kv_buffer allocated above");
-        k_buf.slice_set(&k_new, 2, self.cached_seq_len)?;
-        v_buf.slice_set(&v_new, 2, self.cached_seq_len)?;
+        k_buf.slice_set(&k_new.contiguous()?, 2, self.cached_seq_len)?;
+        v_buf.slice_set(&v_new.contiguous()?, 2, self.cached_seq_len)?;
 
         // Update the cached sequence length.
         self.cached_seq_len = self.seq_len;
@@ -1325,5 +1325,46 @@ mod tests {
              if they match, TurboQuant now caps at the window and this test should be updated",
             k_out.dim(2).unwrap()
         );
+    }
+
+    /// Regression test: buffer reallocation with non-contiguous narrow views.
+    ///
+    /// When the warmup buffer grows (lines 559-562), the existing data is copied via
+    /// `narrow(2, 0, len)` then `slice_set`. The narrow produces a non-contiguous view
+    /// that `slice_set` cannot handle directly. This test verifies the `.contiguous()`
+    /// fix prevents the "slice-set only supports contiguous tensors" error.
+    #[test]
+    fn buffer_realloc_with_narrow_non_contiguous() {
+        let head_dim = 128usize;
+        let n_kv_heads = 4usize;
+        let device = test_device();
+        let dtype = test_dtype(&device);
+
+        // Create cache WITH warmup enabled (not calling .without_warmup())
+        // This exercises the warmup buffer path that has the narrow+slice_set pattern.
+        let mut cache = TurboQuantKvCache::new(
+            &TurboQuantConfig { bits: 8, head_dim },
+            n_kv_heads,
+            dtype,
+            device.clone(),
+        );
+
+        // Append tokens gradually to trigger multiple buffer growths.
+        // The warmup buffer starts small and doubles when needed.
+        // Each growth copies existing data via narrow+slice_set.
+        for step in 0..300usize {
+            let k_data: Vec<f32> = (0..n_kv_heads * head_dim)
+                .map(|i| {
+                    let h = i / head_dim;
+                    let d = i % head_dim;
+                    ((step as f32 * 0.37 + h as f32 * 1.1 + d as f32 * 0.07) * 0.5).sin()
+                })
+                .collect();
+            let k_t = Tensor::from_slice(&k_data, (1, n_kv_heads, 1, head_dim), &device).unwrap();
+            // This must not fail with "slice-set only supports contiguous tensors"
+            cache.append(&k_t, &k_t).unwrap_or_else(|e| {
+                panic!("append step {step} should work with contiguous narrow fix: {e}")
+            });
+        }
     }
 }

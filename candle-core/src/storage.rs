@@ -399,6 +399,28 @@ impl Storage {
         }
     }
 
+    /// Depthwise conv1d optimised path (CUDA only).
+    /// Only called when `matches!(device, Device::Cuda(_))` so the CPU/Metal
+    /// branches are unreachable in practice; they bail with a clear message.
+    #[allow(unused_variables)]
+    pub(crate) fn conv1d_depthwise(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1DDepthwise,
+    ) -> Result<Self> {
+        self.same_device(kernel, "conv1d_depthwise")?;
+        self.same_dtype(kernel, "conv1d_depthwise")?;
+        match (self, kernel) {
+            #[cfg(feature = "cuda")]
+            (Storage::Cuda(inp), Storage::Cuda(k)) => {
+                Ok(Self::Cuda(inp.conv1d_depthwise(l, k, kernel_l, params)?))
+            }
+            _ => crate::bail!("conv1d_depthwise is only supported on CUDA"),
+        }
+    }
+
     pub(crate) fn conv_transpose1d(
         &self,
         l: &Layout,

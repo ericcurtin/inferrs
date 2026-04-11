@@ -715,6 +715,63 @@ impl Map2 for Conv1D<'_> {
     }
 }
 
+struct Conv1DDepthwise<'a>(&'a crate::conv::ParamsConv1DDepthwise);
+impl Map2 for Conv1DDepthwise<'_> {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        inp: &CudaSlice<T>,
+        inp_l: &Layout,
+        k: &CudaSlice<T>,
+        k_l: &Layout,
+        dev: &CudaDevice,
+    ) -> Result<CudaSlice<T>> {
+        // inp: [b, c, l_in]  (possibly non-contiguous strides)
+        // k:   [c, k_size]   (contiguous — squeezed at Tensor level before dispatch)
+        let p = &self.0;
+        let l_out = p.l_out();
+        let dst_el = p.b_size * p.c_size * l_out;
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let func = dev.get_or_load_func(&kernel_name::<T>("conv1d_depthwise"), &kernels::CONV)?;
+
+        let inp = &inp.slice(inp_l.start_offset()..);
+        let k = &k.slice(k_l.start_offset()..);
+
+        let src_strides = inp_l.stride();
+        if src_strides.len() != 3 {
+            crate::bail!(
+                "conv1d_depthwise: expected 3-D input, got strides {:?}",
+                src_strides
+            );
+        }
+        let (src_b_stride, src_c_stride, src_l_stride) =
+            (src_strides[0], src_strides[1], src_strides[2]);
+
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let mut builder = func.builder();
+        barg!(
+            builder,
+            p.b_size,
+            p.c_size,
+            p.l_in,
+            l_out,
+            p.k_size,
+            p.stride,
+            p.padding,
+            p.dilation,
+            src_b_stride,
+            src_c_stride,
+            src_l_stride
+        );
+        builder.arg(inp);
+        builder.arg(k);
+        builder.arg(&out);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(out)
+    }
+}
+
 struct Conv2D<'a>(&'a crate::conv::ParamsConv2D);
 impl Map2 for Conv2D<'_> {
     fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
@@ -1430,6 +1487,21 @@ fn gemm_config<T>(
         stride_b: stride_b as i64,
         stride_c: (m * n) as i64,
     })
+}
+
+impl CudaStorage {
+    pub(crate) fn conv1d_depthwise(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1DDepthwise,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let slice =
+            Conv1DDepthwise(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
+        Ok(Self { slice, device })
+    }
 }
 
 impl BackendStorage for CudaStorage {

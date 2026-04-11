@@ -5,6 +5,7 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{linear_no_bias, ops, rotary_emb, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
+use crate::turbo_quant::TurboQuantKvCache;
 
 /// Paged-attention context passed to each layer's `forward_paged` call.
 ///
@@ -411,6 +412,40 @@ pub fn concat_kv_cache(
     };
     *kv_cache = Some((k.clone(), v.clone()));
     Ok((k, v))
+}
+
+/// Append `k`/`v` to the per-layer KV cache, with optional TurboQuant compression.
+///
+/// Three-path strategy:
+/// - **Prefill** (`seqlen_offset == 0 && t > 1`): plain concat — avoids the TQ
+///   overhead during the long prompt phase.
+/// - **First decode step** (TQ enabled, cache empty): adopt the prefill tensors into
+///   TQ's warmup buffer (zero-copy), then append + dequantize.
+/// - **Subsequent decode / no TQ**: plain concat.
+///
+/// Returns the full `(k, v)` to use for attention, shaped
+/// `[b, num_kv_heads, total_seq_len, head_dim]`.
+pub fn append_kv_tq(
+    k: Tensor,
+    v: Tensor,
+    seqlen_offset: usize,
+    t: usize,
+    kv_cache: &mut Option<(Tensor, Tensor)>,
+    tq_cache: &mut Option<TurboQuantKvCache>,
+) -> Result<(Tensor, Tensor)> {
+    if seqlen_offset == 0 && t > 1 {
+        concat_kv_cache(k, v, kv_cache)
+    } else if let Some(tq) = tq_cache {
+        if tq.is_empty() {
+            if let Some((k_cache, v_cache)) = kv_cache.take() {
+                tq.adopt_warmup_buffer(k_cache, v_cache)?;
+            }
+        }
+        tq.append(&k, &v)?;
+        tq.dequantize()
+    } else {
+        concat_kv_cache(k, v, kv_cache)
+    }
 }
 
 // ---------------------------------------------------------------------------
