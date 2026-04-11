@@ -1547,6 +1547,11 @@ impl Engine {
             }
             self.model.clear_kv_cache();
         }
+        if let Some(ps) = &mut self.paged {
+            // Warmup allocations are synthetic startup traffic and should not
+            // appear as the "last generation" in runtime memory snapshots.
+            ps.last_generation_usage = None;
+        }
         tracing::debug!("Engine warm-up complete (3 rounds, benchmark prompt)");
     }
 
@@ -1591,97 +1596,80 @@ impl Engine {
         );
 
         let mut active: VecDeque<ActiveSequence> = VecDeque::new();
+        let mut pending: VecDeque<EngineRequest> = VecDeque::new();
+        let mut channel_closed = false;
 
         loop {
-            // ── 1. Accept new requests (non-blocking) ─────────────────────
+            // ── 1. Admit pending generation requests up to capacity ───────
             while active.len() < effective_batch_size {
+                let Some(req) = pending.pop_front() else {
+                    break;
+                };
+                Self::admit_sequence(req, block_size, &tokenizer, &mut active);
+            }
+
+            // ── 2. Drain control requests regardless of generation capacity ─
+            while !channel_closed {
                 match rx.try_recv() {
                     Ok(req) => {
-                        // Embed requests are handled inline without becoming an
-                        // ActiveSequence (they don't generate tokens).
-                        if let EngineRequest::Embed {
-                            prompt_tokens,
-                            response_tx,
-                        } = req
-                        {
-                            let result = Self::run_embed(&mut model, &device, &prompt_tokens);
-                            let _ = response_tx.send(result);
-                            continue;
+                        if let Some(req) = Self::handle_control_request(
+                            req,
+                            &mut model,
+                            &device,
+                            kv_cache_dtype,
+                            paged.as_ref(),
+                            &active,
+                        ) {
+                            if active.len() < effective_batch_size {
+                                Self::admit_sequence(req, block_size, &tokenizer, &mut active);
+                            } else {
+                                pending.push_back(req);
+                            }
                         }
-                        if let EngineRequest::MemorySnapshot { response_tx } = req {
-                            let _ = response_tx.send(Self::build_memory_snapshot(
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        channel_closed = true;
+                        break;
+                    }
+                }
+            }
+
+            // ── 3. If idle, block until the next request arrives ──────────
+            if active.is_empty() && pending.is_empty() {
+                if channel_closed {
+                    break;
+                }
+                loop {
+                    match rx.blocking_recv() {
+                        Some(req) => {
+                            if let Some(req) = Self::handle_control_request(
+                                req,
+                                &mut model,
                                 &device,
                                 kv_cache_dtype,
                                 paged.as_ref(),
                                 &active,
-                            ));
-                            continue;
-                        }
-                        let mut seq = ActiveSequence::from_engine_request(req, block_size);
-                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
-                        // If the prompt ends with a thinking delimiter (e.g. the
-                        // server injected <|think|> for think=true), the model
-                        // is already "inside" thinking and the first output token
-                        // will be reasoning content, not a delimiter.
-                        if let Some(&last) = seq.prompt_tokens.last() {
-                            if seq.think_filter.is_open_delimiter(last) {
-                                seq.think_filter.set_in_think(true);
+                            ) {
+                                pending.push_back(req);
+                                break;
                             }
                         }
-                        tracing::debug!(
-                            "Accepted request {} ({} prompt tokens, batch_size={})",
-                            seq.request_id,
-                            seq.prompt_tokens.len(),
-                            active.len() + 1,
-                        );
-                        active.push_back(seq);
+                        None => {
+                            channel_closed = true;
+                            break;
+                        }
                     }
-                    Err(_) => break,
+                }
+                while active.len() < effective_batch_size {
+                    let Some(req) = pending.pop_front() else {
+                        break;
+                    };
+                    Self::admit_sequence(req, block_size, &tokenizer, &mut active);
                 }
             }
 
-            // ── 2. If idle, block until the next request arrives ──────────
-            if active.is_empty() {
-                match rx.blocking_recv() {
-                    Some(req) => {
-                        // Embed requests are handled inline.
-                        if let EngineRequest::Embed {
-                            prompt_tokens,
-                            response_tx,
-                        } = req
-                        {
-                            let result = Self::run_embed(&mut model, &device, &prompt_tokens);
-                            let _ = response_tx.send(result);
-                            continue;
-                        }
-                        if let EngineRequest::MemorySnapshot { response_tx } = req {
-                            let _ = response_tx.send(Self::build_memory_snapshot(
-                                &device,
-                                kv_cache_dtype,
-                                paged.as_ref(),
-                                &active,
-                            ));
-                            continue;
-                        }
-                        let mut seq = ActiveSequence::from_engine_request(req, block_size);
-                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
-                        if let Some(&last) = seq.prompt_tokens.last() {
-                            if seq.think_filter.is_open_delimiter(last) {
-                                seq.think_filter.set_in_think(true);
-                            }
-                        }
-                        tracing::debug!(
-                            "Accepted request {} ({} prompt tokens)",
-                            seq.request_id,
-                            seq.prompt_tokens.len(),
-                        );
-                        active.push_back(seq);
-                    }
-                    None => break, // channel closed
-                }
-            }
-
-            // ── 3. Process one step per active sequence ───────────────────
+            // ── 4. Process one step per active sequence ───────────────────
             for seq in active.iter_mut() {
                 if seq.finished {
                     continue;
@@ -1957,7 +1945,7 @@ impl Engine {
                 }
             }
 
-            // ── 4. Remove completed sequences ─────────────────────────────
+            // ── 5. Remove completed sequences ─────────────────────────────
             active.retain(|s| !s.finished);
         }
 
@@ -2390,6 +2378,62 @@ impl Engine {
             allocated_tokens: block_table.num_tokens(),
             allocated_bytes: block_table.num_blocks() * bytes_per_block,
         })
+    }
+
+    fn handle_control_request(
+        req: EngineRequest,
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        kv_cache_dtype: DType,
+        paged: Option<&PagedState>,
+        active: &VecDeque<ActiveSequence>,
+    ) -> Option<EngineRequest> {
+        match req {
+            EngineRequest::Embed {
+                prompt_tokens,
+                response_tx,
+            } => {
+                let result = Self::run_embed(model, device, &prompt_tokens);
+                let _ = response_tx.send(result);
+                None
+            }
+            EngineRequest::MemorySnapshot { response_tx } => {
+                let _ = response_tx.send(Self::build_memory_snapshot(
+                    device,
+                    kv_cache_dtype,
+                    paged,
+                    active,
+                ));
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    fn admit_sequence(
+        req: EngineRequest,
+        block_size: Option<usize>,
+        tokenizer: &Tokenizer,
+        active: &mut VecDeque<ActiveSequence>,
+    ) {
+        let mut seq = ActiveSequence::from_engine_request(req, block_size);
+        seq.think_filter = ThinkFilter::from_tokenizer(tokenizer);
+        // If the prompt ends with a thinking delimiter (e.g. the
+        // server injected <|think|> for think=true), the model
+        // is already "inside" thinking and the first output token
+        // will be reasoning content, not a delimiter.
+        if let Some(&last) = seq.prompt_tokens.last() {
+            if seq.think_filter.is_open_delimiter(last) {
+                seq.think_filter.set_in_think(true);
+            }
+        }
+        tracing::debug!(
+            "Accepted request {} ({} prompt tokens, batch_size={})",
+            seq.request_id,
+            seq.prompt_tokens.len(),
+            active.len() + 1,
+        );
+        active.push_back(seq);
     }
 
     // ── Streaming generation ──────────────────────────────────────────────────
