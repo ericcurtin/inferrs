@@ -15,7 +15,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::path::Path;
 
-use crate::config::{ModelArchitecture, RawConfig};
+use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use gemma4::QGgufVarBuilder;
 
@@ -634,23 +634,33 @@ pub fn load_model(
 
             // Load vision encoder if vision_config is present in the model config.
             let vision_encoder = if let Some(vision_cfg) = &raw_config.vision_config {
-                tracing::info!(
-                    "Gemma4 vision encoder: {} layers, hidden={}, patch_size={}, output_length={}",
-                    vision_cfg.num_hidden_layers,
-                    vision_cfg.hidden_size,
-                    vision_cfg.patch_size,
-                    vision_cfg.default_output_length,
-                );
-                let enc = vision_encoder::VisionEncoder::load(
-                    vb.pp("model"),
-                    vision_cfg,
-                    config.hidden_size,
-                    device,
-                    dtype,
-                )
-                .context("Failed to load Gemma4 vision encoder")?;
-                tracing::info!("Vision encoder loaded successfully");
-                Some(enc)
+                match vision_cfg {
+                    VisionConfig::Gemma4(cfg) => {
+                        tracing::info!(
+                            "Gemma4 vision encoder: {} layers, hidden={}, patch_size={}, output_length={}",
+                            cfg.num_hidden_layers,
+                            cfg.hidden_size,
+                            cfg.patch_size,
+                            cfg.default_output_length,
+                        );
+                        let enc = vision_encoder::VisionEncoder::load(
+                            vb.pp("model"),
+                            cfg,
+                            config.hidden_size,
+                            device,
+                            dtype,
+                        )
+                        .context("Failed to load Gemma4 vision encoder")?;
+                        tracing::info!("Vision encoder loaded successfully");
+                        Some(enc)
+                    }
+                    VisionConfig::Qwen(_) => {
+                        tracing::info!(
+                            "Qwen vision encoder detected but not yet supported, skipping"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };

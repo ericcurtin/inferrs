@@ -916,10 +916,11 @@ fn loaded_model_from_ctx(
     let eoi_token_id = ctx.raw_config.eoi_token_id;
     let (vision_patch_size, vision_pooling_kernel, vision_default_output_length) =
         if let Some(vc) = &ctx.raw_config.vision_config {
+            let p = vc.preprocess_params();
             (
-                Some(vc.patch_size),
-                Some(vc.pooling_kernel_size),
-                Some(vc.default_output_length),
+                Some(p.patch_size),
+                Some(p.pooling_kernel_size),
+                Some(p.default_output_length),
             )
         } else {
             (None, None, None)

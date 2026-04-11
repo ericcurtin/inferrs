@@ -66,9 +66,49 @@ pub struct TextConfig {
 }
 
 /// Vision encoder configuration from `vision_config` in `config.json`.
+///
+/// Different model families ship different vision encoders, each with its own
+/// config shape.  The `model_type` field inside `vision_config` is used to
+/// dispatch to the right variant at deserialization time.
+#[derive(Debug, Clone)]
+pub enum VisionConfig {
+    Gemma4(Gemma4VisionConfig),
+    Qwen(QwenVisionConfig),
+}
+
+/// Parameters the server needs for image preprocessing, regardless of encoder
+/// architecture.
+pub struct VisionPreprocessParams {
+    pub patch_size: usize,
+    pub pooling_kernel_size: usize,
+    pub default_output_length: usize,
+}
+
+impl VisionConfig {
+    pub fn preprocess_params(&self) -> VisionPreprocessParams {
+        match self {
+            VisionConfig::Gemma4(c) => VisionPreprocessParams {
+                patch_size: c.patch_size,
+                pooling_kernel_size: c.pooling_kernel_size,
+                default_output_length: c.default_output_length,
+            },
+            VisionConfig::Qwen(c) => VisionPreprocessParams {
+                patch_size: c.patch_size,
+                pooling_kernel_size: if c.spatial_merge_size > 0 {
+                    c.spatial_merge_size
+                } else {
+                    3
+                },
+                default_output_length: 280,
+            },
+        }
+    }
+}
+
+/// SigLIP2 ViT vision encoder configuration (Gemma4).
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
-pub struct VisionConfig {
+pub struct Gemma4VisionConfig {
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -84,12 +124,29 @@ pub struct VisionConfig {
     pub rms_norm_eps: f64,
     #[serde(default = "default_vision_rope_theta")]
     pub rope_theta: f64,
-    #[serde(default)]
     pub use_clipped_linears: bool,
-    #[serde(default)]
     pub standardize: bool,
     #[serde(default = "default_vision_hidden_activation")]
     pub hidden_activation: String,
+}
+
+/// Qwen vision encoder configuration (shared by Qwen3.5 and Qwen3-VL).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+#[allow(dead_code)]
+pub struct QwenVisionConfig {
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub num_position_embeddings: usize,
+    pub intermediate_size: usize,
+    pub patch_size: usize,
+    pub in_channels: usize,
+    pub out_hidden_size: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub initializer_range: f64,
+    pub deepstack_visual_indexes: Vec<usize>,
 }
 
 fn default_vision_head_dim() -> usize {
@@ -100,6 +157,25 @@ fn default_vision_rope_theta() -> f64 {
 }
 fn default_vision_hidden_activation() -> String {
     "gelu_pytorch_tanh".to_string()
+}
+
+impl<'de> serde::Deserialize<'de> for VisionConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(de)?;
+        let model_type = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+        match model_type {
+            "qwen3_5" | "qwen3_vl" => {
+                let cfg: QwenVisionConfig =
+                    serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+                Ok(VisionConfig::Qwen(cfg))
+            }
+            _ => {
+                let cfg: Gemma4VisionConfig =
+                    serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+                Ok(VisionConfig::Gemma4(cfg))
+            }
+        }
+    }
 }
 
 /// Audio encoder configuration from `audio_config` in `config.json`.

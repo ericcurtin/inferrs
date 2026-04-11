@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
-use crate::config::VisionConfig;
+use crate::config::Gemma4VisionConfig;
 use crate::models::audio_encoder::ClipLinear;
 
 // ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ struct PatchEmbedder {
 }
 
 impl PatchEmbedder {
-    fn load(vb: VarBuilder, cfg: &VisionConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Gemma4VisionConfig) -> Result<Self> {
         let patch_pixels = cfg.patch_size * cfg.patch_size * 3;
         let input_proj = linear_no_bias(patch_pixels, cfg.hidden_size, vb.pp("input_proj"))?;
         let position_embedding_table = vb.get(
@@ -155,7 +155,7 @@ struct VisionAttention {
 }
 
 impl VisionAttention {
-    fn load(vb: VarBuilder, cfg: &VisionConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Gemma4VisionConfig) -> Result<Self> {
         let h = cfg.hidden_size;
         let nh = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
@@ -267,7 +267,7 @@ struct VisionMlp {
 }
 
 impl VisionMlp {
-    fn load(vb: VarBuilder, cfg: &VisionConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Gemma4VisionConfig) -> Result<Self> {
         let mlp_vb = vb.pp("mlp");
         let gate_proj = ClipLinear::load(
             mlp_vb.pp("gate_proj"),
@@ -310,7 +310,7 @@ struct VisionEncoderLayer {
 }
 
 impl VisionEncoderLayer {
-    fn load(vb: VarBuilder, cfg: &VisionConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Gemma4VisionConfig) -> Result<Self> {
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -364,7 +364,7 @@ impl VisionEncoderLayer {
 struct VisionPooler {}
 
 impl VisionPooler {
-    fn new(_cfg: &VisionConfig) -> Self {
+    fn new(_cfg: &Gemma4VisionConfig) -> Self {
         Self {}
     }
 
@@ -475,7 +475,7 @@ impl VisionEncoder {
     /// Expected call site: `VisionEncoder::load(vb.pp("model"), cfg, lm_hidden_size, device, dtype)`
     pub fn load(
         vb: VarBuilder,
-        cfg: &VisionConfig,
+        cfg: &Gemma4VisionConfig,
         lm_hidden_size: usize,
         _device: &Device,
         dtype: DType,
