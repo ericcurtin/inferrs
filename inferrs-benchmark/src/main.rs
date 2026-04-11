@@ -108,9 +108,11 @@ fn main() -> Result<()> {
     let inferrs_bin = resolve_inferrs_bin(&args);
     let prompt = generate_synthetic_prompt(args.prompt_len);
 
+    let n_benchmarks = 4;
+
     // ── 1. inferrs serve --quantize ──────────────────────────────────────────
     log_header(&format!(
-        "Benchmark 1/3 — inferrs serve --quantize {}",
+        "Benchmark 1/{n_benchmarks} — inferrs serve --quantize {}",
         args.inferrs_model
     ));
     let summary_inferrs = {
@@ -126,12 +128,15 @@ fn main() -> Result<()> {
         ));
 
         let health = format!("http://127.0.0.1:{}/health", args.inferrs_port);
-        if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
-            err(&format!("inferrs serve --quantize failed to start: {e}"));
-            let _ = server.kill();
-            let _ = server.wait();
-            bail!("server failed to start");
-        }
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                err(&format!("inferrs serve --quantize failed to start: {e}"));
+                let _ = server.kill();
+                let _ = server.wait();
+                bail!("server failed to start");
+            }
+        };
 
         let mut tracker = PeakMemoryTracker::start(server.id());
         let t_bench = Instant::now();
@@ -155,12 +160,13 @@ fn main() -> Result<()> {
         ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
+        summary.tth_ms = tth_ms;
         summary
     };
 
     // ── 2. inferrs serve --turbo-quant=false --quantize ─────────────────────
     log_header(&format!(
-        "Benchmark 2/3 — inferrs serve --turbo-quant=false --quantize {}",
+        "Benchmark 2/{n_benchmarks} — inferrs serve --turbo-quant=false --quantize {}",
         args.inferrs_model
     ));
     let summary_inferrs_tq = {
@@ -176,14 +182,17 @@ fn main() -> Result<()> {
         ));
 
         let health = format!("http://127.0.0.1:{}/health", args.inferrs_tq_port);
-        if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
-            err(&format!(
-                "inferrs serve --turbo-quant=false --quantize failed to start: {e}"
-            ));
-            let _ = server.kill();
-            let _ = server.wait();
-            bail!("server failed to start");
-        }
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                err(&format!(
+                    "inferrs serve --turbo-quant=false --quantize failed to start: {e}"
+                ));
+                let _ = server.kill();
+                let _ = server.wait();
+                bail!("server failed to start");
+            }
+        };
 
         let mut tracker = PeakMemoryTracker::start(server.id());
         let t_bench = Instant::now();
@@ -207,12 +216,13 @@ fn main() -> Result<()> {
         ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
+        summary.tth_ms = tth_ms;
         summary
     };
 
     // ── 3. inferrs serve (no quantization) ──────────────────────────────────
     log_header(&format!(
-        "Benchmark 3/4 — inferrs serve (no quantize) {}",
+        "Benchmark 3/{n_benchmarks} — inferrs serve (no quantize) {}",
         args.inferrs_model
     ));
     let summary_inferrs_nq = {
@@ -224,12 +234,15 @@ fn main() -> Result<()> {
         ));
 
         let health = format!("http://127.0.0.1:{}/health", args.inferrs_nq_port);
-        if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
-            err(&format!("inferrs serve (no quantize) failed to start: {e}"));
-            let _ = server.kill();
-            let _ = server.wait();
-            bail!("server failed to start");
-        }
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                err(&format!("inferrs serve (no quantize) failed to start: {e}"));
+                let _ = server.kill();
+                let _ = server.wait();
+                bail!("server failed to start");
+            }
+        };
 
         let mut tracker = PeakMemoryTracker::start(server.id());
         let t_bench = Instant::now();
@@ -253,12 +266,13 @@ fn main() -> Result<()> {
         ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
+        summary.tth_ms = tth_ms;
         summary
     };
 
     // ── 4. llama-server ─────────────────────────────────────────────────────
     log_header(&format!(
-        "Benchmark 4/4 — llama-server -hf {}",
+        "Benchmark 4/{n_benchmarks} — llama-server -hf {}",
         args.llama_model
     ));
     let summary_llama = {
@@ -266,12 +280,15 @@ fn main() -> Result<()> {
         ok(&format!("llama-server started (pid {})", server.id()));
 
         let health = format!("http://127.0.0.1:{}/health", args.llama_port);
-        if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
-            err(&format!("llama-server failed to start: {e}"));
-            let _ = server.kill();
-            let _ = server.wait();
-            bail!("server failed to start");
-        }
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                err(&format!("llama-server failed to start: {e}"));
+                let _ = server.kill();
+                let _ = server.wait();
+                bail!("server failed to start");
+            }
+        };
 
         let mut tracker = PeakMemoryTracker::start(server.id());
         let t_bench = Instant::now();
@@ -295,6 +312,7 @@ fn main() -> Result<()> {
         ));
         let mut summary = summary_res?;
         summary.peak_mem_mb = peak_mem_mb;
+        summary.tth_ms = tth_ms;
         summary
     };
 
@@ -352,15 +370,18 @@ where
     ok(&format!("{label} started (pid {})", server.id()));
 
     let health = format!("http://127.0.0.1:{port}/health");
-    if let Err(e) = wait_for_health(&health, args.server_ready_timeout) {
-        err(&format!("{label} failed to start: {e}"));
-        if let Some(f) = cleanup {
-            f();
+    let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            err(&format!("{label} failed to start: {e}"));
+            if let Some(f) = cleanup {
+                f();
+            }
+            let _ = server.kill();
+            let _ = server.wait();
+            bail!("server failed to start");
         }
-        let _ = server.kill();
-        let _ = server.wait();
-        bail!("server failed to start");
-    }
+    };
 
     let mut tracker = PeakMemoryTracker::start(server.id());
     let t_bench = Instant::now();
@@ -392,6 +413,7 @@ where
 
     let mut summary = summary_res?;
     summary.peak_mem_mb = peak_mem_mb;
+    summary.tth_ms = tth_ms;
     Ok(summary)
 }
 
@@ -710,10 +732,19 @@ fn print_dgx_group(
         }
     }
 
-    type Row = (String, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+    // (name, tth_ms, ttft_ms, prefill_tps, decode_tps, peak_mem_mb)
+    type Row = (
+        String,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    );
     let rows: Vec<Row> = vec![
         (
             ref_name.to_string(),
+            ref_summary.tth_ms,
             ref_summary.ttft_ms,
             ref_summary.prefill_tps,
             ref_summary.decode_tps,
@@ -721,6 +752,7 @@ fn print_dgx_group(
         ),
         (
             inferrs_name.to_string(),
+            inferrs_summary.tth_ms,
             inferrs_summary.ttft_ms,
             inferrs_summary.prefill_tps,
             inferrs_summary.decode_tps,
@@ -728,6 +760,7 @@ fn print_dgx_group(
         ),
         (
             inferrs_tq_name.to_string(),
+            inferrs_tq_summary.tth_ms,
             inferrs_tq_summary.ttft_ms,
             inferrs_tq_summary.prefill_tps,
             inferrs_tq_summary.decode_tps,
@@ -735,29 +768,31 @@ fn print_dgx_group(
         ),
     ];
 
+    const W_TTH: usize = 12;
     const W_TTFT: usize = 12;
     const W_PFILL: usize = 14;
     const W_DEC: usize = 13;
     const W_MEM: usize = 14;
     let w = rows
         .iter()
-        .map(|(name, _, _, _, _)| name.len())
+        .map(|(name, _, _, _, _, _)| name.len())
         .max()
         .unwrap_or(0)
         .max("Backend".len());
-    let total_w = w + 2 + W_TTFT + 2 + W_PFILL + 2 + W_DEC + 2 + W_MEM;
+    let total_w = w + 2 + W_TTH + 2 + W_TTFT + 2 + W_PFILL + 2 + W_DEC + 2 + W_MEM;
 
     println!("\n{title}");
     println!("{}", "═".repeat(total_w));
     println!(
-        "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
-        "Backend", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
+        "{:<w$}  {:>W_TTH$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+        "Backend", "TTH (ms)", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
     );
     println!("{}", "─".repeat(total_w));
-    for (name, ttft, pfill, dec, mem) in &rows {
+    for (name, tth, ttft, pfill, dec, mem) in &rows {
         println!(
-            "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+            "{:<w$}  {:>W_TTH$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
             name,
+            fmt(*tth, "ms"),
             fmt(*ttft, "ms"),
             fmt(*pfill, "t/s"),
             fmt(*dec, "t/s"),
@@ -767,22 +802,25 @@ fn print_dgx_group(
     println!("{}", "═".repeat(total_w));
 
     // Relative comparison vs reference backend.
+    let base_tth = ref_summary.tth_ms;
     let base_ttft = ref_summary.ttft_ms;
     let base_pfill = ref_summary.prefill_tps;
     let base_dec = ref_summary.decode_tps;
     let base_mem = ref_summary.peak_mem_mb;
 
-    if let (Some(bt), Some(bp), Some(bd)) = (base_ttft, base_pfill, base_dec) {
+    if let (Some(bth), Some(bt), Some(bp), Some(bd)) = (base_tth, base_ttft, base_pfill, base_dec) {
         println!(
-            "\n  Relative to {ref_name} (higher prefill/decode is better; lower TTFT/mem is better):"
+            "\n  Relative to {ref_name} (higher prefill/decode is better; lower TTH/TTFT/mem is better):"
         );
-        for (name, ttft, pfill, dec, mem) in &rows[1..] {
-            if let (Some(t), Some(p), Some(d)) = (ttft, pfill, dec) {
+        for (name, tth, ttft, pfill, dec, mem) in &rows[1..] {
+            if let (Some(th), Some(t), Some(p), Some(d)) = (tth, ttft, pfill, dec) {
+                let d_tth = (th - bth) / bth * 100.0;
                 let d_ttft = (t - bt) / bt * 100.0;
                 let d_pfill = (p - bp) / bp * 100.0;
                 let d_dec = (d - bd) / bd * 100.0;
                 let sign = |x: f64| if x >= 0.0 { "+" } else { "" };
                 println!("    {name}");
+                println!("      TTH:      {}{d_tth:.1}%", sign(d_tth));
                 println!("      TTFT:     {}{d_ttft:.1}%", sign(d_ttft));
                 println!("      Prefill:  {}{d_pfill:.1}%", sign(d_pfill));
                 println!("      Decode:   {}{d_dec:.1}%", sign(d_dec));
@@ -942,15 +980,19 @@ fn stop_docker_container(name: &str) {
         .status();
 }
 
-fn wait_for_health(url: &str, timeout_secs: u64) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+/// Wait for a server to become healthy. Returns the time-to-healthy in
+/// milliseconds on success.
+fn wait_for_health(url: &str, timeout_secs: u64) -> Result<f64> {
+    let t0 = Instant::now();
+    let deadline = t0 + Duration::from_secs(timeout_secs);
     eprint!("    Waiting for {url} ");
 
     loop {
         match ureq::get(url).timeout(Duration::from_secs(5)).call() {
             Ok(resp) if resp.status() == 200 => {
-                eprintln!(" ready");
-                return Ok(());
+                let tth_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(" ready ({tth_ms:.0}ms)");
+                return Ok(tth_ms);
             }
             _ => {}
         }
@@ -1019,6 +1061,7 @@ fn generate_synthetic_prompt(token_count: usize) -> String {
 
 /// Summary statistics for one backend.
 struct BenchSummary {
+    tth_ms: Option<f64>,
     ttft_ms: Option<f64>,
     prefill_tps: Option<f64>,
     decode_tps: Option<f64>,
@@ -1170,6 +1213,7 @@ fn bench_http(
     eprintln!("  Decode  : {}", stats(&decodes, "tok/s"));
 
     Ok(BenchSummary {
+        tth_ms: None,
         ttft_ms: mean_or_none(&ttfts),
         prefill_tps: mean_or_none(&prefills),
         decode_tps: mean_or_none(&decodes),
@@ -1291,7 +1335,15 @@ fn stats(vals: &[f64], unit: &str) -> String {
 
 // ── Summary table ────────────────────────────────────────────────────────────
 
-type SummaryRow = (String, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+// (name, tth_ms, ttft_ms, prefill_tps, decode_tps, peak_mem_mb)
+type SummaryRow = (
+    String,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+);
 
 fn print_summary(
     args: &BenchmarkArgs,
@@ -1310,6 +1362,7 @@ fn print_summary(
     let rows: Vec<SummaryRow> = vec![
         (
             format!("llama-server -hf {}", args.llama_model),
+            llama.and_then(|s| s.tth_ms),
             llama.and_then(|s| s.ttft_ms),
             llama.and_then(|s| s.prefill_tps),
             llama.and_then(|s| s.decode_tps),
@@ -1317,6 +1370,7 @@ fn print_summary(
         ),
         (
             format!("inferrs serve --quantize {}", args.inferrs_model),
+            inferrs.and_then(|s| s.tth_ms),
             inferrs.and_then(|s| s.ttft_ms),
             inferrs.and_then(|s| s.prefill_tps),
             inferrs.and_then(|s| s.decode_tps),
@@ -1327,6 +1381,7 @@ fn print_summary(
                 "inferrs serve --turbo-quant=false --quantize {}",
                 args.inferrs_model
             ),
+            inferrs_tq.and_then(|s| s.tth_ms),
             inferrs_tq.and_then(|s| s.ttft_ms),
             inferrs_tq.and_then(|s| s.prefill_tps),
             inferrs_tq.and_then(|s| s.decode_tps),
@@ -1334,6 +1389,7 @@ fn print_summary(
         ),
         (
             format!("inferrs serve {}", args.inferrs_model),
+            inferrs_nq.and_then(|s| s.tth_ms),
             inferrs_nq.and_then(|s| s.ttft_ms),
             inferrs_nq.and_then(|s| s.prefill_tps),
             inferrs_nq.and_then(|s| s.decode_tps),
@@ -1342,17 +1398,18 @@ fn print_summary(
     ];
 
     // Column widths (fixed for numeric columns, dynamic for backend name).
+    const W_TTH: usize = 12;
     const W_TTFT: usize = 12;
     const W_PFILL: usize = 14;
     const W_DEC: usize = 13;
     const W_MEM: usize = 14;
     let w = rows
         .iter()
-        .map(|(name, _, _, _, _)| name.len())
+        .map(|(name, _, _, _, _, _)| name.len())
         .max()
         .unwrap_or(0)
         .max("Backend".len());
-    let total_w = w + 2 + W_TTFT + 2 + W_PFILL + 2 + W_DEC + 2 + W_MEM;
+    let total_w = w + 2 + W_TTH + 2 + W_TTFT + 2 + W_PFILL + 2 + W_DEC + 2 + W_MEM;
 
     println!();
     println!(
@@ -1362,14 +1419,15 @@ fn print_summary(
     println!();
     println!("{}", "═".repeat(total_w));
     println!(
-        "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
-        "Backend", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
+        "{:<w$}  {:>W_TTH$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+        "Backend", "TTH (ms)", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
     );
     println!("{}", "─".repeat(total_w));
-    for (name, ttft, pfill, dec, mem) in &rows {
+    for (name, tth, ttft, pfill, dec, mem) in &rows {
         println!(
-            "{:<w$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
+            "{:<w$}  {:>W_TTH$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
             name,
+            fmt(*tth, "ms"),
             fmt(*ttft, "ms"),
             fmt(*pfill, "t/s"),
             fmt(*dec, "t/s"),
@@ -1380,22 +1438,25 @@ fn print_summary(
     println!();
 
     // Relative comparison vs llama-server.
+    let base_tth = llama.and_then(|s| s.tth_ms);
     let base_ttft = llama.and_then(|s| s.ttft_ms);
     let base_pfill = llama.and_then(|s| s.prefill_tps);
     let base_dec = llama.and_then(|s| s.decode_tps);
     let base_mem = llama.and_then(|s| s.peak_mem_mb);
 
-    if let (Some(bt), Some(bp), Some(bd)) = (base_ttft, base_pfill, base_dec) {
+    if let (Some(bth), Some(bt), Some(bp), Some(bd)) = (base_tth, base_ttft, base_pfill, base_dec) {
         println!(
-            "Relative to llama-server (higher prefill/decode is better; lower TTFT/mem is better):"
+            "Relative to llama-server (higher prefill/decode is better; lower TTH/TTFT/mem is better):"
         );
-        for (name, ttft, pfill, dec, mem) in &rows[1..] {
-            if let (Some(t), Some(p), Some(d)) = (ttft, pfill, dec) {
+        for (name, tth, ttft, pfill, dec, mem) in &rows[1..] {
+            if let (Some(th), Some(t), Some(p), Some(d)) = (tth, ttft, pfill, dec) {
+                let d_tth = (th - bth) / bth * 100.0;
                 let d_ttft = (t - bt) / bt * 100.0;
                 let d_pfill = (p - bp) / bp * 100.0;
                 let d_dec = (d - bd) / bd * 100.0;
                 let sign = |x: f64| if x >= 0.0 { "+" } else { "" };
                 println!("  {name}");
+                println!("    TTH:      {}{d_tth:.1}%", sign(d_tth));
                 println!("    TTFT:     {}{d_ttft:.1}%", sign(d_ttft));
                 println!("    Prefill:  {}{d_pfill:.1}%", sign(d_pfill));
                 println!("    Decode:   {}{d_dec:.1}%", sign(d_dec));

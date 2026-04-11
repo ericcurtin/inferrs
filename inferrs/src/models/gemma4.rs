@@ -333,9 +333,6 @@ fn apply_rms_norm_4d_with_weight(x: &Tensor, weight: &Tensor, eps: f32) -> Resul
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    /// F32 copies for the full-F32 decode fast-path (avoids per-step dtype conversion).
-    sin_f32: Tensor,
-    cos_f32: Tensor,
     /// Number of dimensions that are rotated per head.
     rotary_dim: usize,
 }
@@ -362,13 +359,9 @@ impl RotaryEmbedding {
         let freqs = t.matmul(&inv_freq)?;
         let sin = freqs.sin()?;
         let cos = freqs.cos()?;
-        let sin_f32 = sin.to_dtype(DType::F32)?;
-        let cos_f32 = cos.to_dtype(DType::F32)?;
         Ok(Self {
             sin,
             cos,
-            sin_f32,
-            cos_f32,
             rotary_dim,
         })
     }
@@ -408,13 +401,9 @@ impl RotaryEmbedding {
         let freqs = t.matmul(&inv_freq)?;
         let sin = freqs.sin()?;
         let cos = freqs.cos()?;
-        let sin_f32 = sin.to_dtype(DType::F32)?;
-        let cos_f32 = cos.to_dtype(DType::F32)?;
         Ok(Self {
             sin,
             cos,
-            sin_f32,
-            cos_f32,
             rotary_dim,
         })
     }
@@ -426,14 +415,14 @@ impl RotaryEmbedding {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, head_dim) = q.dims4()?;
-        // Use F32 cos/sin when q is F32 (full-F32 decode fast-path).
-        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
-            (&self.cos_f32, &self.sin_f32)
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        // Match q's dtype — convert the narrow'd slice (seq_len rows, not the full table).
+        let (cos, sin) = if q.dtype() != self.cos.dtype() {
+            (cos.to_dtype(q.dtype())?, sin.to_dtype(q.dtype())?)
         } else {
-            (&self.cos, &self.sin)
+            (cos, sin)
         };
-        let cos = cos_src.narrow(0, seqlen_offset, seq_len)?;
-        let sin = sin_src.narrow(0, seqlen_offset, seq_len)?;
 
         if self.rotary_dim == head_dim {
             let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
@@ -458,13 +447,13 @@ impl RotaryEmbedding {
     /// Apply RoPE only to the query tensor (used for KV-sharing layers where K is reused).
     fn apply_rotary_emb_q(&self, q: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (_b_sz, _h, seq_len, head_dim) = q.dims4()?;
-        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
-            (&self.cos_f32, &self.sin_f32)
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let (cos, sin) = if q.dtype() != self.cos.dtype() {
+            (cos.to_dtype(q.dtype())?, sin.to_dtype(q.dtype())?)
         } else {
-            (&self.cos, &self.sin)
+            (cos, sin)
         };
-        let cos = cos_src.narrow(0, seqlen_offset, seq_len)?;
-        let sin = sin_src.narrow(0, seqlen_offset, seq_len)?;
 
         if self.rotary_dim == head_dim {
             candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)
@@ -1025,14 +1014,13 @@ impl Attention {
         }
 
         // Decode path (q_len == 1) with partial RoPE: use pre-allocated output buffers.
-        // Use F32 cos/sin when q is F32 (full-F32 decode fast-path).
-        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
-            (&self.rotary_emb.cos_f32, &self.rotary_emb.sin_f32)
+        let cos = self.rotary_emb.cos.narrow(0, seqlen_offset, 1)?;
+        let sin = self.rotary_emb.sin.narrow(0, seqlen_offset, 1)?;
+        let (cos, sin) = if q.dtype() != self.rotary_emb.cos.dtype() {
+            (cos.to_dtype(q.dtype())?, sin.to_dtype(q.dtype())?)
         } else {
-            (&self.rotary_emb.cos, &self.rotary_emb.sin)
+            (cos, sin)
         };
-        let cos = cos_src.narrow(0, seqlen_offset, 1)?;
-        let sin = sin_src.narrow(0, seqlen_offset, 1)?;
         let pass_len = head_dim - rotary_dim;
 
         // Lazily allocate (or reallocate if batch size or dtype changed) the output buffers.
@@ -1102,13 +1090,13 @@ impl Attention {
             return self.rotary_emb.apply_rotary_emb_q(q, seqlen_offset);
         }
 
-        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
-            (&self.rotary_emb.cos_f32, &self.rotary_emb.sin_f32)
+        let cos = self.rotary_emb.cos.narrow(0, seqlen_offset, 1)?;
+        let sin = self.rotary_emb.sin.narrow(0, seqlen_offset, 1)?;
+        let (cos, sin) = if q.dtype() != self.rotary_emb.cos.dtype() {
+            (cos.to_dtype(q.dtype())?, sin.to_dtype(q.dtype())?)
         } else {
-            (&self.rotary_emb.cos, &self.rotary_emb.sin)
+            (cos, sin)
         };
-        let cos = cos_src.narrow(0, seqlen_offset, 1)?;
-        let sin = sin_src.narrow(0, seqlen_offset, 1)?;
         let pass_len = head_dim - rotary_dim;
 
         let needs_alloc = self

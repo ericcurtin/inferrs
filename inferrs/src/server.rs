@@ -994,7 +994,7 @@ impl Drop for ModelBackend {
 /// arrive while a load is in progress receive a clone of the watch receiver and
 /// await the result outside the lock.
 enum ModelSlot {
-    /// No model loaded yet.
+    /// No model loaded yet (daemon mode with no model specified).
     Empty,
     /// A load is in progress.  Callers clone the receiver and wait on it.
     Loading {
@@ -1004,6 +1004,8 @@ enum ModelSlot {
     },
     /// A model is loaded and ready.
     Ready(Arc<LoadedModel>),
+    /// The background model load failed; the server cannot serve requests.
+    Failed(String),
 }
 
 struct AppState {
@@ -1410,23 +1412,59 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    // If a model was specified on the CLI, pre-load it eagerly.
-    let initial_slot = if let Some(ref model) = args.model {
-        let ctx = load_engine(&args)?;
-        let lm = Arc::new(loaded_model_from_ctx(model.clone(), ctx)?);
-        ModelSlot::Ready(lm)
-    } else {
-        ModelSlot::Empty
-    };
-
     let model_id_hint = args.model.clone();
 
     let state = Arc::new(AppState {
-        slot: tokio::sync::RwLock::new(initial_slot),
+        slot: tokio::sync::RwLock::new(ModelSlot::Empty),
         default_params,
         serve_args: args.clone(),
         http_client: reqwest::Client::new(),
     });
+
+    // If a model was specified on the CLI, start loading it in the background
+    // so the TCP socket can bind immediately.  /health returns 503 while the
+    // slot is Loading, then 200 once it transitions to Ready — giving an
+    // accurate TTH that reflects when inference is actually available.
+    // Any inference request that arrives during loading waits on the watch
+    // channel and is served as soon as the model is ready.
+    if let Some(ref model) = args.model {
+        let (tx, rx) =
+            tokio::sync::watch::channel::<Option<Result<Arc<LoadedModel>, String>>>(None);
+        {
+            let mut guard = state.slot.write().await;
+            *guard = ModelSlot::Loading {
+                model_id: model.clone(),
+                rx,
+            };
+        }
+        let state_bg = Arc::clone(&state);
+        let model_id = model.clone();
+        let args_clone = args.clone();
+        tokio::task::spawn(async move {
+            let model_id_inner = model_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                load_engine(&args_clone).and_then(|ctx| loaded_model_from_ctx(model_id_inner, ctx))
+            })
+            .await;
+            let lm_result = match result {
+                Ok(Ok(lm)) => Ok(Arc::new(lm)),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("model load panicked: {e}")),
+            };
+            // Update slot first so /health flips to 200, then wake waiters.
+            {
+                let mut guard = state_bg.slot.write().await;
+                *guard = match &lm_result {
+                    Ok(lm) => ModelSlot::Ready(Arc::clone(lm)),
+                    Err(e) => {
+                        tracing::error!("Model load failed: {e}");
+                        ModelSlot::Failed(e.clone())
+                    }
+                };
+            }
+            let _ = tx.send(Some(lm_result));
+        });
+    }
 
     // In daemon mode (`inferrs serve` with no model), negotiate content at GET /:
     //   - browsers (Accept: text/html) → embedded web UI
@@ -1487,11 +1525,15 @@ async fn resolve_openai_model(
     let model_name = if let Some(m) = requested {
         m.to_string()
     } else {
-        // No model in request — use whatever is already loaded.
+        // No model in request — use whatever is already loaded or loading.
         let guard = state.slot.read().await;
         match &*guard {
             ModelSlot::Ready(lm) => lm.model_id.clone(),
-            _ => return Err(server_error("No model specified and no model is loaded")),
+            ModelSlot::Loading { model_id, .. } => model_id.clone(),
+            ModelSlot::Empty => {
+                return Err(server_error("No model specified and no model is loaded"))
+            }
+            ModelSlot::Failed(e) => return Err(server_error(format!("Model load failed: {e}"))),
         }
     };
     load_model_on_demand(state, &model_name, None)
@@ -2590,8 +2632,19 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRespon
     })
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state.slot.read().await;
+    match &*guard {
+        ModelSlot::Loading { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse { status: "loading" }),
+        ),
+        ModelSlot::Failed(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(HealthResponse { status: "error" }),
+        ),
+        _ => (StatusCode::OK, Json(HealthResponse { status: "ok" })),
+    }
 }
 
 // ─── Embeddings handlers ──────────────────────────────────────────────────────
@@ -2620,6 +2673,12 @@ async fn embeddings(
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({"error": "no model loaded"})),
+                ));
+            }
+            ModelSlot::Failed(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("model load failed: {e}")})),
                 ));
             }
         }
