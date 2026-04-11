@@ -1210,7 +1210,7 @@ fn build_memory_config(args: &ServeArgs, ctx: &crate::engine::EngineContext) -> 
         ctx.arch,
         ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4
     );
-    let turbo_quant = if args.paged_attention.is_some() || !turbo_quant_supported {
+    let turbo_quant = if !turbo_quant_supported {
         None
     } else {
         args.turbo_quant.0
