@@ -2,14 +2,16 @@
 //!
 //! ## Usage
 //!
-//! ```text
-//! inferrs serve google/gemma-4-E2B-it --quantize          # default Q4_K_M (= Q4K)
-//! inferrs serve google/gemma-4-E2B-it --quantize=Q8_0     # explicit format
-//! ```
-//!
-//! On first invocation the weights are read from the HuggingFace cache, quantized
-//! on the CPU, and written to a `.gguf` file next to the safetensors shards.
+//! Weight quantization is **enabled by default** (Q4_K_M / Q4K).  On first
+//! invocation the weights are read from the HuggingFace cache, quantized on the
+//! CPU, and written to a `.gguf` file next to the safetensors shards.
 //! Subsequent invocations find the file already present and skip the conversion.
+//!
+//! ```text
+//! inferrs serve google/gemma-4-E2B-it              # default Q4_K_M (= Q4K)
+//! inferrs serve --quantize=Q8_0 google/gemma-4-E2B-it # explicit format
+//! inferrs serve --quantize=false google/gemma-4-E2B-it # disable quantization
+//! ```
 //!
 //! ## Per-tensor policy
 //!

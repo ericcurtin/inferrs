@@ -435,7 +435,7 @@ fn gemma4_e2b_paged_long_context_and_second_request() {
     }
 }
 
-/// Verifies that `inferrs run google/gemma-4-E2B-it --quantize --image <path>`
+/// Verifies that `inferrs run google/gemma-4-E2B-it --image <path>`
 /// processes an image without error and returns an intelligible response.
 ///
 /// Downloads a public-domain cat JPEG via `curl`, then runs `inferrs run` in
@@ -486,10 +486,10 @@ fn gemma4_e2b_run_image() {
 
     // Run `inferrs run` in non-interactive mode.
     // Flags must come before the positional <MODEL> [PROMPT] arguments.
+    // Note: --quantize is now on by default (Q4K), so no need to specify it.
     let output = std::process::Command::new(bin)
         .args([
             "run",
-            "--quantize",
             "--device",
             "auto",
             "--dtype",

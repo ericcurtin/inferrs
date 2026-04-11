@@ -60,13 +60,13 @@ inferrs serve google/gemma-4-E2B-it
 #### Serve a specific model vLLM-style
 
 ```bash
-inferrs serve --paged-attention google/gemma-4-E2B-it
+inferrs serve --paged-attention --quantize=false google/gemma-4-E2B-it
 ```
 
-#### Serve a specific model llama.cpp-style
+#### Serve a specific model (default — weights are quantized to Q4K for fast loading)
 
 ```bash
-inferrs serve --quantize google/gemma-4-E2B-it
+inferrs serve google/gemma-4-E2B-it
 ```
 
 #### Serve models ollama-style

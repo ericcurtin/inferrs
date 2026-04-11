@@ -23,6 +23,37 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+/// CLI argument for `--quantize`.
+///
+/// Parses as a GGUF quantization format string (e.g. `Q4K`, `Q8_0`) or the
+/// literal `"false"` to explicitly disable weight quantization.  The default
+/// value is `"Q4K"`, so quantization is **on by default** — pass
+/// `--quantize=false` to turn it off.
+#[derive(Clone, Debug)]
+pub struct QuantizeArg(pub Option<String>);
+
+impl std::str::FromStr for QuantizeArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("false") {
+            return Ok(QuantizeArg(None));
+        }
+        // Validate the format eagerly so bad values are caught at parse time.
+        crate::quantize::parse_format(s).map_err(|e| e.to_string())?;
+        Ok(QuantizeArg(Some(s.to_uppercase())))
+    }
+}
+
+impl std::fmt::Display for QuantizeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(s) => write!(f, "{s}"),
+            None => write!(f, "false"),
+        }
+    }
+}
+
 /// CLI argument for `--turbo-quant`.
 ///
 /// Parses as either a bit-width (1–8) or the literal string `"false"` to
@@ -178,14 +209,20 @@ pub struct ServeArgs {
     /// On first use the weights are quantized and saved next to the HuggingFace cache;
     /// subsequent runs reuse the cached GGUF, so the slow conversion only happens once.
     ///
+    /// Enabled by default at Q4_K_M (= Q4K) for fast model loading (~7× faster).
+    /// Pass an explicit format (`--quantize=Q8_0`) to change the quantization level.
+    /// Disable entirely with `--quantize=false`.
+    ///
     /// Accepted formats (case-insensitive): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
     /// Q2K, Q3K, Q4K (Q4_K_M), Q5K, Q6K.
-    ///
-    /// When used as a plain flag (`--quantize`) the default Q4_K_M (= Q4K) is used.
     /// Embedding and output (lm_head) tensors are kept at F16 for accuracy.
-    #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
-          value_name = "FORMAT")]
-    pub quantize: Option<String>,
+    #[arg(
+        long,
+        default_value = "Q4K",
+        require_equals(true),
+        value_name = "FORMAT"
+    )]
+    pub quantize: QuantizeArg,
 }
 
 /// Disable per-tensor CUDA event tracking on a CUDA device.
@@ -487,9 +524,11 @@ impl ServeArgs {
         }
     }
 
-    /// Parse the `--quantize` format string (if provided) into a `GgmlDType`.
+    /// Parse the `--quantize` format into a `GgmlDType`.
+    /// Returns `None` when quantization is disabled (`--quantize=false`).
     pub fn resolve_quant_dtype(&self) -> Result<Option<candle_core::quantized::GgmlDType>> {
         self.quantize
+            .0
             .as_deref()
             .map(crate::quantize::parse_format)
             .transpose()

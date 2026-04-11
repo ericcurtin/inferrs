@@ -106,11 +106,16 @@ pub struct RunArgs {
     pub gguf_file: Option<String>,
 
     /// Quantize model weights on first use and cache as GGUF.
-    /// Accepted formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K.
-    /// Plain `--quantize` defaults to Q4K.
-    #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
-          value_name = "FORMAT")]
-    pub quantize: Option<String>,
+    /// Enabled by default at Q4_K_M (= Q4K) for fast model loading.
+    /// Pass an explicit format (`--quantize=Q8_0`) to change the level.
+    /// Disable with `--quantize=false`.
+    #[arg(
+        long,
+        default_value = "Q4K",
+        require_equals(true),
+        value_name = "FORMAT"
+    )]
+    pub quantize: crate::QuantizeArg,
 
     // ── Media attachments (non-interactive / single-turn only) ────────────────
     /// Path to a WAV audio file to attach to the prompt (Gemma 4 audio models).
@@ -505,8 +510,8 @@ async fn warm_up_model(client: &Client, base_url: &str, args: &RunArgs) -> Resul
     if args.turbo_quant.0 != Some(8) {
         options.insert("turbo_quant".into(), args.turbo_quant.to_string().into());
     }
-    if let Some(ref q) = args.quantize {
-        options.insert("quantize".into(), q.clone().into());
+    if args.quantize.0.as_deref() != Some("Q4K") {
+        options.insert("quantize".into(), args.quantize.to_string().into());
     }
     if let Some(ref f) = args.gguf_file {
         options.insert("gguf_file".into(), f.clone().into());
