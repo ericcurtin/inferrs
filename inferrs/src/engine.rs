@@ -1600,12 +1600,19 @@ impl Engine {
         let mut channel_closed = false;
 
         loop {
-            // ── 1. Admit pending generation requests up to capacity ───────
+            // ── 1. Admit pending work up to capacity ──────────────────────
             while active.len() < effective_batch_size {
                 let Some(req) = pending.pop_front() else {
                     break;
                 };
-                Self::admit_sequence(req, block_size, &tokenizer, &mut active);
+                Self::admit_request(
+                    req,
+                    block_size,
+                    &tokenizer,
+                    &mut active,
+                    &mut model,
+                    &device,
+                );
             }
 
             // ── 2. Drain control requests regardless of generation capacity ─
@@ -1614,14 +1621,20 @@ impl Engine {
                     Ok(req) => {
                         if let Some(req) = Self::handle_control_request(
                             req,
-                            &mut model,
                             &device,
                             kv_cache_dtype,
                             paged.as_ref(),
                             &active,
                         ) {
                             if active.len() < effective_batch_size {
-                                Self::admit_sequence(req, block_size, &tokenizer, &mut active);
+                                Self::admit_request(
+                                    req,
+                                    block_size,
+                                    &tokenizer,
+                                    &mut active,
+                                    &mut model,
+                                    &device,
+                                );
                             } else {
                                 pending.push_back(req);
                             }
@@ -1645,7 +1658,6 @@ impl Engine {
                         Some(req) => {
                             if let Some(req) = Self::handle_control_request(
                                 req,
-                                &mut model,
                                 &device,
                                 kv_cache_dtype,
                                 paged.as_ref(),
@@ -1665,7 +1677,14 @@ impl Engine {
                     let Some(req) = pending.pop_front() else {
                         break;
                     };
-                    Self::admit_sequence(req, block_size, &tokenizer, &mut active);
+                    Self::admit_request(
+                        req,
+                        block_size,
+                        &tokenizer,
+                        &mut active,
+                        &mut model,
+                        &device,
+                    );
                 }
             }
 
@@ -2382,21 +2401,12 @@ impl Engine {
 
     fn handle_control_request(
         req: EngineRequest,
-        model: &mut Box<dyn CausalLM>,
         device: &Device,
         kv_cache_dtype: DType,
         paged: Option<&PagedState>,
         active: &VecDeque<ActiveSequence>,
     ) -> Option<EngineRequest> {
         match req {
-            EngineRequest::Embed {
-                prompt_tokens,
-                response_tx,
-            } => {
-                let result = Self::run_embed(model, device, &prompt_tokens);
-                let _ = response_tx.send(result);
-                None
-            }
             EngineRequest::MemorySnapshot { response_tx } => {
                 let _ = response_tx.send(Self::build_memory_snapshot(
                     device,
@@ -2407,6 +2417,26 @@ impl Engine {
                 None
             }
             other => Some(other),
+        }
+    }
+
+    fn admit_request(
+        req: EngineRequest,
+        block_size: Option<usize>,
+        tokenizer: &Tokenizer,
+        active: &mut VecDeque<ActiveSequence>,
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+    ) {
+        match req {
+            EngineRequest::Embed {
+                prompt_tokens,
+                response_tx,
+            } => {
+                let result = Self::run_embed(model, device, &prompt_tokens);
+                let _ = response_tx.send(result);
+            }
+            req => Self::admit_sequence(req, block_size, tokenizer, active),
         }
     }
 
