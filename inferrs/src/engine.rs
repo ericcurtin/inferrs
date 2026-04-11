@@ -96,6 +96,7 @@ pub struct EngineContext {
     pub model_files: ModelFiles,
     pub dtype: DType,
     pub max_seq_len: usize,
+    pub weight_bytes: Option<u64>,
 }
 
 /// Build an [`Engine`] from [`ServeArgs`], handling the repeated sequence:
@@ -137,6 +138,17 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         args.gguf_file.as_deref(),
         quant_dtype,
     )?;
+    let weight_bytes = if let Some(path) = &model_files.gguf_path {
+        std::fs::metadata(path).ok().map(|m| m.len())
+    } else {
+        model_files
+            .weight_paths
+            .iter()
+            .try_fold(0u64, |acc, path| {
+                Ok::<u64, std::io::Error>(acc + std::fs::metadata(path)?.len())
+            })
+            .ok()
+    };
 
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
     let arch = raw_config.detect_architecture()?;
@@ -194,6 +206,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         model_files,
         dtype,
         max_seq_len,
+        weight_bytes,
     })
 }
 

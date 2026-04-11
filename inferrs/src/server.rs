@@ -1197,18 +1197,6 @@ fn build_memory_config(args: &ServeArgs, ctx: &crate::engine::EngineContext) -> 
     } else {
         "safetensors".to_string()
     };
-    let weight_bytes = if let Some(path) = &ctx.model_files.gguf_path {
-        std::fs::metadata(path).ok().map(|m| m.len())
-    } else {
-        let total = ctx
-            .model_files
-            .weight_paths
-            .iter()
-            .try_fold(0u64, |acc, path| {
-                Ok::<u64, std::io::Error>(acc + std::fs::metadata(path)?.len())
-            });
-        total.ok()
-    };
     let weight_quantization = ctx.model_files.gguf_path.as_ref().map(|path| {
         path.file_stem()
             .and_then(|stem| stem.to_str())
@@ -1270,7 +1258,7 @@ fn build_memory_config(args: &ServeArgs, ctx: &crate::engine::EngineContext) -> 
             .as_ref()
             .map(|q| q.to_uppercase())
             .or(weight_quantization),
-        weight_bytes,
+        weight_bytes: ctx.weight_bytes,
         max_seq_len,
         max_kv_cache_bytes,
     }
