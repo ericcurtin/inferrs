@@ -9,14 +9,15 @@
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{embedding, linear_no_bias, Embedding, Init, Linear, RmsNorm, VarBuilder};
+use candle_nn::{embedding, Embedding, Init, RmsNorm, VarBuilder};
+use std::sync::Arc;
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    append_kv_tq, apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
-    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
+    append_kv_tq, apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask,
+    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, PagedCtx, PagedPassCache,
 };
-use crate::models::quantized_linear::QGgufVarBuilder;
+use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
@@ -71,10 +72,10 @@ pub struct Qwen35Config {
 // ---------------------------------------------------------------------------
 
 struct FullAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -89,19 +90,41 @@ impl FullAttention {
     fn new(
         cfg: &Qwen35Config,
         vb: VarBuilder,
-        _qvb: Option<&QGgufVarBuilder>,
+        qvb: Option<&QGgufVarBuilder>,
         tq_cfg: Option<&TurboQuantConfig>,
     ) -> Result<Self> {
-        // q_proj outputs num_heads * head_dim * 2: first half is query, second half is the
-        // output gate (attn_output_gate). The o_proj then takes num_heads * head_dim.
         let q_proj_out = cfg.num_attention_heads * cfg.head_dim * 2;
         let kv_out = cfg.num_key_value_heads * cfg.head_dim;
         let attn_out = cfg.num_attention_heads * cfg.head_dim;
 
-        let q_proj = linear_no_bias(cfg.hidden_size, q_proj_out, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(cfg.hidden_size, kv_out, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(cfg.hidden_size, kv_out, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(attn_out, cfg.hidden_size, vb.pp("o_proj"))?;
+        let q_proj = qlinear_b(
+            cfg.hidden_size,
+            q_proj_out,
+            false,
+            vb.pp("q_proj"),
+            qvb.map(|q| q.pp("q_proj")).as_ref(),
+        )?;
+        let k_proj = qlinear_b(
+            cfg.hidden_size,
+            kv_out,
+            false,
+            vb.pp("k_proj"),
+            qvb.map(|q| q.pp("k_proj")).as_ref(),
+        )?;
+        let v_proj = qlinear_b(
+            cfg.hidden_size,
+            kv_out,
+            false,
+            vb.pp("v_proj"),
+            qvb.map(|q| q.pp("v_proj")).as_ref(),
+        )?;
+        let o_proj = qlinear_b(
+            attn_out,
+            cfg.hidden_size,
+            false,
+            vb.pp("o_proj"),
+            qvb.map(|q| q.pp("o_proj")).as_ref(),
+        )?;
         let q_norm = rms_norm_with_offset(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"), 1.0)?;
         let k_norm = rms_norm_with_offset(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"), 1.0)?;
 
@@ -339,15 +362,15 @@ impl FullAttention {
 //   out = out_proj(out)
 
 struct LinearAttn {
-    in_proj_qkv: Linear,
-    in_proj_z: Linear,
-    in_proj_a: Linear,     // per-head decay input
-    in_proj_b: Linear,     // per-head write strength (beta before sigmoid)
-    conv1d_weight: Tensor, // [conv_dim, 1, kernel], conv_dim = key_dim*2 + value_dim
-    a_log: Tensor,         // [n_heads], F32
-    dt_bias: Tensor,       // [n_heads], F32
-    norm_weight: Tensor,   // [head_v_dim], F32 -- weight for gated RMSNorm
-    out_proj: Linear,
+    in_proj_qkv: QLinear,
+    in_proj_z: QLinear,
+    in_proj_a: QLinear,
+    in_proj_b: QLinear,
+    conv1d_weight: Tensor,
+    a_log: Tensor,
+    dt_bias: Tensor,
+    norm_weight: Tensor,
+    out_proj: QLinear,
     n_heads: usize,
     head_k_dim: usize, // = linear_key_head_dim
     head_v_dim: usize, // = linear_value_head_dim
@@ -360,22 +383,44 @@ struct LinearAttn {
 }
 
 impl LinearAttn {
-    fn new(cfg: &Qwen35Config, vb: VarBuilder, _qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
-        let n_heads = cfg.linear_num_key_heads; // = linear_num_value_heads
+    fn new(cfg: &Qwen35Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
+        let n_heads = cfg.linear_num_key_heads;
         let head_k_dim = cfg.linear_key_head_dim;
         let head_v_dim = cfg.linear_value_head_dim;
         let key_dim = n_heads * head_k_dim;
         let value_dim = n_heads * head_v_dim;
-        let conv_dim = key_dim * 2 + value_dim; // = 3 * key_dim when head_k == head_v
+        let conv_dim = key_dim * 2 + value_dim;
         let hidden = cfg.hidden_size;
         let kernel = cfg.linear_conv_kernel_dim;
 
-        // in_proj_qkv: hidden -> q(key_dim) + k(key_dim) + v(value_dim)
-        let in_proj_qkv = linear_no_bias(hidden, conv_dim, vb.pp("in_proj_qkv"))?;
-        // in_proj_z: hidden -> value_dim  (feeds as gate into gated RMSNorm)
-        let in_proj_z = linear_no_bias(hidden, value_dim, vb.pp("in_proj_z"))?;
-        let in_proj_a = linear_no_bias(hidden, n_heads, vb.pp("in_proj_a"))?;
-        let in_proj_b = linear_no_bias(hidden, n_heads, vb.pp("in_proj_b"))?;
+        let in_proj_qkv = qlinear_b(
+            hidden,
+            conv_dim,
+            false,
+            vb.pp("in_proj_qkv"),
+            qvb.map(|q| q.pp("in_proj_qkv")).as_ref(),
+        )?;
+        let in_proj_z = qlinear_b(
+            hidden,
+            value_dim,
+            false,
+            vb.pp("in_proj_z"),
+            qvb.map(|q| q.pp("in_proj_z")).as_ref(),
+        )?;
+        let in_proj_a = qlinear_b(
+            hidden,
+            n_heads,
+            false,
+            vb.pp("in_proj_a"),
+            qvb.map(|q| q.pp("in_proj_a")).as_ref(),
+        )?;
+        let in_proj_b = qlinear_b(
+            hidden,
+            n_heads,
+            false,
+            vb.pp("in_proj_b"),
+            qvb.map(|q| q.pp("in_proj_b")).as_ref(),
+        )?;
 
         // conv1d weight: [conv_dim, 1, kernel] -- depthwise
         let conv1d_weight = vb
@@ -391,8 +436,13 @@ impl LinearAttn {
             .get_with_hints(head_v_dim, "norm.weight", candle_nn::Init::Const(1.0))?
             .to_dtype(DType::F32)?;
 
-        // out_proj: value_dim -> hidden
-        let out_proj = linear_no_bias(value_dim, hidden, vb.pp("out_proj"))?;
+        let out_proj = qlinear_b(
+            value_dim,
+            hidden,
+            false,
+            vb.pp("out_proj"),
+            qvb.map(|q| q.pp("out_proj")).as_ref(),
+        )?;
 
         Ok(Self {
             in_proj_qkv,
@@ -639,9 +689,55 @@ enum LayerAttn {
     Linear(LinearAttn),
 }
 
+struct QMlp {
+    gate_proj: QLinear,
+    up_proj: QLinear,
+    down_proj: QLinear,
+}
+
+impl QMlp {
+    fn new(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        qvb: Option<&QGgufVarBuilder>,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate_proj: qlinear_b(
+                hidden_size,
+                intermediate_size,
+                false,
+                vb.pp("gate_proj"),
+                qvb.map(|q| q.pp("gate_proj")).as_ref(),
+            )?,
+            up_proj: qlinear_b(
+                hidden_size,
+                intermediate_size,
+                false,
+                vb.pp("up_proj"),
+                qvb.map(|q| q.pp("up_proj")).as_ref(),
+            )?,
+            down_proj: qlinear_b(
+                intermediate_size,
+                hidden_size,
+                false,
+                vb.pp("down_proj"),
+                qvb.map(|q| q.pp("down_proj")).as_ref(),
+            )?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = x.apply(&self.gate_proj)?.silu()?;
+        let up = x.apply(&self.up_proj)?;
+        let hidden = (gate * up)?;
+        hidden.apply(&self.down_proj).map_err(Into::into)
+    }
+}
+
 struct DecoderLayer {
     attn: LayerAttn,
-    mlp: Mlp,
+    mlp: QMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -670,7 +766,12 @@ impl DecoderLayer {
         };
         Ok(Self {
             attn,
-            mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
+            mlp: QMlp::new(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("mlp"),
+                qvb.map(|q| q.pp("mlp")).as_ref(),
+            )?,
             input_layernorm: rms_norm_with_offset(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
@@ -755,8 +856,7 @@ pub struct Qwen35Model {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    // Shared weights with embed_tokens (tied)
-    lm_head_weight_t: Tensor,
+    lm_head: QLinear,
     cos: Tensor,
     sin: Tensor,
 }
@@ -794,11 +894,59 @@ impl Qwen35Model {
 
         let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"), 1.0)?;
 
-        // Tied weights: lm_head = embed_tokens.weight transposed.
-        // This duplicates the embedding table (~vocab×hidden, e.g. ~467 MB for 0.8B)
-        // alongside embed_tokens — acceptable because it eliminates a per-forward
-        // transpose+copy of the same size.
-        let lm_head_weight_t = embed_tokens.embeddings().t()?.contiguous()?;
+        let lm_head = {
+            let dense = embed_tokens.embeddings().clone();
+            let built = lm_qvb
+                .as_ref()
+                .and_then(|q| q.pp("embed_tokens").try_qlinear_weight());
+            match built {
+                Some(Ok(ql)) => {
+                    tracing::info!("lm_head: using quantized embed_tokens QTensor");
+                    ql
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("lm_head: quantized build failed ({e}), using bf16");
+                    QLinear::from_tensor(dense, None)
+                }
+                None => {
+                    let weight = dense;
+                    let elem_count = weight.elem_count();
+                    let quant_dtype = if elem_count % 256 == 0 {
+                        Some(candle_core::quantized::GgmlDType::Q4K)
+                    } else if elem_count % 32 == 0 {
+                        Some(candle_core::quantized::GgmlDType::Q8_0)
+                    } else {
+                        None
+                    };
+                    let mut quantized = None;
+                    if let Some(dtype) = quant_dtype {
+                        match candle_core::quantized::QTensor::quantize(&weight, dtype) {
+                            Ok(qt) => {
+                                tracing::info!(
+                                    "lm_head: online-quantized embed_tokens to {dtype:?} \
+                                     ({} elements, {:.1} MB BF16)",
+                                    elem_count,
+                                    elem_count as f64 * 2.0 / 1e6,
+                                );
+                                match QLinear::from_qtensor(Arc::new(qt), None) {
+                                    Ok(ql) => quantized = Some(ql),
+                                    Err(e) => tracing::debug!(
+                                        "lm_head: QLinear::from_qtensor failed ({e}), using bf16"
+                                    ),
+                                }
+                            }
+                            Err(e) => tracing::debug!(
+                                "lm_head: online quantization failed ({e}), using bf16"
+                            ),
+                        }
+                    }
+                    quantized.unwrap_or_else(|| {
+                        tracing::debug!("lm_head: using dense bf16");
+                        QLinear::from_tensor(weight, None)
+                    })
+                }
+            }
+        };
 
         // Precompute RoPE tables (large enough for typical sequences)
         let max_seq = 32768;
@@ -815,7 +963,7 @@ impl Qwen35Model {
             embed_tokens,
             layers,
             norm,
-            lm_head_weight_t,
+            lm_head,
             cos,
             sin,
         })
@@ -832,7 +980,10 @@ impl Qwen35Model {
         }
 
         x = self.norm.forward(&x)?;
-        compute_logits(&x, &self.lm_head_weight_t)
+        let (_b, t, _h) = x.dims3()?;
+        let last = x.narrow(1, t - 1, 1)?.squeeze(1)?.contiguous()?;
+        let logits = last.apply(&self.lm_head)?;
+        logits.unsqueeze(1).map_err(Into::into)
     }
 
     /// Paged-attention forward pass.
@@ -880,7 +1031,10 @@ impl Qwen35Model {
         }
 
         x = self.norm.forward(&x)?;
-        compute_logits(&x, &self.lm_head_weight_t)
+        let (_b, t, _h) = x.dims3()?;
+        let last = x.narrow(1, t - 1, 1)?.squeeze(1)?.contiguous()?;
+        let logits = last.apply(&self.lm_head)?;
+        logits.unsqueeze(1).map_err(Into::into)
     }
 
     pub fn clear_kv_cache(&mut self) {

@@ -506,7 +506,10 @@ pub fn load_model(
     // NOTE: Only enabled for architectures that have been updated to use
     // qlinear_b. Enabling it before the model uses QLinear would load weights
     // twice (quantized + dequantized), doubling memory usage.
-    let qvb: Option<QGgufVarBuilder> = if matches!(arch, ModelArchitecture::Gemma4) {
+    let qvb: Option<QGgufVarBuilder> = if matches!(
+        arch,
+        ModelArchitecture::Gemma4 | ModelArchitecture::Qwen35
+    ) {
         gguf_path.and_then(|p| {
             match QGgufVarBuilder::from_gguf(p, device) {
                 Ok(qvb) => {
