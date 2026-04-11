@@ -781,9 +781,7 @@ impl RawConfig {
                 let num_kv_heads = self.num_key_value_heads.unwrap_or(8);
                 let num_attention_heads = self.num_attention_heads.unwrap_or(24);
                 let hidden_size = self.hidden_size.unwrap_or(3072);
-                let head_dim = self
-                    .head_dim
-                    .unwrap_or(hidden_size / num_attention_heads);
+                let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
                 let num_layers = self.num_hidden_layers.unwrap_or(32);
                 (num_kv_heads, head_dim, num_layers)
             }
