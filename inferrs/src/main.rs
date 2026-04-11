@@ -23,6 +23,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+/// Default quantization format for `--quantize`.
+pub const DEFAULT_QUANTIZE_FORMAT: &str = "Q4K";
+
 /// CLI argument for `--quantize`.
 ///
 /// Parses as a GGUF quantization format string (e.g. `Q4K`, `Q8_0`) or the

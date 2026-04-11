@@ -510,7 +510,7 @@ async fn warm_up_model(client: &Client, base_url: &str, args: &RunArgs) -> Resul
     if args.turbo_quant.0 != Some(8) {
         options.insert("turbo_quant".into(), args.turbo_quant.to_string().into());
     }
-    if args.quantize.0.as_deref() != Some("Q4K") {
+    if args.quantize.0.as_deref() != Some(crate::DEFAULT_QUANTIZE_FORMAT) {
         options.insert("quantize".into(), args.quantize.to_string().into());
     }
     if let Some(ref f) = args.gguf_file {
