@@ -372,7 +372,9 @@ impl LinearAttn {
         let in_proj_b = linear_no_bias(hidden, n_heads, vb.pp("in_proj_b"))?;
 
         // conv1d weight: [conv_dim, 1, kernel] -- depthwise
-        let conv1d_weight = vb.get((conv_dim, 1, kernel), "conv1d.weight")?;
+        let conv1d_weight = vb
+            .get((conv_dim, 1, kernel), "conv1d.weight")?
+            .to_dtype(DType::F32)?;
 
         // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
         let a_log = vb
@@ -594,19 +596,9 @@ impl LinearAttn {
         self.conv_state = Some(padded.narrow(1, total - pad_len, pad_len)?.contiguous()?);
 
         // Use candle's native conv1d (Metal-accelerated depthwise: groups = c).
-        // Metal conv1d only supports F32; cast if needed and cast back after.
-        let conv_dtype = if dtype == DType::BF16 || dtype == DType::F16 {
-            DType::F32
-        } else {
-            dtype
-        };
-        let w = self.conv1d_weight.to_dtype(conv_dtype)?;
-
-        // Transpose padded: [b, pad_len+t, c] -> [b, c, pad_len+t]
-        let inp = padded.to_dtype(conv_dtype)?.transpose(1, 2)?.contiguous()?;
-
-        // Depthwise conv1d: groups = c, no padding (we already padded manually), stride=1
-        let out = inp.conv1d(&w, 0, 1, 1, c)?; // [b, c, t]
+        // conv1d_weight is pre-computed in F32 at construction time.
+        let inp = padded.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+        let out = inp.conv1d(&self.conv1d_weight, 0, 1, 1, c)?; // [b, c, t]
 
         // Transpose back: [b, c, t] -> [b, t, c], restore original dtype, then SiLU
         out.transpose(1, 2)?
@@ -752,7 +744,7 @@ pub struct Qwen35Model {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     // Shared weights with embed_tokens (tied)
-    lm_head_weight: Tensor,
+    lm_head_weight_t: Tensor,
     cos: Tensor,
     sin: Tensor,
 }
@@ -783,8 +775,11 @@ impl Qwen35Model {
 
         let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"), 1.0)?;
 
-        // Tied weights: lm_head = embed_tokens.weight transposed
-        let lm_head_weight = embed_tokens.embeddings().clone();
+        // Tied weights: lm_head = embed_tokens.weight transposed.
+        // This duplicates the embedding table (~vocab×hidden, e.g. ~467 MB for 0.8B)
+        // alongside embed_tokens — acceptable because it eliminates a per-forward
+        // transpose+copy of the same size.
+        let lm_head_weight_t = embed_tokens.embeddings().t()?.contiguous()?;
 
         // Precompute RoPE tables (large enough for typical sequences)
         let max_seq = 32768;
@@ -801,7 +796,7 @@ impl Qwen35Model {
             embed_tokens,
             layers,
             norm,
-            lm_head_weight,
+            lm_head_weight_t,
             cos,
             sin,
         })
@@ -818,7 +813,7 @@ impl Qwen35Model {
         }
 
         x = self.norm.forward(&x)?;
-        compute_logits(&x, &self.lm_head_weight)
+        compute_logits(&x, &self.lm_head_weight_t)
     }
 
     /// Paged-attention forward pass.
@@ -866,7 +861,7 @@ impl Qwen35Model {
         }
 
         x = self.norm.forward(&x)?;
-        compute_logits(&x, &self.lm_head_weight)
+        compute_logits(&x, &self.lm_head_weight_t)
     }
 
     pub fn clear_kv_cache(&mut self) {

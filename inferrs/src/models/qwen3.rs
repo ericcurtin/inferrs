@@ -332,7 +332,7 @@ pub struct Qwen3Model {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head_weight: Tensor,
+    lm_head_weight_t: Tensor,
     cos: Tensor,
     sin: Tensor,
 }
@@ -370,6 +370,7 @@ impl Qwen3Model {
             .pp("lm_head")
             .get((cfg.vocab_size, cfg.hidden_size), "weight")
             .unwrap_or_else(|_| embed_tokens.embeddings().clone());
+        let lm_head_weight_t = lm_head_weight.t()?.contiguous()?;
 
         // Precompute RoPE tables (large enough for typical sequences).
         // Qwen3 uses full-head-dim rotation (partial_factor = 1.0).
@@ -387,7 +388,7 @@ impl Qwen3Model {
             embed_tokens,
             layers,
             norm,
-            lm_head_weight,
+            lm_head_weight_t,
             cos,
             sin,
         })
@@ -402,7 +403,7 @@ impl Qwen3Model {
         }
 
         x = self.norm.forward(&x)?;
-        compute_logits(&x, &self.lm_head_weight)
+        compute_logits(&x, &self.lm_head_weight_t)
     }
 
     /// Paged-attention forward pass.
@@ -435,7 +436,7 @@ impl Qwen3Model {
         }
 
         x = self.norm.forward(&x)?;
-        compute_logits(&x, &self.lm_head_weight)
+        compute_logits(&x, &self.lm_head_weight_t)
     }
 
     pub fn clear_kv_cache(&mut self) {

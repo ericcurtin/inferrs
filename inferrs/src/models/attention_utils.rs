@@ -376,14 +376,21 @@ pub fn paged_write_gather_sdpa(
 /// Extract the last-token hidden state and project it through the LM head.
 ///
 /// `x`              : `[b, t, hidden]` — hidden states after the final norm
-/// `lm_head_weight` : `[vocab, hidden]` — the unembedding weight matrix
+/// `lm_head_weight_t` : `[hidden, vocab]` — the unembedding weight matrix, pre-transposed & contiguous
 ///
 /// Returns `[b, 1, vocab]`.
-pub fn compute_logits(x: &Tensor, lm_head_weight: &Tensor) -> Result<Tensor> {
+pub fn compute_logits(x: &Tensor, lm_head_weight_t: &Tensor) -> Result<Tensor> {
+    debug_assert!(
+        lm_head_weight_t.dims().len() == 2
+            && lm_head_weight_t.dim(0)? == x.dim(2)?
+            && lm_head_weight_t.is_contiguous(),
+        "compute_logits: lm_head_weight_t must be [hidden, vocab] contiguous, got {:?}",
+        lm_head_weight_t.shape()
+    );
     let (_b, t, _h) = x.dims3()?;
     let last = x.narrow(1, t - 1, 1)?; // [b, 1, hidden]
     let last_2d = last.squeeze(1)?.contiguous()?; // [b, hidden]
-    let logits = last_2d.matmul(&lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
+    let logits = last_2d.matmul(lm_head_weight_t)?; // [b, vocab]
     logits.unsqueeze(1).map_err(Into::into) // [b, 1, vocab]
 }
 
