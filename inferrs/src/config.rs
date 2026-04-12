@@ -64,6 +64,11 @@ pub struct TextConfig {
     pub use_double_wide_mlp: Option<bool>,
     pub num_global_key_value_heads: Option<usize>,
     pub attention_k_eq_v: Option<bool>,
+    // Gemma4 MoE fields (26B A4B variant)
+    pub enable_moe_block: Option<bool>,
+    pub num_experts: Option<usize>,
+    pub top_k_experts: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
 }
 
 /// Vision encoder configuration from `vision_config` in `config.json`.
@@ -567,6 +572,13 @@ impl RawConfig {
         // num_hidden_layers and accidentally disable KV sharing).
         let first_kv_shared_idx = num_hidden_layers.saturating_sub(num_kv_shared_layers);
 
+        let enable_moe_block = tc.and_then(|t| t.enable_moe_block).unwrap_or(false);
+        let num_experts = tc.and_then(|t| t.num_experts).unwrap_or(1);
+        let top_k_experts = tc.and_then(|t| t.top_k_experts).unwrap_or(1);
+        let moe_intermediate_size = tc
+            .and_then(|t| t.moe_intermediate_size)
+            .unwrap_or(intermediate_size);
+
         Gemma4Config {
             vocab_size,
             hidden_size,
@@ -596,6 +608,10 @@ impl RawConfig {
             double_wide_mlp_start_layer,
             first_kv_shared_idx,
             turbo_quant_bits,
+            enable_moe_block,
+            num_experts,
+            top_k_experts,
+            moe_intermediate_size,
             dtype,
             device,
         }
