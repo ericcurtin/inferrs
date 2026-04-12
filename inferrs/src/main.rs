@@ -520,7 +520,11 @@ async fn main() -> Result<()> {
     // A second Ctrl+C forces an immediate exit — useful when the server is
     // stuck in a long prefill or CUDA kernel.
     let _ = ctrlc::set_handler(|| {
-        let prev = SHUTDOWN_REQUESTED.fetch_add(1, Ordering::SeqCst);
+        let prev = SHUTDOWN_REQUESTED
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_add(1))
+            })
+            .unwrap_or(u8::MAX);
         if prev >= 1 {
             std::process::exit(1);
         }

@@ -417,7 +417,9 @@ async fn drain_ndjson_stream(response: reqwest::Response) -> Result<String> {
                 stdout.flush()?;
             }
 
-            if parsed.done || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1 {
+            if parsed.done
+                || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1
+            {
                 return Ok(full_text);
             }
         }
@@ -449,7 +451,9 @@ async fn drain_openai_sse_stream(response: reqwest::Response) -> Result<String> 
             let Some(json) = line.strip_prefix("data: ") else {
                 continue;
             };
-            if json == "[DONE]" || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1 {
+            if json == "[DONE]"
+                || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1
+            {
                 return Ok(full_text);
             }
 
