@@ -208,7 +208,15 @@ fn download_gguf_only_repo(
     let source_repo_id = if let Some(ts) = tokenizer_source {
         Some(ts.to_string())
     } else {
-        read_gguf_source_repo(&gguf_path)?
+        let from_gguf = read_gguf_source_repo(&gguf_path)?;
+        if from_gguf.is_some() {
+            from_gguf
+        } else {
+            // GGUF metadata lacked the source repo key.  Many ggml-org repos
+            // do not embed it but do advertise the original model via the
+            // HuggingFace model card (`cardData.base_model`).  Try that next.
+            read_hf_base_model(model_id)
+        }
     };
 
     let (config_path, tokenizer_path, tokenizer_config_path) = match source_repo_id {
@@ -280,6 +288,72 @@ fn read_gguf_source_repo(gguf_path: &std::path::Path) -> Result<Option<String>> 
     }
 
     Ok(repo_id)
+}
+
+/// Query the HuggingFace model card API for the `base_model` field.
+///
+/// Many GGUF-only repos (e.g. `ggml-org/*-GGUF`) do not embed
+/// `general.source.repo_id` in the GGUF metadata but do declare the original
+/// model via the repo's model card (`cardData.base_model`).  This function
+/// fetches `https://huggingface.co/api/models/{model_id}` and extracts the
+/// first entry from `cardData.base_model`, which is the canonical source repo
+/// ID (e.g. `"google/gemma-4-E2B-it"`).
+///
+/// Returns `None` (never errors) when the API is unreachable or the field is
+/// absent, so the caller can fall through to further fallbacks.
+fn read_hf_base_model(model_id: &str) -> Option<String> {
+    // Build the endpoint URL, respecting HF_ENDPOINT overrides.
+    let hf_endpoint =
+        std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+    let url = format!("{hf_endpoint}/api/models/{model_id}");
+
+    // Resolve the HF token the same way hf-hub does: $HF_TOKEN env var first,
+    // then the token file in the cache directory (respects HF_HOME and
+    // platform-specific paths via Cache::from_env()).
+    let token: Option<String> = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| hf_hub::Cache::from_env().token());
+
+    let mut request = ureq::get(&url);
+    if let Some(tok) = token {
+        request = request.set("Authorization", &format!("Bearer {tok}"));
+    }
+
+    let response: ureq::Response = match request.call() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("HF model card API request failed for {model_id}: {e}");
+            return None;
+        }
+    };
+
+    let json: serde_json::Value = match response.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("Failed to parse HF model card API response for {model_id}: {e}");
+            return None;
+        }
+    };
+
+    // cardData.base_model is either a string or an array of strings.
+    let base_model = json
+        .get("cardData")
+        .and_then(|cd| cd.get("base_model"))
+        .and_then(|bm| {
+            if let Some(s) = bm.as_str() {
+                Some(s.to_string())
+            } else if let Some(arr) = bm.as_array() {
+                arr.first().and_then(|v| v.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
+
+    if let Some(ref src) = base_model {
+        tracing::info!("Found source model from HF model card: {src}");
+    }
+
+    base_model
 }
 
 /// Download the model (same as [`download_model`]) and, when `quant_dtype` is

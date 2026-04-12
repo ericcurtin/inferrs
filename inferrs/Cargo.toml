@@ -47,6 +47,10 @@ tokenizers = { version = "0.21", features = [] }
 # HuggingFace model hub
 hf-hub = { version = "0.4", features = ["tokio"] }
 
+# Synchronous HTTP client used to query the HF model card API when GGUF
+# metadata lacks general.source.repo_id.
+ureq = { version = "2", features = ["json"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -107,5 +111,4 @@ libloading = "0.8"
 flate2 = "1"
 
 [dev-dependencies]
-ureq = { version = "2", features = ["json"] }
 serde_json = "1"
