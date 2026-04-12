@@ -69,6 +69,7 @@ indicatif = "0.17"
 rustfft = "6"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ctrlc = "3"
 
 # Linux: dynamic backend loading + CUDA device support.
 # Enable the cuda feature so Device::new_cuda() is available at runtime.

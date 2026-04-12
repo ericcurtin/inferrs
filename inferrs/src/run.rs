@@ -417,7 +417,7 @@ async fn drain_ndjson_stream(response: reqwest::Response) -> Result<String> {
                 stdout.flush()?;
             }
 
-            if parsed.done {
+            if parsed.done || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1 {
                 return Ok(full_text);
             }
         }
@@ -449,7 +449,7 @@ async fn drain_openai_sse_stream(response: reqwest::Response) -> Result<String> 
             let Some(json) = line.strip_prefix("data: ") else {
                 continue;
             };
-            if json == "[DONE]" {
+            if json == "[DONE]" || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1 {
                 return Ok(full_text);
             }
 
@@ -704,6 +704,10 @@ async fn repl(
             ReadResult::Line(l) => l,
             ReadResult::Interrupt => {
                 println!();
+                // Ctrl+C at the prompt triggers the global signal handler, which
+                // increments SHUTDOWN_REQUESTED.  Reset it here so the *next*
+                // generation isn't immediately cancelled.
+                crate::SHUTDOWN_REQUESTED.store(0, std::sync::atomic::Ordering::Release);
                 buf.clear();
                 multiline = MultilineState::None;
                 continue;
@@ -743,14 +747,16 @@ async fn repl(
 
                 let trimmed = buf.trim().to_string();
                 if trimmed.starts_with('/') {
-                    handle_command(
+                    if handle_command(
                         &trimmed,
                         &mut messages,
                         &mut temperature,
                         &mut top_p,
                         &mut top_k,
                         &mut max_tokens,
-                    );
+                    ) {
+                        break;
+                    }
                     buf.clear();
                     continue;
                 }
@@ -802,6 +808,16 @@ async fn repl(
             }
         };
 
+        // If the user pressed Ctrl+C during generation, discard the partial
+        // turn and go back to the prompt.
+        if crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Acquire) >= 1 {
+            crate::SHUTDOWN_REQUESTED.store(0, std::sync::atomic::Ordering::Release);
+            println!("\n[interrupted]");
+            messages.pop();
+            flush_pending_input();
+            continue;
+        }
+
         println!();
 
         // Discard any keystrokes the user typed during the streaming response.
@@ -829,11 +845,11 @@ fn handle_command(
     top_p: &mut f64,
     top_k: &mut usize,
     max_tokens: &mut usize,
-) {
+) -> bool {
     let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
     match parts[0] {
         "/bye" | "/exit" | "/quit" => {
-            std::process::exit(0);
+            return true;
         }
         "/clear" => {
             let sys: Vec<ApiMessage> = messages.drain(..).filter(|m| m.role == "system").collect();
@@ -923,6 +939,7 @@ fn handle_command(
         }
         other => println!("Unknown command: {other}"),
     }
+    false
 }
 
 // ─── Input helpers ───────────────────────────────────────────────────────────
