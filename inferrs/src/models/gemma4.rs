@@ -109,18 +109,25 @@ impl PliEmbeddingTable {
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
         let content = gguf_file::Content::read(&mut file)?;
 
-        // Find the PLI embedding tensor.  Try both the HF name (inferrs-quantized
-        // GGUFs) and the llama.cpp canonical name (external GGUFs).
-        let tensor_name = "model.language_model.embed_tokens_per_layer.weight";
-        let gguf_tensor_name = "per_layer_token_embd.weight";
-        let info = match content
+        // Find the PLI embedding tensor — check both HF and llama.cpp naming.
+        let tensor_name = if content
+            .tensor_infos
+            .contains_key("model.language_model.embed_tokens_per_layer.weight")
+        {
+            "model.language_model.embed_tokens_per_layer.weight"
+        } else if content
+            .tensor_infos
+            .contains_key("per_layer_token_embd.weight")
+        {
+            "per_layer_token_embd.weight"
+        } else {
+            return Ok(None);
+        };
+        // key was confirmed by contains_key above; unwrap is safe
+        let info = content
             .tensor_infos
             .get(tensor_name)
-            .or_else(|| content.tensor_infos.get(gguf_tensor_name))
-        {
-            Some(t) => t,
-            None => return Ok(None),
-        };
+            .expect("tensor_name key confirmed");
 
         let embed_dim = info.shape.dims()[1];
         let vocab_size = info.shape.dims()[0];
@@ -175,7 +182,7 @@ impl PliEmbeddingTable {
         embed_dim: usize,
         dtype: candle_core::DType,
     ) -> candle_core::Result<candle_core::Tensor> {
-        use candle_core::quantized::{QStorage, QTensor};
+        use candle_core::quantized::{GgmlDType, QStorage, QTensor};
         use std::borrow::Cow;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -197,12 +204,62 @@ impl PliEmbeddingTable {
                     f.read_exact(&mut row_data[i * row_bytes..(i + 1) * row_bytes])
                         .map_err(candle_core::Error::from)?;
                 }
-                let storage =
-                    QStorage::from_data(Cow::Owned(row_data), &candle_core::Device::Cpu, *dtype_q)?;
-                let row_qt = QTensor::new(storage, (n, embed_dim))?;
-                row_qt
-                    .dequantize(&candle_core::Device::Cpu)?
-                    .to_dtype(dtype)
+                // For non-quantized dtypes (BF16, F16, F32), `QStorage::from_data`
+                // reinterprets the `Vec<u8>` as typed values via raw pointer cast.
+                // This is undefined behavior when the buffer's alignment doesn't
+                // satisfy the type's requirement (e.g. BF16 needs 2-byte alignment).
+                // We handle these dtypes directly to avoid the alignment hazard.
+                match dtype_q {
+                    GgmlDType::BF16 => {
+                        let bf16_data: Vec<half::bf16> = row_data
+                            .chunks_exact(2)
+                            .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                            .collect();
+                        candle_core::Tensor::from_vec(
+                            bf16_data,
+                            (n, embed_dim),
+                            &candle_core::Device::Cpu,
+                        )?
+                        .to_dtype(dtype)
+                    }
+                    GgmlDType::F16 => {
+                        let f16_data: Vec<half::f16> = row_data
+                            .chunks_exact(2)
+                            .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                            .collect();
+                        candle_core::Tensor::from_vec(
+                            f16_data,
+                            (n, embed_dim),
+                            &candle_core::Device::Cpu,
+                        )?
+                        .to_dtype(dtype)
+                    }
+                    GgmlDType::F32 => {
+                        let f32_data: Vec<f32> = row_data
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect();
+                        candle_core::Tensor::from_vec(
+                            f32_data,
+                            (n, embed_dim),
+                            &candle_core::Device::Cpu,
+                        )?
+                        .to_dtype(dtype)
+                    }
+                    _ => {
+                        // Quantized dtypes: QStorage::from_data is safe because
+                        // quantized block structs have alignment ≤ 1 byte (packed).
+                        let storage = QStorage::from_data(
+                            Cow::Owned(row_data),
+                            &candle_core::Device::Cpu,
+                            *dtype_q,
+                        )?;
+                        let row_qt = QTensor::new(storage, (n, embed_dim))?;
+                        row_qt
+                            .dequantize(&candle_core::Device::Cpu)?
+                            .to_dtype(dtype)
+                    }
+                }
             }
             PliEmbeddingTable::Quantized {
                 qtensor, row_bytes, ..

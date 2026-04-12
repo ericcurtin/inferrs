@@ -171,9 +171,48 @@ impl<'de> serde::Deserialize<'de> for VisionConfig {
                 Ok(VisionConfig::Qwen(cfg))
             }
             _ => {
+                // Attempt to parse as Gemma4 vision config.  For unsupported encoder
+                // types (e.g. Gemma3's "siglip_vision_model"), parsing will fail
+                // because Gemma4VisionConfig has required fields absent from those
+                // schemas.  Callers should use `deserialize_vision_config_opt` on
+                // RawConfig.vision_config so that failures here surface as `None`
+                // instead of aborting the whole config parse.
                 let cfg: Gemma4VisionConfig =
                     serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
                 Ok(VisionConfig::Gemma4(cfg))
+            }
+        }
+    }
+}
+
+/// Lenient deserializer for `RawConfig.vision_config`: returns `None` for
+/// unknown or unsupported vision encoder types instead of failing the whole
+/// config parse.
+pub fn deserialize_vision_config_opt<'de, D>(
+    de: D,
+) -> std::result::Result<Option<VisionConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(de)?;
+    let Some(val) = raw else { return Ok(None) };
+
+    let model_type = val.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    match model_type {
+        "qwen3_5" | "qwen3_vl" => {
+            let cfg: QwenVisionConfig =
+                serde_json::from_value(val).map_err(serde::de::Error::custom)?;
+            Ok(Some(VisionConfig::Qwen(cfg)))
+        }
+        // Gemma3's vision config uses "siglip_vision_model" which has a different
+        // schema from Gemma4's SigLIP2 config — skip it silently.
+        "siglip_vision_model" => Ok(None),
+        _ => {
+            // Try to parse as Gemma4; on failure fall back to None (e.g. new
+            // unknown encoder types in future model families).
+            match serde_json::from_value::<Gemma4VisionConfig>(val) {
+                Ok(cfg) => Ok(Some(VisionConfig::Gemma4(cfg))),
+                Err(_) => Ok(None),
             }
         }
     }
@@ -276,6 +315,7 @@ pub struct RawConfig {
     // Gemma4 multimodal
     pub audio_config: Option<AudioConfig>,
     pub audio_token_id: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_vision_config_opt")]
     pub vision_config: Option<VisionConfig>,
     pub image_token_id: Option<u32>,
     pub boi_token_id: Option<u32>,

@@ -384,7 +384,7 @@ struct LinearAttn {
 
 impl LinearAttn {
     fn new(cfg: &Qwen35Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
-        let n_heads = cfg.linear_num_key_heads;
+        let n_heads = cfg.linear_num_value_heads;
         let head_k_dim = cfg.linear_key_head_dim;
         let head_v_dim = cfg.linear_value_head_dim;
         let key_dim = n_heads * head_k_dim;
