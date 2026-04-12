@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::io::{self, Write};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc as stdmpsc;
 
 use crate::engine::{load_engine, AudioEmbedContext, StreamToken, SyncEngineRequest};
@@ -160,8 +161,12 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     )?;
 
     // Spawn engine on a dedicated OS thread using stdlib channels (no Tokio).
+    // Store the handle so we can join the engine thread before exiting — this
+    // guarantees that Engine::drop runs (freeing all CUDA tensors) before the
+    // process exits.  On WSL2, skipping this join leaves the CUDA context dirty
+    // in the driver, causing "CUDA initialization error" on the next run.
     let (engine_tx, engine_rx) = stdmpsc::sync_channel::<SyncEngineRequest>(4);
-    std::thread::Builder::new()
+    let engine_handle = std::thread::Builder::new()
         .name("engine".to_string())
         .spawn(move || ctx.engine.run_sync(engine_rx))
         .expect("Failed to spawn engine thread");
@@ -188,63 +193,89 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         });
     }
 
-    // Non-interactive: single prompt then exit
-    if let Some(prompt) = args.prompt {
-        // Build audio context if --audio was given.
-        let audio_ctx = if let Some(audio_path) = &args.audio {
-            let token_id = audio_token_id.ok_or_else(|| {
-                anyhow::anyhow!("This model does not support audio (no audio_token_id in config)")
-            })?;
-            let raw_bytes = std::fs::read(audio_path)?;
-            let samples = crate::audio::decode_audio(&raw_bytes, "wav")?;
-            let (mel_data, n_mel_frames) = crate::audio::compute_log_mel(&samples)?;
-            let effective_mel =
-                n_mel_frames.min(crate::models::audio_encoder::AudioEncoder::MAX_MEL_FRAMES);
-            let after_pass1 = (effective_mel.saturating_sub(1)) / 2 + 1;
-            let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
-            let mel_tensor = candle_core::Tensor::from_vec(
-                mel_data,
-                (1, n_mel_frames, crate::audio::N_MEL),
-                &candle_core::Device::Cpu,
-            )?;
+    // Helper that runs inference and joins the engine thread on exit, ensuring
+    // CUDA tensors are freed via Drop before the process exits.
+    //
+    // Wrapping in a closure lets us use `?` freely and guarantees the cleanup
+    // block at the bottom always runs regardless of early returns or errors.
+    let result = (|| -> Result<()> {
+        // Non-interactive: single prompt then exit
+        if let Some(prompt) = args.prompt {
+            // Build audio context if --audio was given.
+            let audio_ctx = if let Some(audio_path) = &args.audio {
+                let token_id = audio_token_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "This model does not support audio (no audio_token_id in config)"
+                    )
+                })?;
+                let raw_bytes = std::fs::read(audio_path)?;
+                let samples = crate::audio::decode_audio(&raw_bytes, "wav")?;
+                let (mel_data, n_mel_frames) = crate::audio::compute_log_mel(&samples)?;
+                let effective_mel =
+                    n_mel_frames.min(crate::models::audio_encoder::AudioEncoder::MAX_MEL_FRAMES);
+                let after_pass1 = (effective_mel.saturating_sub(1)) / 2 + 1;
+                let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
+                let mel_tensor = candle_core::Tensor::from_vec(
+                    mel_data,
+                    (1, n_mel_frames, crate::audio::N_MEL),
+                    &candle_core::Device::Cpu,
+                )?;
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    audio: Some(AudioInput {
+                        data: String::new(),
+                        format: "wav".to_string(),
+                    }),
+                    content: MessageContent::from_string(prompt),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                let prompt_str = apply_gemma4_with_audio(&messages, &[n_audio_tokens]);
+                let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
+                let ctx = AudioEmbedContext {
+                    mel: mel_tensor,
+                    audio_token_id: token_id,
+                };
+                stream_response_collect(&engine_tx, prompt_tokens, Some(ctx), &sampling_params)?;
+                println!();
+                return Ok(());
+            } else {
+                None
+            };
+
             messages.push(ChatMessage {
                 role: Role::User,
-                audio: Some(AudioInput {
-                    data: String::new(),
-                    format: "wav".to_string(),
-                }),
+                audio: None,
                 content: MessageContent::from_string(prompt),
                 tool_calls: None,
                 tool_call_id: None,
             });
-            let prompt_str = apply_gemma4_with_audio(&messages, &[n_audio_tokens]);
-            let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
-            let ctx = AudioEmbedContext {
-                mel: mel_tensor,
-                audio_token_id: token_id,
-            };
-            stream_response_collect(&engine_tx, prompt_tokens, Some(ctx), &sampling_params)?;
+            let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
+            stream_response_collect(&engine_tx, prompt_tokens, audio_ctx, &sampling_params)?;
             println!();
             return Ok(());
-        } else {
-            None
-        };
+        }
 
-        messages.push(ChatMessage {
-            role: Role::User,
-            audio: None,
-            content: MessageContent::from_string(prompt),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
-        stream_response_collect(&engine_tx, prompt_tokens, audio_ctx, &sampling_params)?;
-        println!();
-        return Ok(());
+        // Interactive REPL — pass engine_tx by reference so it stays owned here
+        // and we can drop it explicitly in the cleanup block below.
+        repl(tokenizer, &engine_tx, sampling_params, messages)
+    })();
+
+    // ── Graceful CUDA cleanup ────────────────────────────────────────────────
+    // Drop the channel sender first: this signals the engine's `run_sync` loop
+    // to exit (the `for request in rx` iterator returns None when all senders
+    // are dropped).  Then join the engine thread, which ensures Engine::drop
+    // runs and all CUDA tensors are freed before this thread returns.
+    //
+    // Without this join the process can exit while CUDA kernels / allocations
+    // are still live, leaving the GPU context dirty in the driver.  On WSL2
+    // this consistently causes "CUDA initialization error" on the next run.
+    drop(engine_tx);
+    if let Err(payload) = engine_handle.join() {
+        tracing::error!("engine thread panicked: {payload:?}");
     }
 
-    // Interactive REPL
-    repl(tokenizer, engine_tx, sampling_params, messages)
+    result
 }
 
 // ─── Interactive REPL ────────────────────────────────────────────────────────
@@ -258,7 +289,7 @@ enum MultilineState {
 
 fn repl(
     tokenizer: Tokenizer,
-    engine_tx: stdmpsc::SyncSender<SyncEngineRequest>,
+    engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
     sampling_params: SamplingParams,
     mut messages: Vec<ChatMessage>,
 ) -> Result<()> {
@@ -325,7 +356,12 @@ fn repl(
                 // Slash commands
                 let trimmed = buf.trim();
                 if trimmed.starts_with('/') {
-                    handle_command(trimmed, &mut messages, &sampling_params);
+                    if handle_command(trimmed, &mut messages, &sampling_params) {
+                        // /bye | /exit | /quit — break out of the REPL loop so
+                        // the cleanup block in run_blocking can join the engine
+                        // thread and free CUDA resources via Drop.
+                        return Ok(());
+                    }
                     buf.clear();
                     continue;
                 }
@@ -362,7 +398,7 @@ fn repl(
 
         // Stream the response and collect the full text for history
         let assistant_text =
-            match stream_response_collect(&engine_tx, prompt_tokens, None, &sampling_params) {
+            match stream_response_collect(engine_tx, prompt_tokens, None, &sampling_params) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Generation error: {e}");
@@ -370,6 +406,15 @@ fn repl(
                     continue;
                 }
             };
+
+        // If the user pressed Ctrl+C during generation, discard the partial
+        // turn and go back to the prompt.
+        if crate::SHUTDOWN_REQUESTED.load(Ordering::Acquire) >= 1 {
+            crate::SHUTDOWN_REQUESTED.store(0, Ordering::Release);
+            println!("\n[interrupted]");
+            messages.pop();
+            continue;
+        }
 
         println!();
 
@@ -388,11 +433,14 @@ fn repl(
 
 // ─── Slash command handler ────────────────────────────────────────────────────
 
-fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingParams) {
+/// Handle a REPL slash command.  Returns `true` if the REPL should exit (so
+/// the caller can break out of the loop and let the engine thread be joined
+/// cleanly instead of calling `std::process::exit`).
+fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingParams) -> bool {
     let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
     match parts[0] {
         "/bye" | "/exit" | "/quit" => {
-            std::process::exit(0);
+            return true;
         }
         "/clear" => {
             // Keep system message if present
@@ -456,11 +504,18 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
         }
         other => println!("Unknown command: {other}"),
     }
+    false
 }
 
 // ─── Streaming helpers ────────────────────────────────────────────────────────
 
 /// Stream tokens from the engine to stdout, returning the full assembled text.
+///
+/// Uses `recv_timeout` instead of a blocking `recv` so that Ctrl+C (which sets
+/// `SHUTDOWN_REQUESTED`) can interrupt the loop cleanly.  When interrupted,
+/// `token_rx` is dropped on return; the engine notices the next `send_token`
+/// failed and exits its decode loop, allowing its CUDA resources to be freed
+/// via `Drop` before the process exits.
 fn stream_response_collect(
     engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
     prompt_tokens: Vec<u32>,
@@ -486,8 +541,17 @@ fn stream_response_collect(
     // carriage-return on '\n', causing a staircase layout.  We stay in
     // cooked mode throughout and simply print each token as it arrives.
     loop {
-        match token_rx.recv() {
-            Err(_) => break, // channel closed — engine done
+        match token_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Err(stdmpsc::RecvTimeoutError::Disconnected) => break,
+            Err(stdmpsc::RecvTimeoutError::Timeout) => {
+                // Check whether the user pressed Ctrl+C.  If so, break out of
+                // the loop; dropping `token_rx` here signals the engine that
+                // its next `send_token` should fail, causing it to exit the
+                // decode loop and free CUDA resources cleanly.
+                if crate::SHUTDOWN_REQUESTED.load(Ordering::Acquire) >= 1 {
+                    break;
+                }
+            }
             Ok(tok) => {
                 full_text.push_str(&tok.text);
                 print!("{}", tok.text);

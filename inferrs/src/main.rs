@@ -20,7 +20,18 @@ mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::sync::atomic::{AtomicU8, Ordering};
 use tracing_subscriber::EnvFilter;
+
+/// Ctrl+C counter used for graceful CUDA shutdown.
+///
+/// - `0` → normal operation
+/// - `1` → first Ctrl+C: the inference loop should exit cleanly (calling `Drop`
+///   on CUDA tensors) instead of being killed mid-kernel, which leaves the GPU
+///   context dirty on some drivers (notably WSL2) and causes CUDA init failures
+///   on the next run.
+/// - `2` → second Ctrl+C: the handler calls `std::process::exit(1)` directly.
+pub static SHUTDOWN_REQUESTED: AtomicU8 = AtomicU8::new(0);
 
 /// CLI argument for `--turbo-quant`.
 ///
@@ -486,6 +497,17 @@ impl ServeArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Install a Ctrl+C handler for graceful shutdown.  The first Ctrl+C sets
+    // SHUTDOWN_REQUESTED so the inference loop can exit cleanly (freeing CUDA
+    // tensors via Drop).  A second Ctrl+C forces an immediate exit — useful
+    // when the engine is stuck in a long prefill or CUDA kernel.
+    let _ = ctrlc::set_handler(|| {
+        let prev = SHUTDOWN_REQUESTED.fetch_add(1, Ordering::SeqCst);
+        if prev >= 1 {
+            std::process::exit(1);
+        }
+    });
 
     // For `run`, `bench`, `rm`, and `list`, suppress info-level logging by default — the
     // interactive REPL writes to stdout and log lines would corrupt the prompt display.

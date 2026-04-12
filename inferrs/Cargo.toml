@@ -61,6 +61,7 @@ crossterm = "0.28"
 indicatif = "0.17"
 rustfft = "6"
 base64 = "0.22"
+ctrlc = "3"
 
 # Linux: dynamic backend loading + CUDA device support.
 # Enable the cuda feature so Device::new_cuda() is available at runtime.
