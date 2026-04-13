@@ -403,7 +403,7 @@ pub fn qlinear_b(
         let dtype = vb.dtype();
         let device = vb.device().clone();
         let weight = if let Some(w) =
-            inferrs_models::nvfp4::try_load_from_varbuilder(&vb, out_dim, in_dim, dtype, &device)?
+            crate::nvfp4::try_load_from_varbuilder(&vb, out_dim, in_dim, dtype, &device)?
         {
             w
         } else {

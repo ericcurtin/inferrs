@@ -17,8 +17,8 @@ use candle_nn::VarBuilder;
 use std::path::Path;
 
 use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
+use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::multimodal_plugin::{AudioEncoderHandle, MultimodalPlugin, VisionEncoderHandle};
-use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 use quantized_linear::QGgufVarBuilder;
 use std::sync::Mutex;
 

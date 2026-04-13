@@ -4,8 +4,8 @@ use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{linear_no_bias, ops, rotary_emb, Linear, RmsNorm, VarBuilder};
 
-use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
-use inferrs_models::turbo_quant::TurboQuantKvCache;
+use crate::kv_cache::{BlockTable, PagedKvStore};
+use crate::turbo_quant::TurboQuantKvCache;
 
 /// Paged-attention context passed to each layer's `forward_paged` call.
 ///

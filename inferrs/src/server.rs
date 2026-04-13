@@ -1769,7 +1769,7 @@ async fn chat_completions(
         // Each pass: out = floor((in - 1) / 2) + 1  (= ceil(in / 2)).
         // Cap to MAX_MEL_FRAMES to match encoder truncation.
         let effective_mel_frames =
-            n_mel_frames.min(crate::multimodal_plugin::AudioEncoderHandle::MAX_MEL_FRAMES);
+            n_mel_frames.min(inferrs_models::multimodal_plugin::AudioEncoderHandle::MAX_MEL_FRAMES);
         let after_pass1 = (effective_mel_frames.saturating_sub(1)) / 2 + 1;
         let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
 

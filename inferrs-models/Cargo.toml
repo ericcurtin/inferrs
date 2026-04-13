@@ -11,12 +11,25 @@ path = "src/lib.rs"
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
 
 [dependencies]
 anyhow = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
 half = { version = "2.5", features = ["num-traits"] }
+libloading = "0.8"
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"

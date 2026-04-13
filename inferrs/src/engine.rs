@@ -22,12 +22,12 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::config::{ModelArchitecture, RawConfig};
-use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
 use crate::ServeArgs;
+use inferrs_models::config::{ModelArchitecture, RawConfig};
 use inferrs_models::kv_cache::{BlockPool, BlockTable, PagedCacheConfig, PagedKvStore};
+use inferrs_models::models::CausalLM;
 
 // ---------------------------------------------------------------------------
 // Output buffer — decouples the engine thread from per-client channels
@@ -161,7 +161,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
             )
         });
 
-        let model_result = crate::models::load_model(
+        let model_result = inferrs_models::models::load_model(
             &raw_config,
             &arch,
             &model_files.weight_paths,
@@ -2140,19 +2140,6 @@ impl Engine {
     /// Returns `Ok(tokens)` where `tokens` contains 1..=K+1 accepted token ids
     /// in sequence order.  Falls back to a single token if MTP is unavailable
     /// or draft/verify fails.
-    ///
-    /// # State rollback note
-    ///
-    /// Batched verification writes draft tokens d1..dK to the main model's KV
-    /// cache AND advances the SSM recurrent state of every linear-attention layer.
-    /// If a draft token is rejected, both the KV slots and the SSM accumulators
-    /// already reflect the rejected token — not the replacement.  For KV attention
-    /// the effect is diluted by low attention weights on subsequent steps; for SSM
-    /// layers the contaminated state propagates as a running accumulator, making
-    /// the drift slightly more persistent.  In practice the degradation is subtle
-    /// since rejections are infrequent and the state self-corrects over subsequent
-    /// correct tokens.  This is a known limitation of this first implementation.
-    /// Proper rollback (KV truncation + SSM state snapshot/restore) is a follow-up.
     ///
     /// Verification follows Algorithm 1 from Chen et al. 2302.01318.
     fn cb_mtp_decode_step(
