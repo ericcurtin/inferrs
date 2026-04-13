@@ -3,10 +3,12 @@
 //! Ports `scripts/benchmark.sh` to Rust so that benchmarks are runnable on
 //! macOS, Windows **and** Linux without requiring Bash or Python.
 //!
-//! Default benchmark (2 backends):
-//!   1. Starts `inferrs serve` and sends timed requests.
-//!   2. Starts `llama-server -hf <model>` and sends timed requests.
-//!   3. Prints a summary table comparing both backends.
+//! Default benchmark (4 backends):
+//!   1. Starts `inferrs serve google/gemma-4-E2B-it` and sends timed requests.
+//!   2. Starts `llama-server -hf ggml-org/gemma-4-E2B-it-GGUF` and sends timed requests.
+//!   3. Starts `inferrs serve google/gemma-4-E4B-it` and sends timed requests.
+//!   4. Starts `llama-server -hf ggml-org/gemma-4-E4B-it-GGUF` and sends timed requests.
+//!   5. Prints a combined summary table comparing all four backends.
 //!
 //! DGX Spark benchmark (`--dgx-spark`), runs 5 groups:
 //!   Group 1: llama-server 31B GGUF  vs  inferrs --quantize nvidia/Gemma-4-31B-IT-NVFP4
@@ -14,6 +16,7 @@
 //!   Group 3: vllm google/gemma-4-31B-it  vs  inferrs --paged-attention google/gemma-4-31B-it
 //!   Group 4: vllm nvidia/Gemma-4-31B-IT-NVFP4  vs  inferrs --paged-attention nvidia/Gemma-4-31B-IT-NVFP4
 //!   Group 5: vllm google/gemma-4-E2B-it  vs  inferrs --paged-attention google/gemma-4-E2B-it
+//!   Group 6: vllm google/gemma-4-E4B-it  vs  inferrs --paged-attention google/gemma-4-E4B-it
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -72,13 +75,21 @@ struct BenchmarkArgs {
     #[arg(long, default_value_t = 8000)]
     vllm_port: u16,
 
-    /// HuggingFace model ID for inferrs.
+    /// HuggingFace model ID for the first inferrs backend (default benchmark).
     #[arg(long, default_value = "google/gemma-4-E2B-it")]
     inferrs_model: String,
 
-    /// GGUF model ID for llama-server.
+    /// GGUF model ID for the first llama-server backend (default benchmark).
     #[arg(long, default_value = "ggml-org/gemma-4-E2B-it-GGUF")]
     llama_model: String,
+
+    /// HuggingFace model ID for the second inferrs backend (default benchmark).
+    #[arg(long, default_value = "google/gemma-4-E4B-it")]
+    inferrs_model2: String,
+
+    /// GGUF model ID for the second llama-server backend (default benchmark).
+    #[arg(long, default_value = "ggml-org/gemma-4-E4B-it-GGUF")]
+    llama_model2: String,
 
     /// Seconds to wait for a server to become healthy.
     #[arg(long, default_value_t = 1800)]
@@ -106,13 +117,14 @@ fn main() -> Result<()> {
     let inferrs_bin = resolve_inferrs_bin(&args);
     let prompt = generate_synthetic_prompt(args.prompt_len);
 
-    let n_benchmarks = 2;
+    let n_benchmarks = 4;
 
+    // ── 1. inferrs E2B ──────────────────────────────────────────────────────
     log_header(&format!(
         "Benchmark 1/{n_benchmarks} — inferrs serve {}",
         args.inferrs_model
     ));
-    let summary_inferrs_nq = {
+    let summary_inferrs_e2b = {
         let t_spawn = Instant::now();
         let mut server =
             start_inferrs(&inferrs_bin, &args.inferrs_model, args.inferrs_nq_port, &[])?;
@@ -155,12 +167,12 @@ fn main() -> Result<()> {
         summary
     };
 
-    // ── 2. llama-server ─────────────────────────────────────────────────────
+    // ── 2. llama-server E2B ─────────────────────────────────────────────────
     log_header(&format!(
         "Benchmark 2/{n_benchmarks} — llama-server -hf {}",
         args.llama_model
     ));
-    let summary_llama = {
+    let summary_llama_e2b = {
         let t_spawn = Instant::now();
         let mut server = start_llama_server(&args.llama_model, args.llama_port)?;
         ok(&format!("llama-server started (pid {})", server.id()));
@@ -202,9 +214,114 @@ fn main() -> Result<()> {
         summary
     };
 
+    // ── 3. inferrs E4B ──────────────────────────────────────────────────────
+    log_header(&format!(
+        "Benchmark 3/{n_benchmarks} — inferrs serve {}",
+        args.inferrs_model2
+    ));
+    let summary_inferrs_e4b = {
+        let t_spawn = Instant::now();
+        let mut server = start_inferrs(
+            &inferrs_bin,
+            &args.inferrs_model2,
+            args.inferrs_nq_port,
+            &[],
+        )?;
+        ok(&format!("inferrs serve started (pid {})", server.id()));
+
+        let health = format!("http://127.0.0.1:{}/health", args.inferrs_nq_port);
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout, t_spawn) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                err(&format!("inferrs serve failed to start: {e}"));
+                let _ = server.kill();
+                let _ = server.wait();
+                bail!("server failed to start");
+            }
+        };
+
+        let mut tracker = PeakMemoryTracker::start(server.id());
+        let t_bench = Instant::now();
+        let summary_res = bench_http(
+            "127.0.0.1",
+            args.inferrs_nq_port,
+            args.warmup,
+            args.runs,
+            args.max_tokens,
+            &args.inferrs_model2,
+            &prompt,
+        );
+        let elapsed = t_bench.elapsed();
+        let peak_mem_mb = tracker.stop();
+
+        let _ = server.kill();
+        let _ = server.wait();
+        ok(&format!(
+            "inferrs serve stopped  (benchmark took {:.1}s)",
+            elapsed.as_secs_f64()
+        ));
+        let mut summary = summary_res?;
+        summary.peak_mem_mb = peak_mem_mb;
+        summary.tth_ms = tth_ms;
+        summary
+    };
+
+    // ── 4. llama-server E4B ─────────────────────────────────────────────────
+    log_header(&format!(
+        "Benchmark 4/{n_benchmarks} — llama-server -hf {}",
+        args.llama_model2
+    ));
+    let summary_llama_e4b = {
+        let t_spawn = Instant::now();
+        let mut server = start_llama_server(&args.llama_model2, args.llama_port)?;
+        ok(&format!("llama-server started (pid {})", server.id()));
+
+        let health = format!("http://127.0.0.1:{}/health", args.llama_port);
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout, t_spawn) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                err(&format!("llama-server failed to start: {e}"));
+                let _ = server.kill();
+                let _ = server.wait();
+                bail!("server failed to start");
+            }
+        };
+
+        let mut tracker = PeakMemoryTracker::start(server.id());
+        let t_bench = Instant::now();
+        let summary_res = bench_http(
+            "127.0.0.1",
+            args.llama_port,
+            args.warmup,
+            args.runs,
+            args.max_tokens,
+            &args.llama_model2,
+            &prompt,
+        );
+        let elapsed = t_bench.elapsed();
+        let peak_mem_mb = tracker.stop();
+
+        let _ = server.kill();
+        let _ = server.wait();
+        ok(&format!(
+            "llama-server stopped  (benchmark took {:.1}s)",
+            elapsed.as_secs_f64()
+        ));
+        let mut summary = summary_res?;
+        summary.peak_mem_mb = peak_mem_mb;
+        summary.tth_ms = tth_ms;
+        summary
+    };
+
     // ── Summary table ───────────────────────────────────────────────────────
     log_header("Results");
-    print_summary(&args, Some(&summary_llama), Some(&summary_inferrs_nq));
+    print_summary(
+        &args,
+        &summary_llama_e2b,
+        &summary_inferrs_e2b,
+        &summary_llama_e4b,
+        &summary_inferrs_e4b,
+    );
 
     Ok(())
 }
@@ -487,7 +604,7 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
     )?;
 
     // ── Group 5: vllm 2B google  vs  inferrs --paged-attention 2B google ────
-    log_header("DGX Spark group 5/5 — vllm google 2B vs inferrs --paged-attention google 2B");
+    log_header("DGX Spark group 5/6 — vllm google 2B vs inferrs --paged-attention google 2B");
     let g5_vllm = run_one_backend_with_cleanup(
         args,
         "vllm serve google/gemma-4-E2B-it",
@@ -525,6 +642,51 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
             start_inferrs(
                 &inferrs_bin,
                 "google/gemma-4-E2B-it",
+                p_tq,
+                &["--turbo-quant=false", "--paged-attention"],
+            )
+        },
+    )?;
+
+    // ── Group 6: vllm 4B google  vs  inferrs --paged-attention 4B google ────
+    log_header("DGX Spark group 6/6 — vllm google 4B vs inferrs --paged-attention google 4B");
+    let g6_vllm = run_one_backend_with_cleanup(
+        args,
+        "vllm serve google/gemma-4-E4B-it",
+        p_vllm,
+        "google/gemma-4-E4B-it",
+        &prompt,
+        || {
+            let (child, name) = start_vllm_server("google/gemma-4-E4B-it", p_vllm)?;
+            let cleanup: Box<dyn FnOnce()> = Box::new(move || stop_docker_container(&name));
+            Ok((child, Some(cleanup)))
+        },
+    )?;
+    let g6_inferrs = run_one_backend(
+        args,
+        "inferrs serve --paged-attention google/gemma-4-E4B-it",
+        p_inf,
+        "google/gemma-4-E4B-it",
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-E4B-it",
+                p_inf,
+                &["--paged-attention"],
+            )
+        },
+    )?;
+    let g6_inferrs_tq = run_one_backend(
+        args,
+        "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-E4B-it",
+        p_tq,
+        "google/gemma-4-E4B-it",
+        &prompt,
+        || {
+            start_inferrs(
+                &inferrs_bin,
+                "google/gemma-4-E4B-it",
                 p_tq,
                 &["--turbo-quant=false", "--paged-attention"],
             )
@@ -588,6 +750,17 @@ fn run_dgx_spark(args: &BenchmarkArgs) -> Result<()> {
         &g5_inferrs,
         "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-E2B-it",
         &g5_inferrs_tq,
+    );
+    println!("  Note: vllm peak mem reflects the docker client process, not the container.");
+
+    print_dgx_group(
+        "Group 6 — Paged attn 4B: vllm vs inferrs google 4B",
+        "vllm serve google/gemma-4-E4B-it",
+        &g6_vllm,
+        "inferrs serve --paged-attention google/gemma-4-E4B-it",
+        &g6_inferrs,
+        "inferrs serve --turbo-quant=false --paged-attention google/gemma-4-E4B-it",
+        &g6_inferrs_tq,
     );
     println!("  Note: vllm peak mem reflects the docker client process, not the container.");
 
@@ -1227,8 +1400,10 @@ type SummaryRow = (
 
 fn print_summary(
     args: &BenchmarkArgs,
-    llama: Option<&BenchSummary>,
-    inferrs_nq: Option<&BenchSummary>,
+    llama_e2b: &BenchSummary,
+    inferrs_e2b: &BenchSummary,
+    llama_e4b: &BenchSummary,
+    inferrs_e4b: &BenchSummary,
 ) {
     fn fmt(v: Option<f64>, unit: &str) -> String {
         match v {
@@ -1240,19 +1415,35 @@ fn print_summary(
     let rows: Vec<SummaryRow> = vec![
         (
             format!("llama-server -hf {}", args.llama_model),
-            llama.and_then(|s| s.tth_ms),
-            llama.and_then(|s| s.ttft_ms),
-            llama.and_then(|s| s.prefill_tps),
-            llama.and_then(|s| s.decode_tps),
-            llama.and_then(|s| s.peak_mem_mb),
+            llama_e2b.tth_ms,
+            llama_e2b.ttft_ms,
+            llama_e2b.prefill_tps,
+            llama_e2b.decode_tps,
+            llama_e2b.peak_mem_mb,
         ),
         (
             format!("inferrs serve {}", args.inferrs_model),
-            inferrs_nq.and_then(|s| s.tth_ms),
-            inferrs_nq.and_then(|s| s.ttft_ms),
-            inferrs_nq.and_then(|s| s.prefill_tps),
-            inferrs_nq.and_then(|s| s.decode_tps),
-            inferrs_nq.and_then(|s| s.peak_mem_mb),
+            inferrs_e2b.tth_ms,
+            inferrs_e2b.ttft_ms,
+            inferrs_e2b.prefill_tps,
+            inferrs_e2b.decode_tps,
+            inferrs_e2b.peak_mem_mb,
+        ),
+        (
+            format!("llama-server -hf {}", args.llama_model2),
+            llama_e4b.tth_ms,
+            llama_e4b.ttft_ms,
+            llama_e4b.prefill_tps,
+            llama_e4b.decode_tps,
+            llama_e4b.peak_mem_mb,
+        ),
+        (
+            format!("inferrs serve {}", args.inferrs_model2),
+            inferrs_e4b.tth_ms,
+            inferrs_e4b.ttft_ms,
+            inferrs_e4b.prefill_tps,
+            inferrs_e4b.decode_tps,
+            inferrs_e4b.peak_mem_mb,
         ),
     ];
 
@@ -1282,7 +1473,11 @@ fn print_summary(
         "Backend", "TTH (ms)", "TTFT (ms)", "Prefill (t/s)", "Decode (t/s)", "Peak mem (MB)",
     );
     println!("{}", "─".repeat(total_w));
-    for (name, tth, ttft, pfill, dec, mem) in &rows {
+    for (i, (name, tth, ttft, pfill, dec, mem)) in rows.iter().enumerate() {
+        // Separator between E2B and E4B groups.
+        if i == 2 {
+            println!("{}", "─".repeat(total_w));
+        }
         println!(
             "{:<w$}  {:>W_TTH$}  {:>W_TTFT$}  {:>W_PFILL$}  {:>W_DEC$}  {:>W_MEM$}",
             name,
@@ -1296,36 +1491,67 @@ fn print_summary(
     println!("{}", "═".repeat(total_w));
     println!();
 
-    // Relative comparison vs llama-server.
-    let base_tth = llama.and_then(|s| s.tth_ms);
-    let base_ttft = llama.and_then(|s| s.ttft_ms);
-    let base_pfill = llama.and_then(|s| s.prefill_tps);
-    let base_dec = llama.and_then(|s| s.decode_tps);
-    let base_mem = llama.and_then(|s| s.peak_mem_mb);
-
-    if let (Some(bth), Some(bt), Some(bp), Some(bd)) = (base_tth, base_ttft, base_pfill, base_dec) {
-        println!(
-            "Relative to llama-server (higher prefill/decode is better; lower TTH/TTFT/mem is better):"
-        );
-        for (name, tth, ttft, pfill, dec, mem) in &rows[1..] {
-            if let (Some(th), Some(t), Some(p), Some(d)) = (tth, ttft, pfill, dec) {
-                let d_tth = (th - bth) / bth * 100.0;
-                let d_ttft = (t - bt) / bt * 100.0;
-                let d_pfill = (p - bp) / bp * 100.0;
-                let d_dec = (d - bd) / bd * 100.0;
-                let sign = |x: f64| if x >= 0.0 { "+" } else { "" };
-                println!("  {name}");
-                println!("    TTH:      {}{d_tth:.1}%", sign(d_tth));
-                println!("    TTFT:     {}{d_ttft:.1}%", sign(d_ttft));
-                println!("    Prefill:  {}{d_pfill:.1}%", sign(d_pfill));
-                println!("    Decode:   {}{d_dec:.1}%", sign(d_dec));
-                if let (Some(m), Some(bm)) = (mem, base_mem) {
-                    let d_mem = (m - bm) / bm * 100.0;
-                    println!("    Peak mem: {}{d_mem:.1}%", sign(d_mem));
+    // Relative comparison: inferrs vs its llama-server counterpart, per model.
+    let sign = |x: f64| if x >= 0.0 { "+" } else { "" };
+    let print_rel = |label: &str, base: &BenchSummary, cmp: &BenchSummary| {
+        if let (Some(bth), Some(bt), Some(bp), Some(bd)) =
+            (base.tth_ms, base.ttft_ms, base.prefill_tps, base.decode_tps)
+        {
+            if let (Some(th), Some(t), Some(p), Some(d)) =
+                (cmp.tth_ms, cmp.ttft_ms, cmp.prefill_tps, cmp.decode_tps)
+            {
+                println!("{label}");
+                println!(
+                    "    TTH:      {}{:.1}%",
+                    sign(th - bth),
+                    (th - bth) / bth * 100.0
+                );
+                println!(
+                    "    TTFT:     {}{:.1}%",
+                    sign(t - bt),
+                    (t - bt) / bt * 100.0
+                );
+                println!(
+                    "    Prefill:  {}{:.1}%",
+                    sign(p - bp),
+                    (p - bp) / bp * 100.0
+                );
+                println!(
+                    "    Decode:   {}{:.1}%",
+                    sign(d - bd),
+                    (d - bd) / bd * 100.0
+                );
+                if let (Some(m), Some(bm)) = (cmp.peak_mem_mb, base.peak_mem_mb) {
+                    println!(
+                        "    Peak mem: {}{:.1}%",
+                        sign(m - bm),
+                        (m - bm) / bm * 100.0
+                    );
                 }
             }
         }
-    }
+    };
+
+    println!(
+        "Relative to llama-server (higher prefill/decode is better; lower TTH/TTFT/mem is better):"
+    );
+    print_rel(
+        &format!(
+            "  inferrs serve {} vs llama-server -hf {}:",
+            args.inferrs_model, args.llama_model
+        ),
+        llama_e2b,
+        inferrs_e2b,
+    );
+    println!();
+    print_rel(
+        &format!(
+            "  inferrs serve {} vs llama-server -hf {}:",
+            args.inferrs_model2, args.llama_model2
+        ),
+        llama_e4b,
+        inferrs_e4b,
+    );
 }
 
 // ── Logging helpers ──────────────────────────────────────────────────────────
