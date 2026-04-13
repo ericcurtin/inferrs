@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{embedding, Embedding, Init, RmsNorm, VarBuilder};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::models::attention_utils::{
@@ -845,76 +846,95 @@ impl Qwen35Model {
             }
         });
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for (i, layer_type) in cfg.layer_types.iter().enumerate() {
-            let layer_vb = lm_vb.pp("layers").pp(i.to_string());
-            let layer_qvb = lm_qvb.as_ref().map(|q| q.pp("layers").pp(i.to_string()));
-            let layer = DecoderLayer::new(
-                cfg,
-                layer_vb,
-                layer_qvb.as_ref(),
-                layer_type.is_full_attention,
-                tq_cfg.as_ref(),
-            )
-            .with_context(|| format!("loading layer {i}"))?;
-            layers.push(layer);
-        }
+        // Pre-extract per-layer VarBuilders (sequential, trivial cost) then
+        // construct all layers + lm_head in parallel via rayon::join.
+        // VarBuilder is Send (Arc<TensorData<Box<dyn SimpleBackend>>> where
+        // SimpleBackend: Send + Sync). QGgufVarBuilder is Send (Arc<Mutex<>>).
+        let layer_specs: Vec<_> = cfg
+            .layer_types
+            .iter()
+            .enumerate()
+            .map(|(i, lt)| {
+                let vb = lm_vb.pp("layers").pp(i.to_string());
+                let qvb = lm_qvb.as_ref().map(|q| q.pp("layers").pp(i.to_string()));
+                (vb, qvb, lt.is_full_attention)
+            })
+            .collect();
 
-        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"), 1.0)?;
+        let norm_vb = lm_vb.pp("norm");
 
-        let lm_head = {
-            let dense = embed_tokens.embeddings().clone();
-            let built = lm_qvb
-                .as_ref()
-                .and_then(|q| q.pp("embed_tokens").try_qlinear_weight());
-            match built {
-                Some(Ok(ql)) => {
-                    tracing::info!("lm_head: using quantized embed_tokens QTensor");
-                    ql
-                }
-                Some(Err(e)) => {
-                    tracing::warn!("lm_head: quantized build failed ({e}), using bf16");
-                    QLinear::from_tensor(dense, None)
-                }
-                None => {
-                    let weight = dense;
-                    let elem_count = weight.elem_count();
-                    let quant_dtype = if elem_count % 256 == 0 {
-                        Some(candle_core::quantized::GgmlDType::Q4K)
-                    } else if elem_count % 32 == 0 {
-                        Some(candle_core::quantized::GgmlDType::Q8_0)
-                    } else {
-                        None
-                    };
-                    let mut quantized = None;
-                    if let Some(dtype) = quant_dtype {
-                        match candle_core::quantized::QTensor::quantize(&weight, dtype) {
-                            Ok(qt) => {
-                                tracing::info!(
-                                    "lm_head: online-quantized embed_tokens to {dtype:?} \
-                                     ({} elements, {:.1} MB BF16)",
-                                    elem_count,
-                                    elem_count as f64 * 2.0 / 1e6,
-                                );
-                                match QLinear::from_qtensor(Arc::new(qt), None) {
-                                    Ok(ql) => quantized = Some(ql),
-                                    Err(e) => tracing::debug!(
-                                        "lm_head: QLinear::from_qtensor failed ({e}), using bf16"
-                                    ),
-                                }
-                            }
-                            Err(e) => tracing::debug!(
-                                "lm_head: online quantization failed ({e}), using bf16"
-                            ),
-                        }
-                    }
-                    quantized.unwrap_or_else(|| {
-                        tracing::debug!("lm_head: using dense bf16");
-                        QLinear::from_tensor(weight, None)
+        // Build layers and lm_head in parallel.
+        // lm_head depends only on embed_tokens (already loaded), not on layers.
+        let (layers_result, lm_head) = rayon::join(
+            || -> Result<Vec<DecoderLayer>> {
+                let layers: Vec<_> = layer_specs
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(i, (vb, qvb, is_full))| {
+                        DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, tq_cfg.as_ref())
+                            .with_context(|| format!("loading layer {i}"))
                     })
-                }
-            }
-        };
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(layers)
+            },
+            || -> QLinear {
+                let dense = embed_tokens.embeddings().clone();
+                let built = lm_qvb
+                    .as_ref()
+                    .and_then(|q| q.pp("embed_tokens").try_qlinear_weight());
+                let ql = match built {
+                    Some(Ok(ql)) => {
+                        tracing::info!("lm_head: using quantized embed_tokens QTensor");
+                        ql
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("lm_head: quantized build failed ({e}), using bf16");
+                        QLinear::from_tensor(dense, None)
+                    }
+                    None => {
+                        let weight = dense;
+                        let elem_count = weight.elem_count();
+                        let quant_dtype = if elem_count % 256 == 0 {
+                            Some(candle_core::quantized::GgmlDType::Q4K)
+                        } else if elem_count % 32 == 0 {
+                            Some(candle_core::quantized::GgmlDType::Q8_0)
+                        } else {
+                            None
+                        };
+                        let mut quantized = None;
+                        if let Some(dtype) = quant_dtype {
+                            match candle_core::quantized::QTensor::quantize(&weight, dtype) {
+                                Ok(qt) => {
+                                    tracing::info!(
+                                        "lm_head: online-quantized embed_tokens to {dtype:?} \
+                                         ({} elements, {:.1} MB BF16)",
+                                        elem_count,
+                                        elem_count as f64 * 2.0 / 1e6,
+                                    );
+                                    match QLinear::from_qtensor(Arc::new(qt), None) {
+                                        Ok(ql) => quantized = Some(ql),
+                                        Err(e) => tracing::debug!(
+                                            "lm_head: QLinear::from_qtensor failed ({e}), using bf16"
+                                        ),
+                                    }
+                                }
+                                Err(e) => tracing::debug!(
+                                    "lm_head: online quantization failed ({e}), using bf16"
+                                ),
+                            }
+                        }
+                        quantized.unwrap_or_else(|| {
+                            tracing::debug!("lm_head: using dense bf16");
+                            QLinear::from_tensor(weight, None)
+                        })
+                    }
+                };
+                ql
+            },
+        );
+        let layers = layers_result?;
+
+        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, norm_vb, 1.0)?;
 
         // Precompute RoPE tables (large enough for typical sequences)
         let max_seq = 32768;
