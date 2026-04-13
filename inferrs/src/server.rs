@@ -566,6 +566,11 @@ pub struct OllamaGenerateRequest {
     /// chain-of-thought will be returned in the `thinking` field.
     #[serde(default)]
     pub think: Option<bool>,
+    /// How long (in seconds) to keep the model loaded after the last request.
+    /// A value of `0` unloads the model immediately — this is what
+    /// `inferrs stop` / `ollama stop` sends.
+    #[serde(default)]
+    pub keep_alive: Option<i64>,
 }
 
 /// Ollama `POST /api/chat` request.
@@ -1360,7 +1365,23 @@ async fn load_model_on_demand(
             let lm = Arc::new(lm);
             {
                 let mut guard = state.slot.write().await;
-                *guard = ModelSlot::Ready(Arc::clone(&lm));
+                // Only transition to Ready when the slot is still in the
+                // Loading state for this model.  A concurrent `stop` request
+                // may have already reset the slot to Empty while we were
+                // loading; in that case we discard the freshly-loaded model
+                // rather than silently overwriting the stop.
+                let still_loading = matches!(&*guard,
+                    ModelSlot::Loading { model_id: loading_id, .. }
+                        if model_matches_id(loading_id, model_id));
+                if still_loading {
+                    *guard = ModelSlot::Ready(Arc::clone(&lm));
+                } else {
+                    tracing::info!(
+                        "Load of '{}' completed but slot was cleared (stop request \
+                         raced with load) — discarding loaded model",
+                        model_id
+                    );
+                }
             }
             let _ = tx.send(Some(Ok(Arc::clone(&lm))));
             Ok(lm)
@@ -3774,6 +3795,45 @@ async fn ollama_generate(
     let request_id = format!("gen-{}", uuid::Uuid::new_v4());
     let created_at = rfc3339_now();
 
+    // Unload request: empty prompt + keep_alive=0 (the protocol used by both
+    // `ollama stop` and `inferrs stop`).  We handle this before calling
+    // `load_model_on_demand` so we never trigger a load just to unload.
+    let prompt = req.prompt.as_deref().unwrap_or("");
+    if prompt.is_empty() && req.keep_alive == Some(0) {
+        {
+            let mut slot = state.slot.write().await;
+            // Only evict the slot when the requested model is the one that is
+            // currently loaded or loading.  Without this check, stopping model
+            // "B" while model "A" is loaded would silently unload "A".
+            // We also match on Loading so that a stop issued while the model is
+            // still being fetched/initialised correctly cancels it (the loader
+            // will find the slot is no longer in the Loading state it set up and
+            // will discard its result rather than overwriting Empty → Ready).
+            let matches = match &*slot {
+                ModelSlot::Ready(lm) => model_matches_id(&lm.model_id, &req.model),
+                ModelSlot::Loading { model_id, .. } => model_matches_id(model_id, &req.model),
+                _ => false,
+            };
+            if matches {
+                *slot = ModelSlot::Empty;
+                tracing::info!("Model '{}' unloaded via stop request", req.model);
+            } else {
+                tracing::info!(
+                    "Stop request for '{}' but that model is not loaded — ignoring",
+                    req.model
+                );
+            }
+        }
+        return Ok(Json(serde_json::json!({
+            "model": req.model,
+            "created_at": created_at,
+            "response": "",
+            "done": true,
+            "done_reason": "unload",
+        }))
+        .into_response());
+    }
+
     let lm = load_model_on_demand(&state, &req.model, req.options.as_ref()).await?;
 
     // Proxy mode: forward the request to the worker.
@@ -3781,7 +3841,6 @@ async fn ollama_generate(
         return proxy_to_worker(&state.http_client, worker_url, "/api/generate", &req).await;
     }
 
-    let prompt = req.prompt.as_deref().unwrap_or("");
     if prompt.is_empty() {
         // Ollama uses an empty prompt to "warm up" (load) the model.
         return Ok(Json(serde_json::json!({

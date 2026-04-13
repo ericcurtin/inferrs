@@ -14,6 +14,7 @@ mod rm;
 mod run;
 mod sampler;
 mod server;
+mod stop;
 mod tokenizer;
 mod util;
 
@@ -76,6 +77,8 @@ enum Commands {
     /// List locally cached models (alias for list)
     #[command(name = "ls")]
     Ls(list::ListArgs),
+    /// Stop a running model and unload it from memory
+    Stop(stop::StopArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -511,7 +514,8 @@ async fn main() -> Result<()> {
         | Commands::Bench(_)
         | Commands::Rm(_)
         | Commands::List(_)
-        | Commands::Ls(_) => "error",
+        | Commands::Ls(_)
+        | Commands::Stop(_) => "error",
         _ => "info", // Pull and Serve both benefit from info-level progress log
     };
     tracing_subscriber::fmt()
@@ -551,6 +555,9 @@ async fn main() -> Result<()> {
         }
         Commands::List(args) | Commands::Ls(args) => {
             list::run(args)?;
+        }
+        Commands::Stop(args) => {
+            stop::run(args).await?;
         }
     }
 
