@@ -438,15 +438,64 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
     }
 }
 
+/// A [`candle_nn::var_builder::SimpleBackend`] that wraps [`GgufBackend`] and
+/// subtracts 1.0 from any tensor whose name ends in `"norm.weight"`.
+///
+/// llama.cpp/GGUF stores the actual RMSNorm scale value directly, but
+/// candle-transformers (following HuggingFace convention) expects the stored
+/// weight `w` to be applied as `1 + w`.  So llama.cpp stores `s`, HF stores
+/// `s - 1.0`.  This wrapper corrects the mismatch for Gemma2 and Gemma3
+/// external GGUFs.
+struct GemmaNormFixBackend {
+    inner: GgufBackend,
+}
+
+impl candle_nn::var_builder::SimpleBackend for GemmaNormFixBackend {
+    fn get(
+        &self,
+        s: candle_core::Shape,
+        name: &str,
+        h: candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let tensor = self.inner.get(s, name, h, dtype, dev)?;
+        if name.ends_with("norm.weight") {
+            tensor - 1.0f64
+        } else {
+            Ok(tensor)
+        }
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let tensor = self.inner.get_unchecked(name, dtype, dev)?;
+        if name.ends_with("norm.weight") {
+            tensor - 1.0f64
+        } else {
+            Ok(tensor)
+        }
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.inner.contains_tensor(name)
+    }
+}
+
 /// Build a [`VarBuilder`] backed by a GGUF file.
 ///
 /// Tensors are dequantized lazily — only on first access — so startup is
 /// fast and peak memory is bounded by the model's actual weight usage rather
 /// than the full file size.
+///
+/// When `arch` is `Gemma2` or `Gemma3` and the file is an external GGUF
+/// (detected by the presence of `token_embd.weight`), the backend is wrapped
+/// in [`GemmaNormFixBackend`] to subtract 1.0 from all `*norm.weight` tensors,
+/// correcting the RMSNorm scale convention difference between llama.cpp and HF.
 fn var_builder_from_gguf(
     gguf_path: &Path,
     dtype: DType,
     device: &Device,
+    arch: &ModelArchitecture,
 ) -> Result<VarBuilder<'static>> {
     use candle_core::quantized::gguf_file;
 
@@ -465,17 +514,29 @@ fn var_builder_from_gguf(
     let top_keys = content.tensor_infos.keys().take(10).collect::<Vec<_>>();
     tracing::debug!("Top 10 GGUF keys: {:?}", top_keys);
 
+    let is_external_gguf = content.tensor_infos.contains_key("token_embd.weight")
+        && !content
+            .tensor_infos
+            .contains_key("model.embed_tokens.weight");
+
     let backend = GgufBackend {
         content,
         reader: std::sync::Mutex::new(reader),
         device: device.clone(),
     };
 
-    Ok(VarBuilder::from_backend(
-        Box::new(backend),
-        dtype,
-        device.clone(),
-    ))
+    let boxed: Box<dyn candle_nn::var_builder::SimpleBackend + 'static> = if is_external_gguf
+        && matches!(arch, ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3)
+    {
+        tracing::info!(
+            "{arch:?}: applying GemmaNormFixBackend to correct RMSNorm scale for external GGUF"
+        );
+        Box::new(GemmaNormFixBackend { inner: backend })
+    } else {
+        Box::new(backend)
+    };
+
+    Ok(VarBuilder::from_backend(boxed, dtype, device.clone()))
 }
 
 /// Map a HuggingFace safetensors tensor name to its llama.cpp canonical GGUF
@@ -704,7 +765,7 @@ pub fn load_model(
     // When a GGUF is present, load weights from it (dequantizing each tensor
     // to `dtype`).  Otherwise fall back to the standard mmap'd safetensors path.
     let vb: VarBuilder<'static> = if let Some(gguf) = gguf_path {
-        let mut base_vb = var_builder_from_gguf(gguf, dtype, device)?;
+        let mut base_vb = var_builder_from_gguf(gguf, dtype, device, arch)?;
 
         // Map safetensors names (expected by candle-transformers) to the
         // llama.cpp canonical GGUF names if the user downloaded an external

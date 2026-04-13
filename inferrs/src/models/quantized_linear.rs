@@ -108,9 +108,27 @@ impl Module for QLinear {
                     Some(b) => result.broadcast_add(b),
                 }
             }
-            _ => {
-                // Dense path (safetensors bf16): standard matmul.
-                let result = self.inner.forward(xs)?;
+            QMatMul::Tensor(w) | QMatMul::TensorF16(w) => {
+                // Dense path: standard matmul.
+                // Some external GGUFs (e.g. bartowski Gemma4) store certain
+                // projections (per_layer_model_projection) as unquantized F32.
+                // QMatMul::from_arc then creates QMatMul::Tensor(F32) rather than
+                // a QTensor, and Tensor::matmul requires both operands to share the
+                // same dtype.  Cast xs to the weight dtype before the multiply, then
+                // cast the result back so the caller sees the expected activation dtype.
+                let orig_dtype = xs.dtype();
+                let w_dtype = w.dtype();
+                let (xs_cast, need_cast_back) = if orig_dtype != w_dtype {
+                    (xs.to_dtype(w_dtype)?, true)
+                } else {
+                    (xs.clone(), false)
+                };
+                let result = self.inner.forward(&xs_cast)?;
+                let result = if need_cast_back && result.dtype() != orig_dtype {
+                    result.to_dtype(orig_dtype)?
+                } else {
+                    result
+                };
                 match &self.bias {
                     None => Ok(result),
                     Some(b) => result.broadcast_add(b),
