@@ -15,9 +15,9 @@ use anyhow::Result;
 use crate::engine::load_engine;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
-use crate::turbo_quant::GROUP_SIZE;
 use crate::util::format_bytes;
 use crate::ServeArgs;
+use inferrs_models::turbo_quant::GROUP_SIZE;
 
 /// Extra options that only apply to the bench subcommand.
 #[derive(clap::Args, Clone)]

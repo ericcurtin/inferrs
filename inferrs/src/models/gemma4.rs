@@ -25,7 +25,7 @@ use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
-use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache, MIN_KV_BUFFER_CAP};
+use inferrs_models::turbo_quant::{TurboQuantConfig, TurboQuantKvCache, MIN_KV_BUFFER_CAP};
 
 // ---------------------------------------------------------------------------
 // PLI embedding cache size

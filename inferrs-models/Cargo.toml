@@ -15,6 +15,8 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
+anyhow = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+half = { version = "2.5", features = ["num-traits"] }
 rayon = "1"

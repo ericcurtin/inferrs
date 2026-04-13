@@ -18,8 +18,8 @@ use crate::models::attention_utils::{
 };
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
-use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
+use inferrs_models::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
     let weight = vb.get_with_hints(size, "weight", Init::Const(0.0))?;

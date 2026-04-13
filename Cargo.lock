@@ -1798,8 +1798,10 @@ dependencies = [
 name = "inferrs-models"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "candle-core",
  "candle-nn",
+ "half",
  "rayon",
 ]
 

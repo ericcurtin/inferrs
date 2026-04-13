@@ -6,8 +6,9 @@
 //! `candle-core` feature sets.
 //!
 //! The extraction is being performed incrementally — further modules
-//! (`config`, `turbo_quant`, and the model implementations themselves)
-//! will move here in subsequent PRs.
+//! (`config` and the model implementations themselves) will move here in
+//! a subsequent PR.
 
 pub mod kv_cache;
 pub mod nvfp4;
+pub mod turbo_quant;

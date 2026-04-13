@@ -14,7 +14,6 @@ mod run;
 mod sampler;
 mod server;
 mod tokenizer;
-mod turbo_quant;
 mod util;
 
 use anyhow::Result;
