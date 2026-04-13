@@ -1,13 +1,10 @@
 mod audio;
 mod backend;
 mod bench;
-mod config;
 mod engine;
 mod grammar;
 mod hub;
 mod list;
-mod models;
-mod multimodal_plugin;
 mod pull;
 mod quantize;
 mod rm;

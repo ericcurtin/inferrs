@@ -312,7 +312,7 @@ impl Tokenizer {
     pub fn from_file_with_arch(
         tokenizer_path: &Path,
         tokenizer_config_path: Option<&Path>,
-        arch_override: Option<&crate::config::ModelArchitecture>,
+        arch_override: Option<&inferrs_models::config::ModelArchitecture>,
     ) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
@@ -321,8 +321,8 @@ impl Tokenizer {
 
         // Detect chat template, optionally overriding based on known architecture
         let chat_template = match arch_override {
-            Some(crate::config::ModelArchitecture::Gemma4) => ChatTemplate::Gemma4,
-            Some(crate::config::ModelArchitecture::Phi3) => ChatTemplate::Phi,
+            Some(inferrs_models::config::ModelArchitecture::Gemma4) => ChatTemplate::Gemma4,
+            Some(inferrs_models::config::ModelArchitecture::Phi3) => ChatTemplate::Phi,
             _ => detect_chat_template(&config),
         };
 

@@ -22,12 +22,12 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::config::{ModelArchitecture, RawConfig};
-use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
 use crate::ServeArgs;
+use inferrs_models::config::{ModelArchitecture, RawConfig};
 use inferrs_models::kv_cache::{BlockPool, BlockTable, PagedCacheConfig, PagedKvStore};
+use inferrs_models::models::CausalLM;
 
 // ---------------------------------------------------------------------------
 // Output buffer — decouples the engine thread from per-client channels
@@ -161,7 +161,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
             )
         });
 
-        let model_result = crate::models::load_model(
+        let model_result = inferrs_models::models::load_model(
             &raw_config,
             &arch,
             &model_files.weight_paths,

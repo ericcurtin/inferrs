@@ -25,7 +25,7 @@ use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
-use inferrs_models::turbo_quant::{TurboQuantConfig, TurboQuantKvCache, MIN_KV_BUFFER_CAP};
+use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache, MIN_KV_BUFFER_CAP};
 
 // ---------------------------------------------------------------------------
 // PLI embedding cache size
@@ -1450,8 +1450,8 @@ impl Attention {
         &mut self,
         xs: &Tensor,
         seqlen_offset: usize,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
         layer_paged_idx: usize,
     ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -1953,8 +1953,8 @@ impl DecoderLayer {
         xs: &Tensor,
         per_layer_input: Option<&Tensor>,
         seqlen_offset: usize,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
         layer_paged_idx: usize,
     ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let residual = xs;
@@ -3029,8 +3029,8 @@ impl Gemma4Model {
         &mut self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
         audio_embeds: Tensor,
         audio_positions: Vec<usize>,
     ) -> candle_core::Result<Tensor> {
@@ -3085,8 +3085,8 @@ impl Gemma4Model {
         &mut self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
         image_embeds: Tensor,
         image_positions: Vec<usize>,
     ) -> candle_core::Result<Tensor> {
@@ -3147,8 +3147,8 @@ impl Gemma4Model {
         &mut self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
     ) -> candle_core::Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
 
@@ -3181,8 +3181,8 @@ impl Gemma4Model {
         ids_for_pli: &Tensor,
         xs_for_pli: Option<&Tensor>,
         mut xs: Tensor,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
     ) -> candle_core::Result<Tensor> {
         let pli_per_layer =
             self.compute_pli_per_layer(b_size, seq_len, ids_for_pli, xs_for_pli, &xs)?;
@@ -3319,8 +3319,8 @@ impl Gemma4Model {
     /// unaffected.
     pub fn populate_paged_from_cache(
         &self,
-        block_table: &inferrs_models::kv_cache::BlockTable,
-        kv_store: &mut inferrs_models::kv_cache::PagedKvStore,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
         prompt_len: usize,
     ) -> candle_core::Result<()> {
         // Resolve slot IDs once for all paged layers.

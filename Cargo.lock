@@ -1820,8 +1820,13 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "candle-transformers",
  "half",
+ "libloading 0.8.9",
  "rayon",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

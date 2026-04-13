@@ -4,11 +4,10 @@
 //! that allows backend plugins (e.g. `inferrs-backend-cuda`) to share the same
 //! model code as the main binary while compiling against different
 //! `candle-core` feature sets.
-//!
-//! The extraction is being performed incrementally — further modules
-//! (`config` and the model implementations themselves) will move here in
-//! a subsequent PR.
 
+pub mod config;
 pub mod kv_cache;
+pub mod models;
+pub mod multimodal_plugin;
 pub mod nvfp4;
 pub mod turbo_quant;

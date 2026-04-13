@@ -13,12 +13,12 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
+use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
     apply_rms_norm_heads, apply_rope, causal_mask, compute_logits, concat_kv_cache,
     paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
 };
-use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
-use inferrs_models::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
+use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 // ---------------------------------------------------------------------------
 // Config
