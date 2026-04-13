@@ -243,13 +243,13 @@ pub fn run(args: PullArgs) -> Result<()> {
                 .map(crate::quantize::parse_format)
                 .transpose()?;
 
-            let files =
-                crate::hub::download_and_maybe_quantize(hf_model,
-        &args.revision,
-        args.gguf_file.as_deref(),
-        args.tokenizer_source.as_deref(),
-        quant_dtype,
-    )?;
+            let files = crate::hub::download_and_maybe_quantize(
+                hf_model,
+                &args.revision,
+                args.gguf_file.as_deref(),
+                args.tokenizer_source.as_deref(),
+                quant_dtype,
+            )?;
 
             println!("Pulled {} (HuggingFace)", args.model);
             println!("  config:    {}", files.config_path.display());
