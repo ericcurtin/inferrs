@@ -107,6 +107,18 @@ pub fn download_model(
     // This allows `inferrs run gemma3` and `inferrs serve docker.io/org/model`
     // to work seamlessly — reusing DMR's cache or pulling on demand.
     if let crate::pull::RefKind::Oci = crate::pull::classify_reference(model_id) {
+        // --revision is only meaningful for HuggingFace references; warn when
+        // it is set to a non-default value for an OCI model so the user knows
+        // it is being ignored.
+        if revision != "main" {
+            tracing::warn!(
+                "--revision '{}' is ignored for OCI model '{}'; \
+                 use an OCI tag instead (e.g. docker.io/org/model:v2)",
+                revision,
+                model_id,
+            );
+        }
+
         let bundle_path = match crate::pull::oci_bundle_path(model_id) {
             Some(p) => {
                 tracing::info!(

@@ -114,7 +114,8 @@ pub enum RefKind {
 ///   - `hf.co/...` or `huggingface.co/...` → HuggingFace
 ///   - Single word (no `/`) → OCI.  The Go library is responsible for
 ///     expanding this to `docker.io/ai/<name>` when calling the registry.
-///   - Has explicit registry (dot before first `/`) → OCI
+///   - Has explicit registry (dot or colon before first `/`) → OCI
+///   - `localhost/...` (no port) → OCI  (local registry)
 ///   - `org/model` (no dots before first `/`) → HuggingFace
 pub fn classify_reference(reference: &str) -> RefKind {
     let reference = reference.trim();
@@ -130,6 +131,10 @@ pub fn classify_reference(reference: &str) -> RefKind {
         // If the part before the first slash contains a dot or colon,
         // it's an explicit registry → OCI
         if before_slash.contains('.') || before_slash.contains(':') {
+            return RefKind::Oci;
+        }
+        // `localhost` without a port is also an OCI local registry
+        if before_slash == "localhost" {
             return RefKind::Oci;
         }
         // Otherwise it's org/model → HuggingFace
@@ -301,5 +306,8 @@ mod tests {
         );
         assert_eq!(classify_reference("docker.io/myorg/mymodel"), RefKind::Oci);
         assert_eq!(classify_reference("localhost:5000/model"), RefKind::Oci);
+
+        // localhost without a port → OCI (local registry)
+        assert_eq!(classify_reference("localhost/model"), RefKind::Oci);
     }
 }

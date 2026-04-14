@@ -140,6 +140,15 @@ jobs:
           $gitLink = "C:\Program Files\Git\usr\bin\link.exe"
           if (Test-Path $gitLink) { Rename-Item $gitLink "link.exe.bak" }
 
+      # On Windows ARM64 we need MSVC tools (cl.exe for the stub DLL and
+      # lib.exe for import library generation).  x86_64 already has MSVC
+      # from the CUDA/nvcc setup above.
+      - name: Set up MSVC environment (Windows ARM64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
       # ── Go OCI library (libocipull) ──────────────────────────────────────
       # The inferrs crate links against a Go C shared library for pulling
       # models from OCI registries.  build.rs tells rustc to link -locipull,
@@ -166,18 +175,17 @@ jobs:
                 -o ../target/debug/libocipull.so .
               ;;
             Windows)
-              CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
-                -o ../target/debug/ocipull.dll .
+              if [ "${{ matrix.target }}" = "aarch64-pc-windows-msvc" ]; then
+                # Go CGO cannot produce a c-shared library on Windows ARM64
+                # (missing ARM64 assembler support).  Build a C stub DLL that
+                # exports the same symbols but returns errors at runtime.
+                cl.exe /nologo /LD /Fe../target/debug/ocipull.dll stub.c
+              else
+                CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
+                  -o ../target/debug/ocipull.dll .
+              fi
               ;;
           esac
-
-      # On Windows ARM64 we also need MSVC tools (lib.exe) for import lib
-      # generation.  x86_64 already has MSVC from the CUDA/nvcc setup above.
-      - name: Set up MSVC environment (Windows ARM64)
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: arm64
 
       # On Windows the MSVC linker needs a .lib import library.  Generate one
       # from a hand-written .def listing the four exported Go symbols.
