@@ -85,6 +85,12 @@ fn decode_dtype(tag: u8) -> Result<DType> {
 
 /// Build a `VarBuilder` from a list of null-terminated safetensors paths.
 ///
+/// Returns `(vb, device)` so the caller can reuse the *exact same* `Device`
+/// instance that was used to load the weights.  On Metal, `same_device` checks
+/// pointer identity (via `DeviceId`), so a second call to `decode_device` would
+/// produce a different ID and trigger spurious "device mismatch" errors when
+/// input tensors are created later.
+///
 /// # Safety
 /// `paths` must point to a valid array of `n_paths` non-null, null-terminated
 /// UTF-8 strings, all of which remain valid for the duration of the call.
@@ -93,7 +99,7 @@ unsafe fn build_var_builder(
     n_paths: usize,
     dtype_tag: u8,
     device_tag: u8,
-) -> Result<VarBuilder<'static>> {
+) -> Result<(VarBuilder<'static>, Device)> {
     let device = decode_device(device_tag)?;
     let dtype = decode_dtype(dtype_tag)?;
 
@@ -110,7 +116,7 @@ unsafe fn build_var_builder(
     // SAFETY: the VarBuilder's mmap lifetime is tied to the encoder object
     // (BoxedEncoder), which is heap-allocated and lives until the caller frees it.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&rust_paths, dtype, &device)? };
-    Ok(vb)
+    Ok((vb, device))
 }
 
 // ---------------------------------------------------------------------------
@@ -228,9 +234,15 @@ pub unsafe extern "C" fn inferrs_mm_free_f32(ptr: *mut f32, len: usize) {
 // ---------------------------------------------------------------------------
 
 /// Opaque handle wrapping either an `AudioEncoder` or `VisionEncoder`.
+///
+/// The `Device` is stored alongside the encoder so that `encode` calls reuse
+/// the exact same `MetalDevice` instance that was used during weight loading.
+/// On Metal, `same_device` checks pointer identity (not just the registry ID),
+/// so creating a new `Device::new_metal(0)` on every encode call produces a
+/// different identity and triggers a spurious "device mismatch" error.
 enum BoxedEncoder {
-    Audio(Box<AudioEncoder>),
-    Vision(Box<VisionEncoder>),
+    Audio(Box<AudioEncoder>, Device),
+    Vision(Box<VisionEncoder>, Device),
 }
 
 // ---------------------------------------------------------------------------
@@ -260,15 +272,14 @@ pub unsafe extern "C" fn inferrs_mm_audio_encoder_load(
     device_tag: u8,
 ) -> *mut std::os::raw::c_void {
     let result = (|| -> Result<*mut std::os::raw::c_void> {
-        let vb = unsafe { build_var_builder(paths, n_paths, dtype_tag, device_tag)? };
-        let device = decode_device(device_tag)?;
+        let (vb, device) = unsafe { build_var_builder(paths, n_paths, dtype_tag, device_tag)? };
         let dtype = decode_dtype(dtype_tag)?;
         let cfg_str = unsafe { CStr::from_ptr(audio_cfg_json) }
             .to_str()
             .map_err(|e| anyhow::anyhow!("audio_cfg_json not UTF-8: {e}"))?;
         let cfg: AudioConfig = serde_json::from_str(cfg_str)?;
         let enc = AudioEncoder::load(vb.pp("model"), &cfg, lm_hidden_size, &device, dtype)?;
-        let boxed = Box::new(BoxedEncoder::Audio(Box::new(enc)));
+        let boxed = Box::new(BoxedEncoder::Audio(Box::new(enc), device));
         Ok(Box::into_raw(boxed) as *mut std::os::raw::c_void)
     })();
     match result {
@@ -302,21 +313,20 @@ pub unsafe extern "C" fn inferrs_mm_audio_encoder_encode(
     handle: *mut std::os::raw::c_void,
     mel: *const f32,
     n_frames: usize,
-    device_tag: u8,
+    _device_tag: u8, // ignored: encoder reuses the device from load time
     out_data: *mut *mut f32,
     out_rows: *mut usize,
     out_cols: *mut usize,
 ) -> i32 {
     let result = (|| -> Result<()> {
         let enc = unsafe { &*(handle as *const BoxedEncoder) };
-        let BoxedEncoder::Audio(audio_enc) = enc else {
+        let BoxedEncoder::Audio(audio_enc, device) = enc else {
             anyhow::bail!("handle is not an audio encoder");
         };
 
-        let device = decode_device(device_tag)?;
         let n_mel = crate::audio::N_MEL;
         let mel_slice = unsafe { std::slice::from_raw_parts(mel, n_frames * n_mel) };
-        let mel_tensor = Tensor::from_slice(mel_slice, (1usize, n_frames, n_mel), &device)?
+        let mel_tensor = Tensor::from_slice(mel_slice, (1usize, n_frames, n_mel), device)?
             .to_dtype(DType::F32)?;
 
         let embeds = audio_enc.encode(&mel_tensor)?;
@@ -379,15 +389,14 @@ pub unsafe extern "C" fn inferrs_mm_vision_encoder_load(
     device_tag: u8,
 ) -> *mut std::os::raw::c_void {
     let result = (|| -> Result<*mut std::os::raw::c_void> {
-        let vb = unsafe { build_var_builder(paths, n_paths, dtype_tag, device_tag)? };
-        let device = decode_device(device_tag)?;
+        let (vb, device) = unsafe { build_var_builder(paths, n_paths, dtype_tag, device_tag)? };
         let dtype = decode_dtype(dtype_tag)?;
         let cfg_str = unsafe { CStr::from_ptr(vision_cfg_json) }
             .to_str()
             .map_err(|e| anyhow::anyhow!("vision_cfg_json not UTF-8: {e}"))?;
         let cfg: Gemma4VisionConfig = serde_json::from_str(cfg_str)?;
         let enc = VisionEncoder::load(vb.pp("model"), &cfg, lm_hidden_size, &device, dtype)?;
-        let boxed = Box::new(BoxedEncoder::Vision(Box::new(enc)));
+        let boxed = Box::new(BoxedEncoder::Vision(Box::new(enc), device));
         Ok(Box::into_raw(boxed) as *mut std::os::raw::c_void)
     })();
     match result {
@@ -425,23 +434,22 @@ pub unsafe extern "C" fn inferrs_mm_vision_encoder_encode(
     pv_cols: usize,
     position_ids: *const i64,
     n_soft_tokens: usize,
-    device_tag: u8,
+    _device_tag: u8, // ignored: encoder reuses the device from load time
     out_data: *mut *mut f32,
     out_rows: *mut usize,
     out_cols: *mut usize,
 ) -> i32 {
     let result = (|| -> Result<()> {
         let enc = unsafe { &*(handle as *const BoxedEncoder) };
-        let BoxedEncoder::Vision(vision_enc) = enc else {
+        let BoxedEncoder::Vision(vision_enc, device) = enc else {
             anyhow::bail!("handle is not a vision encoder");
         };
 
-        let device = decode_device(device_tag)?;
         let pv_slice = unsafe { std::slice::from_raw_parts(pixel_values, pv_rows * pv_cols) };
-        let pixel_tensor = Tensor::from_slice(pv_slice, (pv_rows, pv_cols), &device)?;
+        let pixel_tensor = Tensor::from_slice(pv_slice, (pv_rows, pv_cols), device)?;
 
         let pos_slice = unsafe { std::slice::from_raw_parts(position_ids, pv_rows * 2) };
-        let pos_tensor = Tensor::from_slice(pos_slice, (pv_rows, 2usize), &device)?;
+        let pos_tensor = Tensor::from_slice(pos_slice, (pv_rows, 2usize), device)?;
 
         let embeds = vision_enc.encode(&pixel_tensor, &pos_tensor, Some(n_soft_tokens))?;
         let (rows, cols) = embeds.dims2()?;

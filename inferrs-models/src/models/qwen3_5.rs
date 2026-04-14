@@ -1209,8 +1209,7 @@ impl MtpModule {
         let _ = embed_tokens_weight; // weight is already in lm_head
 
         // MTP has its own copy of the final norm (mtp.norm.weight).
-        let norm =
-            rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("norm"), 1.0)?;
+        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("norm"), 1.0)?;
 
         let (cos, sin) = precompute_rope(
             cfg.head_dim,

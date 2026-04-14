@@ -593,6 +593,9 @@ pub struct OllamaChatRequest {
 pub struct OllamaChatMessage {
     pub role: String,
     pub content: String,
+    /// Base64-encoded image data (standard Ollama vision field).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// Text from inside `<think>…</think>` tags when thinking is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
@@ -3686,6 +3689,7 @@ async fn ollama_dispatch_stream(
     backend: &ModelBackend,
     request_id: &str,
     prompt_tokens: Vec<u32>,
+    image: Option<ImageEmbedContext>,
     params: SamplingParams,
 ) -> Result<mpsc::Receiver<StreamToken>, OllamaHttpError> {
     let (engine_tx, output_buf, stream_registry) = match backend {
@@ -3713,7 +3717,7 @@ async fn ollama_dispatch_stream(
         request_id: request_id.to_string(),
         prompt_tokens,
         audio: None,
-        image: None,
+        image,
         sampling_params: params,
         output_buf: output_buf.clone(),
     };
@@ -3734,6 +3738,7 @@ async fn ollama_dispatch_blocking(
     backend: &ModelBackend,
     request_id: String,
     prompt_tokens: Vec<u32>,
+    image: Option<ImageEmbedContext>,
     params: SamplingParams,
 ) -> Result<GenerationResult, OllamaHttpError> {
     let engine_tx = match backend {
@@ -3752,7 +3757,7 @@ async fn ollama_dispatch_blocking(
         request_id,
         prompt_tokens,
         audio: None,
-        image: None,
+        image,
         sampling_params: params,
         response_tx,
     };
@@ -3940,7 +3945,7 @@ async fn ollama_generate(
     if is_stream {
         let prompt_eval_count = prompt_tokens.len();
         let token_rx =
-            ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
+            ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, None, params).await?;
 
         let model_name = req.model.clone();
         let stream = make_ollama_generate_stream(
@@ -3957,7 +3962,7 @@ async fn ollama_generate(
             .into_response())
     } else {
         let result =
-            ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, params).await?;
+            ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, None, params).await?;
 
         // The engine's ThinkFilter has already separated reasoning and content
         // at the token level.  Surface reasoning only when the client opted in.
@@ -4089,7 +4094,18 @@ async fn ollama_chat(
         return proxy_to_worker(&state.http_client, worker_url, "/api/chat", &req).await;
     }
 
-    let (_, tokenizer, max_seq_len, _, _, _, _, _, _, _) = worker_fields(&lm)
+    let (
+        _,
+        tokenizer,
+        max_seq_len,
+        _,
+        _,
+        _,
+        image_token_id_opt,
+        vision_patch_size,
+        vision_pooling_kernel,
+        vision_default_output_length,
+    ) = worker_fields(&lm)
         .map_err(|(s, j)| (s, Json(serde_json::json!({"error": j.0.error.message}))))?;
 
     // Convert Ollama messages to internal ChatMessage format.
@@ -4102,9 +4118,21 @@ async fn ollama_chat(
                 "assistant" => Role::Assistant,
                 _ => Role::User,
             };
+            // Convert Ollama base64 `images` array to ImageInput objects using
+            // data URLs so the vision preprocessor can decode them.
+            let images: Vec<ImageInput> = m
+                .images
+                .iter()
+                .map(|b64| ImageInput {
+                    url: format!("data:image/jpeg;base64,{b64}"),
+                })
+                .collect();
             ChatMessage {
                 role,
-                content: MessageContent::from_string(&m.content),
+                content: MessageContent {
+                    text: m.content.clone(),
+                    images,
+                },
                 audio: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -4112,14 +4140,102 @@ async fn ollama_chat(
         })
         .collect();
 
-    let prompt_tokens = tokenizer
-        .apply_chat_template_and_encode(&chat_messages)
-        .map_err(|e| {
+    let has_images = chat_messages.iter().any(|m| !m.content.images.is_empty());
+
+    // ── Vision preprocessing (mirrors the /v1/chat/completions path) ──────────
+    let (prompt_tokens, image_ctx) = if has_images {
+        let image_token_id = image_token_id_opt.ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+                Json(serde_json::json!({"error": "This model does not support vision input (no image_token_id in config)"})),
             )
         })?;
+        let patch_size = vision_patch_size.unwrap_or(16);
+        let pooling_kernel = vision_pooling_kernel.unwrap_or(3);
+        let default_output_length = vision_default_output_length.unwrap_or(280);
+
+        let mut all_pixel_values: Vec<f32> = Vec::new();
+        let mut all_position_ids: Vec<i64> = Vec::new();
+        let mut image_token_counts: Vec<usize> = Vec::new();
+        let mut total_patches = 0usize;
+
+        for msg in &chat_messages {
+            for img_input in &msg.content.images {
+                let (pv, pos, n_patches, n_soft) =
+                    preprocess_image(img_input, patch_size, pooling_kernel, default_output_length)
+                        .map_err(|e| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": format!("Image preprocessing failed: {e}")})),
+                            )
+                        })?;
+                all_pixel_values.extend_from_slice(&pv);
+                all_position_ids.extend_from_slice(&pos);
+                image_token_counts.push(n_soft);
+                total_patches += n_patches;
+            }
+        }
+
+        let prompt = apply_gemma4_with_images(&chat_messages, &image_token_counts);
+        let tokens = tokenizer.encode(&prompt, false).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Failed to tokenize: {e}")})),
+            )
+        })?;
+
+        let patch_pixels = patch_size * patch_size * 3;
+        let pixel_tensor = candle_core::Tensor::from_vec(
+            all_pixel_values,
+            (total_patches, patch_pixels),
+            &candle_core::Device::Cpu,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Pixel tensor creation failed: {e}")})),
+            )
+        })?
+        .to_dtype(candle_core::DType::F32)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Pixel dtype conversion failed: {e}")})),
+            )
+        })?;
+
+        let pos_tensor = candle_core::Tensor::from_vec(
+            all_position_ids,
+            (total_patches, 2),
+            &candle_core::Device::Cpu,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Position tensor creation failed: {e}")})),
+            )
+        })?;
+
+        let n_soft_total = image_token_counts.iter().sum();
+        let ctx = ImageEmbedContext {
+            pixel_values: pixel_tensor,
+            position_ids: pos_tensor,
+            n_soft_tokens: n_soft_total,
+            image_token_id,
+        };
+
+        (tokens, Some(ctx))
+    } else {
+        let tokens = tokenizer
+            .apply_chat_template_and_encode(&chat_messages)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+                )
+            })?;
+        (tokens, None)
+    };
 
     ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
@@ -4172,7 +4288,8 @@ async fn ollama_chat(
     if is_stream {
         let prompt_eval_count = prompt_tokens.len();
         let token_rx =
-            ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
+            ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, image_ctx, params)
+                .await?;
 
         let model_name = req.model.clone();
         let stream = make_ollama_chat_stream(
@@ -4189,7 +4306,8 @@ async fn ollama_chat(
             .into_response())
     } else {
         let result =
-            ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, params).await?;
+            ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, image_ctx, params)
+                .await?;
 
         // The engine's ThinkFilter has already separated reasoning and content.
         let (thinking, content) = if think_enabled && !result.reasoning_content.is_empty() {
@@ -4209,6 +4327,7 @@ async fn ollama_chat(
             message: OllamaChatMessage {
                 role: "assistant".to_string(),
                 content,
+                images: vec![],
                 thinking,
             },
             done: true,
@@ -4267,6 +4386,7 @@ fn make_ollama_chat_stream(
                     message: OllamaChatMessage {
                         role: "assistant".to_string(),
                         content: content_text,
+                        images: vec![],
                         thinking,
                     },
                     done: true,
@@ -4285,6 +4405,7 @@ fn make_ollama_chat_stream(
                     message: OllamaChatMessage {
                         role: "assistant".to_string(),
                         content: content_text,
+                        images: vec![],
                         thinking,
                     },
                     done: false,

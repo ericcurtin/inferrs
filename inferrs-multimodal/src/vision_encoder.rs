@@ -244,8 +244,12 @@ impl VisionAttention {
 
         // Bidirectional attention with scale=1.0 (Gemma4VisionAttention sets scaling=1.0,
         // not the usual 1/sqrt(head_dim)).
-        let attn = q.matmul(&k.transpose(1, 2)?)?; // [nh, N, N]
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        // `.contiguous()` on the transposed rhs is required: Metal matmul kernels
+        // require both operands to be contiguous, and transpose produces a strided
+        // view that candle-metal misidentifies as a device mismatch.
+        let k_t = k.transpose(1, 2)?.contiguous()?;
+        let attn = q.matmul(&k_t)?; // [nh, N, N]
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?.contiguous()?;
         let out = attn.matmul(&v)?; // [nh, N, hd]
 
         // Merge heads: [N, nh*hd].
