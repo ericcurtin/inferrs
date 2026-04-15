@@ -95,14 +95,15 @@ impl Device {
         length: usize,
         options: MTLResourceOptions,
     ) -> Result<Buffer, MetalKernelError> {
-        let nonnull = ptr::NonNull::new(pointer as *mut c_void).ok_or_else(|| {
-            MetalKernelError::FailedToCreateResource("null ptr".to_string())
-        })?;
+        let nonnull = ptr::NonNull::new(pointer as *mut c_void)
+            .ok_or_else(|| MetalKernelError::FailedToCreateResource("null ptr".to_string()))?;
         unsafe {
             self.as_ref()
                 .newBufferWithBytesNoCopy_length_options_deallocator(nonnull, length, options, None)
                 .map(Buffer::new)
-                .ok_or(MetalKernelError::FailedToCreateResource("NoCopyBuffer".to_string()))
+                .ok_or(MetalKernelError::FailedToCreateResource(
+                    "NoCopyBuffer".to_string(),
+                ))
         }
     }
 

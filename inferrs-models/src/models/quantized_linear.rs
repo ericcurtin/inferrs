@@ -169,7 +169,6 @@ impl QLinear {
             Err(e) => Some(Err(e)),
         }
     }
-
     #[cfg(feature = "metal")]
     pub fn forward_triple_q4k(
         &self,
@@ -220,7 +219,6 @@ impl QLinear {
             Err(e) => Some(Err(e)),
         }
     }
-
     pub fn forward_f32(&self, xs_f32: &Tensor) -> Result<Tensor> {
         debug_assert_eq!(xs_f32.dtype(), DType::F32, "forward_f32 requires F32 input");
         match &self.inner {
@@ -282,6 +280,9 @@ impl QLinear {
 #[derive(Clone)]
 pub struct QGgufVarBuilder {
     file: Arc<std::sync::Mutex<std::fs::File>>,
+    /// Memory-mapped view of the GGUF file (populated when the file is mmap-able).
+    /// When present, tensors are loaded via no-copy Metal buffers.
+    mmap: Option<Arc<memmap2::Mmap>>,
     content: Arc<candle_core::quantized::gguf_file::Content>,
     cache: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Arc<candle_core::quantized::QTensor>>>,
@@ -303,8 +304,11 @@ impl QGgufVarBuilder {
         use candle_core::quantized::gguf_file;
         let mut file = std::fs::File::open(p.as_ref()).map_err(candle_core::Error::from)?;
         let content = gguf_file::Content::read(&mut file)?;
+        // Memory-map the file for zero-copy Metal buffer creation.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.ok().map(Arc::new);
         Ok(Self {
             file: Arc::new(std::sync::Mutex::new(file)),
+            mmap,
             content: Arc::new(content),
             cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             name_remap: Arc::new(std::collections::HashMap::new()),
@@ -319,6 +323,7 @@ impl QGgufVarBuilder {
         path.push(s.to_string());
         Self {
             file: self.file.clone(),
+            mmap: self.mmap.clone(),
             content: self.content.clone(),
             cache: self.cache.clone(),
             name_remap: self.name_remap.clone(),
@@ -361,7 +366,11 @@ impl QGgufVarBuilder {
         if !self.content.tensor_infos.contains_key(gguf_name.as_ref()) {
             return Ok(None);
         }
-        let qt = {
+        let qt = if let Some(mmap) = &self.mmap {
+            // Zero-copy: load tensor from mmap'd file slice.
+            self.content
+                .tensor_from_mmap(mmap, gguf_name.as_ref(), &self.device)?
+        } else {
             let mut file = self.file.lock().unwrap();
             self.content
                 .tensor(&mut *file, gguf_name.as_ref(), &self.device)?
@@ -434,6 +443,7 @@ impl QGgufVarBuilder {
             .collect();
         Ok(Self {
             file: self.file.clone(),
+            mmap: self.mmap.clone(),
             content: self.content.clone(),
             cache: self.cache.clone(),
             name_remap: Arc::new(remap),

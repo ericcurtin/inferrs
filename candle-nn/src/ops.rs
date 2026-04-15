@@ -1406,16 +1406,6 @@ pub fn sdpa_2pass_prealloc(
     // Try BN=1 kernel first: no intra-block barriers, 8192 threads (1 GPU wave).
     // Falls back to standard 2-pass for non-BF16 or unsupported head dims.
     let used_bn1 = candle_metal_kernels::call_sdpa_vector_2pass_bn1(
-        device.device(), &encoder, device.kernels(),
-        q_l.start_offset(), q_dims, q_m.buffer(),
-        k_l.start_offset(), k_l.dims(), k_l.stride(), k_m.buffer(),
-        v_l.start_offset(), v_l.stride(), v_m.buffer(),
-        out_buf_ref, i_m.buffer(), s_m.buffer(), m_m.buffer(),
-        scale, softcapping, itype,
-    ).map_err(candle::Error::wrap)?;
-
-    if !used_bn1 {
-        candle_metal_kernels::call_sdpa_vector_2pass(
         device.device(),
         &encoder,
         device.kernels(),
@@ -1429,7 +1419,7 @@ pub fn sdpa_2pass_prealloc(
         v_l.start_offset(),
         v_l.stride(),
         v_m.buffer(),
-        &out_buf,
+        out_buf_ref,
         i_m.buffer(),
         s_m.buffer(),
         m_m.buffer(),
@@ -1438,6 +1428,31 @@ pub fn sdpa_2pass_prealloc(
         itype,
     )
     .map_err(candle::Error::wrap)?;
+
+    if !used_bn1 {
+        candle_metal_kernels::call_sdpa_vector_2pass(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            q_l.start_offset(),
+            q_dims,
+            q_m.buffer(),
+            k_l.start_offset(),
+            k_l.dims(),
+            k_l.stride(),
+            k_m.buffer(),
+            v_l.start_offset(),
+            v_l.stride(),
+            v_m.buffer(),
+            &out_buf,
+            i_m.buffer(),
+            s_m.buffer(),
+            m_m.buffer(),
+            scale,
+            softcapping,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
     }
 
     let out_storage = candle::Storage::Metal(candle::MetalStorage::new(
@@ -1455,6 +1470,119 @@ pub fn sdpa_2pass_prealloc(
     Ok(Some(result))
 }
 
+/// Single-token SDPA with ALL buffers pre-allocated (no per-step Metal allocations).
+///
+/// Like `sdpa_2pass_prealloc` but also takes a pre-allocated BF16 output tensor,
+/// eliminating the `new_buffer` call that was the last per-step allocation overhead.
+/// The caller must ensure `out` has the same shape as `q`.
+///
+/// Returns `true` when the kernel was dispatched, `false` when unsupported.
+/// On return, `out` contains the attention output.
+#[cfg(feature = "metal")]
+pub fn sdpa_2pass_prealloc_full(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    intermediate: &Tensor, // pre-allocated [n_q_heads, NBLOCKS, head_dim] F32
+    sums: &Tensor,         // pre-allocated [n_q_heads, NBLOCKS] F32
+    maxs: &Tensor,         // pre-allocated [n_q_heads, NBLOCKS] F32
+    out: &Tensor,          // pre-allocated output, same shape as q, BF16
+) -> Result<bool> {
+    use candle::{DType, Storage};
+    use candle_metal_kernels::SdpaDType;
+
+    if q.dtype() != DType::BF16 {
+        return Ok(false);
+    }
+    let device = match q.device() {
+        candle::Device::Metal(d) => d,
+        _ => return Ok(false),
+    };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    let (i_s, _) = intermediate.storage_and_layout();
+    let (s_s, _) = sums.storage_and_layout();
+    let (m_s, _) = maxs.storage_and_layout();
+    let (o_s, _) = out.storage_and_layout();
+
+    let (q_m, k_m, v_m, i_m, s_m, m_m, o_m) =
+        match (&*q_s, &*k_s, &*v_s, &*i_s, &*s_s, &*m_s, &*o_s) {
+            (
+                Storage::Metal(a),
+                Storage::Metal(b),
+                Storage::Metal(c),
+                Storage::Metal(d),
+                Storage::Metal(e),
+                Storage::Metal(f),
+                Storage::Metal(g),
+            ) => (a, b, c, d, e, f, g),
+            _ => return Ok(false),
+        };
+
+    let q_dims = q_l.dims();
+    let itype = SdpaDType::BF16;
+
+    let encoder = device.command_encoder()?;
+
+    // Use BN=1 2-pass kernel: no intra-block barriers, matches llama.cpp flash_attn_ext_vec
+    // grid layout (NWG=32, NSG=1). Falls back to standard 2-pass for non-BF16.
+    let used_bn1 = candle_metal_kernels::call_sdpa_vector_2pass_bn1(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        q_dims,
+        q_m.buffer(),
+        k_l.start_offset(),
+        k_l.dims(),
+        k_l.stride(),
+        k_m.buffer(),
+        v_l.start_offset(),
+        v_l.stride(),
+        v_m.buffer(),
+        o_m.buffer(),
+        i_m.buffer(),
+        s_m.buffer(),
+        m_m.buffer(),
+        scale,
+        softcapping,
+        itype,
+    )
+    .map_err(candle::Error::wrap)?;
+
+    if !used_bn1 {
+        candle_metal_kernels::call_sdpa_vector_2pass(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            q_l.start_offset(),
+            q_dims,
+            q_m.buffer(),
+            k_l.start_offset(),
+            k_l.dims(),
+            k_l.stride(),
+            k_m.buffer(),
+            v_l.start_offset(),
+            v_l.stride(),
+            v_m.buffer(),
+            o_m.buffer(),
+            i_m.buffer(),
+            s_m.buffer(),
+            m_m.buffer(),
+            scale,
+            softcapping,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+    }
+
+    Ok(true)
+}
+
 #[cfg(feature = "metal")]
 /// Flash attention (llama.cpp flash_attn_ext_vec port).
 /// Uses 32 parallel workgroups with Q in SMEM, for BF16 + head_dim=256.
@@ -1464,13 +1592,17 @@ pub fn sdpa_flash_attn_vec(
     k: &Tensor,
     v: &Tensor,
     scale: f32,
-    tmp: &Tensor,  // pre-allocated: [n_q_heads * 32 * 258] F32
+    tmp: &Tensor, // pre-allocated: [n_q_heads * 32 * 258] F32
 ) -> Result<Option<Tensor>> {
     use candle::{DType, Storage};
 
-    if q.dtype() != DType::BF16 { return Ok(None); }
+    if q.dtype() != DType::BF16 {
+        return Ok(None);
+    }
     let head_dim = q.dims().last().copied().unwrap_or(0);
-    if head_dim != 256 { return Ok(None); }
+    if head_dim != 256 {
+        return Ok(None);
+    }
 
     let device = match q.device() {
         candle::Device::Metal(d) => d,
@@ -1480,10 +1612,12 @@ pub fn sdpa_flash_attn_vec(
     let (q_s, q_l) = q.storage_and_layout();
     let (k_s, k_l) = k.storage_and_layout();
     let (v_s, v_l) = v.storage_and_layout();
-    let (t_s, _)   = tmp.storage_and_layout();
+    let (t_s, _) = tmp.storage_and_layout();
 
     let (qm, km, vm, tm) = match (&*q_s, &*k_s, &*v_s, &*t_s) {
-        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => (a, b, c, d),
+        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => {
+            (a, b, c, d)
+        }
         _ => return Ok(None),
     };
 
@@ -1493,7 +1627,7 @@ pub fn sdpa_flash_attn_vec(
     let n_kv_heads = k_dims[1];
     let gqa_factor = (n_q_heads / n_kv_heads) as i32;
     let n = k_dims[2] as i32;
-    let kstride = k_l.stride()[1];  // stride per KV head in elements
+    let kstride = k_l.stride()[1]; // stride per KV head in elements
     let vstride = v_l.stride()[1];
 
     let elem_count = q_dims.iter().product::<usize>();
@@ -1505,22 +1639,41 @@ pub fn sdpa_flash_attn_vec(
 
     // Pass 1: main kernel (32 workgroups per Q-head)
     candle_metal_kernels::call_flash_attn_ext_vec_main(
-        device.device(), &encoder, device.kernels(),
-        q_l.start_offset(), qm.buffer(),
-        k_l.start_offset(), km.buffer(),
-        v_l.start_offset(), vm.buffer(),
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        qm.buffer(),
+        k_l.start_offset(),
+        km.buffer(),
+        v_l.start_offset(),
+        vm.buffer(),
         tm.buffer(),
-        n, kstride, vstride, alpha, gqa_factor, n_q_heads,
-    ).map_err(candle::Error::wrap)?;
+        n,
+        kstride,
+        vstride,
+        alpha,
+        gqa_factor,
+        n_q_heads,
+    )
+    .map_err(candle::Error::wrap)?;
 
     // Pass 2: reduce kernel (combine 32 partial outputs)
     candle_metal_kernels::call_flash_attn_ext_vec_reduce(
-        device.device(), &encoder, device.kernels(),
-        tm.buffer(), &out_buf, n_q_heads,
-    ).map_err(candle::Error::wrap)?;
+        device.device(),
+        &encoder,
+        device.kernels(),
+        tm.buffer(),
+        &out_buf,
+        n_q_heads,
+    )
+    .map_err(candle::Error::wrap)?;
 
     let out_storage = candle::Storage::Metal(candle::MetalStorage::new(
-        out_buf, device.clone(), elem_count, DType::BF16,
+        out_buf,
+        device.clone(),
+        elem_count,
+        DType::BF16,
     ));
     let result = candle::Tensor::from_storage(
         out_storage,

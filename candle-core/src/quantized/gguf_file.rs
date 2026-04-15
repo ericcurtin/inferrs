@@ -55,6 +55,38 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// Load tensor from a pre-mmap'd byte slice (avoids read_exact copy).
+    pub fn read_from_mmap(
+        &self,
+        gguf_data: &[u8],
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let start = (tensor_data_offset + self.offset) as usize;
+        let end = start + size_in_bytes;
+        if end > gguf_data.len() {
+            crate::bail!(
+                "tensor out of range: end={end} file_len={}",
+                gguf_data.len()
+            );
+        }
+        // No-copy: Metal buffer wraps the mmap'd slice directly.
+        super::ggml_file::qtensor_from_ggml_no_copy(
+            self.ggml_dtype,
+            &gguf_data[start..end],
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
+
     pub fn read<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
@@ -465,6 +497,20 @@ impl Content {
             tensor_infos,
             tensor_data_offset,
         })
+    }
+
+    /// Load tensor from a pre-mmap'd slice — avoids read_exact + heap alloc per tensor.
+    pub fn tensor_from_mmap(
+        &self,
+        gguf_data: &[u8],
+        name: &str,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(ti) => ti,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_from_mmap(gguf_data, self.tensor_data_offset, device)
     }
 
     pub fn tensor<R: std::io::Seek + std::io::Read>(

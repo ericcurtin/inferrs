@@ -304,7 +304,6 @@ impl QMetalStorage {
         let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
     }
-
     /// Fused double GEMV for Q4K: compute `out_a = self @ xs` and `out_b = other @ xs`
     /// in a single Metal dispatch, halving kernel-launch overhead and improving
     /// input-vector cache reuse.  Only valid when both tensors are Q4K with the same shape.
@@ -375,7 +374,6 @@ impl QMetalStorage {
             crate::MetalStorage::new(dst_b, device, dst_shape.elem_count(), DType::F32);
         Ok(((da_storage, dst_shape.clone()), (db_storage, dst_shape)))
     }
-
     /// Fused QKV triple Q4K GEMV on Metal.
     /// `self`=q_weight, `kw`=k_weight, `vw`=v_weight; all must be Q4K.
     pub fn fwd_mv3_q4k(
@@ -590,6 +588,25 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         device,
         buffer,
         offset,
+    }))
+}
+
+/// Load quantized tensor using zero-copy from mmap'd data.
+/// `data` must remain valid for the lifetime of the returned QStorage.
+/// Uses `newBufferWithBytesNoCopy` to avoid the copy overhead of `newBufferWithBytes`.
+pub fn load_quantized_no_copy<T: super::GgmlType + Send + Sync + 'static>(
+    device: &MetalDevice,
+    data: &[T],
+) -> Result<QStorage> {
+    // Safety: data comes from a memory-mapped file that lives for the program lifetime.
+    // The no-copy Metal buffer wraps this memory directly.
+    let buffer = unsafe { device.new_buffer_no_copy(data)? };
+    let device = device.clone();
+    Ok(QStorage::Metal(QMetalStorage {
+        dtype: T::DTYPE,
+        device,
+        buffer,
+        offset: 0,
     }))
 }
 

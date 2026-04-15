@@ -117,6 +117,27 @@ impl Vocab {
     }
 }
 
+/// Like from_raw_data but uses zero-copy Metal allocation (for mmap'd GGUF data).
+fn from_raw_data_no_copy<T: super::GgmlType + Send + Sync + 'static>(
+    raw_data: &[u8],
+    size_in_bytes: usize,
+    dims: Vec<usize>,
+    device: &Device,
+) -> Result<super::QTensor> {
+    let raw_data_ptr = raw_data.as_ptr();
+    let n_blocks = size_in_bytes / std::mem::size_of::<T>();
+    let data = unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) };
+    let storage: QStorage = match device {
+        Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
+        #[cfg(feature = "metal")]
+        Device::Metal(metal) => super::metal::load_quantized_no_copy(metal, data)?,
+        #[cfg(not(feature = "metal"))]
+        Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
+        Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
+    };
+    super::QTensor::new(storage, dims)
+}
+
 fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
     raw_data: &[u8],
     size_in_bytes: usize,
@@ -132,6 +153,66 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
     };
     super::QTensor::new(data, dims)
+}
+
+/// Creates a QTensor from mmap'd GGML data using zero-copy Metal allocation.
+pub fn qtensor_from_ggml_no_copy(
+    ggml_dtype: GgmlDType,
+    raw_data: &[u8],
+    dims: Vec<usize>,
+    device: &Device,
+) -> Result<super::QTensor> {
+    let tensor_elems = dims.iter().product::<usize>();
+    let block_size = ggml_dtype.block_size();
+    if tensor_elems % block_size != 0 {
+        crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+    }
+    let size_in_bytes = tensor_elems / block_size * ggml_dtype.type_size();
+    match ggml_dtype {
+        GgmlDType::F32 => from_raw_data_no_copy::<f32>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::F16 => from_raw_data_no_copy::<half::f16>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::BF16 => {
+            from_raw_data_no_copy::<half::bf16>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q4_0 => {
+            from_raw_data_no_copy::<super::BlockQ4_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q4_1 => {
+            from_raw_data_no_copy::<super::BlockQ4_1>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q5_0 => {
+            from_raw_data_no_copy::<super::BlockQ5_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q5_1 => {
+            from_raw_data_no_copy::<super::BlockQ5_1>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q8_0 => {
+            from_raw_data_no_copy::<super::BlockQ8_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q8_1 => {
+            from_raw_data_no_copy::<super::BlockQ8_1>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q2K => {
+            from_raw_data_no_copy::<super::BlockQ2K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q3K => {
+            from_raw_data_no_copy::<super::BlockQ3K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q4K => {
+            from_raw_data_no_copy::<super::BlockQ4K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q5K => {
+            from_raw_data_no_copy::<super::BlockQ5K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q6K => {
+            from_raw_data_no_copy::<super::BlockQ6K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q8K => {
+            from_raw_data_no_copy::<super::BlockQ8K>(raw_data, size_in_bytes, dims, device)
+        }
+    }
 }
 
 /// Creates a [Tensor] from a raw GGML tensor.

@@ -1313,15 +1313,38 @@ impl Attention {
 
             // Try fused triple QKV GEMV (Q4K Metal only); fall back to 3 separate GEMVs.
             #[cfg(feature = "metal")]
-            let qkv_fused = self.q_proj.forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
+            let qkv_fused = self
+                .q_proj
+                .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
             #[cfg(not(feature = "metal"))]
-            let qkv_fused: Option<candle_core::Result<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)>> = None;
+            let qkv_fused: Option<
+                candle_core::Result<(
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                )>,
+            > = None;
             if let Some(result) = qkv_fused {
                 let (q_f32, k_f32, v_f32) = result?;
                 (
-                    q_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
-                    k_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                    v_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                    q_f32.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_heads,
+                        self.head_dim,
+                    ))?,
+                    k_f32.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ))?,
+                    v_f32.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ))?,
                 )
             } else {
                 // Fallback: three GEMVs sharing one F32 input copy.
@@ -1469,6 +1492,8 @@ impl Attention {
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
 
             // Pre-allocated 2-pass SDPA (Metal only) for donor layers.
+            // All intermediate and output buffers are pre-allocated to avoid
+            // per-step Metal buffer allocations during decode.
             #[cfg(feature = "metal")]
             if self.sdpa_2pass_intermediate.is_none()
                 && matches!(query_states.device(), candle_core::Device::Metal(_))
@@ -1478,24 +1503,47 @@ impl Attention {
                 const NBLOCKS: usize = 32;
                 let dev = query_states.device();
                 self.sdpa_2pass_intermediate = Some(Tensor::zeros(
-                    (self.num_heads, NBLOCKS, self.head_dim), DType::F32, dev,
+                    (self.num_heads, NBLOCKS, self.head_dim),
+                    DType::F32,
+                    dev,
                 )?);
                 self.sdpa_2pass_sums =
                     Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
                 self.sdpa_2pass_maxs =
                     Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                // Pre-allocate output buffer to eliminate per-step new_buffer call.
+                self.sdpa_2pass_out = Some(Tensor::zeros(
+                    (1usize, self.num_heads, 1usize, self.head_dim),
+                    DType::BF16,
+                    dev,
+                )?);
             }
             #[cfg(feature = "metal")]
-            let donor_attn = if let (Some(interm), Some(sums), Some(maxs)) = (
+            let donor_attn = if let (Some(interm), Some(sums), Some(maxs), Some(out)) = (
                 &self.sdpa_2pass_intermediate,
                 &self.sdpa_2pass_sums,
                 &self.sdpa_2pass_maxs,
+                &self.sdpa_2pass_out,
             ) {
-                candle_nn::ops::sdpa_2pass_prealloc(
-                    &query_states, &key_states, &value_states,
-                    1.0_f32, softcapping, interm, sums, maxs,
-                )?
-            } else { None };
+                let used = candle_nn::ops::sdpa_2pass_prealloc_full(
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    1.0_f32,
+                    softcapping,
+                    interm,
+                    sums,
+                    maxs,
+                    out,
+                )?;
+                if used {
+                    Some(out.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             #[cfg(not(feature = "metal"))]
             let donor_attn: Option<candle_core::Tensor> = None;
 
@@ -1593,10 +1641,14 @@ impl Attention {
                     .to_dtype(orig_dtype)?
                     .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             })
-        } else { None };
+        } else {
+            None
+        };
         #[cfg(not(feature = "metal"))]
         let q_raw_metal_opt: Option<candle_core::Tensor> = None;
-        let q_raw = if let Some(q) = q_raw_metal_opt { q } else if need_pre_convert {
+        let q_raw = if let Some(q) = q_raw_metal_opt {
+            q
+        } else if need_pre_convert {
             let orig_dtype = xs.dtype();
             self.q_proj
                 .forward_f32(&xs.to_dtype(DType::F32)?)?
@@ -1639,10 +1691,11 @@ impl Attention {
                         1.0_f32,
                         tmp,
                     )? {
-                        return attn_out
-                            .transpose(1, 2)?
-                            .reshape((b_sz, q_len, ()))?
-                            .apply(&self.o_proj);
+                        return self.apply_o_proj(&attn_out.transpose(1, 2)?.reshape((
+                            b_sz,
+                            q_len,
+                            (),
+                        ))?);
                     }
                 }
             }
@@ -1681,12 +1734,13 @@ impl Attention {
                         dev,
                     )?);
                 }
-                if let (Some(interm), Some(sums), Some(maxs)) = (
+                if let (Some(interm), Some(sums), Some(maxs), Some(out)) = (
                     &self.sdpa_2pass_intermediate,
                     &self.sdpa_2pass_sums,
                     &self.sdpa_2pass_maxs,
+                    &self.sdpa_2pass_out,
                 ) {
-                    if let Some(attn_out) = candle_nn::ops::sdpa_2pass_prealloc(
+                    let used = candle_nn::ops::sdpa_2pass_prealloc_full(
                         &query_states,
                         shared_key,
                         shared_value,
@@ -1695,11 +1749,14 @@ impl Attention {
                         interm,
                         sums,
                         maxs,
-                    )? {
-                        return attn_out
-                            .transpose(1, 2)?
-                            .reshape((b_sz, q_len, ()))?
-                            .apply(&self.o_proj);
+                        out,
+                    )?;
+                    if used {
+                        return self.apply_o_proj(&out.clone().transpose(1, 2)?.reshape((
+                            b_sz,
+                            q_len,
+                            (),
+                        ))?);
                     }
                 }
             }
@@ -1707,18 +1764,19 @@ impl Attention {
             // GQA 1-pass disabled: 2-pass with pre-allocated BN=1 buffers is used below.
 
             // Fallback to standard sdpa.
-            return candle_nn::ops::sdpa(
-                &query_states,
-                shared_key,
-                shared_value,
-                None,
-                false,
-                1.0_f32,
-                softcapping,
-            )?
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, ()))?
-            .apply(&self.o_proj);
+            return self.apply_o_proj(
+                &candle_nn::ops::sdpa(
+                    &query_states,
+                    shared_key,
+                    shared_value,
+                    None,
+                    false,
+                    1.0_f32,
+                    softcapping,
+                )?
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, ()))?,
+            );
         }
 
         // Use Q-reshape GQA path: avoids materializing expanded K/V copies.

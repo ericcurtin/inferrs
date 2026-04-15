@@ -718,7 +718,6 @@ impl QTensor {
             _ => Ok(None),
         }
     }
-
     #[cfg(feature = "metal")]
     /// Fused QKV triple Q4K GEMV on Metal: `(q, k, v) = (self@xs, kw@xs, vw@xs)`
     /// in a single dispatch.  Q and K/V may differ in output size (GQA).
