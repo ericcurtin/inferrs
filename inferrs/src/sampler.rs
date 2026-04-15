@@ -187,7 +187,11 @@ pub fn sample_token(
     // ── 2. Repetition penalty (llama.cpp / Ollama) ────────────────────────────
     // Formula: logit / penalty if logit ≥ 0, logit * penalty if logit < 0.
     // Applied only to tokens within the `repeat_last_n` window.
-    if params.repetition_penalty != 1.0 && !penalty_tokens.is_empty() {
+    // Guard against 1.0 (no-op) and 0.0 (would divide by zero).
+    if params.repetition_penalty != 1.0
+        && params.repetition_penalty != 0.0
+        && !penalty_tokens.is_empty()
+    {
         let p = params.repetition_penalty as f32;
         let mut seen = std::collections::HashSet::new();
         for &id in penalty_tokens {
@@ -675,5 +679,22 @@ mod tests {
         };
         let (tok2, _) = sample_token(&t, &strong, &previous).unwrap();
         assert_eq!(tok2, 1, "strong penalty should suppress token 0");
+    }
+
+    /// repetition_penalty=0.0 must not divide by zero; behaves as disabled.
+    #[test]
+    fn repetition_penalty_zero_does_not_divide_by_zero() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 0.0,
+            repeat_last_n: 64,
+            ..SamplingParams::default()
+        };
+        let previous = vec![0u32];
+        let base: Vec<f32> = vec![10.0, 5.0];
+        let t = Tensor::from_vec(base, 2usize, &Device::Cpu).unwrap();
+        // Should not panic; token 0 wins since no penalty is applied.
+        let (tok, _) = sample_token(&t, &params, &previous).unwrap();
+        assert_eq!(tok, 0, "zero penalty acts as disabled; token 0 still wins");
     }
 }
