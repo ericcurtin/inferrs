@@ -232,7 +232,7 @@ struct ChatOptions {
     top_p: f64,
     top_k: usize,
     num_predict: usize,
-    #[serde(skip_serializing_if = "is_one")]
+    #[serde(skip_serializing_if = "is_default_repeat_penalty")]
     repeat_penalty: f64,
     #[serde(skip_serializing_if = "is_default_repeat_last_n")]
     repeat_last_n: usize,
@@ -240,8 +240,8 @@ struct ChatOptions {
     frequency_penalty: f64,
 }
 
-fn is_one(v: &f64) -> bool {
-    (*v - 1.0).abs() < 1e-9
+fn is_default_repeat_penalty(v: &f64) -> bool {
+    (*v - 1.1).abs() < 1e-9
 }
 fn is_zero(v: &f64) -> bool {
     v.abs() < 1e-9
@@ -404,7 +404,7 @@ async fn audio_stream(
         "top_p": params.top_p,
         "top_k": params.top_k,
     });
-    if !is_one(&params.repetition_penalty) {
+    if !is_default_repeat_penalty(&params.repetition_penalty) {
         body["repetition_penalty"] = serde_json::json!(params.repetition_penalty);
     }
     if !is_default_repeat_last_n(&params.repeat_last_n) {
