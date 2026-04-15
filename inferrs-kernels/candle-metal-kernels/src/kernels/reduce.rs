@@ -227,6 +227,136 @@ pub fn call_rms_norm(
     Ok(())
 }
 
+/// Fused RMSNorm + residual add: `dst[i] = rms_norm(src[i]) * alpha[i] + residual[i]`
+///
+/// Saves one Metal kernel dispatch per call compared to the two-dispatch sequence
+/// (separate rms_norm + separate add), reducing total command encoder overhead.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_add(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements_to_sum: usize,
+    eps: f32,
+    input: &Buffer,
+    input_offset: usize,
+    alpha: &Buffer,
+    alpha_offset: usize,
+    residual: &Buffer,
+    residual_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            length,
+            elements_to_sum,
+            (input, input_offset),
+            output,
+            (alpha, alpha_offset),
+            (residual, residual_offset),
+            eps
+        )
+    );
+    let work_per_threadgroup = elements_to_sum;
+    let out_length = length / work_per_threadgroup;
+
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (work_per_threadgroup / 2).next_power_of_two(),
+    );
+
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.use_resource(input, MTLResourceUsage::Read);
+    encoder.use_resource(alpha, MTLResourceUsage::Read);
+    encoder.use_resource(residual, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+/// Fused RMSNorm + residual add + scalar multiply:
+/// `dst[i] = (rms_norm(src[i]) * alpha[i] + residual[i]) * scale`
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_add_scale(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements_to_sum: usize,
+    eps: f32,
+    scale: f32,
+    input: &Buffer,
+    input_offset: usize,
+    alpha: &Buffer,
+    alpha_offset: usize,
+    residual: &Buffer,
+    residual_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            length,
+            elements_to_sum,
+            (input, input_offset),
+            output,
+            (alpha, alpha_offset),
+            (residual, residual_offset),
+            eps,
+            scale
+        )
+    );
+    let work_per_threadgroup = elements_to_sum;
+    let out_length = length / work_per_threadgroup;
+
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (work_per_threadgroup / 2).next_power_of_two(),
+    );
+
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.use_resource(input, MTLResourceUsage::Read);
+    encoder.use_resource(alpha, MTLResourceUsage::Read);
+    encoder.use_resource(residual, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_layer_norm(
     device: &Device,

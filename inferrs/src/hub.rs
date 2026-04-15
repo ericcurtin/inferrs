@@ -423,16 +423,134 @@ fn read_hf_base_model(model_id: &str) -> Option<String> {
 /// models; progress is logged at INFO level.
 ///
 /// `gguf_file` is forwarded to [`download_model`] to support GGUF-only repos.
+///
+/// `quant_dtype` drives quantization:
+/// - `Some(dtype)` — quantize to `dtype` (or use the model recipe if registered)
+/// - `None` — no explicit format specified; auto-detect a cached GGUF or apply
+///   the model-specific recipe
+/// - use `force_bf16 = true` (i.e. `--quantize=none`) to skip both auto-detect
+///   and auto-recipe and load raw safetensors weights
 pub fn download_and_maybe_quantize(
     model_id: &str,
     revision: &str,
     gguf_file: Option<&str>,
     tokenizer_source: Option<&str>,
     quant_dtype: Option<GgmlDType>,
+    force_bf16: bool,
 ) -> Result<ModelFiles> {
     let mut files = download_model(model_id, revision, gguf_file, tokenizer_source)?;
 
     let Some(dtype) = quant_dtype else {
+        // When the user explicitly requested BF16 (--quantize=none / --quantize=false),
+        // skip both the cached-GGUF auto-detect and the model-recipe auto-quantize paths
+        // and return the raw safetensors weights.
+        if force_bf16 {
+            return Ok(files);
+        }
+
+        // No explicit --quantize flag.  Check whether a previously-generated GGUF
+        // already exists next to the safetensors shards; if so, auto-use it so
+        // that re-running `inferrs serve <model>` after a prior `--quantize` run
+        // automatically benefits from the quantized weights (better decode speed,
+        // smaller memory footprint) without requiring the user to re-specify the flag.
+        if !files.weight_paths.is_empty() && files.gguf_path.is_none() {
+            // Check for any model-*.gguf file alongside the safetensors shards,
+            // preferring Q4K, then Q8_0, then any other quantization.
+            let shard_dir = files.weight_paths[0].parent().map(|p| p.to_path_buf());
+            if let Some(dir) = shard_dir {
+                let candidate = if let Ok(entries) = std::fs::read_dir(&dir) {
+                    let mut gguf_files: Vec<std::path::PathBuf> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.extension().map(|e| e == "gguf").unwrap_or(false)
+                                && !p
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|s| s.contains("mmproj"))
+                                    .unwrap_or(false)
+                        })
+                        .collect();
+                    gguf_files.sort();
+                    // Prefer Q4K, then Q8_0, then anything else.
+                    gguf_files
+                        .iter()
+                        .find(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| {
+                                    let lower = s.to_lowercase();
+                                    lower.contains("q4_k") || lower.contains("q4k")
+                                })
+                                .unwrap_or(false)
+                        })
+                        .or_else(|| {
+                            gguf_files.iter().find(|p| {
+                                p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|s| {
+                                        let lower = s.to_lowercase();
+                                        lower.contains("q8_0")
+                                    })
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .or_else(|| gguf_files.first())
+                        .cloned()
+                } else {
+                    None
+                };
+                if let Some(gguf) = candidate {
+                    tracing::info!(
+                        "Auto-detected pre-existing GGUF at {} — using quantized weights \
+                         (delete the .gguf file or pass `--quantize=none` to force BF16)",
+                        gguf.display(),
+                    );
+                    files.gguf_path = Some(gguf);
+                    return Ok(files);
+                }
+            }
+        }
+
+        // No GGUF found.  If a model-specific recipe is registered, quantize
+        // automatically so that subsequent `inferrs serve` calls get the
+        // optimised weights without the user needing to pass `--quantize`.
+        if !files.weight_paths.is_empty() && files.gguf_path.is_none() {
+            if let Some(recipe) = crate::quantize::recipe_for(model_id) {
+                tracing::info!(
+                    "Auto-quantizing {} using model-specific recipe {:?} ({}). \
+                     Pass `--quantize=none` to load raw BF16 weights instead.",
+                    model_id,
+                    recipe.label,
+                    format!("{:?}", recipe.default_dtype),
+                );
+                // Fall through to the quantization path below by supplying the
+                // recipe's default dtype as if the user had passed --quantize.
+                let dtype = recipe.default_dtype;
+                let effective_dtype = dtype; // recipe IS the effective dtype here
+                let gguf = crate::quantize::gguf_path(&files.weight_paths, effective_dtype);
+                let needs_quantize = !gguf.exists();
+                if needs_quantize {
+                    let tmp = gguf.with_extension("gguf.tmp");
+                    crate::quantize::convert_to_gguf(
+                        &files.weight_paths,
+                        &tmp,
+                        dtype,
+                        Some(model_id),
+                    )?;
+                    std::fs::rename(&tmp, &gguf).with_context(|| {
+                        format!("Failed to rename {} → {}", tmp.display(), gguf.display())
+                    })?;
+                } else {
+                    tracing::info!(
+                        "Reusing cached GGUF at {} ({:?})",
+                        gguf.display(),
+                        effective_dtype
+                    );
+                }
+                files.gguf_path = Some(gguf);
+            }
+        }
         return Ok(files);
     };
 
@@ -456,7 +574,15 @@ pub fn download_and_maybe_quantize(
         return Ok(files);
     }
 
-    let gguf = crate::quantize::gguf_path(&files.weight_paths, dtype);
+    // When a model-specific recipe exists, the GGUF filename is derived from
+    // the recipe's headline dtype (e.g. Q4K for E4B) rather than the raw
+    // user-supplied dtype.  This avoids a misleading "model-Q4K.gguf" when
+    // the recipe actually quantizes some tensors differently.
+    let effective_dtype = crate::quantize::recipe_for(model_id)
+        .map(|r| r.default_dtype)
+        .unwrap_or(dtype);
+
+    let gguf = crate::quantize::gguf_path(&files.weight_paths, effective_dtype);
 
     // Re-quantize if the GGUF doesn't exist OR any base shard is newer than it.
     let needs_quantize = match std::fs::metadata(&gguf).and_then(|m| m.modified()) {
@@ -471,10 +597,14 @@ pub fn download_and_maybe_quantize(
                 tracing::info!(
                     "Base model is newer than cached GGUF at {} ({:?}); re-quantizing…",
                     gguf.display(),
-                    dtype
+                    effective_dtype,
                 );
             } else {
-                tracing::info!("Reusing cached GGUF at {} ({:?})", gguf.display(), dtype);
+                tracing::info!(
+                    "Reusing cached GGUF at {} ({:?})",
+                    gguf.display(),
+                    effective_dtype,
+                );
             }
             base_newer
         }
@@ -482,12 +612,12 @@ pub fn download_and_maybe_quantize(
     };
 
     if needs_quantize {
-        tracing::info!("Quantizing model to {:?}…", dtype);
+        tracing::info!("Quantizing model to {:?}…", effective_dtype);
         // Write to a temp path then atomically rename so that an interrupted
         // conversion (OOM, Ctrl-C, disk-full) never leaves a truncated file
         // that would be silently reused on the next run.
         let tmp = gguf.with_extension("gguf.tmp");
-        crate::quantize::convert_to_gguf(&files.weight_paths, &tmp, dtype)?;
+        crate::quantize::convert_to_gguf(&files.weight_paths, &tmp, dtype, Some(model_id))?;
         std::fs::rename(&tmp, &gguf)
             .with_context(|| format!("Failed to rename {} → {}", tmp.display(), gguf.display()))?;
     }

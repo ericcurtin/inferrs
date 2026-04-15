@@ -1823,6 +1823,7 @@ dependencies = [
  "candle-transformers",
  "half",
  "libloading 0.8.9",
+ "memmap2",
  "rayon",
  "serde",
  "serde_json",

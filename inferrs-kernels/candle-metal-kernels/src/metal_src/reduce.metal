@@ -1159,6 +1159,219 @@ kernel void NAME(                                       \
     }                                                   \
 }
 
+/// Fused RMSNorm + residual add: dst[i] = rms_norm(src[i]) * alpha[i] + residual[i]
+///
+/// Reduces one dispatch vs the standard (rms_norm → separate add).
+/// Used in Gemma4 decoder layers after attention/MLP output:
+///   xs = post_norm(attn_out) + residual
+template<
+    typename T,
+    ushort BLOCKSIZE
+>
+METAL_FUNC void rms_norm_add(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *residual,
+    constant float &eps,
+    threadgroup RMS<float> shared[BLOCKSIZE],
+    threadgroup float &total,
+
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]]
+) {
+    using Indexer = indexer_t<uint, false>;
+    Indexer indexer;
+    Divide fast_divide;
+    loader<T, RMS<float>, RMSLoadOp<float>, BLOCKSIZE,  Indexer, uint> load;
+    block_reducer<RMS<float>, RMSReduceOp<float>, BLOCKSIZE> reduce(shared);
+
+    const uint offset = dst_id * el_per_block;
+    const uint stop_idx = min(el_per_block + offset, src_numel);
+    const uint idx = tid + offset;
+
+    RMS<float> value = load(
+        RMSLoadOp<float>::init(),
+        indexer,
+        src_numel,
+        el_per_block,
+        src,
+        offset,
+        tid
+    );
+    RMS<float> result = RMS<float> { value.count, static_cast<float>(value.mean) };
+    result = reduce(result, tid);
+    if (tid == 0) {
+        total = rsqrt(fast_divide(result.mean, float(el_per_block)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma clang loop unroll(full)
+    for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
+        T val = src[i] * static_cast<T>(total);
+        val *= alpha[i - offset];
+        dst[i] = val + residual[i];
+    }
+}
+
+#define rms_norm_add_case(T, N)                             \
+case N: {                                               \
+    threadgroup RMS<float> shared[N];                   \
+    threadgroup float total;                            \
+    rms_norm_add<T, N>(                                 \
+        src_numel,                                      \
+        el_per_block,                                   \
+        src,                                            \
+        dst,                                            \
+        alpha,                                          \
+        residual,                                       \
+        eps,                                            \
+        shared,                                         \
+        total,                                          \
+        tid,                                            \
+        dst_id);                                        \
+    break;                                              \
+}
+
+#define impl_rms_norm_add(NAME, T)                          \
+kernel void NAME(                                           \
+    constant uint &src_numel,                               \
+    constant uint &el_per_block,                            \
+    device const T *src,                                    \
+    device T *dst,                                          \
+    device const T *alpha,                                  \
+    device const T *residual,                               \
+    constant float &eps,                                    \
+    uint tid [[ thread_index_in_threadgroup ]],             \
+    uint dst_id [[ threadgroup_position_in_grid ]],         \
+    uint block_dim [[ threads_per_threadgroup ]]            \
+) {                                                         \
+    switch (max_shared_mem<float>(block_dim)) {             \
+        rms_norm_add_case(T, 1024);                         \
+        rms_norm_add_case(T,  512);                         \
+        rms_norm_add_case(T,  256);                         \
+        rms_norm_add_case(T,  128);                         \
+        rms_norm_add_case(T,   64);                         \
+        rms_norm_add_case(T,   32);                         \
+        rms_norm_add_case(T,   16);                         \
+        rms_norm_add_case(T,    8);                         \
+        rms_norm_add_case(T,    4);                         \
+        rms_norm_add_case(T,    2);                         \
+        rms_norm_add_case(T,    1);                         \
+    }                                                       \
+}
+
+/// Fused RMSNorm + residual add + scalar multiply:
+///   dst[i] = (rms_norm(src[i]) * alpha[i] + residual[i]) * scale
+///
+/// Saves two dispatches vs the three-dispatch sequence (rms_norm + add + mul).
+/// Used in Gemma4 decoder layers for the PLI path:
+///   xs = (post_pli_norm(pli_out) + residual) * layer_scalar
+template<
+    typename T,
+    ushort BLOCKSIZE
+>
+METAL_FUNC void rms_norm_add_scale(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *residual,
+    constant float &eps,
+    constant float &scale,
+    threadgroup RMS<float> shared[BLOCKSIZE],
+    threadgroup float &total,
+
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]]
+) {
+    using Indexer = indexer_t<uint, false>;
+    Indexer indexer;
+    Divide fast_divide;
+    loader<T, RMS<float>, RMSLoadOp<float>, BLOCKSIZE,  Indexer, uint> load;
+    block_reducer<RMS<float>, RMSReduceOp<float>, BLOCKSIZE> reduce(shared);
+
+    const uint offset = dst_id * el_per_block;
+    const uint stop_idx = min(el_per_block + offset, src_numel);
+    const uint idx = tid + offset;
+
+    RMS<float> value = load(
+        RMSLoadOp<float>::init(),
+        indexer,
+        src_numel,
+        el_per_block,
+        src,
+        offset,
+        tid
+    );
+    RMS<float> result = RMS<float> { value.count, static_cast<float>(value.mean) };
+    result = reduce(result, tid);
+    if (tid == 0) {
+        total = rsqrt(fast_divide(result.mean, float(el_per_block)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma clang loop unroll(full)
+    for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
+        T val = src[i] * static_cast<T>(total);
+        val *= alpha[i - offset];
+        val = (val + residual[i]) * static_cast<T>(scale);
+        dst[i] = val;
+    }
+}
+
+#define rms_norm_add_scale_case(T, N)                           \
+case N: {                                                       \
+    threadgroup RMS<float> shared[N];                           \
+    threadgroup float total;                                    \
+    rms_norm_add_scale<T, N>(                                   \
+        src_numel,                                              \
+        el_per_block,                                           \
+        src,                                                    \
+        dst,                                                    \
+        alpha,                                                  \
+        residual,                                               \
+        eps,                                                    \
+        scale,                                                  \
+        shared,                                                 \
+        total,                                                  \
+        tid,                                                    \
+        dst_id);                                                \
+    break;                                                      \
+}
+
+#define impl_rms_norm_add_scale(NAME, T)                        \
+kernel void NAME(                                               \
+    constant uint &src_numel,                                   \
+    constant uint &el_per_block,                                \
+    device const T *src,                                        \
+    device T *dst,                                              \
+    device const T *alpha,                                      \
+    device const T *residual,                                   \
+    constant float &eps,                                        \
+    constant float &scale,                                      \
+    uint tid [[ thread_index_in_threadgroup ]],                 \
+    uint dst_id [[ threadgroup_position_in_grid ]],             \
+    uint block_dim [[ threads_per_threadgroup ]]                \
+) {                                                             \
+    switch (max_shared_mem<float>(block_dim)) {                 \
+        rms_norm_add_scale_case(T, 1024);                       \
+        rms_norm_add_scale_case(T,  512);                       \
+        rms_norm_add_scale_case(T,  256);                       \
+        rms_norm_add_scale_case(T,  128);                       \
+        rms_norm_add_scale_case(T,   64);                       \
+        rms_norm_add_scale_case(T,   32);                       \
+        rms_norm_add_scale_case(T,   16);                       \
+        rms_norm_add_scale_case(T,    8);                       \
+        rms_norm_add_scale_case(T,    4);                       \
+        rms_norm_add_scale_case(T,    2);                       \
+        rms_norm_add_scale_case(T,    1);                       \
+    }                                                           \
+}
+
 template<typename T>
 struct LayerNormValue {
     uint count;
@@ -1494,6 +1707,10 @@ kernel void FN_NAME_THD( \
 
 impl_rms_norm(rmsnorm_f32, float)
 impl_rms_norm(rmsnorm_f16, half)
+impl_rms_norm_add(rmsnorm_add_f32, float)
+impl_rms_norm_add(rmsnorm_add_f16, half)
+impl_rms_norm_add_scale(rmsnorm_add_scale_f32, float)
+impl_rms_norm_add_scale(rmsnorm_add_scale_f16, half)
 impl_layer_norm(layernorm_f32, float)
 impl_layer_norm(layernorm_f16, half)
 ROPE(rope_f32, rope_i_f32, rope_thd_f32, float)
@@ -1556,4 +1773,6 @@ impl_softmax(softmax_bf16, bfloat)
 impl_rms_norm(rmsnorm_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
+impl_rms_norm_add(rmsnorm_add_bf16, bfloat)
+impl_rms_norm_add_scale(rmsnorm_add_scale_bf16, bfloat)
 #endif

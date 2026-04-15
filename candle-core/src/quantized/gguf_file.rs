@@ -55,6 +55,38 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// Load tensor from a pre-mmap'd byte slice (avoids read_exact copy).
+    pub fn read_from_mmap(
+        &self,
+        gguf_data: &[u8],
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let start = (tensor_data_offset + self.offset) as usize;
+        let end = start + size_in_bytes;
+        if end > gguf_data.len() {
+            crate::bail!(
+                "tensor out of range: end={end} file_len={}",
+                gguf_data.len()
+            );
+        }
+        // No-copy: Metal buffer wraps the mmap'd slice directly.
+        super::ggml_file::qtensor_from_ggml_no_copy(
+            self.ggml_dtype,
+            &gguf_data[start..end],
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
+
     pub fn read<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
@@ -87,6 +119,50 @@ pub struct Content {
     pub metadata: HashMap<String, Value>,
     pub tensor_infos: HashMap<String, TensorInfo>,
     pub tensor_data_offset: u64,
+}
+
+/// Skip over an array value in the GGUF KV section without materializing it.
+/// Called after the value_type (Array) has been read but before the array body.
+fn skip_array<R: std::io::Read>(reader: &mut R, magic: &VersionedMagic) -> Result<()> {
+    let elem_type = reader.read_u32::<LittleEndian>()?;
+    let elem_type = ValueType::from_u32(elem_type)?;
+    let len = match magic {
+        VersionedMagic::GgufV1 => reader.read_u32::<LittleEndian>()? as usize,
+        VersionedMagic::GgufV2 | VersionedMagic::GgufV3 => {
+            reader.read_u64::<LittleEndian>()? as usize
+        }
+    };
+    match elem_type {
+        // String arrays: each element has a length-prefixed string.
+        ValueType::String => {
+            for _ in 0..len {
+                let str_len = match magic {
+                    VersionedMagic::GgufV1 => reader.read_u32::<LittleEndian>()? as usize,
+                    VersionedMagic::GgufV2 | VersionedMagic::GgufV3 => {
+                        reader.read_u64::<LittleEndian>()? as usize
+                    }
+                };
+                // Skip the string bytes without allocating.
+                let mut buf = vec![0u8; str_len];
+                reader.read_exact(&mut buf)?;
+            }
+        }
+        // Scalar arrays: each element has a known fixed size.
+        _ => {
+            let elem_size = match elem_type {
+                ValueType::U8 | ValueType::I8 | ValueType::Bool => 1,
+                ValueType::U16 | ValueType::I16 => 2,
+                ValueType::U32 | ValueType::I32 | ValueType::F32 => 4,
+                ValueType::U64 | ValueType::I64 | ValueType::F64 => 8,
+                ValueType::String | ValueType::Array => {
+                    crate::bail!("nested array/string in skip_array")
+                }
+            };
+            let mut buf = vec![0u8; elem_size * len];
+            reader.read_exact(&mut buf)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_string<R: std::io::Read>(reader: &mut R, magic: &VersionedMagic) -> Result<String> {
@@ -313,7 +389,7 @@ impl Value {
         Ok(v)
     }
 
-    fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
+    pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
         match self {
             &Self::U8(v) => w.write_u8(v)?,
             &Self::I8(v) => w.write_i8(v)?,
@@ -373,7 +449,7 @@ impl ValueType {
         Ok(v)
     }
 
-    fn to_u32(self) -> u32 {
+    pub fn to_u32(self) -> u32 {
         match self {
             Self::U8 => 0,
             Self::I8 => 1,
@@ -409,11 +485,27 @@ impl Content {
             }
         };
 
+        // Keys whose values are large (100K+ entries) and not needed by the inferrs
+        // runtime — inferrs reads the tokenizer from tokenizer.json, not from the GGUF.
+        // Skipping these arrays saves ~200–400 ms on large models.
+        const SKIP_LARGE_KEYS: &[&str] = &[
+            "tokenizer.ggml.tokens",
+            "tokenizer.ggml.merges",
+            "tokenizer.ggml.scores",
+            "tokenizer.ggml.token_type",
+        ];
+
         let mut metadata = HashMap::new();
         for _idx in 0..metadata_kv_count {
             let key = read_string(reader, &magic)?;
             let value_type = reader.read_u32::<LittleEndian>()?;
             let value_type = ValueType::from_u32(value_type)?;
+            // For known large arrays that inferrs doesn't use, skip reading them
+            // into memory — just advance the reader past their bytes.
+            if SKIP_LARGE_KEYS.contains(&key.as_str()) && value_type == ValueType::Array {
+                skip_array(reader, &magic)?;
+                continue;
+            }
             let value = Value::read(reader, value_type, &magic)?;
             metadata.insert(key, value);
         }
@@ -467,6 +559,20 @@ impl Content {
         })
     }
 
+    /// Load tensor from a pre-mmap'd slice — avoids read_exact + heap alloc per tensor.
+    pub fn tensor_from_mmap(
+        &self,
+        gguf_data: &[u8],
+        name: &str,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(ti) => ti,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_from_mmap(gguf_data, self.tensor_data_offset, device)
+    }
+
     pub fn tensor<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
@@ -481,11 +587,23 @@ impl Content {
     }
 }
 
-fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
+pub fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
     let bytes = str.as_bytes();
     w.write_u64::<LittleEndian>(bytes.len() as u64)?;
     w.write_all(bytes)?;
     Ok(())
+}
+
+/// Write a GGUF v3 file — same as [`write`] except the version field is 3.
+///
+/// GGUF v3 is produced by recent `convert_hf_to_gguf.py` versions and is
+/// accepted by llama.cpp, ollama, and open-webui alongside v2.
+pub fn write_v3<W: std::io::Seek + std::io::Write>(
+    w: &mut W,
+    metadata: &[(&str, &Value)],
+    tensors: &[(&str, &QTensor)],
+) -> Result<()> {
+    write_impl(w, 3, metadata, tensors)
 }
 
 pub fn write<W: std::io::Seek + std::io::Write>(
@@ -493,8 +611,17 @@ pub fn write<W: std::io::Seek + std::io::Write>(
     metadata: &[(&str, &Value)],
     tensors: &[(&str, &QTensor)],
 ) -> Result<()> {
+    write_impl(w, 2, metadata, tensors)
+}
+
+fn write_impl<W: std::io::Seek + std::io::Write>(
+    w: &mut W,
+    version: u32,
+    metadata: &[(&str, &Value)],
+    tensors: &[(&str, &QTensor)],
+) -> Result<()> {
     w.write_u32::<LittleEndian>(0x46554747)?;
-    w.write_u32::<LittleEndian>(2)?; // version 2.
+    w.write_u32::<LittleEndian>(version)?;
     w.write_u64::<LittleEndian>(tensors.len() as u64)?;
     w.write_u64::<LittleEndian>(metadata.len() as u64)?;
     for (name, value) in metadata.iter() {

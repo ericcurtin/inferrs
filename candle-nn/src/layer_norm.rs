@@ -181,6 +181,47 @@ impl RmsNorm {
     pub fn forward_diff(&self, xs: &Tensor) -> Result<Tensor> {
         self.0.forward(xs)
     }
+
+    /// Returns a reference to the scale weight tensor.
+    pub fn weight(&self) -> &Tensor {
+        &self.0.weight
+    }
+
+    /// Returns the epsilon value.
+    pub fn eps(&self) -> f64 {
+        self.0.eps
+    }
+
+    /// Fused RMSNorm + residual add + scalar: `(rms_norm(xs) * weight + residual) * scale`.
+    ///
+    /// Single Metal kernel instead of three dispatches (rms_norm + add + scalar_mul).
+    pub fn forward_add_scale(&self, xs: &Tensor, residual: &Tensor, scale: f32) -> Result<Tensor> {
+        if xs.is_contiguous() && residual.is_contiguous() {
+            crate::ops::rms_norm_add_scale(xs, &self.0.weight, residual, self.0.eps as f32, scale)
+        } else {
+            let normed = self.forward_add(xs, residual)?;
+            let s = candle::Tensor::new(&[scale], xs.device())?.reshape(&[1usize])?;
+            normed.broadcast_mul(&s)
+        }
+    }
+
+    /// Fused RMSNorm + residual add: `rms_norm(xs) * weight + residual`.
+    ///
+    /// Single Metal kernel instead of two dispatches (rms_norm + add).
+    /// Falls back to two dispatches when Metal is unavailable or xs is not contiguous.
+    pub fn forward_add(&self, xs: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        if xs.is_contiguous() && residual.is_contiguous() {
+            crate::ops::rms_norm_add(xs, &self.0.weight, residual, self.0.eps as f32)
+        } else {
+            // Fallback: standard rms_norm then add
+            let normed = if xs.is_contiguous() {
+                crate::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)?
+            } else {
+                self.0.forward(xs)?
+            };
+            normed + residual
+        }
+    }
 }
 
 impl Module for RmsNorm {

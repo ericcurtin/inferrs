@@ -100,6 +100,7 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::TQ2_0 => metal::load_quantized(d, as_t_slice::<BlockTq2_0>(data)),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -117,6 +118,7 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::TQ2_0 => cuda::load_quantized(d, as_t_slice::<BlockTq2_0>(data)),
             },
         }
     }
@@ -267,6 +269,8 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    /// Ternary 2-bit quantization (weights in {-1,0,+1}).  GGUF type 35.
+    TQ2_0,
 }
 
 impl GgmlDType {
@@ -288,6 +292,7 @@ impl GgmlDType {
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            35 => Self::TQ2_0,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -311,6 +316,7 @@ impl GgmlDType {
             Self::Q8K => 15,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::TQ2_0 => 35,
         }
     }
 
@@ -332,6 +338,10 @@ impl GgmlDType {
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+            Self::TQ2_0 => Box::new(vec![
+                BlockTq2_0::zeros();
+                elem_count / BlockTq2_0::BLCK_SIZE
+            ]),
         }
     }
 
@@ -352,6 +362,7 @@ impl GgmlDType {
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
+            Self::TQ2_0 => Box::new(as_t_slice::<BlockTq2_0>(data).to_vec()),
         }
     }
 
@@ -374,6 +385,7 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::TQ2_0 => std::mem::size_of::<BlockTq2_0>(),
         }
     }
 
@@ -389,6 +401,7 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::TQ2_0 => k_quants::QK_K,
         }
     }
 }
@@ -718,11 +731,103 @@ impl QTensor {
             _ => Ok(None),
         }
     }
-
     #[cfg(feature = "metal")]
     /// Fused QKV triple Q4K GEMV on Metal: `(q, k, v) = (self@xs, kw@xs, vw@xs)`
     /// in a single dispatch.  Q and K/V may differ in output size (GQA).
     /// Returns `None` on non-Metal or non-Q4K inputs.
+    /// Triple Q8_0 GEMV: computes Q, K, V in one dispatch.
+    pub fn fwd_mv3_q8_0(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q8_0
+                    || km.dtype() != GgmlDType::Q8_0
+                    || vm.dtype() != GgmlDType::Q8_0
+                {
+                    return Ok(None);
+                }
+                let ((dq_s, dq_sh), (dk_s, dk_sh), (dv_s, dv_sh)) =
+                    qm.fwd_mv3_q8_0(km, vm, &self.shape, &kw.shape, &xs_storage, &xs_layout)?;
+                let out_q = crate::tensor::from_storage(
+                    Storage::Metal(dq_s),
+                    dq_sh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_k = crate::tensor::from_storage(
+                    Storage::Metal(dk_s),
+                    dk_sh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_v = crate::tensor::from_storage(
+                    Storage::Metal(dv_s),
+                    dv_sh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some((out_q, out_k, out_v)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Triple Q4K GEMV → BF16 output (saves 2 back-cast dispatches vs F32 variant).
+    pub fn fwd_mv3_q4k_bf16o(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q4K
+                    || km.dtype() != GgmlDType::Q4K
+                    || vm.dtype() != GgmlDType::Q4K
+                {
+                    return Ok(None);
+                }
+                let ((dq, sq), (dk, sk), (dv, sv)) =
+                    qm.fwd_mv3_q4k_bf16o(km, vm, &self.shape, &kw.shape, &xs_s, &xs_l)?;
+                Ok(Some((
+                    crate::tensor::from_storage(
+                        Storage::Metal(dq),
+                        sq,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dk),
+                        sk,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dv),
+                        sv,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn fwd_mv3_q4k(
         &self,
         kw: &QTensor,
@@ -768,12 +873,251 @@ impl QTensor {
         }
     }
 
-    #[cfg(feature = "metal")]
-    /// Fused double Q4K GEMV on Metal: computes `out_a = self @ xs` and
-    /// `out_b = other @ xs` in a single kernel dispatch.
-    ///
-    /// Returns `None` on non-Metal devices or when either tensor is not Q4K,
-    /// so callers can fall back to two sequential `forward` calls.
+    /// Paired BF16-input Q4K GEMV: like `fwd_mv2_q4k` but accepts BF16 input.
+    /// Saves the BF16→F32 `to_dtype` dispatch.
+    /// Returns `None` on non-Metal devices or when either tensor is not Q4K.
+    pub fn fwd_mv2_q4k_bf16i(
+        &self,
+        other: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(self_m), QStorage::Metal(other_m)) => {
+                if self_m.dtype() != GgmlDType::Q4K || other_m.dtype() != GgmlDType::Q4K {
+                    return Ok(None);
+                }
+                let ((da_storage, da_shape), (db_storage, db_shape)) =
+                    self_m.fwd_mv2_q4k_bf16i(other_m, &self.shape, &xs_storage, &xs_layout)?;
+                let out_a = crate::tensor::from_storage(
+                    Storage::Metal(da_storage),
+                    da_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_b = crate::tensor::from_storage(
+                    Storage::Metal(db_storage),
+                    db_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some((out_a, out_b)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Paired Q3K GEMV: computes (self @ xs, other @ xs) in one dispatch.
+    /// Paired Q8_0 GEMV: computes (self @ xs, other @ xs) in one Metal dispatch.
+    pub fn fwd_mv2_q8_0(&self, other: &QTensor, xs: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(self_m), QStorage::Metal(other_m)) => {
+                if self_m.dtype() != GgmlDType::Q8_0 || other_m.dtype() != GgmlDType::Q8_0 {
+                    return Ok(None);
+                }
+                let ((da_storage, da_shape), (db_storage, db_shape)) =
+                    self_m.fwd_mv2_q8_0(other_m, &self.shape, &xs_storage, &xs_layout)?;
+                let out_a = crate::tensor::from_storage(
+                    Storage::Metal(da_storage),
+                    da_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_b = crate::tensor::from_storage(
+                    Storage::Metal(db_storage),
+                    db_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some((out_a, out_b)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Paired Q8_0 GEMV with BF16 activation — returns F32 pair without BF16→F32 pre-cast.
+    pub fn fwd_mv2_q8_0_bf16i(
+        &self,
+        other: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(sm), QStorage::Metal(om)) => {
+                if sm.dtype() != GgmlDType::Q8_0 || om.dtype() != GgmlDType::Q8_0 {
+                    return Ok(None);
+                }
+                let ((da, da_sh), (db, db_sh)) =
+                    sm.fwd_mv2_q8_0_bf16i(om, &self.shape, &xs_s, &xs_l)?;
+                Ok(Some((
+                    crate::tensor::from_storage(
+                        Storage::Metal(da),
+                        da_sh,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(db),
+                        db_sh,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Triple Q8_0 GEMV: F32 input → BF16 output (eliminates 3 back-cast dispatches).
+    pub fn fwd_mv3_q8_0_bf16o(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        if xs.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q8_0
+                    || km.dtype() != GgmlDType::Q8_0
+                    || vm.dtype() != GgmlDType::Q8_0
+                {
+                    return Ok(None);
+                }
+                let ((dq, sq), (dk, sk), (dv, sv)) =
+                    qm.fwd_mv3_q8_0_bf16o(km, vm, &self.shape, &kw.shape, &xs_s, &xs_l)?;
+                Ok(Some((
+                    crate::tensor::from_storage(
+                        Storage::Metal(dq),
+                        sq,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dk),
+                        sk,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dv),
+                        sv,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Triple Q8_0 GEMV with BF16 activation — returns F32 triple without pre-cast.
+    pub fn fwd_mv3_q8_0_bf16i(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q8_0
+                    || km.dtype() != GgmlDType::Q8_0
+                    || vm.dtype() != GgmlDType::Q8_0
+                {
+                    return Ok(None);
+                }
+                let ((dq, sq), (dk, sk), (dv, sv)) =
+                    qm.fwd_mv3_q8_0_bf16i(km, vm, &self.shape, &kw.shape, &xs_s, &xs_l)?;
+                Ok(Some((
+                    crate::tensor::from_storage(
+                        Storage::Metal(dq),
+                        sq,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dk),
+                        sk,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dv),
+                        sv,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn fwd_mv2_q3k(&self, other: &QTensor, xs: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(self_m), QStorage::Metal(other_m)) => {
+                if self_m.dtype() != GgmlDType::Q3K || other_m.dtype() != GgmlDType::Q3K {
+                    return Ok(None);
+                }
+                let ((da_storage, da_shape), (db_storage, db_shape)) =
+                    self_m.fwd_mv2_q3k(other_m, &self.shape, &xs_storage, &xs_layout)?;
+                let out_a = crate::tensor::from_storage(
+                    Storage::Metal(da_storage),
+                    da_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_b = crate::tensor::from_storage(
+                    Storage::Metal(db_storage),
+                    db_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some((out_a, out_b)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn fwd_mv2_q4k(&self, other: &QTensor, xs: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
         let xs_storage_guard = xs.storage();
         let (xs_storage, xs_layout) = match &*xs_storage_guard {

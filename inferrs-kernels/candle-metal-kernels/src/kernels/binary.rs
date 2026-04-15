@@ -4,7 +4,7 @@ use crate::{get_tile_size, linear_split};
 use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
 use objc2_metal::MTLResourceUsage;
 
-ops!(badd, bsub, bmul, bdiv, bminimum, bmaximum, eq, ne, le, lt, ge, gt);
+ops!(badd, bsub, bmul, bdiv, bminimum, bmaximum, bgelu_mul, eq, ne, le, lt, ge, gt);
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_binary_contiguous<S: ToString>(

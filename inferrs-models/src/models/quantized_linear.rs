@@ -95,7 +95,20 @@ impl Module for QLinear {
                 let r = if matches!(xs.device(), candle_core::Device::Cuda(_))
                     && orig_dtype == DType::BF16
                 {
+                    // CUDA: native BF16 path.
                     self.inner.forward(xs)?
+                } else if cfg!(feature = "metal")
+                    && orig_dtype == DType::BF16
+                    && matches!(xs.device(), candle_core::Device::Metal(_))
+                    && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+                {
+                    // Metal single-token decode: use bf16i path for Q4K and Q8_0
+                    // to avoid a separate BF16→F32 cast kernel dispatch.
+                    if let Some(out) = self.forward_bf16i(xs) {
+                        out?
+                    } else {
+                        self.inner.forward(&xs.to_dtype(DType::F32)?)?
+                    }
                 } else {
                     let xs_f32 = if orig_dtype == DType::F32 {
                         xs.clone()
@@ -163,8 +176,125 @@ impl QLinear {
             Err(e) => Some(Err(e)),
         }
     }
+    #[cfg(feature = "metal")]
+    /// Triple Q8_0 BF16i GEMV: Q+K+V in one dispatch, BF16 input → F32 output.
+    /// Eliminates both the xs.to_dtype(F32) pre-cast and the 3×F32→BF16 back-casts.
+    /// Triple Q8_0 GEMV: F32 input → BF16 output (saves 3 back-cast dispatches).
+    pub fn forward_triple_q8_0_bf16o(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        if xs_f32.dtype() != candle_core::DType::F32 {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q8_0_bf16o(qt_k, qt_v, xs_f32) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    pub fn forward_triple_q8_0_bf16i(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_bf16: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q8_0_bf16i(qt_k, qt_v, xs_bf16) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
 
     #[cfg(feature = "metal")]
+    /// Paired Q8_0 BF16i GEMV: gate+up in one dispatch, BF16 input → F32 pair.
+    /// Eliminates the xs.to_dtype(F32) pre-cast for MLP gate+up.
+    pub fn forward_paired_q8_0_bf16i(
+        &self,
+        other: &QLinear,
+        xs_bf16: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if self.bias.is_some() || other.bias.is_some() {
+            return None;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return None;
+        }
+        let (qt_s, qt_o) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return None,
+        };
+        match qt_s.fwd_mv2_q8_0_bf16i(qt_o, xs_bf16) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    /// Triple Q8_0 GEMV: computes Q, K, V projections in one dispatch.
+    /// For E2B Q8_0_full models, replaces 3 separate GEMVs with one.
+    pub fn forward_triple_q8_0(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q8_0(qt_k, qt_v, xs_f32) {
+            Ok(Some(triple)) => Some(Ok(triple)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Triple Q4K GEMV → BF16 output (saves 2 back-cast dispatches).
+    pub fn forward_triple_q4k_bf16o(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q4k_bf16o(qt_k, qt_v, xs_f32) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     pub fn forward_triple_q4k(
         &self,
         kw: &QLinear,
@@ -192,6 +322,69 @@ impl QLinear {
     /// Returns `None` when the fused path is unavailable (non-Metal device,
     /// non-Q4K dtype, or either layer has a bias), so the caller can fall back
     /// to two sequential `forward` calls.
+    /// Paired Q8_0 GEMV: computes gate_proj(xs) and up_proj(xs) in one dispatch.
+    /// Used for E2B models quantized with the Q8_0_full recipe.
+    pub fn forward_paired_q8_0(
+        &self,
+        other: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if self.bias.is_some() || other.bias.is_some() {
+            return None;
+        }
+        let (qt_self, qt_other) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return None,
+        };
+        match qt_self.fwd_mv2_q8_0(qt_other, xs_f32) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Paired Q3K GEMV: like `forward_paired_q4k` but for Q3K weights.
+    pub fn forward_paired_q3k(
+        &self,
+        other: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if self.bias.is_some() || other.bias.is_some() {
+            return None;
+        }
+        let (qt_self, qt_other) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return None,
+        };
+        match qt_self.fwd_mv2_q3k(qt_other, xs_f32) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Paired BF16-input Q4K GEMV: accepts BF16 input directly.
+    /// Saves the BF16→F32 `to_dtype` dispatch vs `forward_paired_q4k`.
+    /// Outputs are both F32.
+    pub fn forward_paired_q4k_bf16i(
+        &self,
+        other: &QLinear,
+        xs_bf16: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        if self.bias.is_some() || other.bias.is_some() {
+            return None;
+        }
+        let (qt_self, qt_other) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return None,
+        };
+        match qt_self.fwd_mv2_q4k_bf16i(qt_other, xs_bf16) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     ///
     /// Both `self` and `other` must be bias-free Q4K layers; `xs` must be a
     /// contiguous F32 Metal tensor.  The outputs are both F32.
@@ -287,6 +480,9 @@ impl QLinear {
 #[derive(Clone)]
 pub struct QGgufVarBuilder {
     file: Arc<std::sync::Mutex<std::fs::File>>,
+    /// Memory-mapped view of the GGUF file (populated when the file is mmap-able).
+    /// When present, tensors are loaded via no-copy Metal buffers.
+    mmap: Option<Arc<memmap2::Mmap>>,
     content: Arc<candle_core::quantized::gguf_file::Content>,
     cache: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Arc<candle_core::quantized::QTensor>>>,
@@ -296,6 +492,8 @@ pub struct QGgufVarBuilder {
     name_remap: Arc<std::collections::HashMap<String, String>>,
     device: Device,
     path: Vec<String>,
+    /// Filesystem path to the GGUF file, for re-opening without re-parsing.
+    gguf_path: Option<std::path::PathBuf>,
 }
 
 impl QGgufVarBuilder {
@@ -308,13 +506,17 @@ impl QGgufVarBuilder {
         use candle_core::quantized::gguf_file;
         let mut file = std::fs::File::open(p.as_ref()).map_err(candle_core::Error::from)?;
         let content = gguf_file::Content::read(&mut file)?;
+        // Memory-map the file for zero-copy Metal buffer creation.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.ok().map(Arc::new);
         Ok(Self {
             file: Arc::new(std::sync::Mutex::new(file)),
+            mmap,
             content: Arc::new(content),
             cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             name_remap: Arc::new(std::collections::HashMap::new()),
             device: device.clone(),
             path: Vec::new(),
+            gguf_path: Some(p.as_ref().to_path_buf()),
         })
     }
 
@@ -324,11 +526,13 @@ impl QGgufVarBuilder {
         path.push(s.to_string());
         Self {
             file: self.file.clone(),
+            mmap: self.mmap.clone(),
             content: self.content.clone(),
             cache: self.cache.clone(),
             name_remap: self.name_remap.clone(),
             device: self.device.clone(),
             path,
+            gguf_path: self.gguf_path.clone(),
         }
     }
 
@@ -366,7 +570,11 @@ impl QGgufVarBuilder {
         if !self.content.tensor_infos.contains_key(gguf_name.as_ref()) {
             return Ok(None);
         }
-        let qt = {
+        let qt = if let Some(mmap) = &self.mmap {
+            // Zero-copy: load tensor from mmap'd file slice.
+            self.content
+                .tensor_from_mmap(mmap, gguf_name.as_ref(), &self.device)?
+        } else {
             let mut file = self.file.lock().unwrap();
             self.content
                 .tensor(&mut *file, gguf_name.as_ref(), &self.device)?
@@ -429,6 +637,19 @@ impl QGgufVarBuilder {
     ///
     /// This replaces the previous eager implementation that loaded every GGUF
     /// tensor into device memory upfront, causing a large transient RSS spike
+    /// Return the pre-parsed GGUF content and a fresh file handle for re-use.
+    /// Used by PLI table setup to avoid re-parsing the GGUF header (~400ms savings).
+    pub fn gguf_content_and_file(
+        &self,
+    ) -> Option<(
+        Arc<candle_core::quantized::gguf_file::Content>,
+        std::fs::File,
+    )> {
+        let path = self.gguf_path.as_ref()?;
+        let file = std::fs::File::open(path).ok()?;
+        Some((self.content.clone(), file))
+    }
+
     /// and preventing parallelisation with other startup work.
     pub fn rename_keys<F: Fn(&str) -> String>(&self, map_fn: F) -> Result<Self> {
         let remap: std::collections::HashMap<String, String> = self
@@ -439,11 +660,13 @@ impl QGgufVarBuilder {
             .collect();
         Ok(Self {
             file: self.file.clone(),
+            mmap: self.mmap.clone(),
             content: self.content.clone(),
             cache: self.cache.clone(),
             name_remap: Arc::new(remap),
             device: self.device.clone(),
             path: self.path.clone(),
+            gguf_path: self.gguf_path.clone(),
         })
     }
 }
