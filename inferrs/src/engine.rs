@@ -1407,10 +1407,20 @@ pub struct Engine {
     /// avoid excessive memory use.
     token_bytes: Option<Vec<Vec<u8>>>,
     /// Draft model for speculative decoding.  `None` when `--draft-model` was
-    /// not specified.  Added in task-004; stats fields come in task-005.
+    /// not specified.
     pub(crate) draft_model: Option<Box<dyn CausalLM>>,
     /// Number of draft tokens proposed per speculative decode step.
     pub(crate) draft_gamma: usize,
+    /// Cumulative accepted draft tokens across all speculative decode steps.
+    /// Incremented by the speculative decode loop (task-007); reset per-sequence
+    /// and logged at sequence completion (task-008).
+    #[allow(dead_code)]
+    pub(crate) draft_accepted_total: u64,
+    /// Cumulative speculative decode steps taken (each step proposes `draft_gamma`
+    /// draft tokens).  Used together with `draft_accepted_total` to compute the
+    /// acceptance rate logged at sequence completion (task-008).
+    #[allow(dead_code)]
+    pub(crate) draft_steps_total: u64,
 }
 
 /// Shared state for paged-attention mode.
@@ -1450,6 +1460,8 @@ impl Engine {
             token_bytes: None,
             draft_model: None,
             draft_gamma: 5,
+            draft_accepted_total: 0,
+            draft_steps_total: 0,
         }
     }
 
@@ -1507,8 +1519,10 @@ impl Engine {
             max_tokens_per_step: _,
             paged,
             token_bytes: token_bytes_opt,
-            draft_model: _,
-            draft_gamma: _,
+            draft_model: _draft_model_opt,
+            draft_gamma: _draft_gamma,
+            draft_accepted_total: _,
+            draft_steps_total: _,
         } = self;
         // Lazily-populated cache of per-token byte strings for grammar masking.
         // Populated on the first grammar-constrained request so startup is not
@@ -2369,6 +2383,140 @@ impl Engine {
         Ok(accepted)
     }
 
+    /// Run a speculative decode step using an external draft model.
+    ///
+    /// Returns `Ok(tokens)` where `tokens` contains 1..=gamma+1 accepted token ids
+    /// in sequence order.  The draft model proposes `gamma` tokens autoregressively;
+    /// the target model verifies each one sequentially.  On the first rejection the
+    /// draft KV cache is rolled back and a replacement token is returned.  On full
+    /// acceptance a bonus token is sampled from the last target logits.
+    ///
+    /// Verification follows Algorithm 1 from Chen et al. 2302.01318.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn cb_speculative_decode_step(
+        target: &mut Box<dyn CausalLM>,
+        draft: &mut Box<dyn CausalLM>,
+        device: &Device,
+        last_token: u32,
+        seqlen_offset: usize,
+        gamma: usize,
+        params: &sampler::SamplingParams,
+        previous_tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        // ── 1. Draft phase ────────────────────────────────────────────────────
+        // Run the draft model autoregressively for `gamma` steps, collecting
+        // (token_id, softmax_probs) per step.  The draft KV cache starts from
+        // the same seqlen_offset as the target's current position.
+        //
+        // hint_ calls allow models with per-token state (e.g. PLI embedding
+        // cache) to prepare before the GPU tensor is created.
+        let mut draft_tokens: Vec<(u32, Vec<f32>)> = Vec::with_capacity(gamma);
+        let mut draft_offset = seqlen_offset;
+        let mut draft_input = last_token;
+
+        for _ in 0..gamma {
+            draft.hint_decode_token(draft_input);
+            draft.hint_sampling_temperature(params.temperature);
+            let input_ids = Tensor::new(&[draft_input], device)?.unsqueeze(0)?;
+            let logits = draft.forward(&input_ids, draft_offset)?;
+
+            // Convert logits to f32 and compute temperature-scaled softmax.
+            // These probs are passed to speculative_verify() as q(x).
+            let logits_vec: Vec<f32> = logits
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(candle_core::DType::F32)?
+                .to_vec1()?;
+            let probs = if params.temperature <= 0.0 {
+                // Greedy: one-hot on argmax.
+                let best = logits_vec
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let mut v = vec![0.0f32; logits_vec.len()];
+                v[best] = 1.0;
+                v
+            } else if (params.temperature - 1.0).abs() < 1e-6 {
+                sampler::softmax_vec(&logits_vec)
+            } else {
+                let inv_t = (1.0 / params.temperature) as f32;
+                let scaled: Vec<f32> = logits_vec.iter().map(|&l| l * inv_t).collect();
+                sampler::softmax_vec(&scaled)
+            };
+
+            // Sample from the draft distribution.
+            let (tok, _) = sampler::sample_token(&logits, params, previous_tokens)?;
+            draft_tokens.push((tok, probs));
+
+            draft_offset += 1;
+            draft_input = tok;
+        }
+
+        // ── 2. Verify phase ───────────────────────────────────────────────────
+        // Feed the anchor token (last_token) through the target model to get
+        // logits that predict the token *after* last_token (used to verify
+        // draft_tokens[0]).  Then verify each draft token sequentially.
+        target.hint_decode_token(last_token);
+        target.hint_sampling_temperature(params.temperature);
+        let anchor_ids = Tensor::new(&[last_token], device)?.unsqueeze(0)?;
+        let anchor_logits = target.forward(&anchor_ids, seqlen_offset)?;
+        let mut cur_logits: Vec<f32> = anchor_logits
+            .squeeze(0)?
+            .squeeze(0)?
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec1()?;
+
+        let step_base = previous_tokens.len() as u64;
+        let mut accepted: Vec<u32> = Vec::with_capacity(gamma + 1);
+        let mut target_offset = seqlen_offset + 1;
+
+        for (draft_idx, (draft_tok, draft_probs)) in draft_tokens.iter().enumerate() {
+            let (verdict, _) = sampler::speculative_verify(
+                &cur_logits,
+                draft_probs,
+                *draft_tok,
+                params.temperature,
+                params.seed,
+                step_base + draft_idx as u64,
+            )?;
+
+            match verdict {
+                sampler::SpecVerdict::Accept => {
+                    accepted.push(*draft_tok);
+                    let tok_ids = Tensor::new(&[*draft_tok], device)?.unsqueeze(0)?;
+                    let logits = target.forward(&tok_ids, target_offset)?;
+                    cur_logits = logits
+                        .squeeze(0)?
+                        .squeeze(0)?
+                        .to_dtype(candle_core::DType::F32)?
+                        .to_vec1()?;
+                    target_offset += 1;
+                }
+                sampler::SpecVerdict::Reject(replacement) => {
+                    // Roll back the draft KV cache by the number of tokens that
+                    // were NOT committed (gamma - n_accepted).  The accepted
+                    // draft tokens are already in the target KV cache; the draft
+                    // model only needs to match the accepted prefix so that the
+                    // next step can continue from the right position.
+                    let n_accepted = draft_idx; // indices 0..draft_idx were accepted
+                    let rollback = gamma - n_accepted;
+                    draft.truncate_kv_cache(rollback);
+                    accepted.push(replacement);
+                    return Ok(accepted);
+                }
+            }
+        }
+
+        // All gamma draft tokens accepted — sample bonus token from target.
+        let bonus_logits = Tensor::from_vec(cur_logits.clone(), (1, 1, cur_logits.len()), device)?;
+        let (bonus, _) = sampler::sample_token(&bonus_logits, params, previous_tokens)?;
+        accepted.push(bonus);
+
+        Ok(accepted)
+    }
+
     /// Run the engine loop using only stdlib channels — no Tokio runtime required.
     /// Used by `inferrs run` so that blocking sends/recvs work on a plain OS thread.
     #[allow(dead_code)]
@@ -2460,8 +2608,14 @@ impl Engine {
 
     /// Run the prefill forward pass (paged or concat-KV) and return the logits.
     /// Resets the KV cache and (if paged) the block table before running.
+    ///
+    /// Also clears the draft model's KV cache (when present) so that both
+    /// caches are always reset together at sequence boundaries.
     fn run_prefill(&mut self, prompt_tokens: &[u32]) -> Result<Tensor> {
         self.model.clear_kv_cache();
+        if let Some(dm) = &mut self.draft_model {
+            dm.clear_kv_cache();
+        }
         if let Some(ps) = &mut self.paged {
             ps.block_table.free_all(&mut ps.block_pool);
             Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)
