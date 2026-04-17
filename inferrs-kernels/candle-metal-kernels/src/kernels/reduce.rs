@@ -554,3 +554,54 @@ pub fn call_rope(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Fused partial-RoPE for single-token BF16 decode.
+///
+/// Applies RoPE to the first `rotary_dim` features and copies the rest.
+/// Replaces 4 dispatches per head with 1.
+#[allow(clippy::too_many_arguments)]
+pub fn call_partial_rope_bf16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src: &Buffer,
+    src_offset: usize,
+    cos: &Buffer,
+    cos_offset: usize,
+    sin: &Buffer,
+    sin_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, "partial_rope_bf16")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (src, src_offset),
+            (cos, cos_offset),
+            (sin, sin_offset),
+            (dst, dst_offset),
+            n_heads,
+            head_dim,
+            rotary_dim
+        )
+    );
+    let tgc = MTLSize { width: n_heads as usize, height: head_dim as usize, depth: 1 };
+    let tgs = MTLSize {
+        width: std::cmp::min(n_heads as usize, 8),
+        height: std::cmp::min(head_dim as usize, 32),
+        depth: 1,
+    };
+    encoder.use_resource(src, MTLResourceUsage::Read);
+    encoder.use_resource(cos, MTLResourceUsage::Read);
+    encoder.use_resource(sin, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_threads(tgc, tgs);
+    Ok(())
+}

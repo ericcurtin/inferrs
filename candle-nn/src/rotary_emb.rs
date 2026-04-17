@@ -807,3 +807,75 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
 }
+
+/// Fused partial-RoPE for single-token BF16 decode on Metal.
+///
+/// Applies RoPE to the first `rotary_dim` elements of each head vector
+/// and copies the remaining elements unchanged, in a single Metal dispatch.
+///
+/// `xs`: [1, n_heads, 1, head_dim] BF16 contiguous
+/// `cos`: [rotary_dim/2] BF16 contiguous
+/// `sin`: [rotary_dim/2] BF16 contiguous  
+/// `dst`: pre-allocated [1, n_heads, 1, head_dim] BF16 output buffer
+/// `rotary_dim`: must be even and ≤ head_dim
+///
+/// Returns `true` if the fused path was taken, `false` on fallback.
+#[cfg(feature = "metal")]
+pub fn partial_rope_inplace_bf16(
+    xs: &candle::Tensor,
+    cos: &candle::Tensor,
+    sin: &candle::Tensor,
+    dst: &candle::Tensor,
+    rotary_dim: usize,
+) -> candle::Result<bool> {
+    use candle::{DType, Storage};
+    if xs.dtype() != DType::BF16 || cos.dtype() != DType::BF16 || sin.dtype() != DType::BF16 {
+        return Ok(false);
+    }
+    if !xs.is_contiguous() || !cos.is_contiguous() || !sin.is_contiguous() {
+        return Ok(false);
+    }
+    let dims = xs.dims();
+    if dims.len() < 2 {
+        return Ok(false);
+    }
+    let head_dim = *dims.last().unwrap();
+    let n_heads: usize = dims.iter().rev().skip(1).product();
+    if rotary_dim > head_dim || rotary_dim % 2 != 0 {
+        return Ok(false);
+    }
+
+    let (xs_sg, xs_l) = xs.storage_and_layout();
+    let (cos_sg, cos_l) = cos.storage_and_layout();
+    let (sin_sg, sin_l) = sin.storage_and_layout();
+    let (dst_sg, _dst_l) = dst.storage_and_layout();
+
+    let (xs_m, cos_m, sin_m, dst_m) = match (&*xs_sg, &*cos_sg, &*sin_sg, &*dst_sg) {
+        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => {
+            (a, b, c, d)
+        }
+        _ => return Ok(false),
+    };
+
+    use candle::backend::BackendStorage;
+    let device = xs_m.device().clone();
+    let encoder = device.command_encoder().map_err(candle::Error::wrap)?;
+    candle_metal_kernels::call_partial_rope_bf16(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        xs_m.buffer(),
+        xs_l.start_offset() * DType::BF16.size_in_bytes(),
+        cos_m.buffer(),
+        cos_l.start_offset() * DType::BF16.size_in_bytes(),
+        sin_m.buffer(),
+        sin_l.start_offset() * DType::BF16.size_in_bytes(),
+        dst_m.buffer(),
+        0,
+        n_heads as u32,
+        head_dim as u32,
+        rotary_dim as u32,
+    )
+    .map_err(candle::Error::wrap)?;
+    Ok(true)
+}

@@ -1775,4 +1775,68 @@ impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 impl_rms_norm_add(rmsnorm_add_bf16, bfloat)
 impl_rms_norm_add_scale(rmsnorm_add_scale_bf16, bfloat)
+
+/// Partial-RoPE kernel for BF16 tensors.
+///
+/// Applied to a single-token decode tensor with shape [1, n_heads, 1, head_dim].
+/// Only the first `rotary_dim` features are rotated; the remaining
+/// `head_dim - rotary_dim` features are copied unchanged.
+///
+/// This fuses: narrow(rotary) + contiguous + rope + slice_set(rot)
+///             + narrow(pass)  + contiguous + slice_set(pass)
+/// into a single kernel dispatch — eliminating 4 intermediate compute dispatches
+/// per head (Q or K) per global attention layer.
+///
+/// Thread mapping: one thread per output element (n_heads × head_dim total).
+///   tid = head_idx * head_dim + d_idx
+///
+/// For d_idx < rotary_dim: apply RoPE.
+///   rot_pair = d_idx % (rotary_dim/2)
+///   if d_idx < rotary_dim/2: dst = src_d * cos[rot_pair] - src_{d + rotary_dim/2} * sin[rot_pair]
+///   else:                    dst = src_d * sin[rot_pair - rotary_dim/2]
+///                                    + src_{d - rotary_dim/2} * cos[rot_pair - rotary_dim/2]
+/// For d_idx >= rotary_dim: pass through unchanged.
+///
+/// Note: src tensor has shape [1, n_heads, 1, head_dim] with contiguous strides.
+///       cos/sin shape: [1, rotary_dim/2].
+[[host_name("partial_rope_bf16")]]
+kernel void partial_rope_bf16(
+    device const bfloat  * src,        // [n_heads, head_dim] (after squeezing batch/seq)
+    device const bfloat  * cos,        // [rotary_dim/2]
+    device const bfloat  * sin,        // [rotary_dim/2]
+    device       bfloat  * dst,        // [n_heads, head_dim] output
+    constant uint32_t    & n_heads,    // number of heads
+    constant uint32_t    & head_dim,   // total head dimension
+    constant uint32_t    & rotary_dim, // number of dims to rotate (< head_dim)
+    uint2 tid [[thread_position_in_grid]]   // x = head_idx, y = d_idx
+) {
+    const uint h = tid.x;
+    const uint d = tid.y;
+    if (h >= n_heads || d >= head_dim) { return; }
+
+    const uint src_off = h * head_dim + d;
+    const uint dst_off = h * head_dim + d;
+
+    if (d >= rotary_dim) {
+        // Passthrough region: copy unchanged.
+        dst[dst_off] = src[src_off];
+    } else {
+        // RoPE region.
+        const uint rdim2 = rotary_dim / 2;  // half of rotary_dim (avoid "half" keyword)
+        const uint rot_pair = d % rdim2;
+        const float c = (float)cos[rot_pair];
+        const float s = (float)sin[rot_pair];
+        if (d < rdim2) {
+            // First rdim2 elements: x*cos - y*sin
+            const float x = (float)src[h * head_dim + d];
+            const float y = (float)src[h * head_dim + d + rdim2];
+            dst[dst_off] = (bfloat)(x * c - y * s);
+        } else {
+            // Second rdim2 elements: x*sin + y*cos
+            const float x = (float)src[h * head_dim + d - rdim2];
+            const float y = (float)src[h * head_dim + d];
+            dst[dst_off] = (bfloat)(x * s + y * c);
+        }
+    }
+}
 #endif
