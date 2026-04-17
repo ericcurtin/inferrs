@@ -638,6 +638,14 @@ pub struct OllamaOptions {
     pub gguf_file: Option<String>,
     /// Optional HuggingFace repository to download tokenizer.json and config.json from
     pub tokenizer_source: Option<String>,
+    /// Speculative decoding draft model (HF model ID)
+    pub draft_model: Option<String>,
+    /// Number of draft tokens per speculative step
+    pub draft_gamma: Option<usize>,
+    /// Weight dtype for draft model
+    pub draft_dtype: Option<String>,
+    /// Quantization scheme for draft model
+    pub draft_quantize: Option<String>,
 
     // ── Extended sampling fields ──────────────────────────────────────────────
     pub seed: Option<i64>,
@@ -1228,6 +1236,18 @@ async fn spawn_worker(
         }
         if let Some(ref ts) = o.tokenizer_source {
             args.extend(["--tokenizer-source".into(), ts.clone()]);
+        }
+        if let Some(ref dm) = o.draft_model {
+            args.extend(["--draft-model".into(), dm.clone()]);
+        }
+        if let Some(gamma) = o.draft_gamma {
+            args.extend(["--draft-gamma".into(), gamma.to_string()]);
+        }
+        if let Some(ref dd) = o.draft_dtype {
+            args.extend(["--draft-dtype".into(), dd.clone()]);
+        }
+        if let Some(ref dq) = o.draft_quantize {
+            args.push(format!("--draft-quantize={dq}"));
         }
     }
 
