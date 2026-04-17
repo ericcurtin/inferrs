@@ -631,6 +631,10 @@ impl Module for Mlp {
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
                     let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    // Use BF16-output down_proj: eliminates F32→BF16 back-cast (1 dispatch).
+                    if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
+                        return bf16_out;
+                    }
                     return self
                         .down_proj
                         .forward_f32(&hidden_act_f32)?
@@ -652,6 +656,14 @@ impl Module for Mlp {
                 if let Some(result) = paired_result {
                     let (gate_f32, up_f32) = result?;
                     let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    // BF16-output down_proj: eliminates F32→BF16 back-cast.
+                    if let Some(bf16_out) = self
+                        .down_proj
+                        .forward_q8_0_bf16o(&hidden_act_f32)
+                        .or_else(|| self.down_proj.forward_q4k_bf16o(&hidden_act_f32))
+                    {
+                        return bf16_out;
+                    }
                     return self
                         .down_proj
                         .forward_f32(&hidden_act_f32)?
@@ -2614,9 +2626,14 @@ impl DecoderLayer {
                     // gelu_mul accepts F32 gate + BF16 up directly, saving
                     // the pli_input.to_dtype(F32) dispatch per PLI layer.
                     let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
-                    pli.projection
-                        .forward_f32(&pli_mid_f32)?
-                        .to_dtype(xs.dtype())?
+                    // Use BF16-output PLI projection: eliminates F32→BF16 back-cast.
+                    if let Some(bf16_out) = pli.projection.forward_q8_0_bf16o(&pli_mid_f32) {
+                        bf16_out?
+                    } else {
+                        pli.projection
+                            .forward_f32(&pli_mid_f32)?
+                            .to_dtype(xs.dtype())?
+                    }
                 } else {
                     let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
                     let pli_out = gate.broadcast_mul(pli_input)?;
