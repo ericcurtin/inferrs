@@ -255,8 +255,8 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
     if let Some((_, draft_raw_config, _, _)) = &draft_info {
         let target_vocab = raw_config.effective_vocab_size();
         let draft_vocab = draft_raw_config.effective_vocab_size();
-        if let (Some(tv), Some(dv)) = (target_vocab, draft_vocab) {
-            if tv != dv {
+        match (target_vocab, draft_vocab) {
+            (Some(tv), Some(dv)) if tv != dv => {
                 let draft_id = args.draft_model.as_deref().unwrap_or("<unknown>");
                 let target_id = args.model.as_deref().unwrap_or("<unknown>");
                 anyhow::bail!(
@@ -266,6 +266,14 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
                      (target: {target_id}, draft: {draft_id})"
                 );
             }
+            (None, _) | (_, None) => {
+                tracing::warn!(
+                    "Could not validate vocabulary compatibility (vocab_size missing \
+                     from one or both configs). Ensure the draft and target models \
+                     share the same vocabulary."
+                );
+            }
+            _ => {}
         }
     }
 
@@ -2807,6 +2815,11 @@ impl Engine {
         self.model.clear_kv_cache();
         if let Some(dm) = &mut self.draft_model {
             dm.clear_kv_cache();
+            // Prefill draft with the same prompt so its KV context matches the
+            // target's at seqlen_offset=0.  Without this the draft has no prompt
+            // context and acceptance rates collapse to near zero.
+            let draft_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            dm.forward(&draft_ids, 0)?;
         }
         if let Some(ps) = &mut self.paged {
             ps.block_table.free_all(&mut ps.block_pool);
