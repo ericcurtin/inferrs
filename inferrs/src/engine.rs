@@ -195,12 +195,17 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
             None
         };
 
-    // Load model weights and tokenizer in parallel: both are I/O + CPU bound
-    // and independent of each other.  On a 256K-token vocabulary the tokenizer
-    // parse takes ~300 ms; running it concurrently with the ~840 ms weight load
-    // hides it almost entirely.  When a draft model is requested it is loaded
-    // in a third thread alongside the other two.
-    let (model, tokenizer, draft_model_opt) = std::thread::scope(|s| {
+    // Load target model weights and tokenizer in parallel: both are I/O + CPU
+    // bound and independent of each other.  On a 256K-token vocabulary the
+    // tokenizer parse takes ~300 ms; running it concurrently with the weight
+    // load hides it almost entirely.
+    //
+    // IMPORTANT: the draft model is loaded SEQUENTIALLY after the target model,
+    // not in a third parallel thread.  Metal (Apple Silicon) does not allow two
+    // threads to encode Metal commands on the same device simultaneously — doing
+    // so triggers a command-buffer assertion in the Metal driver.  Loading the
+    // draft model after the target model has fully finished avoids this.
+    let (model, tokenizer) = std::thread::scope(|s| {
         let tok_handle = s.spawn(|| {
             Tokenizer::from_file_with_arch(
                 &model_files.tokenizer_path,
@@ -208,29 +213,6 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
                 Some(&arch),
             )
         });
-
-        // Spawn draft model load thread if a draft model was requested.
-        // We pass `&device` explicitly to avoid moving `device` into the
-        // closure (it is still needed for the target model load below and
-        // after the scope to build the Engine).
-        let draft_handle =
-            draft_info
-                .as_ref()
-                .map(|(draft_files, draft_raw_config, draft_arch, draft_dtype)| {
-                    let device_ref = &device;
-                    s.spawn(move || {
-                        inferrs_models::models::load_model(
-                            draft_raw_config,
-                            draft_arch,
-                            &draft_files.weight_paths,
-                            draft_files.gguf_path.as_deref(),
-                            *draft_dtype,
-                            device_ref,
-                            args.turbo_quant.0,
-                            &draft_files.config_path,
-                        )
-                    })
-                });
 
         let model_result = inferrs_models::models::load_model(
             &raw_config,
@@ -247,17 +229,26 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
             .join()
             .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))?;
 
-        let draft_model_result: Option<Box<dyn CausalLM>> = match draft_handle {
-            Some(handle) => Some(
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("draft model thread panicked"))??,
-            ),
-            None => None,
-        };
-
-        Ok::<_, anyhow::Error>((model_result?, Arc::new(tok_result?), draft_model_result))
+        Ok::<_, anyhow::Error>((model_result?, Arc::new(tok_result?)))
     })?;
+
+    // Load draft model sequentially (after target model) so both models never
+    // encode Metal commands simultaneously on the same device.
+    let draft_model_opt: Option<Box<dyn CausalLM>> =
+        if let Some((draft_files, draft_raw_config, draft_arch, draft_dtype)) = &draft_info {
+            Some(inferrs_models::models::load_model(
+                draft_raw_config,
+                draft_arch,
+                &draft_files.weight_paths,
+                draft_files.gguf_path.as_deref(),
+                *draft_dtype,
+                &device,
+                args.turbo_quant.0,
+                &draft_files.config_path,
+            )?)
+        } else {
+            None
+        };
 
     // Validate that the draft and target models share the same vocabulary.
     // Mismatched vocabularies make the acceptance step undefined.
