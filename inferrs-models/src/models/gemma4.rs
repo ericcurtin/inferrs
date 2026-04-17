@@ -1039,12 +1039,19 @@ impl Attention {
     /// Apply o_proj using BF16-input inline GEMV when available (eliminates
     /// a BF16->F32 to_dtype dispatch for single-token decode on Metal).
     fn apply_o_proj(&self, xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "metal")]
+        // For Metal single-token decode with BF16 input, use the BF16→BF16 kernel:
+        // no pre-cast (BF16→F32) and no post-cast (F32→BF16) needed.
+        // Saves 1 dispatch vs forward_bf16i (which outputs F32, then back-cast).
         if xs.rank() >= 2
             && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
+            if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
+                return out;
+            }
+            // Fallback for non-Q8_0 weights: BF16i→F32, then back-cast.
+            #[cfg(feature = "metal")]
             if let Some(out) = self.o_proj.forward_bf16i(xs) {
                 return out?.to_dtype(xs.dtype());
             }
@@ -1351,95 +1358,124 @@ impl Attention {
         let is_single_token_decode = q_len == 1;
 
         let (q_raw, k_raw, v_raw) = if need_pre_convert && is_single_token_decode {
-            let xs_f32 = xs.to_dtype(DType::F32)?;
-
-            // Try BF16-output triple QKV GEMV: produces BF16 Q/K/V directly,
-            // eliminating 3 × F32→BF16 back-cast dispatches.
-            // Q8_0 (E2B): inline BF16 conversion per element in the GEMV kernel.
-            // Q4K (E4B): inline BF16 conversion via kernel_mul_mv3_q4_K_f32_to_bf16,
-            //            no intermediate F32 buffers — saves 3 dispatches per attn layer.
+            // Best path: BF16 input → BF16 output triple QKV GEMV.
+            // No pre-cast (BF16→F32) and no post-casts (3×F32→BF16) — saves 1 dispatch
+            // vs the bf16o variant which still needs the pre-cast.
+            // Q8_0 (E2B): kernel_mul_mv3_q8_0_bf16i_to_bf16.
+            // Saves 1 dispatch per attention layer × 35 layers = 35 fewer dispatches/token.
             #[cfg(feature = "metal")]
-            let qkv_bf16o = self
-                .q_proj
-                .forward_triple_q8_0_bf16o(&self.k_proj, &self.v_proj, &xs_f32)
-                .or_else(|| {
-                    self.q_proj
-                        .forward_triple_q4k_bf16o(&self.k_proj, &self.v_proj, &xs_f32)
-                });
+            let qkv_b2b = if orig_dtype == DType::BF16
+                && matches!(xs.device(), candle_core::Device::Metal(_))
+            {
+                self.q_proj
+                    .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
+            } else {
+                None
+            };
             #[cfg(not(feature = "metal"))]
-            let qkv_bf16o: Option<
+            let qkv_b2b: Option<
                 candle_core::Result<(
                     candle_core::Tensor,
                     candle_core::Tensor,
                     candle_core::Tensor,
                 )>,
             > = None;
-            if let Some(result) = qkv_bf16o {
+            if let Some(result) = qkv_b2b {
                 let (q_bf16, k_bf16, v_bf16) = result?;
-                // Already BF16 — just reshape, no back-cast needed.
                 (
                     q_bf16.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
                     k_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
                     v_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
                 )
             } else {
-                // Standard F32 path: triple GEMV then back-cast, or fallback to separate GEMVs.
+                let xs_f32 = xs.to_dtype(DType::F32)?;
+
+                // Second choice: BF16-output triple QKV GEMV (F32 input → BF16 output).
+                // Q8_0 (E2B): kernel_mul_mv3_q8_0_f32_to_bf16.
+                // Q4K (E4B): kernel_mul_mv3_q4_K_f32_to_bf16.
                 #[cfg(feature = "metal")]
-                let qkv_fused = self
+                let qkv_bf16o = self
                     .q_proj
-                    .forward_triple_q8_0(&self.k_proj, &self.v_proj, &xs_f32)
+                    .forward_triple_q8_0_bf16o(&self.k_proj, &self.v_proj, &xs_f32)
                     .or_else(|| {
                         self.q_proj
-                            .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32)
+                            .forward_triple_q4k_bf16o(&self.k_proj, &self.v_proj, &xs_f32)
                     });
                 #[cfg(not(feature = "metal"))]
-                let qkv_fused: Option<
+                let qkv_bf16o: Option<
                     candle_core::Result<(
                         candle_core::Tensor,
                         candle_core::Tensor,
                         candle_core::Tensor,
                     )>,
                 > = None;
-                if let Some(result) = qkv_fused {
-                    let (q_f32, k_f32, v_f32) = result?;
+                if let Some(result) = qkv_bf16o {
+                    let (q_bf16, k_bf16, v_bf16) = result?;
+                    // Already BF16 — just reshape, no back-cast needed.
                     (
-                        q_f32.to_dtype(orig_dtype)?.reshape((
-                            b_sz,
-                            q_len,
-                            self.num_heads,
-                            self.head_dim,
-                        ))?,
-                        k_f32.to_dtype(orig_dtype)?.reshape((
-                            b_sz,
-                            q_len,
-                            self.num_kv_heads,
-                            self.head_dim,
-                        ))?,
-                        v_f32.to_dtype(orig_dtype)?.reshape((
-                            b_sz,
-                            q_len,
-                            self.num_kv_heads,
-                            self.head_dim,
-                        ))?,
+                        q_bf16.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                        k_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                        v_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
                     )
                 } else {
-                    // Fallback: three GEMVs sharing one F32 input copy.
-                    (
-                        self.q_proj
-                            .forward_f32(&xs_f32)?
-                            .to_dtype(orig_dtype)?
-                            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
-                        self.k_proj
-                            .forward_f32(&xs_f32)?
-                            .to_dtype(orig_dtype)?
-                            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                        self.v_proj
-                            .forward_f32(&xs_f32)?
-                            .to_dtype(orig_dtype)?
-                            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                    )
-                }
-            } // end else (non-bf16o path)
+                    // Standard F32 path: triple GEMV then back-cast, or fallback to separate GEMVs.
+                    #[cfg(feature = "metal")]
+                    let qkv_fused = self
+                        .q_proj
+                        .forward_triple_q8_0(&self.k_proj, &self.v_proj, &xs_f32)
+                        .or_else(|| {
+                            self.q_proj
+                                .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32)
+                        });
+                    #[cfg(not(feature = "metal"))]
+                    let qkv_fused: Option<
+                        candle_core::Result<(
+                            candle_core::Tensor,
+                            candle_core::Tensor,
+                            candle_core::Tensor,
+                        )>,
+                    > = None;
+                    if let Some(result) = qkv_fused {
+                        let (q_f32, k_f32, v_f32) = result?;
+                        (
+                            q_f32.to_dtype(orig_dtype)?.reshape((
+                                b_sz,
+                                q_len,
+                                self.num_heads,
+                                self.head_dim,
+                            ))?,
+                            k_f32.to_dtype(orig_dtype)?.reshape((
+                                b_sz,
+                                q_len,
+                                self.num_kv_heads,
+                                self.head_dim,
+                            ))?,
+                            v_f32.to_dtype(orig_dtype)?.reshape((
+                                b_sz,
+                                q_len,
+                                self.num_kv_heads,
+                                self.head_dim,
+                            ))?,
+                        )
+                    } else {
+                        // Fallback: three GEMVs sharing one F32 input copy.
+                        (
+                            self.q_proj
+                                .forward_f32(&xs_f32)?
+                                .to_dtype(orig_dtype)?
+                                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                            self.k_proj
+                                .forward_f32(&xs_f32)?
+                                .to_dtype(orig_dtype)?
+                                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                            self.v_proj
+                                .forward_f32(&xs_f32)?
+                                .to_dtype(orig_dtype)?
+                                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                        )
+                    }
+                } // end else (non-bf16o path)
+            } // end else (non-b2b path)
         } else if need_pre_convert {
             let xs_f32 = xs.to_dtype(DType::F32)?;
             (

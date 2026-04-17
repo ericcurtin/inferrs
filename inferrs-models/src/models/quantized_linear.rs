@@ -197,6 +197,24 @@ impl QLinear {
         }
     }
 
+    /// Q8_0 GEMV: BF16 input → BF16 output.
+    /// Eliminates both the BF16→F32 pre-cast and the F32→BF16 post-cast.
+    /// Used for o_proj and PLI projection in the decode path.
+    pub fn forward_q8_0_bf16i_to_bf16(&self, xs_bf16: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_q8_0_bf16i_to_bf16(xs_bf16) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     /// BF16-input Q4K GEMV: eliminates per-GEMV BF16->F32 conversion dispatch.
     /// Returns None when unavailable (non-Metal, non-Q4K, or non-BF16 input).
     #[cfg(feature = "metal")]
@@ -258,6 +276,32 @@ impl QLinear {
             _ => return None,
         };
         match qt_q.fwd_mv3_q8_0_bf16i(qt_k, qt_v, xs_bf16) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Triple Q8_0 BF16i→BF16o GEMV: BF16 input → BF16 Q/K/V output.
+    /// Eliminates BOTH the BF16→F32 pre-cast AND the 3×F32→BF16 back-casts:
+    /// saves 1 dispatch over forward_triple_q8_0_bf16o (which still needs the pre-cast).
+    pub fn forward_triple_q8_0_bf16i_to_bf16(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_bf16: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q8_0_bf16i_to_bf16(qt_k, qt_v, xs_bf16) {
             Ok(Some(t)) => Some(Ok(t)),
             Ok(None) => None,
             Err(e) => Some(Err(e)),

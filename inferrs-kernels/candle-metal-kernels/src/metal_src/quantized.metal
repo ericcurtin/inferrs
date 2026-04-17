@@ -2776,6 +2776,112 @@ void kernel_mul_mv_q8_0_bf16i_impl_4sg(
     }
 }
 
+/// BF16-input + BF16-output single-row Q8_0 GEMV impl.
+/// Combines the bf16i input conversion (bit-shift) with the bf16 output
+/// (upper 16 bits) to avoid both the pre-cast and post-cast dispatches.
+void kernel_mul_mv_q8_0_bf16i_to_bf16_impl_4sg(
+        device const  void   * src0,
+        device const ushort  * src1_bf16,   // BF16 activation
+        device       ushort  * dst,         // BF16 output
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup float  * shmem,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    constexpr int NR0 = 2, NSG = 4, NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = ne00/QK8_0;
+    const int r0 = tgpig.x * NR0, r1 = tgpig.y, im = tgpig.z;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = r0*nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q8_0 * x = (device const block_q8_0 *)src0 + off0;
+    device const ushort * y = src1_bf16 + r1*ne10 + im*ne00*ne1;
+    const int ix = tiisg/(NW/NQ), il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NQ], sumf[NR0] = {0.f};
+    device const ushort * yb = y + ib0*QK8_0 + il*NQ;
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        // BF16→F32 inline: left-shift the 16-bit BF16 mantissa to align with F32.
+        for (int i = 0; i < NQ; ++i) { yl[i] = as_type<float>(uint(yb[i]) << 16); }
+        for (int row = 0; row < NR0; ++row) {
+            device const int8_t * qs = x[ib + row*nb].qs + il*NQ;
+            float s = 0.f;
+            for (int i = 0; i < NQ; ++i) { s += qs[i] * yl[i]; }
+            sumf[row] += s * x[ib + row*nb].d;
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+    for (int row = 0; row < NR0; ++row) {
+        if (sgitg == 0) { shmem[NW*row + tiisg] = 0.f; }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int row = 0; row < NR0; ++row) { if (tiisg == 0) { shmem[NW*row + sgitg] = sumf[row]; } }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int row = 0; row < NR0; ++row) {
+        float tot = simd_sum(shmem[NW*row + tiisg]);
+        if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {
+            // F32→BF16 output: take upper 16 bits of float32 bit pattern.
+            dst[r1*ne0 + im*ne0*ne1 + r0 + row] = (ushort)(as_type<uint>(tot) >> 16);
+        }
+    }
+}
+
+/// BF16-input triple Q8_0 GEMV with BF16 OUTPUT.
+/// Eliminates BOTH the pre-cast (BF16→F32) AND post-casts (3×F32→BF16).
+/// Net saving vs kernel_mul_mv3_q8_0_f32_to_bf16: 1 dispatch (the pre-cast).
+/// Net saving vs 3 separate GEMVs: saves the triple dispatch overhead.
+[[host_name("kernel_mul_mv3_q8_0_bf16i_to_bf16")]]
+kernel void kernel_mul_mv3_q8_0_bf16i_to_bf16(
+        device const  void   * src0_q,
+        device const  void   * src0_k,
+        device const  void   * src0_v,
+        device const ushort  * src1_bf16,  // BF16 activation
+        device       ushort  * dst_q,      // BF16 Q output
+        device       ushort  * dst_k,      // BF16 K output
+        device       ushort  * dst_v,      // BF16 V output
+        constant   int64_t & ne00,
+        constant   int64_t & ne01_q, constant   int64_t & ne01_kv,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = 2, NW = N_SIMDWIDTH;
+    threadgroup float shmem[NW * NR0];
+    const int tg_q_count  = (int)((ne01_q  + NR0 - 1) / NR0);
+    const int tg_kv_count = (int)((ne01_kv + NR0 - 1) / NR0);
+    const int tg_x = (int)tgpig.x;
+    uint3 tgpig_local = tgpig;
+    if (tg_x < tg_q_count) {
+        kernel_mul_mv_q8_0_bf16i_to_bf16_impl_4sg(src0_q, src1_bf16, dst_q,
+            ne00, ne01_q, ne02, ne10, ne12, ne01_q, ne1, r2, r3,
+            shmem, tgpig_local, tiisg, sgitg);
+    } else if (tg_x < tg_q_count + tg_kv_count) {
+        tgpig_local.x = (uint)(tg_x - tg_q_count);
+        kernel_mul_mv_q8_0_bf16i_to_bf16_impl_4sg(src0_k, src1_bf16, dst_k,
+            ne00, ne01_kv, ne02, ne10, ne12, ne01_kv, ne1, r2, r3,
+            shmem, tgpig_local, tiisg, sgitg);
+    } else {
+        tgpig_local.x = (uint)(tg_x - tg_q_count - tg_kv_count);
+        kernel_mul_mv_q8_0_bf16i_to_bf16_impl_4sg(src0_v, src1_bf16, dst_v,
+            ne00, ne01_kv, ne02, ne10, ne12, ne01_kv, ne1, r2, r3,
+            shmem, tgpig_local, tiisg, sgitg);
+    }
+}
+
 /// Triple Q8_0 GEMV with BF16 OUTPUT: Q, K, V in one dispatch, outputs BF16.
 /// Eliminates 3×F32→BF16 back-cast dispatches vs the F32-output variant.
 /// Input activation is F32; output Q/K/V are BF16 (ready for norms + SDPA).
@@ -3206,6 +3312,30 @@ kernel void kernel_mul_mv_q8_0_bf16i_f32(
             dst[(uint64_t)r1 * ne0 + (uint64_t)im * ne0 * ne1 + first_row + row] = tot;
         }
     }
+}
+
+/// Q8_0 GEMV: BF16 input → BF16 output.
+/// Combines bf16i conversion (input) and f32→bf16 (output) to eliminate
+/// both the pre-cast and post-cast dispatches for the o_proj / down_proj paths.
+[[host_name("kernel_mul_mv_q8_0_bf16i_to_bf16")]]
+kernel void kernel_mul_mv_q8_0_bf16i_to_bf16(
+        device const  void   * src0,
+        device const ushort  * src1_bf16,   // BF16 activation
+        device       ushort  * dst,         // BF16 output
+        constant   int64_t & ne00, constant   int64_t & ne01, constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne0,  constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 2, NW = N_SIMDWIDTH;
+    threadgroup float shmem[NW * NR0];
+    kernel_mul_mv_q8_0_bf16i_to_bf16_impl_4sg(src0, src1_bf16, dst,
+        ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3,
+        shmem, tgpig, tiisg, sgitg);
 }
 
 /// TQ2_0 GEMV: block_tq2_0 (QK_K=256 ternary weights, 66 bytes) x F32 input -> F32 output.

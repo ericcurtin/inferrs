@@ -350,6 +350,89 @@ pub fn call_quantized_matmul_mv_q8_0_bf16o(
     Ok(())
 }
 
+/// Q8_0 GEMV: BF16 input → BF16 output.
+/// Eliminates both the pre-cast (BF16→F32) and post-cast (F32→BF16) dispatches.
+/// Used for o_proj (hidden→hidden) and PLI projection (256→hidden).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q8_0_bf16i_to_bf16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_bf16: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    rhs_offset: usize,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+    let tgc = MTLSize {
+        width: divide(ne01 as usize, 2),
+        height: ne11 as usize,
+        depth: (ne12 * ne13) as usize,
+    };
+    let tgs = MTLSize {
+        width: 32,
+        height: 4,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Quantized,
+        "kernel_mul_mv_q8_0_bf16i_to_bf16",
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (rhs, rhs_offset),
+            (lhs_bf16, lhs_offset),
+            (dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(rhs, MTLResourceUsage::Read);
+    encoder.use_resource(lhs_bf16, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tgc, tgs);
+    Ok(())
+}
+
 /// Q4K GEMV with BF16 input: avoids a separate BF16->F32 conversion dispatch.
 /// Calls kernel_mul_mv_q4_K_bf16i_f32 which converts BF16 to F32 inline.
 #[allow(clippy::too_many_arguments)]
@@ -1365,6 +1448,110 @@ pub fn call_quantized_matmul_mv3_q8_0_bf16i(
     };
     let pipeline =
         kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv3_q8_0_bf16i_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (src0_q, src0_q_offset),
+            (src0_k, src0_k_offset),
+            (src0_v, src0_v_offset),
+            (src1_bf16, src1_offset),
+            (dst_q, dst_q_offset),
+            (dst_k, dst_k_offset),
+            (dst_v, dst_v_offset),
+            ne00,
+            ne01_q,
+            ne01_kv,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0_q, MTLResourceUsage::Read);
+    encoder.use_resource(src0_k, MTLResourceUsage::Read);
+    encoder.use_resource(src0_v, MTLResourceUsage::Read);
+    encoder.use_resource(src1_bf16, MTLResourceUsage::Read);
+    encoder.use_resource(dst_q, MTLResourceUsage::Write);
+    encoder.use_resource(dst_k, MTLResourceUsage::Write);
+    encoder.use_resource(dst_v, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tgc, tgs);
+    Ok(())
+}
+
+/// Triple Q8_0 GEMV: BF16 input → BF16 output for Q, K, V.
+/// Combines the BF16-input (no pre-cast dispatch) and BF16-output (no post-cast
+/// dispatch) variants: saves 1 dispatch per attention layer vs the
+/// f32_to_bf16 variant, and 4 dispatches vs 3 separate F32-path GEMVs.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv3_q8_0_bf16i_to_bf16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n_q, n_kv, k): (usize, usize, usize, usize, usize),
+    src1_bf16: &Buffer,
+    src1_offset: usize,
+    src0_q: &Buffer,
+    src0_q_offset: usize,
+    dst_q_offset: usize,
+    dst_q: &Buffer,
+    src0_k: &Buffer,
+    src0_k_offset: usize,
+    dst_k_offset: usize,
+    dst_k: &Buffer,
+    src0_v: &Buffer,
+    src0_v_offset: usize,
+    dst_v_offset: usize,
+    dst_v: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01_q = n_q as i64;
+    let ne01_kv = n_kv as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+    let align = 2usize;
+    let tg_q = divide(n_q, align);
+    let tg_kv = divide(n_kv, align);
+    let total_tg = tg_q + 2 * tg_kv;
+    let tgc = MTLSize {
+        width: total_tg,
+        height: m,
+        depth: b,
+    };
+    let tgs = MTLSize {
+        width: 32,
+        height: 4,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Quantized,
+        "kernel_mul_mv3_q8_0_bf16i_to_bf16",
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

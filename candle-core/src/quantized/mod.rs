@@ -764,6 +764,35 @@ impl QTensor {
         }
     }
 
+    /// Q8_0 GEMV: BF16 input → BF16 output. Eliminates both casts.
+    pub fn fwd_mv_q8_0_bf16i_to_bf16(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        match &self.storage {
+            QStorage::Metal(m) => {
+                if m.dtype() != GgmlDType::Q8_0 {
+                    return Ok(None);
+                }
+                let (dst_storage, dst_shape) =
+                    m.fwd_mv_q8_0_bf16i_to_bf16(&self.shape, &xs_storage, &xs_layout)?;
+                let out = crate::tensor::from_storage(
+                    Storage::Metal(dst_storage),
+                    dst_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Q4K GEMV with BF16 input on Metal — avoids separate BF16→F32 dispatch.
     #[cfg(feature = "metal")]
     pub fn fwd_mv_bf16i(&self, xs: &Tensor) -> Result<Option<Tensor>> {
@@ -1124,6 +1153,57 @@ impl QTensor {
                 }
                 let ((dq, sq), (dk, sk), (dv, sv)) =
                     qm.fwd_mv3_q8_0_bf16i(km, vm, &self.shape, &kw.shape, &xs_s, &xs_l)?;
+                Ok(Some((
+                    crate::tensor::from_storage(
+                        Storage::Metal(dq),
+                        sq,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dk),
+                        sk,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                    crate::tensor::from_storage(
+                        Storage::Metal(dv),
+                        sv,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ),
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Triple Q8_0 GEMV: BF16 input → BF16 output.
+    /// One dispatch eliminates both the pre-cast and the 3 post-casts.
+    pub fn fwd_mv3_q8_0_bf16i_to_bf16(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q8_0
+                    || km.dtype() != GgmlDType::Q8_0
+                    || vm.dtype() != GgmlDType::Q8_0
+                {
+                    return Ok(None);
+                }
+                let ((dq, sq), (dk, sk), (dv, sv)) =
+                    qm.fwd_mv3_q8_0_bf16i_to_bf16(km, vm, &self.shape, &kw.shape, &xs_s, &xs_l)?;
                 Ok(Some((
                     crate::tensor::from_storage(
                         Storage::Metal(dq),
