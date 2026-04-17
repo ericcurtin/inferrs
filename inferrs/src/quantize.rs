@@ -769,25 +769,23 @@ pub fn convert_to_gguf(
         let meta = Gemma4Meta::from_model_dir(dir, effective_dtype)
             .context("building Gemma4 GGUF metadata")?;
 
-        // Generate rope_freqs.weight: F32 tensor of shape [global_head_dim/2].
-        // Contains precomputed RoPE inverse frequencies:
-        //   freqs[i] = 1.0 / rope_theta ^ (2i / global_head_dim)
-        // Matches ggml-org's rope_freqs.weight exactly.
+        // Generate rope_freqs.weight: freq_factors tensor of shape [global_head_dim/2].
+        //
+        // This is NOT the inverse-frequency tensor — it is a freq_factors (scaling)
+        // tensor used by llama.cpp to implement partial RoPE for global attention layers.
+        //
+        // Gemma4 global attention uses "proportional" RoPE with partial_rotary_factor=0.25:
+        //   n_rot  = int(global_head_dim * partial_rotary_factor / 2)  = 64  (rotated dims)
+        //   n_unrot = int(global_head_dim / 2) - n_rot                 = 192 (unrotated dims)
+        //
+        // The freq_factors tensor has shape [global_head_dim/2] = [256]:
+        //   values[0..n_rot]  = 1.0   → these dims are rotated normally
+        //   values[n_rot..]   = 1e30  → multiplying inv_freq by 1e30 drives the angle to
+        //                               infinity, making cos≈1, sin≈0 (no rotation)
+        //
+        // This matches convert_hf_to_gguf.py Gemma4Model.generate_extra_tensors() exactly.
         let rope_freqs_qt = {
             use candle_core::quantized::QTensor;
-            // Extract rope_theta and global_head_dim from the metadata KV.
-            let rope_theta = meta
-                .kv
-                .iter()
-                .find(|(k, _)| k == "gemma4.rope.freq_base")
-                .and_then(|(_, v)| {
-                    if let gguf_file::Value::F32(f) = v {
-                        Some(*f)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(1_000_000.0f32);
             let global_head_dim = meta
                 .kv
                 .iter()
@@ -799,12 +797,28 @@ pub fn convert_to_gguf(
                         None
                     }
                 })
-                .unwrap_or(512u32);
-            let n = (global_head_dim / 2) as usize;
-            let freqs: Vec<f32> = (0..n)
-                .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / global_head_dim as f32))
-                .collect();
-            let t = candle_core::Tensor::from_vec(freqs, (n,), &Device::Cpu)?;
+                .unwrap_or(512u32) as usize;
+            // partial_rotary_factor for global layers is always 0.25 for Gemma4.
+            // Read from config.json rope_parameters.full_attention.partial_rotary_factor
+            // if available; fall back to 0.25 (correct for all known Gemma4 variants).
+            let partial_rotary_factor = {
+                let cfg_factor: Option<f64> = model_dir
+                    .and_then(|d| std::fs::read_to_string(d.join("config.json")).ok())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|c| {
+                        let tc = c.get("text_config").cloned().unwrap_or_else(|| c.clone());
+                        tc.get("rope_parameters")
+                            .and_then(|rp| rp.get("full_attention"))
+                            .and_then(|fa| fa.get("partial_rotary_factor"))
+                            .and_then(|v| v.as_f64())
+                    });
+                cfg_factor.unwrap_or(0.25)
+            };
+            let n_rot = (global_head_dim as f64 * partial_rotary_factor / 2.0).floor() as usize;
+            let n_unrot = global_head_dim / 2 - n_rot;
+            let mut values = vec![1.0f32; n_rot];
+            values.extend(std::iter::repeat(1e30f32).take(n_unrot));
+            let t = candle_core::Tensor::from_vec(values, (global_head_dim / 2,), &Device::Cpu)?;
             QTensor::quantize(&t, GgmlDType::F32).context("rope_freqs.weight quantize failed")?
         };
 

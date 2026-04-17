@@ -612,10 +612,35 @@ impl Module for Mlp {
             #[allow(unused_variables)]
             let is_single_token = xs.rank() >= 2 && xs.dim(xs.rank() - 2).unwrap_or(0) == 1;
 
+            // Fused double-GEMV for single-token decode.
+            //
+            // For BF16 input on Metal, prefer the BF16-input variants (bf16i) which
+            // accept BF16 directly and output F32 — eliminating the xs.to_dtype(F32)
+            // dispatch entirely.  This saves 1 Metal kernel dispatch per MLP layer
+            // per decode step (35 layers × 1 = 35 fewer dispatches on E2B only).
+            // Note: Q4K bf16i is disabled pending kernel validation for E4B.
+            #[cfg(feature = "metal")]
+            if is_single_token
+                && orig_dtype == DType::BF16
+                && matches!(xs.device(), candle_core::Device::Metal(_))
+            {
+                // BF16i paired GEMV: skips the xs→F32 pre-cast.
+                // Q8_0 only (E2B) — Q4K bf16i adds per-element bit-shift overhead that
+                // outweighs the dispatch savings for the larger E4B weight matrices.
+                let paired_bf16i = self.gate_proj.forward_paired_q8_0_bf16i(&self.up_proj, xs);
+                if let Some(result) = paired_bf16i {
+                    let (gate_f32, up_f32) = result?;
+                    let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    return self
+                        .down_proj
+                        .forward_f32(&hidden_act_f32)?
+                        .to_dtype(orig_dtype);
+                }
+            }
+
             // Use the F32-fused path (gate+up in 1 dispatch) for Mlp.
             let xs_f32 = xs.to_dtype(DType::F32)?;
 
-            // Fused double-GEMV for single-token decode.
             // Try Q8_0 first (E2B recipe), then Q3K (ggml-org), then Q4K.
             #[cfg(feature = "metal")]
             if is_single_token {
@@ -1645,10 +1670,16 @@ impl Attention {
                         softcapping,
                     )?
                 };
-                attn_result
-                    .transpose(1, 2)?
-                    .reshape((b_sz, q_len, ()))?
-                    .apply(&self.o_proj)?
+                // For decode (q_len=1), attn_result is [b, n_heads, 1, head_dim] — contiguous.
+                // Directly reshape to [b, 1, n_heads*head_dim] without transpose:
+                // [b, n_heads, 1, d] and [b, 1, n_heads*d] have the same memory layout.
+                // This eliminates the transpose(1,2) which produces a non-contiguous view
+                // that forces a contiguous copy in reshape() — saving 1 Metal dispatch per
+                // attention layer per decode step.
+                // For prefill the 2-pass pre-alloc path is not taken (kv_len <= threshold
+                // is irrelevant here; the donor_attn branch handles that), so this is
+                // only reached at decode time (q_len==1 guard above).
+                self.apply_o_proj(&attn_result.reshape((b_sz, q_len, ()))?)?
             }
         } else {
             // Manual GQA path: use Q-reshape to avoid materializing expanded K/V.
@@ -1848,17 +1879,17 @@ impl Attention {
                             out,
                         )?;
                         if used {
-                            return self.apply_o_proj(&out.clone().transpose(1, 2)?.reshape((
-                                b_sz,
-                                q_len,
-                                (),
-                            ))?);
+                            // out is [b, n_heads, 1, head_dim] — contiguous.
+                            // Reshape directly to [b, 1, hidden] without transpose.
+                            return self.apply_o_proj(&out.clone().reshape((b_sz, q_len, ()))?);
                         }
                     }
                 }
             } // end #[cfg(feature = "metal")]
 
             // Standard 1-pass sdpa (for N ≤ 1024 or 2-pass unavailable).
+            // SDPA output is [b, n_heads, 1, head_dim] — contiguous.
+            // reshape directly to [b, 1, hidden] without transpose.
             return self.apply_o_proj(
                 &candle_nn::ops::sdpa(
                     &query_states,
@@ -1869,7 +1900,6 @@ impl Attention {
                     1.0_f32,
                     softcapping,
                 )?
-                .transpose(1, 2)?
                 .reshape((b_sz, q_len, ()))?,
             );
         }
@@ -2548,8 +2578,9 @@ impl DecoderLayer {
                     // gelu_mul accepts F32 gate + BF16 up directly, saving
                     // the pli_input.to_dtype(F32) dispatch per PLI layer.
                     let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
-                    let pli_proj_f32 = pli.projection.forward_f32(&pli_mid_f32)?;
-                    pli_proj_f32.to_dtype(xs.dtype())?
+                    pli.projection
+                        .forward_f32(&pli_mid_f32)?
+                        .to_dtype(xs.dtype())?
                 } else {
                     let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
                     let pli_out = gate.broadcast_mul(pli_input)?;
