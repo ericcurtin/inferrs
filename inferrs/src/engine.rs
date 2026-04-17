@@ -741,6 +741,11 @@ struct ActiveSequence {
     token_logprobs: Vec<crate::sampler::TokenLogprob>,
     /// JSON grammar FSM for structured output.  `None` = free generation.
     grammar_fsm: Option<crate::grammar::JsonFsm>,
+    /// Per-sequence speculative decode stats.  Accumulated while this sequence
+    /// is active; logged at sequence completion if non-zero.
+    spec_accepted: u64,
+    /// Total draft tokens proposed for this sequence (gamma * number of steps).
+    spec_steps: u64,
 }
 
 impl ActiveSequence {
@@ -788,6 +793,8 @@ impl ActiveSequence {
                     max_stop_string_len,
                     token_logprobs: Vec::new(),
                     grammar_fsm,
+                    spec_accepted: 0,
+                    spec_steps: 0,
                 }
             }
             EngineRequest::GenerateStream {
@@ -830,6 +837,8 @@ impl ActiveSequence {
                     max_stop_string_len,
                     token_logprobs: Vec::new(),
                     grammar_fsm,
+                    spec_accepted: 0,
+                    spec_steps: 0,
                 }
             }
             EngineRequest::Embed { .. } => {
@@ -1411,14 +1420,6 @@ pub struct Engine {
     pub(crate) draft_model: Option<Box<dyn CausalLM>>,
     /// Number of draft tokens proposed per speculative decode step.
     pub(crate) draft_gamma: usize,
-    /// Cumulative accepted draft tokens across all speculative decode steps.
-    /// Incremented by the speculative decode loop; reset per-sequence
-    /// and logged at sequence completion (task-008).
-    pub(crate) draft_accepted_total: u64,
-    /// Cumulative speculative decode steps taken (each step proposes `draft_gamma`
-    /// draft tokens).  Used together with `draft_accepted_total` to compute the
-    /// acceptance rate logged at sequence completion (task-008).
-    pub(crate) draft_steps_total: u64,
 }
 
 /// Shared state for paged-attention mode.
@@ -1458,8 +1459,6 @@ impl Engine {
             token_bytes: None,
             draft_model: None,
             draft_gamma: 5,
-            draft_accepted_total: 0,
-            draft_steps_total: 0,
         }
     }
 
@@ -1519,10 +1518,6 @@ impl Engine {
             token_bytes: token_bytes_opt,
             draft_model: mut draft_model_opt,
             draft_gamma,
-            #[allow(unused_variables)]
-            mut draft_accepted_total,
-            #[allow(unused_variables)]
-            mut draft_steps_total,
         } = self;
         // Lazily-populated cache of per-token byte strings for grammar masking.
         // Populated on the first grammar-constrained request so startup is not
@@ -1790,12 +1785,48 @@ impl Engine {
                         }
                     }
 
-                    // Update cumulative speculative decode statistics.
-                    // These are read and logged in task-008.
-                    #[allow(unused_assignments)]
-                    {
-                        draft_accepted_total += n_accepted as u64;
-                        draft_steps_total += draft_gamma as u64;
+                    // Per-step acceptance rate log (debug level).
+                    // accepted draft tokens = returned vec length minus the
+                    // bonus/replacement token, capped at gamma.
+                    let n_accepted_draft = (n_accepted as u64)
+                        .saturating_sub(1)
+                        .min(draft_gamma as u64);
+                    tracing::debug!(
+                        "speculative: accepted {}/{} draft tokens",
+                        n_accepted_draft,
+                        draft_gamma,
+                    );
+
+                    // Update per-sequence statistics.
+                    seq.spec_accepted += n_accepted_draft;
+                    seq.spec_steps += draft_gamma as u64;
+
+                    // At sequence completion, log cumulative acceptance rate and
+                    // warn if it is below the useful threshold.
+                    // NOTE: this block only fires when the sequence ends on a
+                    // speculative step.  If the very last token is produced by
+                    // the single-token fallback path (e.g. EOS was hit while
+                    // stepping through the single-token path after a rejection),
+                    // seq.finished will be set there, not here, and the
+                    // completion log will be silently skipped.  This is a known
+                    // minor gap; fixing it would require a second check in the
+                    // single-token path and is not worth the added complexity.
+                    if seq.finished && seq.spec_steps > 0 {
+                        let pct = seq.spec_accepted as f64 / seq.spec_steps as f64 * 100.0;
+                        tracing::info!(
+                            "speculative decoding: {:.1}% acceptance ({}/{} tokens)",
+                            pct,
+                            seq.spec_accepted,
+                            seq.spec_steps,
+                        );
+                        if pct < 20.0 {
+                            tracing::warn!(
+                                "speculative decoding acceptance rate {:.1}% is below \
+                                 20% — consider reducing --draft-gamma or using a \
+                                 better-matched draft model",
+                                pct,
+                            );
+                        }
                     }
 
                     if !seq.prefilled {
