@@ -1058,8 +1058,15 @@ impl Attention {
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
-            // BF16→BF16 path: DISABLED pending correctness investigation.
-            // if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) { return out; }
+            // BF16→BF16 GEMV: eliminates both pre-cast and post-cast (saves 1 dispatch vs bf16i path).
+            // Q8_0 (E2B) only — Q4K bf16i_to_bf16 pending kernel validation.
+            if let Some(out) = self
+                .o_proj
+                .forward_q8_0_bf16i_to_bf16(xs)
+                .or_else(|| self.o_proj.forward_q4k_bf16i_to_bf16(xs))
+            {
+                return out;
+            }
             // Fallback for other dtypes: BF16i→F32, then back-cast.
             #[cfg(feature = "metal")]
             if let Some(out) = self.o_proj.forward_bf16i(xs) {
@@ -1375,11 +1382,7 @@ impl Attention {
         let is_single_token_decode = q_len == 1;
 
         let (q_raw, k_raw, v_raw) = if need_pre_convert && is_single_token_decode {
-            // Best path: BF16 input → BF16 output triple QKV GEMV.
-            // No pre-cast (BF16→F32) and no post-casts (3×F32→BF16) — saves 1 dispatch
-            // vs the bf16o variant which still needs the pre-cast.
-            // Q8_0 (E2B) only — Q4K bf16i_to_bf16 has unresolved correctness issue.
-            // TODO: bf16i_to_bf16 QKV disabled pending correctness investigation.
+            // BF16→BF16 triple QKV: disabled — see kernel investigation notes.
             #[cfg(feature = "metal")]
             let qkv_b2b: Option<
                 candle_core::Result<(
