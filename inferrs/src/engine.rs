@@ -1412,14 +1412,12 @@ pub struct Engine {
     /// Number of draft tokens proposed per speculative decode step.
     pub(crate) draft_gamma: usize,
     /// Cumulative accepted draft tokens across all speculative decode steps.
-    /// Incremented by the speculative decode loop (task-007); reset per-sequence
+    /// Incremented by the speculative decode loop; reset per-sequence
     /// and logged at sequence completion (task-008).
-    #[allow(dead_code)]
     pub(crate) draft_accepted_total: u64,
     /// Cumulative speculative decode steps taken (each step proposes `draft_gamma`
     /// draft tokens).  Used together with `draft_accepted_total` to compute the
     /// acceptance rate logged at sequence completion (task-008).
-    #[allow(dead_code)]
     pub(crate) draft_steps_total: u64,
 }
 
@@ -1519,10 +1517,12 @@ impl Engine {
             max_tokens_per_step: _,
             paged,
             token_bytes: token_bytes_opt,
-            draft_model: _draft_model_opt,
-            draft_gamma: _draft_gamma,
-            draft_accepted_total: _,
-            draft_steps_total: _,
+            draft_model: mut draft_model_opt,
+            draft_gamma,
+            #[allow(unused_variables)]
+            mut draft_accepted_total,
+            #[allow(unused_variables)]
+            mut draft_steps_total,
         } = self;
         // Lazily-populated cache of per-token byte strings for grammar masking.
         // Populated on the first grammar-constrained request so startup is not
@@ -1649,6 +1649,160 @@ impl Engine {
                             continue;
                         }
                     }
+                }
+
+                // ── Draft-model speculative decode path ──────────────────
+                // Active only when a draft model is loaded, for single-sequence
+                // batches without grammar constraints or logprobs, using the
+                // internal concat-KV cache (not paged).  Takes priority over MTP.
+                let use_draft = seq.prefilled
+                    && active_count == 1
+                    && seq.grammar_fsm.is_none()
+                    && !seq.sampling_params.logprobs
+                    && paged.is_none()
+                    && draft_model_opt.is_some();
+
+                if use_draft {
+                    let last_token = match seq.output_tokens.last() {
+                        Some(&t) => t,
+                        None => {
+                            seq.finish_error(
+                                anyhow::anyhow!(
+                                    "internal error: speculative decode before prefill"
+                                ),
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            continue;
+                        }
+                    };
+                    let seqlen_offset = seq.prompt_tokens.len() + seq.output_tokens.len() - 1;
+                    model.hint_decode_token(last_token);
+                    model.hint_sampling_temperature(seq.sampling_params.temperature);
+
+                    let draft = draft_model_opt.as_mut().unwrap();
+                    let spec_tokens = match Self::cb_speculative_decode_step(
+                        &mut model,
+                        draft,
+                        &device,
+                        last_token,
+                        seqlen_offset,
+                        draft_gamma,
+                        &seq.sampling_params,
+                        &seq.all_tokens,
+                    ) {
+                        Ok(toks) => toks,
+                        Err(e) => {
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                            continue;
+                        }
+                    };
+
+                    let n_accepted = spec_tokens.len();
+
+                    // Emit each accepted token through the normal output pipeline.
+                    for token_id in spec_tokens {
+                        seq.output_tokens.push(token_id);
+                        seq.all_tokens.push(token_id);
+
+                        let decoded_text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+
+                        if seq.max_stop_string_len > 0 {
+                            update_decoded_suffix(
+                                &mut seq.decoded_suffix,
+                                &decoded_text,
+                                seq.max_stop_string_len * 2,
+                            );
+                        }
+
+                        let finish_reason = check_stop(
+                            token_id,
+                            seq.output_tokens.len(),
+                            &seq.sampling_params,
+                            &stop_token_ids,
+                            &seq.decoded_suffix,
+                        );
+
+                        let is_last = finish_reason.is_some();
+                        let (total_ns, prompt_eval_ns, eval_ns) = if is_last {
+                            let t = seq.timing_ns();
+                            (Some(t.0), Some(t.1), Some(t.2))
+                        } else {
+                            (None, None, None)
+                        };
+
+                        let kind = seq.think_filter.classify(token_id);
+                        match kind {
+                            TokenKind::Reasoning => seq.reasoning_tokens.push(token_id),
+                            TokenKind::Content => seq.content_tokens.push(token_id),
+                            TokenKind::Delimiter => {}
+                        }
+
+                        let client_gone = match kind {
+                            TokenKind::Delimiter => {
+                                if is_last {
+                                    let _ = seq.sink.send_token(StreamToken {
+                                        token_id,
+                                        text: String::new(),
+                                        reasoning_content: String::new(),
+                                        finish_reason: finish_reason.clone(),
+                                        total_duration_ns: total_ns,
+                                        prompt_eval_duration_ns: prompt_eval_ns,
+                                        eval_duration_ns: eval_ns,
+                                        logprob: None,
+                                    });
+                                }
+                                false
+                            }
+                            TokenKind::Reasoning => !seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: String::new(),
+                                reasoning_content: decoded_text.clone(),
+                                finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
+                                logprob: None,
+                            }),
+                            TokenKind::Content => !seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: decoded_text,
+                                reasoning_content: String::new(),
+                                finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
+                                logprob: None,
+                            }),
+                        };
+
+                        if is_last || client_gone {
+                            if !seq.prefilled {
+                                seq.prefilled = true;
+                                seq.prefill_end = Some(Instant::now());
+                            }
+                            let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
+                            seq.finish_ok(
+                                &reason,
+                                &tokenizer,
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            break;
+                        }
+                    }
+
+                    // Update cumulative speculative decode statistics.
+                    // These are read and logged in task-008.
+                    #[allow(unused_assignments)]
+                    {
+                        draft_accepted_total += n_accepted as u64;
+                        draft_steps_total += draft_gamma as u64;
+                    }
+
+                    if !seq.prefilled {
+                        seq.prefilled = true;
+                        seq.prefill_end = Some(Instant::now());
+                    }
+                    continue; // skip MTP and single-token paths below
                 }
 
                 // ── MTP speculative decode path ───────────────────────────
@@ -2392,7 +2546,7 @@ impl Engine {
     /// acceptance a bonus token is sampled from the last target logits.
     ///
     /// Verification follows Algorithm 1 from Chen et al. 2302.01318.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn cb_speculative_decode_step(
         target: &mut Box<dyn CausalLM>,
         draft: &mut Box<dyn CausalLM>,
