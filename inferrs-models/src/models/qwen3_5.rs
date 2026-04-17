@@ -330,6 +330,26 @@ impl FullAttention {
         }
     }
 
+    /// Remove the last `n` tokens from the KV cache.
+    fn truncate_kv_cache(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(tq) = &mut self.tq_cache {
+            tq.truncate(n);
+        } else if let Some((k, v)) = &self.kv_cache {
+            let seq_len = k.dim(2).unwrap_or(0);
+            if n >= seq_len {
+                self.kv_cache = None;
+            } else {
+                let new_len = seq_len - n;
+                let k_new = k.narrow(2, 0, new_len).ok();
+                let v_new = v.narrow(2, 0, new_len).ok();
+                self.kv_cache = k_new.zip(v_new);
+            }
+        }
+    }
+
     /// Paged-attention forward pass.
     ///
     /// Instead of growing a per-layer concat KV cache, keys and values are
@@ -1058,6 +1078,14 @@ impl DecoderLayer {
             LayerAttn::Linear(a) => a.clear_state(),
         }
     }
+
+    fn truncate_kv_cache(&mut self, n: usize) {
+        if let LayerAttn::Full(a) = &mut self.attn {
+            a.truncate_kv_cache(n);
+        }
+        // Linear-attention (SSM) layers maintain recurrent state, not a KV cache;
+        // they are skipped here (no rollback needed for SSM layers).
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,6 +1361,15 @@ impl Qwen35Model {
         if let Some(m) = &mut self.mtp {
             m.clear_kv_cache();
         }
+    }
+
+    /// Remove the last `n` tokens from every layer's KV cache.
+    pub fn truncate_kv_cache(&mut self, n: usize) {
+        for layer in &mut self.layers {
+            layer.truncate_kv_cache(n);
+        }
+        // MTP module has its own KV cache but it is cleared before each draft
+        // session (see mtp_draft), so no truncation is needed here.
     }
 
     /// Forward pass returning logits for **all** positions: `[b, t, vocab]`.

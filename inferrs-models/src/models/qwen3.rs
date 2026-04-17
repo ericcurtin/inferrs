@@ -201,6 +201,28 @@ impl Attention {
         }
     }
 
+    /// Remove the last `n` tokens from the KV cache.
+    ///
+    /// Used by speculative decoding to roll back rejected draft tokens.
+    fn truncate_kv_cache(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(tq) = &mut self.tq_cache {
+            tq.truncate(n);
+        } else if let Some((k, v)) = &self.kv_cache {
+            let seq_len = k.dim(2).unwrap_or(0);
+            if n >= seq_len {
+                self.kv_cache = None;
+            } else {
+                let new_len = seq_len - n;
+                let k_new = k.narrow(2, 0, new_len).ok();
+                let v_new = v.narrow(2, 0, new_len).ok();
+                self.kv_cache = k_new.zip(v_new);
+            }
+        }
+    }
+
     /// Borrow the current KV cache tensors (post-prefill).
     /// Returns `None` if no prefill has been run yet.
     fn kv_cache(&self) -> Option<&(Tensor, Tensor)> {
@@ -317,6 +339,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.attn.clear_kv_cache();
+    }
+
+    fn truncate_kv_cache(&mut self, n: usize) {
+        self.attn.truncate_kv_cache(n);
     }
 
     fn kv_cache(&self) -> Option<&(Tensor, Tensor)> {
@@ -442,6 +468,13 @@ impl Qwen3Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
+        }
+    }
+
+    /// Remove the last `n` tokens from every layer's KV cache.
+    pub fn truncate_kv_cache(&mut self, n: usize) {
+        for layer in &mut self.layers {
+            layer.truncate_kv_cache(n);
         }
     }
 

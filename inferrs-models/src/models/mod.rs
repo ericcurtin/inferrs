@@ -399,6 +399,10 @@ impl CausalLM for Qwen3ModelWrapper {
         self.inner.clear_kv_cache();
     }
 
+    fn truncate_kv_cache(&mut self, n: usize) {
+        self.inner.truncate_kv_cache(n);
+    }
+
     fn populate_paged_from_cache(
         &mut self,
         block_table: &BlockTable,
@@ -482,6 +486,10 @@ impl CausalLM for Gemma4ModelWrapper {
 
     fn clear_kv_cache(&mut self) {
         self.inner.clear_kv_cache();
+    }
+
+    fn truncate_kv_cache(&mut self, n: usize) {
+        self.inner.truncate_kv_cache(n);
     }
 
     fn has_audio_tower(&self) -> bool {
@@ -635,6 +643,10 @@ impl CausalLM for Qwen35ModelWrapper {
 
     fn clear_kv_cache(&mut self) {
         self.inner.clear_kv_cache();
+    }
+
+    fn truncate_kv_cache(&mut self, n: usize) {
+        self.inner.truncate_kv_cache(n);
     }
 }
 

@@ -1985,6 +1985,33 @@ impl Attention {
         }
     }
 
+    /// Remove the last `n` tokens from the KV cache.
+    ///
+    /// Only global (non-sliding) attention layers have usable concat/TQ caches.
+    /// Sliding layers use a fixed-size rotating cache; their content cannot be
+    /// reliably truncated (the buffer is overwritten in a ring), so they are
+    /// left untouched — speculative decoding should not be used with paged or
+    /// sliding-window configs, and the engine guards this appropriately.
+    fn truncate_kv_cache(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(tq) = &mut self.tq_cache {
+            tq.truncate(n);
+            return;
+        }
+        if let KvCache::Normal(c) = &mut self.kv_cache {
+            // RetainingKvCache stores tensors in `k_buf`/`v_buf` pre-allocated buffers;
+            // truncate by reducing `seq_len` so the next `append` overwrites the tail.
+            if n >= c.seq_len {
+                c.reset();
+            } else {
+                c.seq_len -= n;
+            }
+        }
+        // KvCache::Rotating (sliding layers): no-op — see doc comment above.
+    }
+
     /// Return the current K/V tensors from the internal cache, if any.
     /// Returns `None` for rotating (sliding) layers or if no prefill has been run.
     /// Returns `Some((k, v))` where each has shape `[1, n_kv_heads, seq_len, head_dim]`.
@@ -2469,6 +2496,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    fn truncate_kv_cache(&mut self, n: usize) {
+        self.self_attn.truncate_kv_cache(n);
     }
 }
 
@@ -3710,6 +3741,13 @@ impl Gemma4Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
+        }
+    }
+
+    /// Remove the last `n` tokens from every layer's KV cache.
+    pub fn truncate_kv_cache(&mut self, n: usize) {
+        for layer in self.layers.iter_mut() {
+            layer.truncate_kv_cache(n);
         }
     }
 

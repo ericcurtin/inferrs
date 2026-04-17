@@ -1198,6 +1198,69 @@ impl TurboQuantKvCache {
         self
     }
 
+    /// Remove the last `n` tokens from the KV cache.
+    ///
+    /// Used by speculative decoding to roll back rejected draft tokens after
+    /// the verification step.  Handles both the compressed (packed/norms) path
+    /// and the warmup-buffer (unquantized on-device) path.
+    ///
+    /// If `n >= total_tokens`, the cache is fully cleared (equivalent to
+    /// calling `clear()`).  Truncating by 0 is a no-op.
+    pub fn truncate(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+
+        // ── Warmup (unquantized on-device) path ────────────────────────────
+        if self.warmup_kv_buf_len > 0 {
+            if n >= self.warmup_kv_buf_len {
+                // Also remove any compressed tokens that preceded the warmup buffer.
+                let remaining_compressed = self.seq_len.saturating_sub(n - self.warmup_kv_buf_len);
+                self.warmup_kv_buf_len = 0;
+                // Truncate compressed portion if any spillover.
+                if remaining_compressed < self.seq_len {
+                    let drop = self.seq_len - remaining_compressed;
+                    let bytes_per_token =
+                        ((self.head_dim - 1) * self.bits as usize).div_ceil(8);
+                    for h in 0..self.num_kv_heads {
+                        let new_packed_len = remaining_compressed * bytes_per_token;
+                        self.k_packed[h].truncate(new_packed_len);
+                        self.v_packed[h].truncate(new_packed_len);
+                        self.k_norms[h].truncate(remaining_compressed);
+                        self.v_norms[h].truncate(remaining_compressed);
+                    }
+                    self.seq_len = remaining_compressed;
+                    self.cached_seq_len = self.cached_seq_len.min(remaining_compressed);
+                    let _ = drop; // informational only
+                }
+            } else {
+                // n < warmup_kv_buf_len: remove from the warmup buffer only.
+                self.warmup_kv_buf_len -= n;
+            }
+            // kv_buffer is not used while warmup_kv_buf_len > 0 — no need to adjust.
+            return;
+        }
+
+        // ── Compressed (quantized) path ────────────────────────────────────
+        if n >= self.seq_len {
+            self.clear();
+            return;
+        }
+        let new_seq_len = self.seq_len - n;
+        let bytes_per_token = ((self.head_dim - 1) * self.bits as usize).div_ceil(8);
+        for h in 0..self.num_kv_heads {
+            let new_packed_len = new_seq_len * bytes_per_token;
+            self.k_packed[h].truncate(new_packed_len);
+            self.v_packed[h].truncate(new_packed_len);
+            self.k_norms[h].truncate(new_seq_len);
+            self.v_norms[h].truncate(new_seq_len);
+        }
+        self.seq_len = new_seq_len;
+        // cached_seq_len may now exceed seq_len; clamp it so that the next
+        // dequantize() call sees delta == 0 (no stale tokens to re-upload).
+        self.cached_seq_len = self.cached_seq_len.min(new_seq_len);
+    }
+
     /// Clear all cached tokens (start of a new sequence).
     ///
     /// The pre-allocated `kv_buffer` is retained but the sequence pointers are
@@ -1774,5 +1837,105 @@ mod tests {
                 panic!("append step {step} should work with contiguous narrow fix: {e}")
             });
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TurboQuantKvCache::truncate — speculative decode KV rollback
+    // -----------------------------------------------------------------------
+
+    /// Helper: append `n_tokens` distinct 1-token steps, return the cache.
+    fn append_n_tokens(n_tokens: usize, head_dim: usize) -> TurboQuantKvCache {
+        let mut cache = make_cache(head_dim, 4);
+        let device = cache.device.clone();
+        let dtype = test_dtype(&device);
+        for i in 0..n_tokens {
+            let vals: Vec<f32> = (0..head_dim)
+                .map(|j| ((i * head_dim + j) as f32 * 0.13).sin())
+                .collect();
+            let t = Tensor::from_slice(&vals, (1, 1, 1, head_dim), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            cache.append(&t, &t).unwrap();
+        }
+        cache
+    }
+
+    #[test]
+    fn truncate_removes_last_n_tokens() {
+        let mut cache = append_n_tokens(10, 32);
+        assert_eq!(cache.seq_len, 10);
+        cache.truncate(3);
+        assert_eq!(cache.seq_len, 7, "seq_len should be 7 after truncate(3) from 10");
+        // Dequantize should produce shape [1, 1, 7, 32].
+        let (k, _v) = cache.dequantize().unwrap();
+        assert_eq!(k.dim(2).unwrap(), 7, "dequantized k should have seq_len=7");
+        assert_eq!(k.dim(3).unwrap(), 32, "dequantized k should have head_dim=32");
+    }
+
+    #[test]
+    fn truncate_zero_is_noop() {
+        let mut cache = append_n_tokens(5, 32);
+        assert_eq!(cache.seq_len, 5);
+        cache.truncate(0);
+        assert_eq!(cache.seq_len, 5, "truncate(0) should be a no-op");
+    }
+
+    #[test]
+    fn truncate_all_clears_cache() {
+        let mut cache = append_n_tokens(7, 32);
+        cache.truncate(7);
+        assert_eq!(cache.seq_len, 0, "truncate(7) from 7 should empty the cache");
+        assert!(cache.k_packed[0].is_empty());
+        assert!(cache.k_norms[0].is_empty());
+    }
+
+    #[test]
+    fn truncate_beyond_length_clears_cache() {
+        let mut cache = append_n_tokens(4, 32);
+        cache.truncate(100);
+        assert_eq!(cache.seq_len, 0, "truncate(100) from 4 should empty the cache");
+    }
+
+    #[test]
+    fn truncate_then_append_works() {
+        // Append 10 tokens, truncate 3, then append 2 more → expect 9 total.
+        let mut cache = append_n_tokens(10, 32);
+        cache.truncate(3);
+        assert_eq!(cache.seq_len, 7);
+        let device = cache.device.clone();
+        let dtype = test_dtype(&device);
+        for i in 0..2usize {
+            let vals: Vec<f32> = (0..32)
+                .map(|j| ((i * 32 + j + 1000) as f32 * 0.17).cos())
+                .collect();
+            let t = Tensor::from_slice(&vals, (1, 1, 1, 32), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            cache.append(&t, &t).unwrap();
+        }
+        assert_eq!(cache.seq_len, 9, "after truncate(3)+append(2) from 10 expect seq_len=9");
+        let (k, _v) = cache.dequantize().unwrap();
+        assert_eq!(k.dim(2).unwrap(), 9);
+    }
+
+    #[test]
+    fn truncate_internal_storage_size_matches() {
+        let head_dim = 64usize;
+        let bits = 4u8;
+        let bytes_per_token = ((head_dim - 1) * bits as usize).div_ceil(8);
+        let mut cache = append_n_tokens(10, head_dim);
+        cache.truncate(3);
+        assert_eq!(
+            cache.k_packed[0].len(),
+            7 * bytes_per_token,
+            "packed storage should match 7 tokens"
+        );
+        assert_eq!(
+            cache.k_norms[0].len(),
+            7,
+            "norms storage should match 7 tokens"
+        );
     }
 }
