@@ -697,4 +697,87 @@ mod tests {
         let (tok, _) = sample_token(&t, &params, &previous).unwrap();
         assert_eq!(tok, 0, "zero penalty acts as disabled; token 0 still wins");
     }
+
+    // -----------------------------------------------------------------------
+    // speculative_verify — acceptance / rejection logic
+    // -----------------------------------------------------------------------
+
+    /// When draft_probs == softmax(target_logits) the acceptance ratio is
+    /// p(x)/q(x) = 1.0 for every token.  With any deterministic seed the
+    /// random draw r is always in [0, 1), so r < 1.0 is always true →
+    /// every token must be accepted regardless of which token was drafted.
+    #[test]
+    fn speculative_verify_full_acceptance_when_distributions_match() {
+        // 4-token vocabulary; draft token = token 2.
+        let logits = vec![1.0f32, 2.0, 3.0, 0.5];
+        let probs = softmax_vec(&logits);
+
+        // Use a fixed seed so the test is deterministic.
+        let seed = Some(42u64);
+        for step in 0u64..20 {
+            let (verdict, _) = speculative_verify(&logits, &probs, 2, 1.0, seed, step).unwrap();
+            assert!(
+                matches!(verdict, SpecVerdict::Accept),
+                "step={step}: expected Accept when draft == target, got Reject"
+            );
+        }
+    }
+
+    /// Draft assigns all probability mass to token 0 (one-hot).
+    /// Target heavily favours token 1.
+    /// The acceptance ratio is p(0)/q(0) ≈ small_p / 1.0 which is near 0,
+    /// so with a seed that makes rand_f32 > small_p, rejection fires.
+    ///
+    /// We use temperature=0.0 so the target is a one-hot on token 1 (argmax).
+    /// Then p(0)=0 → ratio = 0/1 = 0 < r always → always rejected.
+    #[test]
+    fn speculative_verify_rejects_when_draft_disagrees_with_target() {
+        // Target greedy argmax → token 1 (highest logit).
+        let logits = vec![0.1f32, 10.0, 0.1, 0.1];
+        // Draft is a one-hot on token 0 (wrong token).
+        let draft_probs = vec![1.0f32, 0.0, 0.0, 0.0];
+
+        let seed = Some(99u64);
+        for step in 0u64..10 {
+            let (verdict, _) =
+                speculative_verify(&logits, &draft_probs, 0, 0.0, seed, step).unwrap();
+            assert!(
+                matches!(verdict, SpecVerdict::Reject(_)),
+                "step={step}: expected Reject when target is greedy-1 but draft proposes token 0"
+            );
+        }
+    }
+
+    /// On rejection the replacement is drawn from p' = norm(max(0, p - q)).
+    ///
+    /// Setup: target logits [1.0, 2.0, 0.0] at temperature=0 → p = one-hot on
+    /// token 1 (argmax).  Draft is one-hot on token 0.
+    /// p(0) = 0 → acceptance ratio = 0/1 = 0 → always rejected.
+    /// p' = max(0, [0,1,0] - [1,0,0]) = [0,1,0] → replacement = token 1.
+    #[test]
+    fn speculative_verify_replacement_token_from_adjusted_distribution() {
+        // Target argmax = token 1 (logit 2.0 > 1.0 > 0.0).
+        let logits = vec![1.0f32, 2.0, 0.0];
+        // Draft is a one-hot on token 0 (wrong token).
+        let draft_probs = vec![1.0f32, 0.0, 0.0];
+
+        // temp=0 → p = one-hot on token 1 (argmax).  p(0)=0 → ratio=0 → always rejected.
+        // p' = max(0, p-q) = max(0,[0,1,0]-[1,0,0]) = [0,1,0] → replacement = token 1.
+        let seed = Some(7u64);
+        for step in 0u64..10 {
+            let (verdict, _) =
+                speculative_verify(&logits, &draft_probs, 0, 0.0, seed, step).unwrap();
+            match verdict {
+                SpecVerdict::Reject(replacement) => {
+                    assert_eq!(
+                        replacement, 1,
+                        "step={step}: replacement should be token 1 (target argmax), got {replacement}"
+                    );
+                }
+                SpecVerdict::Accept => {
+                    panic!("step={step}: expected Reject but got Accept");
+                }
+            }
+        }
+    }
 }
