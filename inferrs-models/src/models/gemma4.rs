@@ -1292,7 +1292,9 @@ impl Attention {
             )?;
         }
 
-        // Disable fused_k until dispatch_thread_groups issue with n_heads_k=1 is resolved
+        // K partial_rope: disabled — combining Q+K fused partial_rope causes incorrect
+        // attention output (early EOS). Root cause unknown; Q-only is safe and still
+        // saves 5 dispatches per global attention layer per decode step.
         #[cfg(feature = "metal")]
         let fused_k = false;
         #[cfg(not(feature = "metal"))]
