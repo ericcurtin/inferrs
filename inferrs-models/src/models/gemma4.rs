@@ -1412,15 +1412,17 @@ impl Attention {
         let is_single_token_decode = q_len == 1;
 
         let (q_raw, k_raw, v_raw) = if need_pre_convert && is_single_token_decode {
-            // BF16→BF16 triple QKV: disabled — see kernel investigation notes.
+            // BF16→BF16 triple QKV GEMV: tries Q4K (E4B) only.
+            // Q8_0 bf16i_to_bf16 is still disabled (generates EOS after 1 token, root cause TBD).
             #[cfg(feature = "metal")]
-            let qkv_b2b: Option<
-                candle_core::Result<(
-                    candle_core::Tensor,
-                    candle_core::Tensor,
-                    candle_core::Tensor,
-                )>,
-            > = None;
+            let qkv_b2b = if orig_dtype == DType::BF16
+                && matches!(xs.device(), candle_core::Device::Metal(_))
+            {
+                self.q_proj
+                    .forward_triple_q4k_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
+            } else {
+                None
+            };
             #[cfg(not(feature = "metal"))]
             let qkv_b2b: Option<
                 candle_core::Result<(
