@@ -70,10 +70,11 @@ pub fn gated_delta_rule_chunked(
     // dims fall through to MatMulNonContiguous. Reshaping to [bhnc, S, d] avoids this.
     let bhnc = b * n_heads * num_chunks;
 
-    // Reshape [b, t, n_h, d] -> [b, n_h, num_chunks, chunk, d] with padding
+    // Reshape [b, t, n_h, d] -> [b, n_h, num_chunks, chunk, d] with padding.
+    // Padding zeros use tensor.dtype() so BF16 tensors can be padded correctly.
     let reshape_4d = |tensor: &Tensor, d: usize| -> Result<Tensor> {
         let padded = if needs_pad {
-            let zeros = Tensor::zeros((b, pad_t - t, n_heads, d), DType::F32, &device)?;
+            let zeros = Tensor::zeros((b, pad_t - t, n_heads, d), tensor.dtype(), &device)?;
             Tensor::cat(&[tensor, &zeros], 1)?
         } else {
             tensor.clone()
@@ -86,7 +87,7 @@ pub fn gated_delta_rule_chunked(
 
     let reshape_3d = |tensor: &Tensor| -> Result<Tensor> {
         let padded = if needs_pad {
-            let zeros = Tensor::zeros((b, pad_t - t, n_heads), DType::F32, &device)?;
+            let zeros = Tensor::zeros((b, pad_t - t, n_heads), tensor.dtype(), &device)?;
             Tensor::cat(&[tensor, &zeros], 1)?
         } else {
             tensor.clone()
@@ -102,6 +103,64 @@ pub fn gated_delta_rule_chunked(
     let v_c = reshape_4d(v, head_v_dim)?; // [b, n_h, C, S, hv]
     let log_g_c = reshape_3d(log_g)?; // [b, n_h, C, S]
     let beta_c = reshape_3d(beta)?; // [b, n_h, C, S]
+
+    // ── CUDA fast path ────────────────────────────────────────────────────────
+    // Flatten [b, n_h, C, S, d] → [b*n_h, C, S, d] and dispatch the monolithic
+    // kernel.  Supports F32 and BF16 inputs for q/k/v.
+    // The candle path below is used on CPU and as a fallback.
+    #[cfg(feature = "cuda")]
+    if matches!(device, candle_core::Device::Cuda(_))
+        && matches!((head_k_dim, head_v_dim), (64, 64) | (128, 128))
+        && matches!(q.dtype(), DType::F32 | DType::BF16)
+    {
+        let bn = b * n_heads;
+        let q_flat = q_c.reshape((bn, num_chunks, chunk, head_k_dim))?;
+        let k_flat = k_c.reshape((bn, num_chunks, chunk, head_k_dim))?;
+        let v_flat = v_c.reshape((bn, num_chunks, chunk, head_v_dim))?;
+        let logg_flat = log_g_c.reshape((bn, num_chunks, chunk))?;
+        let beta_flat = beta_c.reshape((bn, num_chunks, chunk))?;
+        let state_flat = state.reshape((bn, head_k_dim, head_v_dim))?.contiguous()?;
+
+        let (out_flat, new_state_flat) = candle_core::cuda_linear_attn_scan::cuda_linear_attn_scan(
+            &q_flat,
+            &k_flat,
+            &v_flat,
+            &logg_flat,
+            &beta_flat,
+            &state_flat,
+        )?;
+
+        *state = new_state_flat
+            .reshape((b, n_heads, head_k_dim, head_v_dim))?
+            .detach();
+
+        // out_flat: [b*n_h, C, S, hv] → [b, n_h, C, S, hv] → [b, pad_t, n_h, hv]
+        let out_perm = out_flat
+            .reshape((b, n_heads, num_chunks, chunk, head_v_dim))?
+            .permute((0, 2, 3, 1, 4))?
+            .contiguous()?
+            .reshape((b, pad_t, n_heads, head_v_dim))?;
+        return Ok(out_perm.narrow(1, 0, t)?);
+    }
+
+    // ── Candle CPU path: ensure F32 ───────────────────────────────────────────
+    // The CUDA fast path above handles BF16 natively and has already returned.
+    // The candle ops below require F32; cast here once rather than at each use.
+    let q_c = if q_c.dtype() != DType::F32 {
+        q_c.to_dtype(DType::F32)?
+    } else {
+        q_c
+    };
+    let k_c = if k_c.dtype() != DType::F32 {
+        k_c.to_dtype(DType::F32)?
+    } else {
+        k_c
+    };
+    let v_c = if v_c.dtype() != DType::F32 {
+        v_c.to_dtype(DType::F32)?
+    } else {
+        v_c
+    };
 
     // ── Step 3a: Log-decay cumsum + decay mask ────────────────────────────
     // g_cumsum[i] = sum(log_g[0..i+1]) within each chunk

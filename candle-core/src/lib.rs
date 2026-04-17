@@ -61,6 +61,8 @@ pub mod cuda_backend;
 pub mod cuda_flash_attn;
 #[cfg(feature = "cuda")]
 pub mod cuda_linear_attn;
+#[cfg(feature = "cuda")]
+pub mod cuda_linear_attn_scan;
 mod custom_op;
 mod device;
 pub mod display;

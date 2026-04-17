@@ -708,11 +708,7 @@ impl LinearAttn {
 
         // ── Gated Delta Rule recurrence ───────────────────────────────────────
         let out_raw = if t == 1 {
-            // Decode path — compute g via fused Metal kernel when available.
-            // g = exp(-a_exp * softplus(a_input + dt_bias))
-            // Metal: fused kernel replaces 14 dispatches with 1.
-            // Fallback: Rust reference — same numerically stable softplus form as the
-            // Metal kernel (exp(-|x|) avoids overflow for large positive x).
+            // Decode path: single-token sequential step (F32 required).
             let g = if let Some(result) =
                 candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
             {
