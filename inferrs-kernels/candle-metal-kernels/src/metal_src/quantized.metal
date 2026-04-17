@@ -5814,12 +5814,27 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     for (int ib = ix; ib < nb; ib += 4) {
 
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (int i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        // float4 vectorized loads: 2 × 128-bit loads per chunk vs 8 scalar loads.
+        float4 sumy;
+        {
+            device const float4 * yv0 = (device const float4 *)(y4 +   0);
+            device const float4 * yv1 = (device const float4 *)(y4 +  32);
+            device const float4 * yv2 = (device const float4 *)(y4 + 128);
+            device const float4 * yv3 = (device const float4 *)(y4 + 160);
+            float4 a0=yv0[0],a1=yv0[1],b0=yv1[0],b1=yv1[1];
+            float4 c0=yv2[0],c1=yv2[1],d0=yv3[0],d1=yv3[1];
+            yl[ 0]=a0[0]; yl[ 1]=a0[1]; yl[ 2]=a0[2]; yl[ 3]=a0[3];
+            yl[ 4]=a1[0]; yl[ 5]=a1[1]; yl[ 6]=a1[2]; yl[ 7]=a1[3];
+            yl[ 8]=b0[0]; yl[ 9]=b0[1]; yl[10]=b0[2]; yl[11]=b0[3];
+            yl[12]=b1[0]; yl[13]=b1[1]; yl[14]=b1[2]; yl[15]=b1[3];
+            yh[ 0]=c0[0]; yh[ 1]=c0[1]; yh[ 2]=c0[2]; yh[ 3]=c0[3];
+            yh[ 4]=c1[0]; yh[ 5]=c1[1]; yh[ 6]=c1[2]; yh[ 7]=c1[3];
+            yh[ 8]=d0[0]; yh[ 9]=d0[1]; yh[10]=d0[2]; yh[11]=d0[3];
+            yh[12]=d1[0]; yh[13]=d1[1]; yh[14]=d1[2]; yh[15]=d1[3];
+            sumy[0]=dot(a0,float4(1))+dot(a1,float4(1));
+            sumy[1]=dot(b0,float4(1))+dot(b1,float4(1));
+            sumy[2]=dot(c0,float4(1))+dot(c1,float4(1));
+            sumy[3]=dot(d0,float4(1))+dot(d1,float4(1));
         }
 
         device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
@@ -6334,12 +6349,27 @@ void kernel_mul_mv_q4_K_f32_to_bf16_impl(
 
     for (int ib = ix; ib < nb; ib += 4) {
 
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (int i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        // float4 vectorized loads: 2 × 128-bit loads per chunk vs 8 scalar loads.
+        float4 sumy;
+        {
+            device const float4 * yv0 = (device const float4 *)(y4 +   0);
+            device const float4 * yv1 = (device const float4 *)(y4 +  32);
+            device const float4 * yv2 = (device const float4 *)(y4 + 128);
+            device const float4 * yv3 = (device const float4 *)(y4 + 160);
+            float4 a0=yv0[0],a1=yv0[1],b0=yv1[0],b1=yv1[1];
+            float4 c0=yv2[0],c1=yv2[1],d0=yv3[0],d1=yv3[1];
+            yl[ 0]=a0[0]; yl[ 1]=a0[1]; yl[ 2]=a0[2]; yl[ 3]=a0[3];
+            yl[ 4]=a1[0]; yl[ 5]=a1[1]; yl[ 6]=a1[2]; yl[ 7]=a1[3];
+            yl[ 8]=b0[0]; yl[ 9]=b0[1]; yl[10]=b0[2]; yl[11]=b0[3];
+            yl[12]=b1[0]; yl[13]=b1[1]; yl[14]=b1[2]; yl[15]=b1[3];
+            yh[ 0]=c0[0]; yh[ 1]=c0[1]; yh[ 2]=c0[2]; yh[ 3]=c0[3];
+            yh[ 4]=c1[0]; yh[ 5]=c1[1]; yh[ 6]=c1[2]; yh[ 7]=c1[3];
+            yh[ 8]=d0[0]; yh[ 9]=d0[1]; yh[10]=d0[2]; yh[11]=d0[3];
+            yh[12]=d1[0]; yh[13]=d1[1]; yh[14]=d1[2]; yh[15]=d1[3];
+            sumy[0]=dot(a0,float4(1))+dot(a1,float4(1));
+            sumy[1]=dot(b0,float4(1))+dot(b1,float4(1));
+            sumy[2]=dot(c0,float4(1))+dot(c1,float4(1));
+            sumy[3]=dot(d0,float4(1))+dot(d1,float4(1));
         }
 
         device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;

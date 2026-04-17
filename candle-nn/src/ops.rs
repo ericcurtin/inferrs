@@ -1014,6 +1014,49 @@ pub fn gelu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
             up.shape()
         );
     }
+    // Mixed path: F32 gate + BF16 up → F32 output (avoids to_dtype for pli_input).
+    #[cfg(feature = "metal")]
+    if gate.dtype() == candle::DType::F32
+        && up.dtype() == candle::DType::BF16
+        && gate.is_contiguous()
+        && up.is_contiguous()
+        && matches!(gate.device(), candle::Device::Metal(_))
+    {
+        use candle::backend::BackendStorage;
+        use candle::Storage;
+        let device = match gate.device() {
+            candle::Device::Metal(d) => d,
+            _ => unreachable!(),
+        };
+        let (g_s, g_l) = gate.storage_and_layout();
+        let (u_s, u_l) = up.storage_and_layout();
+        if let (Storage::Metal(gm), Storage::Metal(um)) = (&*g_s, &*u_s) {
+            let elem_count = g_l.shape().elem_count();
+            let output = device.new_buffer(elem_count, candle::DType::F32, "gelu_mul_f32_bf16i")?;
+            let encoder = device.command_encoder()?;
+            encoder.set_label("gelu_mul_f32_bf16i");
+            candle_metal_kernels::call_gelu_mul_f32_bf16i_f32(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                elem_count,
+                gm.buffer(),
+                g_l.start_offset() * candle::DType::F32.size_in_bytes(),
+                um.buffer(),
+                u_l.start_offset() * candle::DType::BF16.size_in_bytes(),
+                &output,
+            )
+            .map_err(candle::Error::wrap)?;
+            let newstorage =
+                candle::MetalStorage::new(output, device.clone(), elem_count, candle::DType::F32);
+            return Ok(candle::Tensor::from_storage(
+                candle::Storage::Metal(newstorage),
+                gate.shape().clone(),
+                candle::op::BackpropOp::none(),
+                false,
+            ));
+        }
+    }
     #[cfg(feature = "metal")]
     if gate.dtype() == candle::DType::F32
         && up.dtype() == candle::DType::F32

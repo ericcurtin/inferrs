@@ -6,6 +6,36 @@ use objc2_metal::MTLResourceUsage;
 
 ops!(badd, bsub, bmul, bdiv, bminimum, bmaximum, bgelu_mul, eq, ne, le, lt, ge, gt);
 
+/// Fused GELU-multiply: F32 gate × BF16 up → F32 output.
+/// Eliminates the BF16→F32 to_dtype dispatch for `pli_input` in the PLI path.
+pub fn call_gelu_mul_f32_bf16i_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    length: usize,
+    gate_f32: &Buffer,
+    gate_offset: usize,
+    up_bf16: &Buffer,
+    up_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Binary, "bgelu_mul_f32_bf16i_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    let dim = length as u32;
+    set_params!(
+        encoder,
+        ((gate_f32, gate_offset), (up_bf16, up_offset), output, dim)
+    );
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
+    encoder.use_resource(gate_f32, MTLResourceUsage::Read);
+    encoder.use_resource(up_bf16, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_binary_contiguous<S: ToString>(
     device: &Device,

@@ -207,6 +207,21 @@ init_binary(bminimum);
 init_binary(bmaximum);
 init_binary(bgelu_mul);
 
+/// Fused GELU-multiply with mixed types: F32 gate, BF16 up → F32 output.
+/// Eliminates the BF16→F32 to_dtype dispatch for pli_input in the PLI path.
+[[host_name("bgelu_mul_f32_bf16i_f32")]]
+kernel void bgelu_mul_f32_bf16i_f32(
+    device const float   * gate     [[buffer(0)]],
+    device const bfloat  * up_bf16  [[buffer(1)]],
+    device       float   * output   [[buffer(2)]],
+    constant     uint    & dim      [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid >= dim) return;
+    const float g = gate[tid];
+    const float u = (float)up_bf16[tid];
+    output[tid] = (float)gelu_tanh(g) * u;
+}
+
 init_boolean_binary(eq, beq);
 init_boolean_binary(ne, bne);
 init_boolean_binary(le, ble);

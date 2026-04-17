@@ -2545,8 +2545,9 @@ impl DecoderLayer {
                     && matches!(xs.device(), candle_core::Device::Metal(_))
                     && is_pli_decode
                 {
-                    let pli_input_f32 = pli_input.to_dtype(DType::F32)?;
-                    let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, &pli_input_f32)?;
+                    // gelu_mul accepts F32 gate + BF16 up directly, saving
+                    // the pli_input.to_dtype(F32) dispatch per PLI layer.
+                    let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
                     let pli_proj_f32 = pli.projection.forward_f32(&pli_mid_f32)?;
                     pli_proj_f32.to_dtype(xs.dtype())?
                 } else {
