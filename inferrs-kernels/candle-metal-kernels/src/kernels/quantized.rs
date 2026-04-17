@@ -71,9 +71,6 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q8_0 => {
             // 4-simdgroup variant: NR0=2, NSG=4, 128 threads/TG.
             // Grid width = ceil(ne01/NR0) = ceil(ne01/2) — matches llama.cpp.
-            // NSG=4 simdgroups partition input blocks; multiple TGs compute the same
-            // output rows but each covers a disjoint subset of input blocks, so the
-            // final result is always correct (last writer wins, but all values match).
             let nth0 = 32;
             let nth1 = 4;
             let align = 2;

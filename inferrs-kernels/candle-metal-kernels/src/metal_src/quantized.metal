@@ -2983,6 +2983,82 @@ kernel void kernel_mul_mv2_q8_0_bf16i_f32(
     kernel_mul_mv_q8_0_bf16i_impl_4sg(src0_b,src1_bf16,dst_b,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,shmem,tgpig,tiisg,sgitg);
 }
 
+/// Optimised Q8_0 GEMV: float4 dequant + dot products, matching llama's approach.
+/// Full simdgroup (32 threads) per output row, each thread handles stride-32 float4 chunks.
+/// Grid: (ceil(ne01/2), ne11, ne12*ne13), TG: (32, 2, 1) = 64 threads.
+[[host_name("kernel_mul_mv_q8_0_f32_v2")]]
+kernel void kernel_mul_mv_q8_0_f32_v2(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // Each full simdgroup (32 threads) handles 1 output row.
+    // tx=0..31: K-direction stripe index.
+    const short tx = (short)tiisg;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    // 2 simdgroups → 2 rows per TG.
+    const int first_row = r0 * 2 + (int)sgitg;
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+    const uint offset0 = (i12/r2)*(ne01*(ne00/QK8_0)) + (i13/r3)*(ne01*(ne00/QK8_0)*ne02);
+
+    device const block_q8_0 * x = (device const block_q8_0 *) src0 + first_row * (ne00/QK8_0) + offset0;
+    device const float       * y = src1 + r1 * ne10 + im * ne00 * ne1;
+
+    const int nb    = ne00 / QK8_0;   // blocks per row (e.g. 1536/32 = 48)
+    const int nchk  = nb * 8;         // total float4 chunks (48*8=384)
+
+    float sumf = 0.0f;
+
+    // Thread tx processes chunks {tx, tx+32, tx+64, ...}.
+    // Chunk ich = ib*8 + ic: block ib, float4-chunk ic ∈ [0,7].
+    for (int ich = tx; ich < nchk; ich += 32) {
+        const int ib = ich / 8;
+        const int ic = ich % 8;
+
+        // Dequantize 4 Q8_0 int8 values: float4 = qs[ic*4..ic*4+4] * d
+        device const int8_t * qs = x[ib].qs + ic * 4;
+        const float d = (float)x[ib].d;
+        const float4 w = float4(qs[0], qs[1], qs[2], qs[3]) * d;
+
+        // Corresponding activation float4.
+        const float4 yv = *((device const float4 *)(y + ib * QK8_0 + ic * 4));
+
+        sumf += dot(w, yv);
+    }
+
+    // Reduce all 32 threads' partial sums for this row.
+    const float all_sum = simd_sum(sumf);
+
+    if (tiisg == 0 && first_row < ne01) {
+        dst[(int64_t)im * ne0 * ne1 + (int64_t)r1 * ne0 + first_row] = all_sum;
+    }
+}
+
 /// Single Q8_0 GEMV with inline BF16 output.
 /// Like kernel_mul_mv_q8_0_f32 but writes BF16 directly — eliminates the
 /// F32→BF16 to_dtype dispatch after down_proj / pli_projection.
