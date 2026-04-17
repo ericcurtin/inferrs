@@ -5919,6 +5919,136 @@ kernel void kernel_mul_mv_q4_K_f32(
     kernel_mul_mv_q4_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
+// ── Optimized Q4K GEMV: float4x4 dequant + dot products ─────────────────────
+//
+// Port of llama.cpp kernel_mul_mv_ext_q4x4_f32 for ne11=1 (single decode).
+// Key differences from the original kernel_mul_mv_q4_K_f32_impl:
+//
+//  • Dequantizes 16 floats per call into a float4 (4 floats at a time),
+//    using the same scale/nibble logic but vectorised.
+//  • Accumulates via dot(float4, float4) — one SIMD instruction covers
+//    4 multiply-adds, vs 4 independent scalar operations.
+//  • Uses nxpsg=16 threads per simdgroup in the K direction, so each
+//    thread covers ne00/(nxpsg*nypsg*NSG) blocks cooperatively.
+//  • `nypsg=2` threads per output row within a simdgroup: the 32-thread
+//    simdgroup covers 2 output rows simultaneously, sharing the load.
+//
+// Grid: (ceil(ne01/4), ne11, ne12*ne13), TG: (32, 2, 1) — identical to
+// the existing kernel.
+//
+// Inline helper: extract 4 dequantized floats from block_q4_K at position (il, i4).
+// Faithfully mirrors llama's dequantize_q4_K: il ∈ [0,15], i4 ∈ [0,3].
+static inline float4 q4k_deq4(device const block_q4_K * xb, short il, short i4) {
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    // Exactly as in dequantize_q4_K (llama.cpp):
+    const short is_orig = il;
+    const short is      = (il / 4) * 2;   // scale stride: 0,2,4,6
+    // q base pointer for this 16-element chunk:
+    device const uchar * q = xb->qs + (il / 4) * 32 + 16 * (il & 1) + i4 * 4;
+    il = il & 3;  // re-index within the scale group (0..3)
+
+    // Scale extraction — identical to get_scale_min_k4_just2(is, il/2, xb->scales):
+    const short k = il / 2;
+    uchar2 sc;
+    if (is < 4) {
+        sc = uchar2{uchar(xb->scales[is + 0 + k] & 63),
+                    uchar(xb->scales[is + 4 + k] & 63)};
+    } else {
+        sc = uchar2{uchar((xb->scales[is + 4 + k] & 0xF)  | ((xb->scales[is - 4 + k] & 0xc0) >> 2)),
+                    uchar((xb->scales[is + 4 + k] >> 4)    | ((xb->scales[is + 0 + k] & 0xc0) >> 2))};
+    }
+
+    const float d   = il < 2 ? (float)xb->d : (float)xb->d / 16.0f;
+    const float dl  = d * sc[0];
+    const float ml  = (float)xb->dmin * sc[1];
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+
+    return float4(dl * (q[0] & mask), dl * (q[1] & mask),
+                  dl * (q[2] & mask), dl * (q[3] & mask)) - ml;
+}
+
+/// Optimised Q4K GEMV for single-token decode.
+/// Uses float4 dequantisation + dot() for 4× fewer multiply-add instructions.
+///
+/// Layout: nxpsg=32, nypsg=1, N_SG_Q4K=2 → 2 rows per TG, 64 threads.
+/// Each full simdgroup of 32 threads handles 1 output row cooperatively.
+/// Grid: (ceil(ne01/2), ne11, ne12*ne13). TG: (32, 2, 1).
+[[host_name("kernel_mul_mv_q4_K_f32_v2")]]
+kernel void kernel_mul_mv_q4_K_f32_v2(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // Each simdgroup (32 threads) handles exactly 1 output row.
+    // tx = thread index within the simdgroup = K-direction stripe index.
+    const short tx = (short)tiisg;  // 0..31
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    // Each TG covers N_SG_Q4K=2 rows total (one per simdgroup).
+    const int first_row = r0 * N_SG_Q4K + (int)sgitg;
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+    const uint offset0 = (i12/r2)*(ne01*(ne00/QK_K)) + (i13/r3)*(ne01*(ne00/QK_K)*ne02);
+
+    device const block_q4_K * x = (device const block_q4_K *) src0 + first_row * (ne00/QK_K) + offset0;
+    device const float       * y = src1 + r1 * ne10 + im * ne00 * ne1;
+
+    const int nb    = ne00 / QK_K;    // Q4K blocks per row (e.g. 1536/256 = 6)
+    const int nchk  = nb * 16;        // total 16-element chunks (6*16=96)
+
+    float sumf = 0.0f;
+
+    // Each thread handles chunks {tx, tx+32, tx+64, ...} (stride=32).
+    // Chunk ich = ib*16 + il: block ib, sub-chunk il ∈ [0,15].
+    // Activation for chunk (ib,il): y[ib*QK_K + il*16 .. +16].
+    for (int ich = tx; ich < nchk; ich += 32) {
+        const int ib = ich / 16;
+        const int il = ich % 16;
+
+        device const float * yc = y + ib * QK_K + il * 16;
+
+        // Dequantize 16 nibbles as 4 × float4, dot with 4 × float4 activations.
+        sumf += dot(q4k_deq4(x + ib, il, 0), float4(yc[ 0], yc[ 1], yc[ 2], yc[ 3]));
+        sumf += dot(q4k_deq4(x + ib, il, 1), float4(yc[ 4], yc[ 5], yc[ 6], yc[ 7]));
+        sumf += dot(q4k_deq4(x + ib, il, 2), float4(yc[ 8], yc[ 9], yc[10], yc[11]));
+        sumf += dot(q4k_deq4(x + ib, il, 3), float4(yc[12], yc[13], yc[14], yc[15]));
+    }
+
+    // Full simdgroup reduction: sum all 32 thread contributions for this row.
+    const float all_sum = simd_sum(sumf);
+
+    // Thread 0 writes the result.
+    if (tiisg == 0 && first_row < ne01) {
+        dst[(int64_t)im * ne0 * ne1 + (int64_t)r1 * ne0 + first_row] = all_sum;
+    }
+}
+
 /// Q4K GEMV with F32 input and BF16 output.
 /// Saves the separate F32→BF16 to_dtype dispatch after down_proj.
 [[host_name("kernel_mul_mv_q4_K_f32_bf16o")]]
