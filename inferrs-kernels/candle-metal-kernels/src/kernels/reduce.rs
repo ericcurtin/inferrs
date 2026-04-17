@@ -592,16 +592,25 @@ pub fn call_partial_rope_bf16(
             rotary_dim
         )
     );
-    let tgc = MTLSize { width: n_heads as usize, height: head_dim as usize, depth: 1 };
+    // Use dispatch_thread_groups (not dispatch_threads) to avoid edge-case behaviour
+    // with small non-power-of-2 grid dimensions.
+    let tgs_w = std::cmp::min(n_heads as usize, 8);
+    let tgs_h = std::cmp::min(head_dim as usize, 32);
     let tgs = MTLSize {
-        width: std::cmp::min(n_heads as usize, 8),
-        height: std::cmp::min(head_dim as usize, 32),
+        width: tgs_w,
+        height: tgs_h,
+        depth: 1,
+    };
+    // Ceiling division — may over-dispatch but kernel guards via tid range check.
+    let tgc = MTLSize {
+        width: (n_heads as usize + tgs_w - 1) / tgs_w,
+        height: (head_dim as usize + tgs_h - 1) / tgs_h,
         depth: 1,
     };
     encoder.use_resource(src, MTLResourceUsage::Read);
     encoder.use_resource(cos, MTLResourceUsage::Read);
     encoder.use_resource(sin, MTLResourceUsage::Read);
     encoder.use_resource(dst, MTLResourceUsage::Write);
-    encoder.dispatch_threads(tgc, tgs);
+    encoder.dispatch_thread_groups(tgc, tgs);
     Ok(())
 }

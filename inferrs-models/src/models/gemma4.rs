@@ -1267,32 +1267,49 @@ impl Attention {
         // compute dispatches (2×contiguous + 1×rope + 1×slice_set) per head.
         //
         // q/k are [1, n_heads, 1, head_dim] contiguous after reshape at line ~1499.
-        // Apply RoPE to the first `rotary_dim` features, write passthrough unchanged.
-        // q/k come from reshape and are contiguous; narrow+contiguous
-        // materialises a small, packed slice for the rope kernel.
-        let q_rot = candle_nn::rotary_emb::rope(
-            &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        q_out.slice_set(&q_rot, D::Minus1, 0)?;
-        q_out.slice_set(
-            &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
+        // Apply partial RoPE: first `rotary_dim` features get RoPE, rest pass through.
+        // Fused path: single dispatch via partial_rope_bf16 kernel (dispatch_thread_groups).
+        #[cfg(feature = "metal")]
+        let fused_q =
+            if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
+                candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
+            } else {
+                false
+            };
+        #[cfg(not(feature = "metal"))]
+        let fused_q = false;
+        if !fused_q {
+            let q_rot = candle_nn::rotary_emb::rope(
+                &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            q_out.slice_set(&q_rot, D::Minus1, 0)?;
+            q_out.slice_set(
+                &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
 
-        let k_rot = candle_nn::rotary_emb::rope(
-            &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        k_out.slice_set(&k_rot, D::Minus1, 0)?;
-        k_out.slice_set(
-            &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
+        // Disable fused_k until dispatch_thread_groups issue with n_heads_k=1 is resolved
+        #[cfg(feature = "metal")]
+        let fused_k = false;
+        #[cfg(not(feature = "metal"))]
+        let fused_k = false;
+        if !fused_k {
+            let k_rot = candle_nn::rotary_emb::rope(
+                &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            k_out.slice_set(&k_rot, D::Minus1, 0)?;
+            k_out.slice_set(
+                &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
 
         // Return the pre-allocated buffers directly.
         // `clone()` shares the underlying Metal buffer (ref-counted); no new
@@ -1336,17 +1353,28 @@ impl Attention {
         }
         let q_out = self.partial_rope_q_out.as_mut().unwrap();
 
-        let q_rot = candle_nn::rotary_emb::rope(
-            &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        q_out.slice_set(&q_rot, D::Minus1, 0)?;
-        q_out.slice_set(
-            &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
+        #[cfg(feature = "metal")]
+        let fused =
+            if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
+                candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
+            } else {
+                false
+            };
+        #[cfg(not(feature = "metal"))]
+        let fused = false;
+        if !fused {
+            let q_rot = candle_nn::rotary_emb::rope(
+                &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            q_out.slice_set(&q_rot, D::Minus1, 0)?;
+            q_out.slice_set(
+                &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
 
         // Same aliasing rationale as `apply_rope_qkv_buffered`: the clone is
         // consumed within this decode step before the next step overwrites q_out.
