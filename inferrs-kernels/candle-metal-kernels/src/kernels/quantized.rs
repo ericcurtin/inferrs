@@ -1328,9 +1328,10 @@ pub fn call_quantized_matmul_mv3_q4k_bf16i_to_bf16(
         height: m,
         depth: b,
     };
+    // Q4K: N_SG_Q4K=2 simdgroups × 32 threads = 64 threads per TG.
     let tgs = MTLSize {
-        width: 4,
-        height: 8,
+        width: 32,
+        height: 2,
         depth: 1,
     };
     let pipeline = kernels.load_pipeline(
