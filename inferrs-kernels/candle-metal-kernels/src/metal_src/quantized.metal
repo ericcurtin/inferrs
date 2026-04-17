@@ -6264,8 +6264,9 @@ kernel void kernel_mul_mv3_q4_K_f32(
         uint sgitg[[simdgroup_index_in_threadgroup]]) {
 
     // Determine which segment this threadgroup belongs to.
-    const int tg_q_count  = (int)((ne01_q  + 3) / 4);
-    const int tg_kv_count = (int)((ne01_kv + 3) / 4);
+    // Each TG covers N_DST_Q4K * N_SG_Q4K = 2*2 = 4 rows.
+    const int tg_q_count  = (int)((ne01_q  + N_DST_Q4K * N_SG_Q4K - 1) / (N_DST_Q4K * N_SG_Q4K));
+    const int tg_kv_count = (int)((ne01_kv + N_DST_Q4K * N_SG_Q4K - 1) / (N_DST_Q4K * N_SG_Q4K));
 
     const int tg_x = (int)tgpig.x;
 

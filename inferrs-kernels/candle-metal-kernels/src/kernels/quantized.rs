@@ -386,7 +386,7 @@ pub fn call_quantized_matmul_mv_q4k_bf16i(
     let ne1 = m as i64;
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
-    // Same dispatch params as Q4K: align=4, nth0=32, nth1=2
+    // N_SG_Q4K=2, N_DST_Q4K=2: 8 rows/TG, 128 threads.
     let nth0 = 32usize;
     let nth1 = 2usize;
     let align = 4usize;
@@ -438,6 +438,7 @@ pub fn call_quantized_matmul_mv_q4k_bf16i(
 }
 /// Q4K single GEMV with F32 input and BF16 output.
 /// Uses kernel_mul_mv_q4_K_f32_bf16o — eliminates F32→BF16 to_dtype after down_proj/PLI.
+/// NOTE: disabled (correctness bug produces garbled output); kept for future investigation.
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_q4k_bf16o(
     device: &Device,
@@ -941,7 +942,7 @@ pub fn call_quantized_matmul_mv3_q4k(
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
 
-    // Q4K: align=4; grid width = ceil(n_q/4) + 2*ceil(n_kv/4)
+    // N_SG_Q4K=2: align=8; grid width = ceil(n_q/8) + 2*ceil(n_kv/8)
     let align = 4usize;
     let tg_q = divide(n_q, align);
     let tg_kv = divide(n_kv, align);
@@ -1050,7 +1051,7 @@ pub fn call_quantized_matmul_mv3_q4k_bf16o(
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
 
-    // Q4K: N_DST_Q4K=2, N_SG_Q4K=2 → 4 rows per TG; align=4
+    // N_SG_Q4K=2, N_DST_Q4K=2 → 8 rows per TG; align=8
     let align = 4usize;
     let tg_q = divide(n_q, align);
     let tg_kv = divide(n_kv, align);
