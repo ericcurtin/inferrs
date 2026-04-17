@@ -5850,19 +5850,23 @@ void kernel_mul_mv_q4_K_f32_impl(
 
             device const uint16_t * q2 = q1 + 32;
 
+            // Load 4 weight uint16s in a single 64-bit transaction.
+            typedef __attribute__((ext_vector_type(4))) ushort ushort4;
+            const ushort4 q1v = *((device const ushort4 *)q1);
+            const ushort4 q2v = *((device const ushort4 *)q2);
+
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-            // Full unroll of 4-iteration inner loop — matches llama.cpp FOR_UNROLL.
             _Pragma("clang loop unroll(full)")
             for (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2*i+0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2*i+1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2*i+8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2*i+9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2*i+0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2*i+1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2*i+8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2*i+9] * (q2[i] & 0xF000);
+                acc1[0] += yl[2*i+0] * (q1v[i] & 0x000F);
+                acc1[1] += yl[2*i+1] * (q1v[i] & 0x0F00);
+                acc1[2] += yl[2*i+8] * (q1v[i] & 0x00F0);
+                acc1[3] += yl[2*i+9] * (q1v[i] & 0xF000);
+                acc2[0] += yh[2*i+0] * (q2v[i] & 0x000F);
+                acc2[1] += yh[2*i+1] * (q2v[i] & 0x0F00);
+                acc2[2] += yh[2*i+8] * (q2v[i] & 0x00F0);
+                acc2[3] += yh[2*i+9] * (q2v[i] & 0xF000);
             }
 
             sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
@@ -6384,20 +6388,22 @@ void kernel_mul_mv_q4_K_f32_to_bf16_impl(
             sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
             sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
-            device const uint16_t * q2 = q1 + 32;
+            typedef __attribute__((ext_vector_type(4))) ushort ushort4;
+            const ushort4 q1v = *((device const ushort4 *)q1);
+            const ushort4 q2v = *((device const ushort4 *)(q1 + 32));
 
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
             _Pragma("clang loop unroll(full)")
             for (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2*i+0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2*i+1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2*i+8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2*i+9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2*i+0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2*i+1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2*i+8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2*i+9] * (q2[i] & 0xF000);
+                acc1[0] += yl[2*i+0] * (q1v[i] & 0x000F);
+                acc1[1] += yl[2*i+1] * (q1v[i] & 0x0F00);
+                acc1[2] += yl[2*i+8] * (q1v[i] & 0x00F0);
+                acc1[3] += yl[2*i+9] * (q1v[i] & 0xF000);
+                acc2[0] += yh[2*i+0] * (q2v[i] & 0x000F);
+                acc2[1] += yh[2*i+1] * (q2v[i] & 0x0F00);
+                acc2[2] += yh[2*i+8] * (q2v[i] & 0x00F0);
+                acc2[3] += yh[2*i+9] * (q2v[i] & 0xF000);
             }
 
             sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
