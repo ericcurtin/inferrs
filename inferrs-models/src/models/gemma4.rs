@@ -631,10 +631,6 @@ impl Module for Mlp {
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
                     let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
-                    // Use BF16-output down_proj: eliminates F32→BF16 back-cast (1 dispatch).
-                    if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
-                        return bf16_out;
-                    }
                     return self
                         .down_proj
                         .forward_f32(&hidden_act_f32)?
@@ -656,14 +652,6 @@ impl Module for Mlp {
                 if let Some(result) = paired_result {
                     let (gate_f32, up_f32) = result?;
                     let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
-                    // BF16-output down_proj: eliminates F32→BF16 back-cast.
-                    if let Some(bf16_out) = self
-                        .down_proj
-                        .forward_q8_0_bf16o(&hidden_act_f32)
-                        .or_else(|| self.down_proj.forward_q4k_bf16o(&hidden_act_f32))
-                    {
-                        return bf16_out;
-                    }
                     return self
                         .down_proj
                         .forward_f32(&hidden_act_f32)?
@@ -1059,11 +1047,8 @@ impl Attention {
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
-            // BF16→BF16 path: eliminates both pre-cast and post-cast.
-            // Q8_0 (E2B) only — Q4K bf16i_to_bf16 has unresolved correctness issue.
-            if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
-                return out;
-            }
+            // BF16→BF16 path: DISABLED pending correctness investigation.
+            // if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) { return out; }
             // Fallback for other dtypes: BF16i→F32, then back-cast.
             #[cfg(feature = "metal")]
             if let Some(out) = self.o_proj.forward_bf16i(xs) {
@@ -1264,13 +1249,10 @@ impl Attention {
         // compute dispatches (2×contiguous + 1×rope + 1×slice_set) per head.
         //
         // q/k are [1, n_heads, 1, head_dim] contiguous after reshape at line ~1499.
+        // TODO: partial_rope_inplace_bf16 produces incorrect output for E4B (Q4K)
+        // and possibly other models. Disabled until root cause is found.
         #[cfg(feature = "metal")]
-        let fused_q =
-            if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
-                candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
-            } else {
-                false
-            };
+        let fused_q = false;
         #[cfg(not(feature = "metal"))]
         let fused_q = false;
 
@@ -1289,13 +1271,9 @@ impl Attention {
             )?;
         }
 
+        // TODO: same issue as fused_q above.
         #[cfg(feature = "metal")]
-        let fused_k =
-            if k.dtype() == DType::BF16 && matches!(k.device(), candle_core::Device::Metal(_)) {
-                candle_nn::rotary_emb::partial_rope_inplace_bf16(k, &cos, &sin, k_out, rotary_dim)?
-            } else {
-                false
-            };
+        let fused_k = false;
         #[cfg(not(feature = "metal"))]
         let fused_k = false;
 
@@ -1355,14 +1333,9 @@ impl Attention {
         }
         let q_out = self.partial_rope_q_out.as_mut().unwrap();
 
-        // Fused partial RoPE for Q-only path.
+        // TODO: partial_rope_inplace_bf16 disabled pending correctness fix.
         #[cfg(feature = "metal")]
-        let fused =
-            if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
-                candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
-            } else {
-                false
-            };
+        let fused = false;
         #[cfg(not(feature = "metal"))]
         let fused = false;
 
@@ -1418,15 +1391,15 @@ impl Attention {
             // No pre-cast (BF16→F32) and no post-casts (3×F32→BF16) — saves 1 dispatch
             // vs the bf16o variant which still needs the pre-cast.
             // Q8_0 (E2B) only — Q4K bf16i_to_bf16 has unresolved correctness issue.
+            // TODO: bf16i_to_bf16 QKV disabled pending correctness investigation.
             #[cfg(feature = "metal")]
-            let qkv_b2b = if orig_dtype == DType::BF16
-                && matches!(xs.device(), candle_core::Device::Metal(_))
-            {
-                self.q_proj
-                    .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
-            } else {
-                None
-            };
+            let qkv_b2b: Option<
+                candle_core::Result<(
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                )>,
+            > = None;
             #[cfg(not(feature = "metal"))]
             let qkv_b2b: Option<
                 candle_core::Result<(
@@ -2669,14 +2642,9 @@ impl DecoderLayer {
                     // gelu_mul accepts F32 gate + BF16 up directly, saving
                     // the pli_input.to_dtype(F32) dispatch per PLI layer.
                     let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
-                    // Use BF16-output PLI projection: eliminates F32→BF16 back-cast.
-                    if let Some(bf16_out) = pli.projection.forward_q8_0_bf16o(&pli_mid_f32) {
-                        bf16_out?
-                    } else {
-                        pli.projection
-                            .forward_f32(&pli_mid_f32)?
-                            .to_dtype(xs.dtype())?
-                    }
+                    pli.projection
+                        .forward_f32(&pli_mid_f32)?
+                        .to_dtype(xs.dtype())?
                 } else {
                     let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
                     let pli_out = gate.broadcast_mul(pli_input)?;
