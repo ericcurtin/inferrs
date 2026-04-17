@@ -78,6 +78,24 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    pub fn fwd_mv_q4k_bf16o(
+        &self,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(MetalStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv_q8_0_bf16o(
+        &self,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(MetalStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn fwd_mv_bf16i(
         &self,
         _self_shape: &crate::Shape,

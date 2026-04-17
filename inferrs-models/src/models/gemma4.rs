@@ -1331,7 +1331,8 @@ impl Attention {
             // Try BF16-output triple QKV GEMV: produces BF16 Q/K/V directly,
             // eliminating 3 × F32→BF16 back-cast dispatches.
             // Q8_0 (E2B): inline BF16 conversion per element in the GEMV kernel.
-            // Q4K (E4B): triple GEMV then one batch-cast dispatch (saves 2 back-casts).
+            // Q4K (E4B): inline BF16 conversion via kernel_mul_mv3_q4_K_f32_to_bf16,
+            //            no intermediate F32 buffers — saves 3 dispatches per attn layer.
             #[cfg(feature = "metal")]
             let qkv_bf16o = self
                 .q_proj
@@ -1566,6 +1567,10 @@ impl Attention {
             //   - softcapping=sc if softcapping is set, else 1.0 (no-op)
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
 
+            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) is disabled — correctness
+            // bug causes early EOS. The standard sdpa_vector path handles GQA correctly
+            // via gqa_factor broadcast within a single dispatch.
+
             // 1-pass for N ≤ 1024; pre-allocated 2-pass for N > 1024.
             {
                 #[cfg(feature = "metal")]
@@ -1757,6 +1762,9 @@ impl Attention {
         // Use fused SDPA for decode (q_len=1) when available.
         if self.use_sdpa && q_len == 1 && attention_mask.is_none() {
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
+
+            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) is disabled — correctness
+            // bug causes early EOS. The standard sdpa_vector path handles GQA correctly.
 
             // ── Flash attention (llama.cpp flash_attn_ext_vec) ─────────────────────
             // 32 parallel workgroups, BF16 + head_dim=256, single-token decode.

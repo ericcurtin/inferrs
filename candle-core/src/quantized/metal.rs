@@ -252,6 +252,127 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q4K GEMV with F32 input and BF16 output.
+    /// Uses `kernel_mul_mv_q4_K_f32_bf16o` — eliminates F32→BF16 to_dtype after down_proj/PLI.
+    pub fn fwd_mv_q4k_bf16o(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K {
+            crate::bail!("fwd_mv_q4k_bf16o only supports Q4K weights");
+        }
+        if storage.dtype() != DType::F32 {
+            crate::bail!("fwd_mv_q4k_bf16o requires F32 input");
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("fwd_mv_q4k_bf16o: input not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("fwd_mv_q4k_bf16o: input has only one dimension {layout:?}")
+        }
+        let (n, k) = self_shape.dims2()?;
+        let mut dst_shape = src_shape.dims().to_vec();
+        let m = match dst_shape.len() {
+            3 => dst_shape[0] * dst_shape[1],
+            2 => dst_shape[0],
+            r => crate::bail!("fwd_mv_q4k_bf16o: invalid rank {r}"),
+        };
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("fwd_mv_q4k_bf16o: input incompatible with weight shape")
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let device = storage.device().clone();
+        let dst = device.new_buffer(dst_shape.elem_count(), DType::BF16, "qmatmul_q4k_bf16o")?;
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes();
+            let dst_offset = batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16o(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        let dst_storage =
+            crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::BF16);
+        Ok((dst_storage, dst_shape))
+    }
+
+    /// Q8_0 GEMV with F32 input and BF16 output.
+    /// Uses `kernel_mul_mv_q8_0_f32_to_bf16` — eliminates the F32→BF16 `to_dtype`
+    /// dispatch after down_proj / pli_projection.
+    pub fn fwd_mv_q8_0_bf16o(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q8_0 {
+            crate::bail!("fwd_mv_q8_0_bf16o only supports Q8_0 weights");
+        }
+        if storage.dtype() != DType::F32 {
+            crate::bail!("fwd_mv_q8_0_bf16o requires F32 input");
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("fwd_mv_q8_0_bf16o: input not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("fwd_mv_q8_0_bf16o: input has only one dimension {layout:?}")
+        }
+        let (n, k) = self_shape.dims2()?;
+        let mut dst_shape = src_shape.dims().to_vec();
+        let m = match dst_shape.len() {
+            3 => dst_shape[0] * dst_shape[1],
+            2 => dst_shape[0],
+            r => crate::bail!("fwd_mv_q8_0_bf16o: invalid rank {r}"),
+        };
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("fwd_mv_q8_0_bf16o: input incompatible with weight shape")
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let device = storage.device().clone();
+        let dst = device.new_buffer(dst_shape.elem_count(), DType::BF16, "qmatmul_q8_bf16o")?;
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes();
+            let dst_offset = batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q8_0_bf16o(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        let dst_storage =
+            crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::BF16);
+        Ok((dst_storage, dst_shape))
+    }
+
     /// GEMV with BF16 input: calls kernel_mul_mv_q4_K_bf16i_f32, avoiding a separate
     /// BF16->F32 conversion dispatch.  Only valid for Q4K weights on Metal.
     pub fn fwd_mv_bf16i(
@@ -753,8 +874,9 @@ impl QMetalStorage {
         ))
     }
 
-    /// Triple Q4K GEMV with BF16 output: like fwd_mv3_q4k but produces BF16 Q/K/V.
-    /// Replaces 3 separate F32→BF16 back-cast dispatches with a single batch-cast.
+    /// Triple Q4K GEMV with inline BF16 output.
+    /// Uses `kernel_mul_mv3_q4_K_f32_to_bf16` which converts F32→BF16 directly
+    /// in the accumulator write — no intermediate F32 buffers, no extra cast dispatch.
     pub fn fwd_mv3_q4k_bf16o(
         &self,
         kw: &QMetalStorage,
@@ -769,39 +891,89 @@ impl QMetalStorage {
         (MetalStorage, Shape),
     )> {
         use crate::MetalError;
-        // Compute F32 outputs using the existing triple kernel.
-        let ((dq_f32, sq), (dk_f32, skv_k), (dv_f32, skv_v)) =
-            self.fwd_mv3_q4k(kw, vw, self_shape, kv_shape, storage, layout)?;
-        let device = dq_f32.device().clone();
-        // Batch-cast F32→BF16 in one dispatch instead of 3 separate to_dtype calls.
-        let dst_q = device.new_buffer(sq.elem_count(), DType::BF16, "q4k_bf16o_q")?;
-        let dst_k = device.new_buffer(skv_k.elem_count(), DType::BF16, "q4k_bf16o_k")?;
-        let dst_v = device.new_buffer(skv_v.elem_count(), DType::BF16, "q4k_bf16o_v")?;
+
+        if !layout.is_contiguous() {
+            crate::bail!("fwd_mv3_q4k_bf16o: input not contiguous {layout:?}")
+        }
+        if self.dtype != GgmlDType::Q4K || kw.dtype != GgmlDType::Q4K || vw.dtype != GgmlDType::Q4K
+        {
+            crate::bail!("fwd_mv3_q4k_bf16o: all tensors must be Q4K")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("fwd_mv3_q4k_bf16o: input has only one dimension {layout:?}")
+        }
+        let (n_q, k) = self_shape.dims2()?;
+        let (n_kv, _) = kv_shape.dims2()?;
+
+        let mut dst_dims = src_shape.dims().to_vec();
+        let m = match dst_dims.len() {
+            3 => dst_dims[0] * dst_dims[1],
+            2 => dst_dims[0],
+            rank => crate::bail!("fwd_mv3_q4k_bf16o: invalid rank {rank}"),
+        };
+        let last_k = dst_dims.pop().unwrap();
+        if last_k != k {
+            crate::bail!(
+                "fwd_mv3_q4k_bf16o: input {layout:?} incompatible with q_shape {:?}",
+                self_shape
+            )
+        }
+        let mut dst_dims_kv = dst_dims.clone();
+        dst_dims.push(n_q);
+        dst_dims_kv.push(n_kv);
+        let dst_shape_q = Shape::from(dst_dims);
+        let dst_shape_kv = Shape::from(dst_dims_kv);
+
+        let device = storage.device().clone();
+        // Allocate BF16 output buffers directly — no F32 intermediates.
+        let dst_q = device.new_buffer(dst_shape_q.elem_count(), DType::BF16, "q4k_bf16o_q")?;
+        let dst_k = device.new_buffer(dst_shape_kv.elem_count(), DType::BF16, "q4k_bf16o_k")?;
+        let dst_v = device.new_buffer(dst_shape_kv.elem_count(), DType::BF16, "q4k_bf16o_v")?;
         let encoder = device.command_encoder()?;
-        candle_metal_kernels::call_cast3_f32_to_bf16(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            sq.elem_count(),
-            skv_k.elem_count(),
-            dq_f32.buffer(),
-            0,
-            dk_f32.buffer(),
-            0,
-            dv_f32.buffer(),
-            0,
-            &dst_q,
-            0,
-            &dst_k,
-            0,
-            &dst_v,
-            0,
-        )
-        .map_err(MetalError::from)?;
-        let rq = crate::MetalStorage::new(dst_q, device.clone(), sq.elem_count(), DType::BF16);
-        let rk = crate::MetalStorage::new(dst_k, device.clone(), skv_k.elem_count(), DType::BF16);
-        let rv = crate::MetalStorage::new(dst_v, device, skv_v.elem_count(), DType::BF16);
-        Ok(((rq, sq), (rk, skv_k), (rv, skv_v)))
+
+        for batch_id in 0..m {
+            let src1_offset =
+                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes();
+            let dst_q_offset = batch_id * n_q * DType::BF16.size_in_bytes();
+            let dst_kv_offset = batch_id * n_kv * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv3_q4k_bf16o(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n_q, n_kv, k),
+                storage.buffer(),
+                src1_offset,
+                &self.buffer,
+                self.offset,
+                dst_q_offset,
+                &dst_q,
+                &kw.buffer,
+                kw.offset,
+                dst_kv_offset,
+                &dst_k,
+                &vw.buffer,
+                vw.offset,
+                dst_kv_offset,
+                &dst_v,
+            )
+            .map_err(MetalError::from)?;
+        }
+
+        let rq =
+            crate::MetalStorage::new(dst_q, device.clone(), dst_shape_q.elem_count(), DType::BF16);
+        let rk = crate::MetalStorage::new(
+            dst_k,
+            device.clone(),
+            dst_shape_kv.elem_count(),
+            DType::BF16,
+        );
+        let rv = crate::MetalStorage::new(dst_v, device, dst_shape_kv.elem_count(), DType::BF16);
+        Ok((
+            (rq, dst_shape_q),
+            (rk, dst_shape_kv.clone()),
+            (rv, dst_shape_kv),
+        ))
     }
 
     /// Triple Q8_0 GEMV: computes Q, K, V projections in one Metal dispatch.

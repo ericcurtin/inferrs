@@ -1,0 +1,15 @@
+[2m2026-04-14T15:29:09.227866Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Downloading model ggml-org/gemma-4-26B-A4B-it-GGUF (revision: main)
+[2m2026-04-14T15:29:09.227930Z[0m [32m INFO[0m [2mhf_hub[0m[2m:[0m Using token file found "/Users/ecurtin/.cache/huggingface/token"
+[2m2026-04-14T15:29:10.455493Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m config.json not found in ggml-org/gemma-4-26B-A4B-it-GGUF — checking for GGUF-only repo
+[2m2026-04-14T15:29:10.625357Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m GGUF-only repo detected. Available files: ["gemma-4-26B-A4B-it-Q4_K_M.gguf", "gemma-4-26B-A4B-it-Q8_0.gguf", "gemma-4-26B-A4B-it-bf16.gguf"]. Selected: gemma-4-26B-A4B-it-Q4_K_M.gguf
+[2m2026-04-14T15:29:10.625497Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Downloading GGUF file: gemma-4-26B-A4B-it-Q4_K_M.gguf
+[2m2026-04-14T16:51:05.929661Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Downloaded gemma-4-26B-A4B-it-Q4_K_M.gguf
+[2m2026-04-14T16:51:05.977930Z[0m [32m INFO[0m [2mhf_hub[0m[2m:[0m Using token file found "/Users/ecurtin/.cache/huggingface/token"
+[2m2026-04-14T16:51:06.155566Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Found source model from HF model card: google/gemma-4-26B-A4B-it
+[2m2026-04-14T16:51:06.155604Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Fetching config and tokenizer from source model: google/gemma-4-26B-A4B-it
+[2m2026-04-14T16:51:06.157142Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Downloaded config.json from google/gemma-4-26B-A4B-it
+[2m2026-04-14T16:51:06.157470Z[0m [32m INFO[0m [2minferrs::hub[0m[2m:[0m Downloaded tokenizer.json from google/gemma-4-26B-A4B-it
+Pulled ggml-org/gemma-4-26B-A4B-it-GGUF
+  config:    /Users/ecurtin/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/7d4c97e54145f8ffd1a4dd1b4986a5015a517842/config.json
+  tokenizer: /Users/ecurtin/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/7d4c97e54145f8ffd1a4dd1b4986a5015a517842/tokenizer.json
+  gguf:      /Users/ecurtin/.cache/huggingface/hub/models--ggml-org--gemma-4-26B-A4B-it-GGUF/snapshots/ae4d537a6345467d1c86bb5cc0d4505ff3ebe0f3/gemma-4-26B-A4B-it-Q4_K_M.gguf

@@ -702,6 +702,68 @@ impl QTensor {
         }
     }
 
+    /// Q4K GEMV with F32 input and BF16 output.
+    /// Saves 1 dispatch vs `forward_f32 + to_dtype(BF16)` for down_proj / pli_projection.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q4k_bf16o(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        if xs.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        match &self.storage {
+            QStorage::Metal(m) => {
+                if m.dtype() != GgmlDType::Q4K {
+                    return Ok(None);
+                }
+                let (dst_storage, dst_shape) =
+                    m.fwd_mv_q4k_bf16o(&self.shape, &xs_storage, &xs_layout)?;
+                let out = crate::tensor::from_storage(
+                    Storage::Metal(dst_storage),
+                    dst_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Q8_0 GEMV with F32 input and BF16 output.
+    /// Saves 1 dispatch vs `forward_f32 + to_dtype(BF16)` for down_proj / pli_projection.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q8_0_bf16o(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        if xs.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        match &self.storage {
+            QStorage::Metal(m) => {
+                if m.dtype() != GgmlDType::Q8_0 {
+                    return Ok(None);
+                }
+                let (dst_storage, dst_shape) =
+                    m.fwd_mv_q8_0_bf16o(&self.shape, &xs_storage, &xs_layout)?;
+                let out = crate::tensor::from_storage(
+                    Storage::Metal(dst_storage),
+                    dst_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Q4K GEMV with BF16 input on Metal — avoids separate BF16→F32 dispatch.
     #[cfg(feature = "metal")]
     pub fn fwd_mv_bf16i(&self, xs: &Tensor) -> Result<Option<Tensor>> {

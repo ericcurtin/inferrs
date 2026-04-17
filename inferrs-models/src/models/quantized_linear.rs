@@ -159,6 +159,44 @@ impl Module for QLinear {
 }
 
 impl QLinear {
+    /// Q4K GEMV with F32 input and BF16 output.
+    /// Saves the F32→BF16 `to_dtype` dispatch after down_proj / pli_projection.
+    /// Returns None when unavailable (non-Metal, non-Q4K, or non-F32 input).
+    #[cfg(feature = "metal")]
+    pub fn forward_q4k_bf16o(&self, xs_f32: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_q4k_bf16o(xs_f32) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Q8_0 GEMV with F32 input and BF16 output.
+    /// Saves the F32→BF16 `to_dtype` dispatch after down_proj / pli_projection.
+    /// Returns None when unavailable (non-Metal, non-Q8_0, or non-F32 input).
+    #[cfg(feature = "metal")]
+    pub fn forward_q8_0_bf16o(&self, xs_f32: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_q8_0_bf16o(xs_f32) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     /// BF16-input Q4K GEMV: eliminates per-GEMV BF16->F32 conversion dispatch.
     /// Returns None when unavailable (non-Metal, non-Q4K, or non-BF16 input).
     #[cfg(feature = "metal")]
