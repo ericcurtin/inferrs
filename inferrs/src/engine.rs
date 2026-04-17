@@ -148,11 +148,59 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
     }
 
+    // Resolve draft model files before entering the thread scope so that any
+    // network / disk errors surface early (and cleanly via `?`).
+    //
+    // The draft config is loaded here too: we need the vocab size before the
+    // scope finishes so we can validate it against the target's vocab size.
+    let draft_info: Option<(crate::hub::ModelFiles, RawConfig, ModelArchitecture, DType)> =
+        if let Some(draft_id) = args.draft_model.as_deref() {
+            // Resolve dtype: use --draft-dtype if set, otherwise fall back to
+            // the target model dtype (already normalised for CPU above).
+            let draft_dtype = if let Some(ref s) = args.draft_dtype {
+                match s.as_str() {
+                    "f32" => candle_core::DType::F32,
+                    "f16" => candle_core::DType::F16,
+                    "bf16" => candle_core::DType::BF16,
+                    other => anyhow::bail!("Unknown draft-dtype: {other}"),
+                }
+            } else {
+                dtype // inherit target model dtype
+            };
+
+            // Resolve quantize: use --draft-quantize if set, otherwise fall back
+            // to the target model quant_dtype.
+            let draft_quant_dtype: Option<candle_core::quantized::GgmlDType> =
+                match args.draft_quantize.as_deref() {
+                    Some(s) if matches!(s.to_lowercase().as_str(), "none" | "false") => None,
+                    Some(s) => Some(crate::quantize::parse_format(s)?),
+                    None => quant_dtype, // inherit target model quant setting
+                };
+
+            tracing::info!("Downloading draft model: {draft_id}");
+            let draft_files = crate::hub::download_and_maybe_quantize(
+                draft_id,
+                &args.revision,
+                None, // no --gguf-file override for draft model
+                None, // no --tokenizer-source override for draft model
+                draft_quant_dtype,
+            )?;
+
+            let draft_raw_config = RawConfig::from_file(&draft_files.config_path)?;
+            let draft_arch = draft_raw_config.detect_architecture()?;
+            tracing::info!("Draft model architecture: {:?}", draft_arch);
+
+            Some((draft_files, draft_raw_config, draft_arch, draft_dtype))
+        } else {
+            None
+        };
+
     // Load model weights and tokenizer in parallel: both are I/O + CPU bound
     // and independent of each other.  On a 256K-token vocabulary the tokenizer
     // parse takes ~300 ms; running it concurrently with the ~840 ms weight load
-    // hides it almost entirely.
-    let (model, tokenizer) = std::thread::scope(|s| {
+    // hides it almost entirely.  When a draft model is requested it is loaded
+    // in a third thread alongside the other two.
+    let (model, tokenizer, draft_model_opt) = std::thread::scope(|s| {
         let tok_handle = s.spawn(|| {
             Tokenizer::from_file_with_arch(
                 &model_files.tokenizer_path,
@@ -160,6 +208,29 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
                 Some(&arch),
             )
         });
+
+        // Spawn draft model load thread if a draft model was requested.
+        // We pass `&device` explicitly to avoid moving `device` into the
+        // closure (it is still needed for the target model load below and
+        // after the scope to build the Engine).
+        let draft_handle =
+            draft_info
+                .as_ref()
+                .map(|(draft_files, draft_raw_config, draft_arch, draft_dtype)| {
+                    let device_ref = &device;
+                    s.spawn(move || {
+                        inferrs_models::models::load_model(
+                            draft_raw_config,
+                            draft_arch,
+                            &draft_files.weight_paths,
+                            draft_files.gguf_path.as_deref(),
+                            *draft_dtype,
+                            device_ref,
+                            args.turbo_quant.0,
+                            &draft_files.config_path,
+                        )
+                    })
+                });
 
         let model_result = inferrs_models::models::load_model(
             &raw_config,
@@ -175,8 +246,37 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         let tok_result = tok_handle
             .join()
             .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))?;
-        Ok::<_, anyhow::Error>((model_result?, Arc::new(tok_result?)))
+
+        let draft_model_result: Option<Box<dyn CausalLM>> = match draft_handle {
+            Some(handle) => Some(
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("draft model thread panicked"))??,
+            ),
+            None => None,
+        };
+
+        Ok::<_, anyhow::Error>((model_result?, Arc::new(tok_result?), draft_model_result))
     })?;
+
+    // Validate that the draft and target models share the same vocabulary.
+    // Mismatched vocabularies make the acceptance step undefined.
+    if let Some((_, draft_raw_config, _, _)) = &draft_info {
+        let target_vocab = raw_config.effective_vocab_size();
+        let draft_vocab = draft_raw_config.effective_vocab_size();
+        if let (Some(tv), Some(dv)) = (target_vocab, draft_vocab) {
+            if tv != dv {
+                let draft_id = args.draft_model.as_deref().unwrap_or("<unknown>");
+                let target_id = args.model.as_deref().unwrap_or("<unknown>");
+                anyhow::bail!(
+                    "Draft model vocabulary size ({dv}) does not match target model \
+                     vocabulary size ({tv}). Speculative decoding requires the draft \
+                     and target models to share the same vocabulary. \
+                     (target: {target_id}, draft: {draft_id})"
+                );
+            }
+        }
+    }
 
     let mut engine = Engine::new(
         model,
@@ -185,6 +285,15 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         args.max_batch_size,
         args.max_tokens_per_step,
     );
+
+    // Attach draft model if one was loaded.
+    if let Some(draft_model) = draft_model_opt {
+        engine = engine.with_draft_model(draft_model, args.draft_gamma);
+        tracing::info!(
+            "Speculative decoding enabled (gamma={} draft tokens per step)",
+            args.draft_gamma
+        );
+    }
 
     engine = attach_paged_kv_if_requested(
         engine,
@@ -1297,6 +1406,11 @@ pub struct Engine {
     /// Stays `None` when the tokenizer vocab size exceeds 512K tokens to
     /// avoid excessive memory use.
     token_bytes: Option<Vec<Vec<u8>>>,
+    /// Draft model for speculative decoding.  `None` when `--draft-model` was
+    /// not specified.  Added in task-004; stats fields come in task-005.
+    pub(crate) draft_model: Option<Box<dyn CausalLM>>,
+    /// Number of draft tokens proposed per speculative decode step.
+    pub(crate) draft_gamma: usize,
 }
 
 /// Shared state for paged-attention mode.
@@ -1334,7 +1448,20 @@ impl Engine {
             // Defer the vocab scan to the first grammar-constrained request so
             // it does not add ~100 ms to every server startup.
             token_bytes: None,
+            draft_model: None,
+            draft_gamma: 5,
         }
+    }
+
+    /// Attach a speculative-decoding draft model to this engine.
+    ///
+    /// Called by [`load_engine`] after vocab validation when `--draft-model`
+    /// is specified.  `gamma` is the number of tokens the draft model proposes
+    /// per step (default 5, mirrors llama.cpp).
+    pub fn with_draft_model(mut self, draft_model: Box<dyn CausalLM>, gamma: usize) -> Self {
+        self.draft_model = Some(draft_model);
+        self.draft_gamma = gamma;
+        self
     }
 
     /// Attach a paged KV store to this engine, enabling paged-attention mode.
@@ -1380,6 +1507,8 @@ impl Engine {
             max_tokens_per_step: _,
             paged,
             token_bytes: token_bytes_opt,
+            draft_model: _,
+            draft_gamma: _,
         } = self;
         // Lazily-populated cache of per-token byte strings for grammar masking.
         // Populated on the first grammar-constrained request so startup is not
