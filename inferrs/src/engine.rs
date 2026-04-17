@@ -2671,13 +2671,17 @@ impl Engine {
                     target_offset += 1;
                 }
                 sampler::SpecVerdict::Reject(replacement) => {
-                    // Roll back the draft KV cache by the number of tokens that
-                    // were NOT committed (gamma - n_accepted).  The accepted
-                    // draft tokens are already in the target KV cache; the draft
-                    // model only needs to match the accepted prefix so that the
-                    // next step can continue from the right position.
-                    let n_accepted = draft_idx; // indices 0..draft_idx were accepted
-                    let rollback = gamma - n_accepted;
+                    // After rejection at position i (draft_idx), the accepted prefix
+                    // is d[0..i].  Both the anchor (last_token) and d[0..i] have
+                    // been run through both models.  The draft KV must be left at
+                    // seqlen_offset + i + 1 so the next step can place the replacement
+                    // token at seqlen_offset + i + 1 without a gap.
+                    //
+                    // Draft KV after the full draft phase = seqlen_offset + gamma.
+                    // Needed = seqlen_offset + draft_idx + 1.
+                    // Rollback = gamma - draft_idx - 1.
+                    let n_accepted = draft_idx; // tokens d[0..draft_idx] were accepted
+                    let rollback = gamma - n_accepted - 1;
                     draft.truncate_kv_cache(rollback);
                     accepted.push(replacement);
                     return Ok(accepted);
@@ -2685,7 +2689,19 @@ impl Engine {
             }
         }
 
-        // All gamma draft tokens accepted — sample bonus token from target.
+        // All gamma draft tokens accepted.
+        //
+        // The target has now run gamma+1 forwards (anchor + d[0..gamma-1]), so its
+        // KV is at seqlen_offset + gamma + 1.  The draft only ran gamma forwards
+        // (anchor + d[0..gamma-2]), so its KV is at seqlen_offset + gamma — one
+        // position behind.  Sync by running d[gamma-1] through the draft so the
+        // next speculative step starts from the same offset on both models.
+        let sync_ids = Tensor::new(&[draft_input], device)?.unsqueeze(0)?;
+        draft.hint_decode_token(draft_input);
+        draft.forward(&sync_ids, draft_offset)?;
+
+        // Sample bonus token from the last target logits (cur_logits already holds
+        // the distribution over the position after d[gamma-1]).
         let bonus_logits = Tensor::from_vec(cur_logits.clone(), (1, 1, cur_logits.len()), device)?;
         let (bonus, _) = sampler::sample_token(&bonus_logits, params, previous_tokens)?;
         accepted.push(bonus);

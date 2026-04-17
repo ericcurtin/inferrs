@@ -727,9 +727,10 @@ fn gemma4_26b_moe_produces_intelligible_output() {
 #[ignore = "requires model download and significant compute; run with --ignored"]
 fn speculative_decoding_gemma4_e2b_produces_correct_output() {
     let model_id = "google/gemma-4-E2B-it";
-    // Use a prompt that produces alphabetic output so looks_intelligible() passes.
-    // Arithmetic prompts like "2+2" produce bare digits which fail the check.
-    let prompt = "What is the capital of France? Reply in one word.";
+    // Use a multi-sentence prompt to produce a response long enough (>gamma tokens)
+    // to exercise multiple speculative decode steps.  Single-word answers like
+    // "Paris" fit in one step and would not catch KV-offset drift bugs.
+    let prompt = "List the first 5 planets of the solar system, one per line, no extra text.";
 
     // Single speculative server: same model used as both target and draft.
     // This avoids two sequential Metal processes (which can cause GPU command-buffer
