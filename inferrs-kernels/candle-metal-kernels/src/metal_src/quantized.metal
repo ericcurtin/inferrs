@@ -6255,13 +6255,24 @@ kernel void kernel_mul_mv_q4_K_f32_v2(
     }
 }
 
+// Forward declaration — defined at kernel_mul_mv_q4_K_f32_to_bf16_impl below.
+void kernel_mul_mv_q4_K_f32_to_bf16_impl(
+        device const  void   * src0,
+        device const float   * src1,
+        device       ushort  * dst,
+                   int64_t    ne00, int64_t ne01, int64_t ne02,
+                   int64_t    ne10, int64_t ne12, int64_t ne0,  int64_t ne1,
+                   uint       r2,   uint    r3,
+        threadgroup int8_t  * shared_values,
+                   uint3      tgpig, uint tiisg, uint sgitg);
+
 /// Q4K GEMV with F32 input and BF16 output.
 /// Saves the separate F32→BF16 to_dtype dispatch after down_proj.
 [[host_name("kernel_mul_mv_q4_K_f32_bf16o")]]
 kernel void kernel_mul_mv_q4_K_f32_bf16o(
         device const  void * src0,
         device const float * src1,
-        device      ushort * dst,   // BF16 output (ushort = bfloat16 bits)
+        device      ushort * dst,   // BF16 output
         constant   int64_t & ne00,
         constant   int64_t & ne01,
         constant   int64_t & ne02,
@@ -6281,70 +6292,11 @@ kernel void kernel_mul_mv_q4_K_f32_bf16o(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint tiisg[[thread_index_in_simdgroup]],
         uint sgitg[[simdgroup_index_in_threadgroup]]) {
-
-    // Use a temporary F32 dst buffer via threadgroup memory for the impl,
-    // then cast to BF16.  For the standard non-batched GEMV (ne11=1, ne12=1),
-    // we compute the result in the impl's float accumulators, reduce via simd_sum,
-    // and write BF16 directly.
-    //
-    // We reuse the impl by pointing to a local scalar; only tiisg==0 writes.
-    // For ne11>1 (batch), this approach falls back to F32 cast externally.
-    const int nb = ne00/QK_K;
-    const int64_t r0 = tgpig.x;
-    const int64_t r1 = tgpig.y;
-    const int64_t im = tgpig.z;
-    const int first_row = (r0 * N_SG_Q4K + sgitg) * N_DST_Q4K;
-    const uint i12 = im%ne12;
-    const uint i13 = im/ne12;
-    const uint off0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
-    device const block_q4_K * x = (device const block_q4_K *) src0 + first_row*nb + off0;
-    device const float      * yy = src1 + r1*ne10 + im*ne00*ne1;
-
-    // Use the Q4K_f32 impl with a local thread-register accumulator
-    // We cannot call impl directly with ushort* dst, so we use a small trick:
-    // compute using the original impl pattern but cast output at write time.
-    // For simplicity: call impl with a dummy F32 pointer and then cast.
-    // Since the impl writes via tiisg==0 only, we intercept that write.
-    //
-    // Simpler approach: just use the standard float impl and cast to BF16.
-    // The cost of casting ne01 floats to BF16 is trivial vs the GEMV itself.
-    float sumf1[N_DST_Q4K]={0.f}, sumf2[N_DST_Q4K]={0.f};
-    const uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
-    const int ix = tiisg/8, it = tiisg%8, iq = it/4, ir = it%4;
-    const int step = sizeof(block_q4_K) * nb / 2;
-    device const float * y1 = yy + ix*QK_K + iq*64 + ir*8;
-    uint16_t sc16[4]; thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
-    float yl[16], yh[16];
-    for (int ib = ix; ib < nb; ib += 4) {
-        float4 sumy = {0.f,0.f,0.f,0.f};
-        for (int i = 0; i < 8; ++i) {
-            yl[i+0]=y1[i+ 0]; sumy[0]+=yl[i+0]; yl[i+8]=y1[i+32]; sumy[1]+=yl[i+8];
-            yh[i+0]=y1[i+64]; sumy[2]+=yh[i+0]; yh[i+8]=y1[i+96]; sumy[3]+=yh[i+8];
-        }
-        for (short row = 0; row < N_DST_Q4K; row++) {
-            device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
-            device const uint16_t *  q = (device const uint16_t *)x[ib].qs + 16*iq + ir;
-            device const half * dh = &x[ib].d;
-            sc16[0]=sc[0]&kmask1; sc16[1]=sc[2]&kmask1;
-            sc16[2]=((sc[4]>>0)&kmask2)|((sc[0]&kmask3)>>2);
-            sc16[3]=((sc[4]>>4)&kmask2)|((sc[2]&kmask3)>>2);
-            device const uint16_t * q1 = q; device const uint16_t * q2 = q+32;
-            float4 acc1={0.f,0.f,0.f,0.f}, acc2={0.f,0.f,0.f,0.f};
-            for (int i=0;i<4;++i){acc1[0]+=yl[2*i+0]*(q1[i]&0x000F);acc1[1]+=yl[2*i+1]*(q1[i]&0x0F00);acc1[2]+=yl[2*i+8]*(q1[i]&0x00F0);acc1[3]+=yl[2*i+9]*(q1[i]&0xF000);acc2[0]+=yh[2*i+0]*(q2[i]&0x000F);acc2[1]+=yh[2*i+1]*(q2[i]&0x0F00);acc2[2]+=yh[2*i+8]*(q2[i]&0x00F0);acc2[3]+=yh[2*i+9]*(q2[i]&0xF000);}
-            sumf1[row]+=dh[0]*((acc1[0]+1.f/256.f*acc1[1])*sc8[0]+(acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f+(acc2[0]+1.f/256.f*acc2[1])*sc8[4]+(acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f)-dh[1]*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
-            q+=step; sc+=step; dh+=step;
-        }
-        y1 += 4*QK_K;
-    }
-    for (int row = 0; row < N_DST_Q4K && first_row + row < ne0; ++row) {
-        const float sumf = simd_sum(sumf1[row] + 0.25f*sumf2[row]);
-        if (tiisg == 0) {
-            // Cast F32 result to BF16: reinterpret bit pattern then take upper 16 bits.
-            // `as_type` requires same-size types, so use (ushort) for the final truncation.
-            dst[(int64_t)im*ne0*ne1 + (int64_t)r1*ne0 + first_row + row] =
-                (ushort)(as_type<uint>(sumf) >> 16);
-        }
-    }
+    // Delegate to the tested f32→bf16 impl (identical inner loop to f32 variant,
+    // writes BF16 via upper-16-bit truncation of each float result).
+    kernel_mul_mv_q4_K_f32_to_bf16_impl(src0, src1, dst,
+        ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3,
+        nullptr, tgpig, tiisg, sgitg);
 }
 
 // Fused double-GEMV for Q4K: computes gate_proj(x) and up_proj(x) in a single

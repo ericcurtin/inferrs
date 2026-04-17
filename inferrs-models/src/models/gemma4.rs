@@ -631,6 +631,10 @@ impl Module for Mlp {
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
                     let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    // Use bf16o for down_proj (F32→BF16, saves 1 dispatch)
+                    if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
+                        return bf16_out;
+                    }
                     return self
                         .down_proj
                         .forward_f32(&hidden_act_f32)?
@@ -652,6 +656,13 @@ impl Module for Mlp {
                 if let Some(result) = paired_result {
                     let (gate_f32, up_f32) = result?;
                     let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    if let Some(bf16_out) = self
+                        .down_proj
+                        .forward_q8_0_bf16o(&hidden_act_f32)
+                        .or_else(|| self.down_proj.forward_q4k_bf16o(&hidden_act_f32))
+                    {
+                        return bf16_out;
+                    }
                     return self
                         .down_proj
                         .forward_f32(&hidden_act_f32)?
@@ -1249,47 +1260,32 @@ impl Attention {
         // compute dispatches (2×contiguous + 1×rope + 1×slice_set) per head.
         //
         // q/k are [1, n_heads, 1, head_dim] contiguous after reshape at line ~1499.
-        // TODO: partial_rope_inplace_bf16 produces incorrect output for E4B (Q4K)
-        // and possibly other models. Disabled until root cause is found.
-        #[cfg(feature = "metal")]
-        let fused_q = false;
-        #[cfg(not(feature = "metal"))]
-        let fused_q = false;
+        // Apply RoPE to the first `rotary_dim` features, write passthrough unchanged.
+        // q/k come from reshape and are contiguous; narrow+contiguous
+        // materialises a small, packed slice for the rope kernel.
+        let q_rot = candle_nn::rotary_emb::rope(
+            &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+            &cos,
+            &sin,
+        )?;
+        q_out.slice_set(&q_rot, D::Minus1, 0)?;
+        q_out.slice_set(
+            &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+            D::Minus1,
+            rotary_dim,
+        )?;
 
-        if !fused_q {
-            // Fallback: narrow + contiguous + rope + slice_set.
-            let q_rot = candle_nn::rotary_emb::rope(
-                &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-                &cos,
-                &sin,
-            )?;
-            q_out.slice_set(&q_rot, D::Minus1, 0)?;
-            q_out.slice_set(
-                &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-                D::Minus1,
-                rotary_dim,
-            )?;
-        }
-
-        // TODO: same issue as fused_q above.
-        #[cfg(feature = "metal")]
-        let fused_k = false;
-        #[cfg(not(feature = "metal"))]
-        let fused_k = false;
-
-        if !fused_k {
-            let k_rot = candle_nn::rotary_emb::rope(
-                &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-                &cos,
-                &sin,
-            )?;
-            k_out.slice_set(&k_rot, D::Minus1, 0)?;
-            k_out.slice_set(
-                &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-                D::Minus1,
-                rotary_dim,
-            )?;
-        }
+        let k_rot = candle_nn::rotary_emb::rope(
+            &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+            &cos,
+            &sin,
+        )?;
+        k_out.slice_set(&k_rot, D::Minus1, 0)?;
+        k_out.slice_set(
+            &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+            D::Minus1,
+            rotary_dim,
+        )?;
 
         // Return the pre-allocated buffers directly.
         // `clone()` shares the underlying Metal buffer (ref-counted); no new
@@ -1333,25 +1329,17 @@ impl Attention {
         }
         let q_out = self.partial_rope_q_out.as_mut().unwrap();
 
-        // TODO: partial_rope_inplace_bf16 disabled pending correctness fix.
-        #[cfg(feature = "metal")]
-        let fused = false;
-        #[cfg(not(feature = "metal"))]
-        let fused = false;
-
-        if !fused {
-            let q_rot = candle_nn::rotary_emb::rope(
-                &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-                &cos,
-                &sin,
-            )?;
-            q_out.slice_set(&q_rot, D::Minus1, 0)?;
-            q_out.slice_set(
-                &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-                D::Minus1,
-                rotary_dim,
-            )?;
-        }
+        let q_rot = candle_nn::rotary_emb::rope(
+            &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+            &cos,
+            &sin,
+        )?;
+        q_out.slice_set(&q_rot, D::Minus1, 0)?;
+        q_out.slice_set(
+            &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+            D::Minus1,
+            rotary_dim,
+        )?;
 
         // Same aliasing rationale as `apply_rope_qkv_buffered`: the clone is
         // consumed within this decode step before the next step overwrites q_out.
@@ -2642,9 +2630,13 @@ impl DecoderLayer {
                     // gelu_mul accepts F32 gate + BF16 up directly, saving
                     // the pli_input.to_dtype(F32) dispatch per PLI layer.
                     let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
-                    pli.projection
-                        .forward_f32(&pli_mid_f32)?
-                        .to_dtype(xs.dtype())?
+                    if let Some(bf16_out) = pli.projection.forward_q8_0_bf16o(&pli_mid_f32) {
+                        bf16_out?
+                    } else {
+                        pli.projection
+                            .forward_f32(&pli_mid_f32)?
+                            .to_dtype(xs.dtype())?
+                    }
                 } else {
                     let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
                     let pli_out = gate.broadcast_mul(pli_input)?;
