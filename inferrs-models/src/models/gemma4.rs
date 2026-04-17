@@ -1059,10 +1059,16 @@ impl Attention {
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
-            if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
+            // BF16→BF16 path: eliminates both pre-cast and post-cast.
+            // Try Q8_0 (E2B) then Q4K (E4B).
+            if let Some(out) = self
+                .o_proj
+                .forward_q8_0_bf16i_to_bf16(xs)
+                .or_else(|| self.o_proj.forward_q4k_bf16i_to_bf16(xs))
+            {
                 return out;
             }
-            // Fallback for non-Q8_0 weights: BF16i→F32, then back-cast.
+            // Fallback for other dtypes: BF16i→F32, then back-cast.
             #[cfg(feature = "metal")]
             if let Some(out) = self.o_proj.forward_bf16i(xs) {
                 return out?.to_dtype(xs.dtype());

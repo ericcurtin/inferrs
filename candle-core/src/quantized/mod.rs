@@ -764,6 +764,33 @@ impl QTensor {
         }
     }
 
+    /// Q4K GEMV: BF16 input → BF16 output. For E4B decode.
+    pub fn fwd_mv_q4k_bf16i_to_bf16(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        match &self.storage {
+            QStorage::Metal(m) => {
+                if m.dtype() != GgmlDType::Q4K {
+                    return Ok(None);
+                }
+                let (ds, dsh) = m.fwd_mv_q4k_bf16i_to_bf16(&self.shape, &xs_s, &xs_l)?;
+                Ok(Some(crate::tensor::from_storage(
+                    Storage::Metal(ds),
+                    dsh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output. Eliminates both casts.
     pub fn fwd_mv_q8_0_bf16i_to_bf16(&self, xs: &Tensor) -> Result<Option<Tensor>> {
         let xs_storage_guard = xs.storage();

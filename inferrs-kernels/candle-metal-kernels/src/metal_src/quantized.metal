@@ -6458,6 +6458,72 @@ kernel void kernel_mul_mv2_q4_K_f32(
 
 /// Paired BF16-input GEMV: computes (src0_a @ x, src0_b @ x) where x is BF16.
 /// Avoids the BF16→F32 to_dtype dispatch by converting inline.
+/// Q4K GEMV: BF16 input → BF16 output. Eliminates both pre-cast and post-cast.
+[[host_name("kernel_mul_mv_q4_K_bf16i_to_bf16")]]
+kernel void kernel_mul_mv_q4_K_bf16i_to_bf16(
+        device const  void * src0,
+        device const ushort * src1_bf16,
+        device       ushort * dst,          // BF16 output
+        constant   int64_t & ne00, constant   int64_t & ne01, constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne0,  constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    const int ix = tiisg/8, it = tiisg%8, iq = it/4, ir = it%4;
+    const int nb = ne00/QK_K, r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;
+    const int first_row = (r0 * N_SG_Q4K + sgitg) * N_DST_Q4K;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q4_K * x = (device const block_q4_K *)src0 + first_row*nb + off0;
+    device const ushort * y4u = src1_bf16 + r1*ne10 + im*ne00*ne1 + ix*QK_K + 64*iq + 8*ir;
+    float yl[16], yh[16], sumf[N_DST_Q4K]={0.f}, all_sum;
+    const int step = sizeof(block_q4_K) * nb / 2;
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f,0.f,0.f,0.f};
+        for (int i = 0; i < 8; ++i) {
+            yl[i+0]=as_type<float>(uint(y4u[i+  0])<<16); sumy[0]+=yl[i+0];
+            yl[i+8]=as_type<float>(uint(y4u[i+ 32])<<16); sumy[1]+=yl[i+8];
+            yh[i+0]=as_type<float>(uint(y4u[i+128])<<16); sumy[2]+=yh[i+0];
+            yh[i+8]=as_type<float>(uint(y4u[i+160])<<16); sumy[3]+=yh[i+8];
+        }
+        device const uint16_t * sc=(device const uint16_t *)x[ib].scales+iq;
+        device const uint16_t * q1=(device const uint16_t *)x[ib].qs+16*iq+4*ir;
+        device const half     * dh=&x[ib].d;
+        for (int row=0; row<N_DST_Q4K; row++) {
+            sc16[0]=sc[0]&kmask1; sc16[1]=sc[2]&kmask1;
+            sc16[2]=((sc[4]>>0)&kmask2)|((sc[0]&kmask3)>>2);
+            sc16[3]=((sc[4]>>4)&kmask2)|((sc[2]&kmask3)>>2);
+            device const uint16_t * q2=q1+32;
+            float4 acc1={0.f,0.f,0.f,0.f}, acc2={0.f,0.f,0.f,0.f};
+            _Pragma("clang loop unroll(full)")
+            for (short i=0; i<4; ++i) {
+                acc1[0]+=yl[2*i+0]*(q1[i]&0x000F); acc1[1]+=yl[2*i+1]*(q1[i]&0x0F00);
+                acc1[2]+=yl[2*i+8]*(q1[i]&0x00F0); acc1[3]+=yl[2*i+9]*(q1[i]&0xF000);
+                acc2[0]+=yh[2*i+0]*(q2[i]&0x000F); acc2[1]+=yh[2*i+1]*(q2[i]&0x0F00);
+                acc2[2]+=yh[2*i+8]*(q2[i]&0x00F0); acc2[3]+=yh[2*i+9]*(q2[i]&0xF000);
+            }
+            sumf[row]+=dh[0]*((acc1[0]+1.f/256.f*acc1[1])*sc8[0]+(acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f+
+                              (acc2[0]+1.f/256.f*acc2[1])*sc8[4]+(acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f)
+                      -dh[1]*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
+            q1+=step; sc+=step; dh+=step;
+        }
+        y4u+=4*QK_K;
+    }
+    for (int row=0; row<N_DST_Q4K; ++row) {
+        all_sum=simd_sum(sumf[row]);
+        // F32→BF16: upper 16 bits of float32 bit pattern
+        if (tiisg==0 && first_row+row<ne01)
+            dst[r1*ne0+im*ne0*ne1+first_row+row]=(ushort)(as_type<uint>(all_sum)>>16);
+    }
+}
+
 [[host_name("kernel_mul_mv2_q4_K_bf16i_f32")]]
 kernel void kernel_mul_mv2_q4_K_bf16i_f32(
         device const  void   * src0_a,

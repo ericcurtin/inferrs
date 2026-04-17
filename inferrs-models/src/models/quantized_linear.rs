@@ -197,6 +197,22 @@ impl QLinear {
         }
     }
 
+    /// Q4K GEMV: BF16 input → BF16 output. For E4B decode.
+    pub fn forward_q4k_bf16i_to_bf16(&self, xs_bf16: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_q4k_bf16i_to_bf16(xs_bf16) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output.
     /// Eliminates both the BF16→F32 pre-cast and the F32→BF16 post-cast.
     /// Used for o_proj and PLI projection in the decode path.

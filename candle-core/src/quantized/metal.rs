@@ -373,6 +373,62 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q4K GEMV: BF16 input → BF16 output. For E4B decode.
+    pub fn fwd_mv_q4k_bf16i_to_bf16(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K {
+            crate::bail!("fwd_mv_q4k_bf16i_to_bf16: Q4K only");
+        }
+        if storage.dtype() != DType::BF16 {
+            crate::bail!("fwd_mv_q4k_bf16i_to_bf16: BF16 input required");
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("fwd_mv_q4k_bf16i_to_bf16: not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        let (n, k) = self_shape.dims2()?;
+        let mut dst_shape = src_shape.dims().to_vec();
+        let m = match dst_shape.len() {
+            3 => dst_shape[0] * dst_shape[1],
+            2 => dst_shape[0],
+            r => crate::bail!("fwd_mv_q4k_bf16i_to_bf16: rank {r}"),
+        };
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("fwd_mv_q4k_bf16i_to_bf16: shape mismatch")
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let device = storage.device().clone();
+        let dst = device.new_buffer(dst_shape.elem_count(), DType::BF16, "qmv_q4k_b2b")?;
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let dst_offset = batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16i_to_bf16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        let dst_storage =
+            crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::BF16);
+        Ok((dst_storage, dst_shape))
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output.
     /// Eliminates both the pre-cast (BF16→F32) and post-cast (F32→BF16).
     pub fn fwd_mv_q8_0_bf16i_to_bf16(
