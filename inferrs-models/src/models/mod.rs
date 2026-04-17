@@ -226,6 +226,14 @@ pub trait CausalLM: Send {
     /// Clear all KV caches (for starting a new sequence).
     fn clear_kv_cache(&mut self);
 
+    /// Remove the last `n` tokens from all KV caches.
+    ///
+    /// Used by speculative decoding to roll back rejected draft tokens after
+    /// the verification step.  The default implementation is a no-op; models
+    /// with accessible KV tensors (e.g. concat-KV caches) override this in
+    /// task-003.
+    fn truncate_kv_cache(&mut self, _n: usize) {}
+
     /// Run MTP draft steps starting from `anchor_token` (the token just sampled
     /// from the main model) using `hidden` (the main model's last-layer hidden
     /// state for that step).
