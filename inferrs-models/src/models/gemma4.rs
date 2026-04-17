@@ -1060,12 +1060,8 @@ impl Attention {
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
             // BF16→BF16 path: eliminates both pre-cast and post-cast.
-            // Try Q8_0 (E2B) then Q4K (E4B).
-            if let Some(out) = self
-                .o_proj
-                .forward_q8_0_bf16i_to_bf16(xs)
-                .or_else(|| self.o_proj.forward_q4k_bf16i_to_bf16(xs))
-            {
+            // Q8_0 (E2B) only — Q4K bf16i has numerical issues pending investigation.
+            if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
                 return out;
             }
             // Fallback for other dtypes: BF16i→F32, then back-cast.
@@ -1421,8 +1417,7 @@ impl Attention {
             // Best path: BF16 input → BF16 output triple QKV GEMV.
             // No pre-cast (BF16→F32) and no post-casts (3×F32→BF16) — saves 1 dispatch
             // vs the bf16o variant which still needs the pre-cast.
-            // Q8_0 (E2B): kernel_mul_mv3_q8_0_bf16i_to_bf16.
-            // Saves 1 dispatch per attention layer × 35 layers = 35 fewer dispatches/token.
+            // Q8_0 (E2B) only — Q4K bf16i has numerical issues pending investigation.
             #[cfg(feature = "metal")]
             let qkv_b2b = if orig_dtype == DType::BF16
                 && matches!(xs.device(), candle_core::Device::Metal(_))

@@ -373,6 +373,30 @@ impl QLinear {
     }
 
     /// Triple Q4K GEMV → BF16 output (saves 2 back-cast dispatches).
+    /// Q4K triple GEMV: BF16 input → BF16 output. For E4B decode.
+    pub fn forward_triple_q4k_bf16i_to_bf16(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_bf16: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q4k_bf16i_to_bf16(qt_k, qt_v, xs_bf16) {
+            Ok(Some(t)) => Some(Ok(t)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     pub fn forward_triple_q4k_bf16o(
         &self,
         kw: &QLinear,

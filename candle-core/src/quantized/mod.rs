@@ -946,6 +946,45 @@ impl QTensor {
         }
     }
 
+    /// Q4K triple GEMV: BF16 input → BF16 output.
+    pub fn fwd_mv3_q4k_bf16i_to_bf16(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q4K
+                    || km.dtype() != GgmlDType::Q4K
+                    || vm.dtype() != GgmlDType::Q4K
+                {
+                    return Ok(None);
+                }
+                let ((dq, sq), (dk, sk), (dv, sv)) =
+                    qm.fwd_mv3_q4k_bf16i_to_bf16(km, vm, &self.shape, &kw.shape, &xs_s, &xs_l)?;
+                let mk = |s, sh| {
+                    crate::tensor::from_storage(
+                        Storage::Metal(s),
+                        sh,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    )
+                };
+                Ok(Some((mk(dq, sq), mk(dk, sk), mk(dv, sv))))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn fwd_mv3_q4k(
         &self,
         kw: &QTensor,
