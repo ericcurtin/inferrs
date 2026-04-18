@@ -11,10 +11,8 @@ use std::sync::{Arc, Mutex};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-// 100 ops per command buffer: empirically better than 64 for Gemma4 decode on Apple Silicon.
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 100;
-// Pool of 8 command buffers: allows more in-flight GPU work across the 35-42 layer decode.
-const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 8;
+const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 64;
+const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 5;
 
 /// Creates a new command buffer from the queue with an attached semaphore for tracking its state.
 pub fn create_command_buffer(

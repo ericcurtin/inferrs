@@ -2670,19 +2670,24 @@ void kernel_mul_mv_q8_0_f32_to_bf16_impl_4sg(
     const int r0=tgpig.x*NR0, r1=tgpig.y, im=tgpig.z;
     const uint i12=im%ne12, i13=im/ne12;
     const uint off0=r0*nb+(i12/r2)*(nb*ne01)+(i13/r3)*(nb*ne01*ne02);
-    device const block_q8_0 *x=(device const block_q8_0*)src0+off0;
+     device const block_q8_0 *x=(device const block_q8_0*)src0+off0;
     device const float *y=src1+r1*ne10+im*ne00*ne1;
     const int ix=tiisg/(NW/NQ), il=tiisg%(NW/NQ);
     const int ib0=sgitg*NQ+ix;
     float yl[NQ], sumf[NR0]={0.f};
     device const float *yb=y+ib0*QK8_0+il*NQ;
+    device const block_q8_0 * ax2[NR0];
+    for(int row=0;row<NR0;++row) ax2[row]=x+row*nb;
     for(int ib=ib0;ib<nb;ib+=NSG*NQ){
+        _Pragma("clang loop unroll(full)")
         for(int i=0;i<NQ;++i)yl[i]=yb[i];
+        _Pragma("clang loop unroll(full)")
         for(int row=0;row<NR0;++row){
-            device const int8_t*qs=x[ib+row*nb].qs+il*NQ;
+            device const int8_t*qs=ax2[row][ib].qs+il*NQ;
             float s=0.f;
+            _Pragma("clang loop unroll(full)")
             for(int i=0;i<NQ;++i)s+=qs[i]*yl[i];
-            sumf[row]+=s*x[ib+row*nb].d;
+            sumf[row]+=s*ax2[row][ib].d;
         }
         yb+=NSG*NQ*QK8_0;
     }
@@ -2745,16 +2750,25 @@ void kernel_mul_mv_q8_0_bf16i_impl_4sg(
 
     device const ushort * yb = y + ib0*QK8_0 + il*NQ;
 
+    // Pre-compute pointers for both rows to avoid repeated pointer arithmetic.
+    device const block_q8_0 * ax[NR0];
+    for (int row = 0; row < NR0; ++row) {
+        ax[row] = x + row*nb;
+    }
+
     for (int ib = ib0; ib < nb; ib += NSG*NQ) {
         // Convert BF16 to F32 inline via bit-shift.
+        _Pragma("clang loop unroll(full)")
         for (int i = 0; i < NQ; ++i) {
             yl[i] = as_type<float>(uint(yb[i]) << 16);
         }
+        _Pragma("clang loop unroll(full)")
         for (int row = 0; row < NR0; ++row) {
-            device const int8_t * qs = x[ib + row*nb].qs + il*NQ;
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
             float sumq = 0.f;
+            _Pragma("clang loop unroll(full)")
             for (int iq = 0; iq < NQ; ++iq) { sumq += qs[iq] * yl[iq]; }
-            sumf[row] += sumq * x[ib + row*nb].d;
+            sumf[row] += sumq * ax[row][ib].d;
         }
         yb += NSG*NQ*QK8_0;
     }

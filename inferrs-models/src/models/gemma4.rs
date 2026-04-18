@@ -1308,13 +1308,6 @@ impl Attention {
             rotary_dim,
         )?;
 
-        // Return the pre-allocated buffers directly.
-        // `clone()` shares the underlying Metal buffer (ref-counted); no new
-        // allocation occurs.  The caller consumes the clones for attention
-        // computation within the same `forward_returning_kv` call.  By the time
-        // the *next* decode step calls this method and overwrites the buffers via
-        // `slice_set`, the previous clones have already been dropped — so there
-        // is no aliasing hazard.
         Ok((q_out.clone(), k_out.clone()))
     }
 

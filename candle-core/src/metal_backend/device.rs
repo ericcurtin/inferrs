@@ -234,12 +234,17 @@ impl MetalDevice {
     }
 
     /// Returns (buffer, offset=0) for compatibility with arena-aware callers.
-    pub fn new_buffer_with_data_untracked_offset<T>(&self, data: &[T]) -> Result<(Arc<Buffer>, usize)> {
+    pub fn new_buffer_with_data_untracked_offset<T>(
+        &self,
+        data: &[T],
+    ) -> Result<(Arc<Buffer>, usize)> {
         Ok((self.new_buffer_with_data_untracked(data)?, 0))
     }
 
     /// Placeholder for future batch weight-loading optimization.
-    pub fn begin_weight_arena(&self, _total_bytes: usize) -> Result<()> { Ok(()) }
+    pub fn begin_weight_arena(&self, _total_bytes: usize) -> Result<()> {
+        Ok(())
+    }
     pub fn end_weight_arena(&self) {}
 
     /// Creates a Metal buffer wrapping existing memory WITHOUT copying.
@@ -318,6 +323,16 @@ fn buf_size(size: usize) -> usize {
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    // Fast path: check exact size match first (most common case during steady-state decode
+    // where the same tensor shapes recur every step).
+    if let Some(subbuffers) = buffers.get(&size) {
+        for sub in subbuffers {
+            if Arc::strong_count(sub) == 1 {
+                return Some(sub.clone());
+            }
+        }
+    }
+    // Slow path: find the smallest available buffer >= size.
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
