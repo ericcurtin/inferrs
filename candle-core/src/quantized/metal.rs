@@ -312,6 +312,66 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q4K GEMV v2: float4 dequantization + dot() hardware instruction.
+    /// Accepts F32 input, outputs F32. Uses `kernel_mul_mv_q4_K_f32_v2`.
+    /// Alternative to standard Q4K GEMV — may be faster due to vectorized dot().
+    pub fn fwd_mv_q4k_v2(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K {
+            crate::bail!("fwd_mv_q4k_v2: Q4K only");
+        }
+        if storage.dtype() != DType::F32 {
+            crate::bail!("fwd_mv_q4k_v2: F32 input required");
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("fwd_mv_q4k_v2: input not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("fwd_mv_q4k_v2: input rank < 2")
+        }
+        let (n, k) = self_shape.dims2()?;
+        let mut dst_shape = src_shape.dims().to_vec();
+        let m = match dst_shape.len() {
+            3 => dst_shape[0] * dst_shape[1],
+            2 => dst_shape[0],
+            r => crate::bail!("fwd_mv_q4k_v2: invalid rank {r}"),
+        };
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("fwd_mv_q4k_v2: shape mismatch")
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let device = storage.device().clone();
+        let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul_q4k_v2")?;
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes();
+            let dst_offset = batch_id * n * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_v2(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+        Ok((dst_storage, dst_shape))
+    }
+
     /// Q8_0 GEMV with F32 input and BF16 output.
     /// Uses `kernel_mul_mv_q8_0_f32_to_bf16` — eliminates the F32→BF16 `to_dtype`
     /// dispatch after down_proj / pli_projection.

@@ -733,6 +733,37 @@ impl QTensor {
         }
     }
 
+    /// Q4K GEMV v2: float4 dequantization + dot() hardware instruction.
+    /// F32 input → F32 output. May be faster than standard Q4K GEMV for some shapes.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q4k_v2(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        if xs.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        match &self.storage {
+            QStorage::Metal(m) => {
+                if m.dtype() != GgmlDType::Q4K {
+                    return Ok(None);
+                }
+                let (dst_storage, dst_shape) =
+                    m.fwd_mv_q4k_v2(&self.shape, &xs_storage, &xs_layout)?;
+                let out = crate::tensor::from_storage(
+                    Storage::Metal(dst_storage),
+                    dst_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Q8_0 GEMV with F32 input and BF16 output.
     /// Saves 1 dispatch vs `forward_f32 + to_dtype(BF16)` for down_proj / pli_projection.
     #[cfg(feature = "metal")]

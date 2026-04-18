@@ -178,6 +178,27 @@ impl QLinear {
         }
     }
 
+    /// Q4K GEMV v2: float4 dequantization + dot() hardware instruction.
+    /// F32 input → F32 output. May be faster than standard Q4K for E4B decode.
+    #[cfg(feature = "metal")]
+    pub fn forward_q4k_v2(&self, xs_f32: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        if xs_f32.dtype() != candle_core::DType::F32 {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_q4k_v2(xs_f32) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     /// Q8_0 GEMV with F32 input and BF16 output.
     /// Saves the F32→BF16 `to_dtype` dispatch after down_proj / pli_projection.
     /// Returns None when unavailable (non-Metal, non-Q8_0, or non-F32 input).

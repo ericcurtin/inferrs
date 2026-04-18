@@ -1587,7 +1587,7 @@ impl candle::CustomOp3 for Sdpa {
             let q_dims = q_l.dims();
             let k_dims = k_l.dims();
             let gqa_factor = q_dims[1] / k_dims[1];
-            let head_dim = *q_dims.last().unwrap_or(&0);
+            let _head_dim = *q_dims.last().unwrap_or(&0);
             if false && gqa_factor > 1 {
                 // GQA fused path — disabled: correctness needs more testing.
                 // The sdpa_gqa_fused_decode function provides this path directly.
@@ -2039,6 +2039,103 @@ pub fn sdpa_2pass_prealloc_full(
     }
 
     Ok(true)
+}
+
+#[cfg(feature = "metal")]
+/// Single-token SDPA using the `sdpa_vector_full_dot` kernel (32 threads per head).
+///
+/// This is a port of llama.cpp's single-token decode attention approach:
+/// - 32 threads per Q-head (one simdgroup)
+/// - Q is loaded to SMEM once; K/V are accessed per-token
+/// - Each thread handles one KV token per tile (no cross-lane simd_sum for score)
+/// - Uses `simd_max`/`simd_sum`/`simd_shuffle` for online softmax
+///
+/// Compared to `sdpa_vector` (1024 threads/head), this uses far fewer GPU resources
+/// per head, allowing more heads to run in parallel — faster for typical decode lengths.
+///
+/// Supports: BF16, head_dim ∈ {256, 512}, no mask, any GQA factor.
+/// Returns `None` on non-Metal, wrong dtype, unsupported head_dim, or with mask.
+pub fn sdpa_full_dot_decode(
+    q: &Tensor, // [1, n_q_heads, 1, head_dim]
+    k: &Tensor, // [1, n_kv_heads, N, head_dim]
+    v: &Tensor, // [1, n_kv_heads, N, head_dim]
+    scale: f32,
+    softcapping: f32,
+) -> Result<Option<Tensor>> {
+    use candle::{DType, Storage};
+    use candle_metal_kernels::SdpaDType;
+
+    if q.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+
+    let device = match q.device() {
+        candle::Device::Metal(d) => d,
+        _ => return Ok(None),
+    };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+
+    let (q_metal, k_metal, v_metal) = match (&*q_s, &*k_s, &*v_s) {
+        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c)) => (a, b, c),
+        _ => return Ok(None),
+    };
+
+    let q_dims = q_l.dims();
+    let k_dims = k_l.dims();
+    let _head_dim = *q_dims.last().unwrap_or(&0);
+    let itype = SdpaDType::BF16;
+
+    let elem_count = q_dims.iter().product::<usize>();
+    let out_buf = device.new_buffer(elem_count, DType::BF16, "full_dot_sdpa_out")?;
+
+    let alpha = if softcapping != 1. {
+        scale / softcapping
+    } else {
+        scale
+    };
+
+    let encoder = device.command_encoder()?;
+    let used = candle_metal_kernels::call_sdpa_vector_flash(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        q_dims,
+        q_metal.buffer(),
+        k_l.start_offset(),
+        k_dims,
+        k_l.stride(),
+        k_metal.buffer(),
+        v_l.start_offset(),
+        v_l.stride(),
+        v_metal.buffer(),
+        &out_buf,
+        alpha,
+        softcapping,
+        itype,
+    )
+    .map_err(candle::Error::wrap)?;
+
+    if !used {
+        return Ok(None);
+    }
+
+    let out_storage = candle::Storage::Metal(candle::MetalStorage::new(
+        out_buf,
+        device.clone(),
+        elem_count,
+        DType::BF16,
+    ));
+    let result = candle::Tensor::from_storage(
+        out_storage,
+        candle::Shape::from_dims(q_dims),
+        candle::op::BackpropOp::none(),
+        false,
+    );
+    Ok(Some(result))
 }
 
 #[cfg(feature = "metal")]
