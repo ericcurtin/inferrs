@@ -2658,7 +2658,11 @@ impl DecoderLayer {
                     // gelu_mul accepts F32 gate + BF16 up directly, saving
                     // the pli_input.to_dtype(F32) dispatch per PLI layer.
                     let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
-                    if let Some(bf16_out) = pli.projection.forward_q8_0_bf16o(&pli_mid_f32) {
+                    if let Some(bf16_out) = pli
+                        .projection
+                        .forward_q8_0_bf16o(&pli_mid_f32)
+                        .or_else(|| pli.projection.forward_q4k_bf16o(&pli_mid_f32))
+                    {
                         bf16_out?
                     } else {
                         pli.projection
