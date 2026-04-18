@@ -1060,7 +1060,7 @@ impl Attention {
         {
             // BF16→BF16 GEMV: eliminates both pre-cast and post-cast (saves 1 dispatch vs bf16i path).
             // Q8_0 (E2B): bf16i_to_bf16 saves pre+post casts (2 dispatches → 1).
-            // Q4K (E4B): disabled — bf16i inline conversion overhead > savings.
+            // Q4K (E4B): disabled — overhead vs savings not favorable.
             if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
                 return out;
             }
@@ -2616,6 +2616,7 @@ impl DecoderLayer {
             // explicit F32 conversion needed. Each QLinear::forward call uses
             // the fused BF16→Q8_1 path on CUDA.
             // BF16-input inline GEMV for pli.gate (Metal decode only);
+            // Try Q8_0 bf16i→f32 first (E2B), then Q4K bf16i→f32 (E4B),
             // on other platforms falls back to standard forward.
             #[cfg(feature = "metal")]
             let gate_f32 = if xs.dtype() == DType::BF16
@@ -2623,7 +2624,11 @@ impl DecoderLayer {
                 && xs.rank() >= 2
                 && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
             {
-                if let Some(out) = pli.gate.forward_bf16i(&xs) {
+                if let Some(out) = pli
+                    .gate
+                    .forward_q8_0_bf16i_f32(&xs)
+                    .or_else(|| pli.gate.forward_bf16i(&xs))
+                {
                     out?
                 } else {
                     xs.apply(&pli.gate)?
