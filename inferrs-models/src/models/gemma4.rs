@@ -1059,12 +1059,9 @@ impl Attention {
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
             // BF16→BF16 GEMV: eliminates both pre-cast and post-cast (saves 1 dispatch vs bf16i path).
-            // Q8_0 (E2B) only — Q4K bf16i_to_bf16 pending kernel validation.
-            if let Some(out) = self
-                .o_proj
-                .forward_q8_0_bf16i_to_bf16(xs)
-                .or_else(|| self.o_proj.forward_q4k_bf16i_to_bf16(xs))
-            {
+            // Q8_0 (E2B): bf16i_to_bf16 saves pre+post casts (2 dispatches → 1).
+            // Q4K (E4B): disabled — bf16i inline conversion overhead > savings.
+            if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
                 return out;
             }
             // Fallback for other dtypes: BF16i→F32, then back-cast.
@@ -1412,12 +1409,10 @@ impl Attention {
             let qkv_b2b = if orig_dtype == DType::BF16
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
+                // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast.
+                // Q4K (E4B): disabled — benchmark shows no improvement vs bf16o path.
                 self.q_proj
                     .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
-                    .or_else(|| {
-                        self.q_proj
-                            .forward_triple_q4k_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
-                    })
             } else {
                 None
             };
