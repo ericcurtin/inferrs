@@ -596,6 +596,54 @@ mod tests {
         run_chunked_large_decay(&device, 42, 16, 128, 128);
     }
 
+    /// Same as `run_chunked_vs_sequential` but starts from a random non-zero
+    /// state, exercising the `P @ state_0` branch inside K2c that was previously
+    /// broken by a per-group smem aliasing bug (s_tile) and a diagonal-read bug
+    /// (s_row_st). With zero state those two terms cancel to 0 and mask the bug.
+    fn run_chunked_vs_sequential_nonzero_state(
+        device: &Device,
+        b: usize,
+        t: usize,
+        n_heads: usize,
+        hk: usize,
+        hv: usize,
+    ) {
+        let q = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let k = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let v = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), device).unwrap();
+        let g_raw = Tensor::randn(-2.0f32, 1.0f32, (b, t, n_heads), device).unwrap();
+        let g = candle_nn::ops::sigmoid(&g_raw).unwrap();
+        let log_g = g.log().unwrap();
+        let beta_raw = Tensor::randn(0f32, 1.0f32, (b, t, n_heads), device).unwrap();
+        let beta = candle_nn::ops::sigmoid(&beta_raw).unwrap();
+
+        // Build state on CPU then copy to target device twice to get two
+        // independent tensors with identical initial values.
+        let state_cpu = Tensor::randn(0f32, 0.1f32, (b, n_heads, hk, hv), &Device::Cpu).unwrap();
+        let mut state_seq = state_cpu.to_device(device).unwrap();
+        let mut state_chk = state_cpu.to_device(device).unwrap();
+
+        let out_seq = sequential_loop(&q, &k, &v, &g, &beta, &mut state_seq).unwrap();
+        let out_chk = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state_chk).unwrap();
+
+        let out_diff = max_abs_diff(&out_seq, &out_chk);
+        let state_diff = max_abs_diff(&state_seq, &state_chk);
+
+        println!(
+            "nonzero_state b={b} t={t} n_h={n_heads} hk={hk} hv={hv}: \
+             out_diff={out_diff:.6} state_diff={state_diff:.6}"
+        );
+
+        assert!(
+            out_diff < 1e-3,
+            "b={b} t={t}: output mismatch (nonzero state): max diff = {out_diff}"
+        );
+        assert!(
+            state_diff < 1e-3,
+            "b={b} t={t}: state mismatch (nonzero state): max diff = {state_diff}"
+        );
+    }
+
     #[test]
     fn chunked_matches_sequential_cpu() {
         let device = Device::Cpu;
@@ -635,6 +683,37 @@ mod tests {
         // batch > 1: validates identity broadcast and slice_set across batch dim
         run_chunked_vs_sequential(&device, 2, 56, 2, 4, 4);
         run_chunked_vs_sequential(&device, 2, 128, 2, 4, 4);
+    }
+
+    #[test]
+    fn nonzero_state_matches_sequential_cpu() {
+        let device = Device::Cpu;
+        // single chunk — ensures basic P@state correctness on CPU path
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 56, 2, 4, 4);
+        // multi-chunk — exercises composed prefix operators applied to non-zero state
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 128, 2, 4, 4);
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 192, 16, 128, 128);
+        // batch > 1
+        run_chunked_vs_sequential_nonzero_state(&device, 2, 128, 2, 4, 4);
+    }
+
+    #[test]
+    fn nonzero_state_matches_sequential_cuda() {
+        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        if matches!(device, Device::Cpu) {
+            eprintln!("CUDA not available, skipping GPU test");
+            return;
+        }
+        // single chunk (ci=0 prefix=I, state_in=state_0 directly)
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 56, 16, 128, 128);
+        // two chunks — ci=1 uses P[1]=A_0, exercises the P@state_0 matvec in K2c
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 128, 16, 128, 128);
+        // four chunks — exercises multi-level Blelloch scan + P@state_0 for ci=2,3
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 200, 16, 128, 128);
+        // hk=hv=64 variant (HPG=16, N_GROUPS=4)
+        run_chunked_vs_sequential_nonzero_state(&device, 1, 128, 16, 64, 64);
+        // batch > 1
+        run_chunked_vs_sequential_nonzero_state(&device, 2, 128, 16, 128, 128);
     }
 
     /// Run a chunked prefill followed by sequential decode steps, comparing
