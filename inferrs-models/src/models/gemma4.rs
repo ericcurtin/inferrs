@@ -1061,8 +1061,12 @@ impl Attention {
         {
             // BF16→BF16 GEMV: eliminates both pre-cast and post-cast (saves 1 dispatch vs bf16i path).
             // Q8_0 (E2B): bf16i_to_bf16 saves pre+post casts (2 dispatches → 1).
-            // Q4K (E4B): disabled — overhead vs savings not favorable.
+            // Q4K (E4B): bf16i_to_bf16 — saves 1 dispatch (2 dispatches → 1) vs bf16i+to_dtype.
             if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
+                return out;
+            }
+            #[cfg(feature = "metal")]
+            if let Some(out) = self.o_proj.forward_q4k_bf16i_to_bf16(xs) {
                 return out;
             }
             // Fallback for other dtypes: BF16i→F32, then back-cast.
@@ -1843,8 +1847,11 @@ impl Attention {
                 if let Some(out) = self.q_proj.forward_q8_0_bf16i_to_bf16(xs) {
                     // Q8_0 (E2B): BF16→BF16 in 1 dispatch, no back-cast needed.
                     out?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                } else if let Some(out) = self.q_proj.forward_q4k_bf16i_to_bf16(xs) {
+                    // Q4K (E4B): BF16→BF16 in 1 dispatch, no back-cast needed.
+                    out?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?
                 } else if let Some(out) = self.q_proj.forward_bf16i(xs) {
-                    // Q4K (E4B): BF16→F32 + back-cast.
+                    // Other quant (fallback): BF16→F32 + back-cast.
                     out?.to_dtype(orig_dtype)?.reshape((
                         b_sz,
                         q_len,
