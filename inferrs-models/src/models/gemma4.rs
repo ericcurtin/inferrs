@@ -627,7 +627,7 @@ impl Module for Mlp {
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
                 // BF16i paired GEMV: skips the xs→F32 pre-cast.
-                // Q8_0 only (E2B) — Q4K bf16i confirmed slower on benchmark.
+                // Q8_0 only (E2B) — Q4K bf16i confirmed slower on benchmark for large matrices.
                 let paired_bf16i = self.gate_proj.forward_paired_q8_0_bf16i(&self.up_proj, xs);
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
@@ -1421,7 +1421,7 @@ impl Attention {
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
                 // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast.
-                // Q4K (E4B): bf16i overhead > dispatch savings — use bf16o path instead.
+                // Q4K (E4B): bf16i overhead > dispatch savings for large matrices — use bf16o path.
                 self.q_proj
                     .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
             } else {
