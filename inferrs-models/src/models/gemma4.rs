@@ -1268,17 +1268,24 @@ impl Attention {
         //
         // q/k are [1, n_heads, 1, head_dim] contiguous after reshape at line ~1499.
         // Apply partial RoPE: first `rotary_dim` features get RoPE, rest pass through.
-        // Fused path: single dispatch via partial_rope_bf16 kernel (dispatch_thread_groups).
+        //
+        // Q: fused single dispatch writes to persistent q_out (partial_rope_inplace_bf16).
+        //    Saves 4 dispatches vs narrow+contiguous+rope+2×slice_set.
+        //
+        // K: standard path. When BOTH Q and K use the fused persistent-buffer approach
+        //    in the same 64-op command-buffer batch, Metal's hazard tracking hangs.
+        //    K-only fused also works, but Q+K combined doesn't — root cause TBD.
+        //    Q-only fused is safe and saves the most dispatch overhead.
         #[cfg(feature = "metal")]
-        let fused_q =
+        let q_fused =
             if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
                 candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
             } else {
                 false
             };
         #[cfg(not(feature = "metal"))]
-        let fused_q = false;
-        if !fused_q {
+        let q_fused = false;
+        if !q_fused {
             let q_rot = candle_nn::rotary_emb::rope(
                 &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
                 &cos,
@@ -1291,27 +1298,18 @@ impl Attention {
                 rotary_dim,
             )?;
         }
-
-        // K partial_rope: disabled — combining Q+K fused partial_rope causes incorrect
-        // attention output (early EOS). Root cause unknown; Q-only is safe and still
-        // saves 5 dispatches per global attention layer per decode step.
-        #[cfg(feature = "metal")]
-        let fused_k = false;
-        #[cfg(not(feature = "metal"))]
-        let fused_k = false;
-        if !fused_k {
-            let k_rot = candle_nn::rotary_emb::rope(
-                &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-                &cos,
-                &sin,
-            )?;
-            k_out.slice_set(&k_rot, D::Minus1, 0)?;
-            k_out.slice_set(
-                &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-                D::Minus1,
-                rotary_dim,
-            )?;
-        }
+        // K: standard narrow+contiguous+rope+slice_set path.
+        let k_rot = candle_nn::rotary_emb::rope(
+            &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+            &cos,
+            &sin,
+        )?;
+        k_out.slice_set(&k_rot, D::Minus1, 0)?;
+        k_out.slice_set(
+            &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+            D::Minus1,
+            rotary_dim,
+        )?;
 
         // Return the pre-allocated buffers directly.
         // `clone()` shares the underlying Metal buffer (ref-counted); no new
@@ -1377,9 +1375,6 @@ impl Attention {
                 rotary_dim,
             )?;
         }
-
-        // Same aliasing rationale as `apply_rope_qkv_buffered`: the clone is
-        // consumed within this decode step before the next step overwrites q_out.
         Ok(q_out.clone())
     }
 
