@@ -1776,6 +1776,72 @@ ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 impl_rms_norm_add(rmsnorm_add_bf16, bfloat)
 impl_rms_norm_add_scale(rmsnorm_add_scale_bf16, bfloat)
 
+/// RMSNorm with BF16 input and F32 output.
+///
+/// Eliminates the separate BF16→F32 to_dtype dispatch that is otherwise
+/// needed before Q4K GEMV kernels (which require F32 activations).
+///
+/// For Gemma4 E4B decode: saves 1 dispatch per MLP layer (42 layers =
+/// 42 fewer encoder roundtrips per decode step) by fusing the norm
+/// output conversion into the normalization kernel.
+///
+/// API matches rmsnorm_bf16: same grid layout (one TG per sequence element),
+/// same alpha (BF16 weight), just different output type (float).
+#define rmsnorm_bf16i_f32o_case(N)                              \
+case N: {                                                       \
+    threadgroup RMS<float> shared[N];                           \
+    threadgroup float total;                                     \
+    const uint offset = dst_id * el_per_block;                  \
+    const uint stop_idx = min(el_per_block + offset, src_numel);\
+    const uint idx = tid + offset;                              \
+    using Indexer = indexer_t<uint, false>;                     \
+    Indexer indexer;                                            \
+    Divide fast_divide;                                         \
+    loader<bfloat, RMS<float>, RMSLoadOp<float>, N,            \
+           Indexer, uint> load_fn;                              \
+    block_reducer<RMS<float>, RMSReduceOp<float>, N> reduce(shared); \
+    RMS<float> value = load_fn(RMSLoadOp<float>::init(),        \
+        indexer, src_numel, el_per_block, src, offset, tid);   \
+    RMS<float> result = {value.count, (float)value.mean};       \
+    result = reduce(result, tid);                               \
+    if (tid == 0) total = rsqrt(fast_divide(result.mean,        \
+                                float(el_per_block)) + eps);   \
+    threadgroup_barrier(mem_flags::mem_threadgroup);            \
+    for (uint i = idx; i < stop_idx; i += N) {                 \
+        float val = float(src[i]) * total;                      \
+        val *= float(alpha[i - offset]);                        \
+        dst[i] = val;                                           \
+    }                                                           \
+    break;                                                      \
+}
+
+[[host_name("rmsnorm_bf16i_f32o")]]
+kernel void rmsnorm_bf16i_f32o(
+    constant uint  &src_numel     [[ buffer(0) ]],
+    constant uint  &el_per_block  [[ buffer(1) ]],
+    device const bfloat *src      [[ buffer(2) ]],
+    device       float  *dst      [[ buffer(3) ]],
+    device const bfloat *alpha    [[ buffer(4) ]],
+    constant float &eps           [[ buffer(5) ]],
+    uint tid     [[ thread_index_in_threadgroup ]],
+    uint dst_id  [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    switch (max_shared_mem<float>(block_dim)) {
+        rmsnorm_bf16i_f32o_case(1024);
+        rmsnorm_bf16i_f32o_case( 512);
+        rmsnorm_bf16i_f32o_case( 256);
+        rmsnorm_bf16i_f32o_case( 128);
+        rmsnorm_bf16i_f32o_case(  64);
+        rmsnorm_bf16i_f32o_case(  32);
+        rmsnorm_bf16i_f32o_case(  16);
+        rmsnorm_bf16i_f32o_case(   8);
+        rmsnorm_bf16i_f32o_case(   4);
+        rmsnorm_bf16i_f32o_case(   2);
+        rmsnorm_bf16i_f32o_case(   1);
+    }
+}
+
 /// Partial-RoPE kernel for BF16 tensors.
 ///
 /// Applied to a single-token decode tensor with shape [1, n_heads, 1, head_dim].
