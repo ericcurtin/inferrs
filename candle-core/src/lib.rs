@@ -58,6 +58,8 @@ pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 #[cfg(feature = "cuda")]
+pub mod cuda_conv1d_depthwise_btc;
+#[cfg(feature = "cuda")]
 pub mod cuda_flash_attn;
 #[cfg(feature = "cuda")]
 pub mod cuda_linear_attn;
