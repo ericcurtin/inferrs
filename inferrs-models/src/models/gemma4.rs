@@ -618,15 +618,16 @@ impl Module for Mlp {
             // accept BF16 directly and output F32 — eliminating the xs.to_dtype(F32)
             // dispatch entirely.  This saves 1 Metal kernel dispatch per MLP layer
             // per decode step (35 layers × 1 = 35 fewer dispatches on E2B only).
-            // Note: Q4K bf16i is disabled pending kernel validation for E4B.
+            // Note: Q4K bf16i adds per-element bit-shift overhead that outweighs the
+            // dispatch savings even for large E4B weight matrices — benchmarked and
+            // confirmed slower.
             #[cfg(feature = "metal")]
             if is_single_token
                 && orig_dtype == DType::BF16
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
                 // BF16i paired GEMV: skips the xs→F32 pre-cast.
-                // Q8_0 only (E2B) — Q4K bf16i adds per-element bit-shift overhead that
-                // outweighs the dispatch savings for the larger E4B weight matrices.
+                // Q8_0 only (E2B) — Q4K bf16i confirmed slower on benchmark.
                 let paired_bf16i = self.gate_proj.forward_paired_q8_0_bf16i(&self.up_proj, xs);
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
