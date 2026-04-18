@@ -1198,50 +1198,39 @@ impl TurboQuantKvCache {
         self
     }
 
-    /// Remove the last `n` tokens from the KV cache.
-    ///
-    /// Used by speculative decoding to roll back rejected draft tokens after
-    /// the verification step.  Handles both the compressed (packed/norms) path
-    /// and the warmup-buffer (unquantized on-device) path.
-    ///
-    /// If `n >= total_tokens`, the cache is fully cleared (equivalent to
-    /// calling `clear()`).  Truncating by 0 is a no-op.
+    /// Remove the last `n` tokens from the KV cache (speculative decode rollback).
+    /// No-op when `n == 0`; clears the cache when `n >= total_tokens`.
     pub fn truncate(&mut self, n: usize) {
         if n == 0 {
             return;
         }
 
-        // ── Warmup (unquantized on-device) path ────────────────────────────
+        // Warmup (unquantized on-device) path.
+        // seq_len counts compressed tokens only; warmup_kv_buf_len is separate.
         if self.warmup_kv_buf_len > 0 {
             if n >= self.warmup_kv_buf_len {
-                // Also remove any compressed tokens that preceded the warmup buffer.
-                let remaining_compressed = self.seq_len.saturating_sub(n - self.warmup_kv_buf_len);
+                let n_from_compressed = n - self.warmup_kv_buf_len;
                 self.warmup_kv_buf_len = 0;
-                // Truncate compressed portion if any spillover.
-                if remaining_compressed < self.seq_len {
-                    let drop = self.seq_len - remaining_compressed;
+                if n_from_compressed > 0 {
+                    let new_seq_len = self.seq_len.saturating_sub(n_from_compressed);
                     let bytes_per_token =
                         ((self.head_dim - 1) * self.bits as usize).div_ceil(8);
                     for h in 0..self.num_kv_heads {
-                        let new_packed_len = remaining_compressed * bytes_per_token;
-                        self.k_packed[h].truncate(new_packed_len);
-                        self.v_packed[h].truncate(new_packed_len);
-                        self.k_norms[h].truncate(remaining_compressed);
-                        self.v_norms[h].truncate(remaining_compressed);
+                        self.k_packed[h].truncate(new_seq_len * bytes_per_token);
+                        self.v_packed[h].truncate(new_seq_len * bytes_per_token);
+                        self.k_norms[h].truncate(new_seq_len);
+                        self.v_norms[h].truncate(new_seq_len);
                     }
-                    self.seq_len = remaining_compressed;
-                    self.cached_seq_len = self.cached_seq_len.min(remaining_compressed);
-                    let _ = drop; // informational only
+                    self.seq_len = new_seq_len;
+                    self.cached_seq_len = self.cached_seq_len.min(new_seq_len);
                 }
             } else {
-                // n < warmup_kv_buf_len: remove from the warmup buffer only.
                 self.warmup_kv_buf_len -= n;
             }
-            // kv_buffer is not used while warmup_kv_buf_len > 0 — no need to adjust.
             return;
         }
 
-        // ── Compressed (quantized) path ────────────────────────────────────
+        // Compressed (quantized) path.
         if n >= self.seq_len {
             self.clear();
             return;
@@ -1249,15 +1238,12 @@ impl TurboQuantKvCache {
         let new_seq_len = self.seq_len - n;
         let bytes_per_token = ((self.head_dim - 1) * self.bits as usize).div_ceil(8);
         for h in 0..self.num_kv_heads {
-            let new_packed_len = new_seq_len * bytes_per_token;
-            self.k_packed[h].truncate(new_packed_len);
-            self.v_packed[h].truncate(new_packed_len);
+            self.k_packed[h].truncate(new_seq_len * bytes_per_token);
+            self.v_packed[h].truncate(new_seq_len * bytes_per_token);
             self.k_norms[h].truncate(new_seq_len);
             self.v_norms[h].truncate(new_seq_len);
         }
         self.seq_len = new_seq_len;
-        // cached_seq_len may now exceed seq_len; clamp it so that the next
-        // dequantize() call sees delta == 0 (no stale tokens to re-upload).
         self.cached_seq_len = self.cached_seq_len.min(new_seq_len);
     }
 
@@ -1937,5 +1923,44 @@ mod tests {
             7,
             "norms storage should match 7 tokens"
         );
+    }
+
+    /// Truncate from the warmup-buffer path.
+    ///
+    /// `seq_len` tracks compressed tokens only; `warmup_kv_buf_len` is a
+    /// separate counter.  On CPU the warmup threshold is 256 so appending
+    /// a handful of tokens exercises the warmup path without a flush.
+    #[test]
+    fn truncate_warmup_path() {
+        let device = test_device();
+        let dtype = test_dtype(&device);
+        let head_dim = 32usize;
+        // Use the real constructor (warmup enabled, threshold=256 on CPU).
+        let mut cache =
+            TurboQuantKvCache::new(&TurboQuantConfig { bits: 4, head_dim }, 1, dtype, device);
+
+        // Append 5 tokens — all stay in the warmup buffer on CPU.
+        for i in 0..5usize {
+            let vals: Vec<f32> = (0..head_dim)
+                .map(|j| ((i * head_dim + j) as f32 * 0.1).sin())
+                .collect();
+            let t = Tensor::from_slice(&vals, (1, 1, 1, head_dim), &cache.device.clone())
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            cache.append(&t, &t).unwrap();
+        }
+        assert_eq!(cache.warmup_kv_buf_len, 5, "all tokens in warmup buffer");
+        assert_eq!(cache.seq_len, 0, "no compressed tokens yet");
+
+        // Truncate 2 from warmup: only warmup_kv_buf_len changes.
+        cache.truncate(2);
+        assert_eq!(cache.warmup_kv_buf_len, 3);
+        assert_eq!(cache.seq_len, 0, "compressed still empty");
+
+        // Truncate all remaining warmup.
+        cache.truncate(3);
+        assert_eq!(cache.warmup_kv_buf_len, 0);
+        assert_eq!(cache.seq_len, 0);
     }
 }

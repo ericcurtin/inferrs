@@ -1784,9 +1784,7 @@ impl Engine {
                         }
                     }
 
-                    // Per-step acceptance rate log (debug level).
-                    // accepted draft tokens = returned vec length minus the
-                    // bonus/replacement token, capped at gamma.
+                    // vec len minus bonus/replacement = accepted draft tokens.
                     let n_accepted_draft = (n_accepted as u64)
                         .saturating_sub(1)
                         .min(draft_gamma as u64);
@@ -1795,21 +1793,9 @@ impl Engine {
                         n_accepted_draft,
                         draft_gamma,
                     );
-
-                    // Update per-sequence statistics.
                     seq.spec_accepted += n_accepted_draft;
                     seq.spec_steps += draft_gamma as u64;
 
-                    // At sequence completion, log cumulative acceptance rate and
-                    // warn if it is below the useful threshold.
-                    // NOTE: this block only fires when the sequence ends on a
-                    // speculative step.  If the very last token is produced by
-                    // the single-token fallback path (e.g. EOS was hit while
-                    // stepping through the single-token path after a rejection),
-                    // seq.finished will be set there, not here, and the
-                    // completion log will be silently skipped.  This is a known
-                    // minor gap; fixing it would require a second check in the
-                    // single-token path and is not worth the added complexity.
                     if seq.finished && seq.spec_steps > 0 {
                         let pct = seq.spec_accepted as f64 / seq.spec_steps as f64 * 100.0;
                         tracing::info!(
@@ -2587,13 +2573,7 @@ impl Engine {
         params: &sampler::SamplingParams,
         previous_tokens: &[u32],
     ) -> Result<Vec<u32>> {
-        // ── 1. Draft phase ────────────────────────────────────────────────────
-        // Run the draft model autoregressively for `gamma` steps, collecting
-        // (token_id, softmax_probs) per step.  The draft KV cache starts from
-        // the same seqlen_offset as the target's current position.
-        //
-        // hint_ calls allow models with per-token state (e.g. PLI embedding
-        // cache) to prepare before the GPU tensor is created.
+        // 1. Draft phase: run draft autoregressively for `gamma` steps.
         let mut draft_tokens: Vec<(u32, Vec<f32>)> = Vec::with_capacity(gamma);
         let mut draft_offset = seqlen_offset;
         let mut draft_input = last_token;
@@ -2604,8 +2584,7 @@ impl Engine {
             let input_ids = Tensor::new(&[draft_input], device)?.unsqueeze(0)?;
             let logits = draft.forward(&input_ids, draft_offset)?;
 
-            // Convert logits to f32 and compute temperature-scaled softmax.
-            // These probs are passed to speculative_verify() as q(x).
+            // Temperature-scaled softmax probs passed to speculative_verify() as q(x).
             let logits_vec: Vec<f32> = logits
                 .squeeze(0)?
                 .squeeze(0)?
@@ -2630,7 +2609,6 @@ impl Engine {
                 sampler::softmax_vec(&scaled)
             };
 
-            // Sample from the draft distribution.
             let (tok, _) = sampler::sample_token(&logits, params, previous_tokens)?;
             draft_tokens.push((tok, probs));
 
@@ -2638,10 +2616,7 @@ impl Engine {
             draft_input = tok;
         }
 
-        // ── 2. Verify phase ───────────────────────────────────────────────────
-        // Feed the anchor token (last_token) through the target model to get
-        // logits that predict the token *after* last_token (used to verify
-        // draft_tokens[0]).  Then verify each draft token sequentially.
+        // 2. Verify phase: target runs last_token then verifies each draft token.
         target.hint_decode_token(last_token);
         target.hint_sampling_temperature(params.temperature);
         let anchor_ids = Tensor::new(&[last_token], device)?.unsqueeze(0)?;
@@ -2679,17 +2654,10 @@ impl Engine {
                     target_offset += 1;
                 }
                 sampler::SpecVerdict::Reject(replacement) => {
-                    // After rejection at position i (draft_idx), the accepted prefix
-                    // is d[0..i].  Both the anchor (last_token) and d[0..i] have
-                    // been run through both models.  The draft KV must be left at
-                    // seqlen_offset + i + 1 so the next step can place the replacement
-                    // token at seqlen_offset + i + 1 without a gap.
-                    //
-                    // Draft KV after the full draft phase = seqlen_offset + gamma.
-                    // Needed = seqlen_offset + draft_idx + 1.
-                    // Rollback = gamma - draft_idx - 1.
-                    let n_accepted = draft_idx; // tokens d[0..draft_idx] were accepted
-                    let rollback = gamma - n_accepted - 1;
+                    // Rollback draft KV to seqlen_offset + draft_idx + 1.
+                    // After full draft phase KV = seqlen_offset + gamma;
+                    // rollback = gamma - draft_idx - 1.
+                    let rollback = gamma - draft_idx - 1;
                     draft.truncate_kv_cache(rollback);
                     accepted.push(replacement);
                     return Ok(accepted);
@@ -2697,19 +2665,12 @@ impl Engine {
             }
         }
 
-        // All gamma draft tokens accepted.
-        //
-        // The target has now run gamma+1 forwards (anchor + d[0..gamma-1]), so its
-        // KV is at seqlen_offset + gamma + 1.  The draft only ran gamma forwards
-        // (anchor + d[0..gamma-2]), so its KV is at seqlen_offset + gamma — one
-        // position behind.  Sync by running d[gamma-1] through the draft so the
-        // next speculative step starts from the same offset on both models.
+        // All gamma tokens accepted. Sync draft KV (one position behind target)
+        // then sample bonus token from last target logits.
         let sync_ids = Tensor::new(&[draft_input], device)?.unsqueeze(0)?;
         draft.hint_decode_token(draft_input);
         draft.forward(&sync_ids, draft_offset)?;
 
-        // Sample bonus token from the last target logits (cur_logits already holds
-        // the distribution over the position after d[gamma-1]).
         let bonus_logits = Tensor::from_vec(cur_logits.clone(), (1, 1, cur_logits.len()), device)?;
         let (bonus, _) = sampler::sample_token(&bonus_logits, params, previous_tokens)?;
         accepted.push(bonus);
@@ -2815,9 +2776,6 @@ impl Engine {
         self.model.clear_kv_cache();
         if let Some(dm) = &mut self.draft_model {
             dm.clear_kv_cache();
-            // Prefill draft with the same prompt so its KV context matches the
-            // target's at seqlen_offset=0.  Without this the draft has no prompt
-            // context and acceptance rates collapse to near zero.
             let draft_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
             dm.forward(&draft_ids, 0)?;
         }
@@ -3029,22 +2987,21 @@ impl Engine {
 
     /// Run a single generation and return the result plus timing breakdown.
     ///
-    /// Returns `(result, prefill_ms, decode_ms)` where:
-    /// - `prefill_ms` is the wall time for the prefill forward pass
-    /// - `decode_ms`  is the wall time for all decode steps combined
+    /// When a draft model is loaded, uses speculative decoding automatically.
+    ///
+    /// Returns `(result, prefill_ms, decode_ms, acceptance_rate)`.
+    /// `acceptance_rate` is `Some(f64)` when spec-decode was used, else `None`.
     pub fn bench_generate(
         &mut self,
         _request_id: &str,
         prompt_tokens: &[u32],
         sampling_params: &SamplingParams,
-    ) -> Result<(GenerationResult, f64, f64)> {
+    ) -> Result<(GenerationResult, f64, f64, Option<f64>)> {
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
         let prefill_start = Instant::now();
-
         let logits = self.run_prefill(prompt_tokens)?;
-
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         let (mut token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
@@ -3053,23 +3010,58 @@ impl Engine {
 
         let decode_start = Instant::now();
         let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+        let mut spec_accepted: u64 = 0;
+        let mut spec_steps: u64 = 0;
 
         while finish_reason.is_none() {
-            let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits =
-                self.run_decode_step(token_id, seqlen_offset, sampling_params.temperature)?;
-            (token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
-            output_tokens.push(token_id);
-            all_tokens.push(token_id);
-            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+            if let Some(draft) = self.draft_model.as_mut() {
+                // Speculative decode path.
+                let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
+                let gamma = self.draft_gamma;
+                let spec_tokens = Self::cb_speculative_decode_step(
+                    &mut self.model,
+                    draft,
+                    &self.device,
+                    token_id,
+                    seqlen_offset,
+                    gamma,
+                    sampling_params,
+                    &all_tokens,
+                )?;
+                let n = spec_tokens.len() as u64;
+                spec_accepted += n.saturating_sub(1).min(gamma as u64);
+                spec_steps += gamma as u64;
+                for tok in spec_tokens {
+                    output_tokens.push(tok);
+                    all_tokens.push(tok);
+                    finish_reason = self.check_stop(tok, output_tokens.len(), sampling_params, "");
+                    if finish_reason.is_some() {
+                        break;
+                    }
+                }
+                token_id = *output_tokens.last().unwrap();
+            } else {
+                // Standard single-token decode path.
+                let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
+                let logits =
+                    self.run_decode_step(token_id, seqlen_offset, sampling_params.temperature)?;
+                (token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+                output_tokens.push(token_id);
+                all_tokens.push(token_id);
+                finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+            }
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-
         self.free_paged_blocks();
 
         let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
         let output_text = self.tokenizer.decode(&output_tokens, true)?;
+        let acceptance_rate = if spec_steps > 0 {
+            Some(spec_accepted as f64 / spec_steps as f64)
+        } else {
+            None
+        };
 
         Ok((
             GenerationResult {
@@ -3086,6 +3078,7 @@ impl Engine {
             },
             prefill_ms,
             decode_ms,
+            acceptance_rate,
         ))
     }
 
