@@ -2701,6 +2701,8 @@ impl DecoderLayer {
         );
         // Standard Gemma MLP sub-layer (shared expert for MoE, or sole FFN for dense).
         let residual = &xs;
+
+        // Standard Gemma MLP sub-layer (shared expert for MoE, or sole FFN for dense).
         let shared_mlp_out = self
             .pre_feedforward_layernorm
             .forward(&xs)

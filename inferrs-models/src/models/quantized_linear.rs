@@ -73,6 +73,15 @@ impl QLinear {
         matches!(self.inner, QMatMul::QTensor(_))
     }
 
+    /// Returns true when the underlying weight is Q4K-quantized (4-bit mixed-precision).
+    pub fn is_q4k(&self) -> bool {
+        if let QMatMul::QTensor(qt) = &self.inner {
+            qt.dtype() == candle_core::quantized::GgmlDType::Q4K
+        } else {
+            false
+        }
+    }
+
     /// Returns the underlying weight tensor if this is a dense (non-quantized) layer.
     /// Returns `None` for quantized (GGUF) weights.
     pub fn dense_weight(&self) -> Option<&Tensor> {
