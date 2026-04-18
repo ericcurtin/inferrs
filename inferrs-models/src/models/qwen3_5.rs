@@ -20,6 +20,7 @@ use crate::models::attention_utils::{
 };
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
+use crate::nvtx_range;
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
@@ -280,29 +281,44 @@ impl FullAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        nvtx_range!("full_attn_layer");
         let (b, t, _) = x.dims3()?;
         let orig_dtype = x.dtype();
-        let (q, k, v, gate) = self.project_qkv(x)?;
+        let (q, k, v, gate) = {
+            nvtx_range!("full_attn/qkv_proj");
+            self.project_qkv(x)?
+        };
 
         // QK norms (per-head, on head_dim)
-        let q = apply_rms_norm_heads(&q, &self.q_norm)?;
-        let k = apply_rms_norm_heads(&k, &self.k_norm)?;
+        let (q, k) = {
+            nvtx_range!("full_attn/qk_norm");
+            let q = apply_rms_norm_heads(&q, &self.q_norm)?;
+            let k = apply_rms_norm_heads(&k, &self.k_norm)?;
+            (q, k)
+        };
 
         // RoPE
-        let cos_slice = cos.narrow(0, seqlen_offset, t)?;
-        let sin_slice = sin.narrow(0, seqlen_offset, t)?;
-        let q = apply_rope(&q, &cos_slice, &sin_slice)?;
-        let k = apply_rope(&k, &cos_slice, &sin_slice)?;
+        let (q, k) = {
+            nvtx_range!("full_attn/rope");
+            let cos_slice = cos.narrow(0, seqlen_offset, t)?;
+            let sin_slice = sin.narrow(0, seqlen_offset, t)?;
+            let q = apply_rope(&q, &cos_slice, &sin_slice)?;
+            let k = apply_rope(&k, &cos_slice, &sin_slice)?;
+            (q, k)
+        };
 
         // Append to KV cache (with optional TurboQuant compression).
-        let (k, v) = append_kv_tq(
-            k,
-            v,
-            seqlen_offset,
-            t,
-            &mut self.kv_cache,
-            &mut self.tq_cache,
-        )?;
+        let (k, v) = {
+            nvtx_range!("full_attn/kv_append");
+            append_kv_tq(
+                k,
+                v,
+                seqlen_offset,
+                t,
+                &mut self.kv_cache,
+                &mut self.tq_cache,
+            )?
+        };
 
         let kv_len = k.dim(2)?;
         let groups = self.num_heads / self.num_kv_heads;
@@ -323,6 +339,7 @@ impl FullAttention {
         //     must never go through `sdpa`.
         let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
         let fast_out = if self.use_sdpa {
+            nvtx_range!("full_attn/sdpa_dispatch");
             match x.device() {
                 candle_core::Device::Metal(_) if t == 1 => Some(
                     candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
@@ -334,14 +351,18 @@ impl FullAttention {
                 ),
                 #[cfg(feature = "cuda")]
                 candle_core::Device::Cuda(_) if t == 1 => {
+                    nvtx_range!("full_attn/sdpa_cuda_flash_decode");
                     candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, scale, 1.0_f32)
                         .map_err(anyhow::Error::from)?
                 }
                 #[cfg(feature = "cuda")]
-                candle_core::Device::Cuda(_) => Some(
-                    candle_nn::ops::sdpa_cuda_flash_prefill(&q, &k, &v, seqlen_offset, scale)
-                        .map_err(anyhow::Error::from)?,
-                ),
+                candle_core::Device::Cuda(_) => {
+                    nvtx_range!("full_attn/sdpa_cuda_flash_prefill");
+                    Some(
+                        candle_nn::ops::sdpa_cuda_flash_prefill(&q, &k, &v, seqlen_offset, scale)
+                            .map_err(anyhow::Error::from)?,
+                    )
+                }
                 _ => None,
             }
         } else {
@@ -349,10 +370,13 @@ impl FullAttention {
         };
 
         let out = match fast_out {
-            Some(attn) => attn
-                .transpose(1, 2)?
-                .reshape((b, t, self.num_heads * self.head_dim))?,
+            Some(attn) => {
+                nvtx_range!("full_attn/post_sdpa_reshape");
+                attn.transpose(1, 2)?
+                    .reshape((b, t, self.num_heads * self.head_dim))?
+            }
             None => {
+                nvtx_range!("full_attn/fallback_naive");
                 let mask = if t > 1 {
                     Some(causal_mask(
                         t,
@@ -369,7 +393,11 @@ impl FullAttention {
         };
 
         // Apply output gate: sigmoid(gate) * out
-        let out = apply_output_gate(&out, &gate)?;
+        let out = {
+            nvtx_range!("full_attn/output_gate");
+            apply_output_gate(&out, &gate)?
+        };
+        nvtx_range!("full_attn/o_proj");
         self.apply_o_proj(&out)
     }
 
@@ -667,6 +695,7 @@ impl LinearAttn {
     /// x: [batch=1, seq_len, hidden]
     /// Returns: [1, seq_len, hidden]
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
+        nvtx_range!("gdn_layer");
         let (b, t, _) = x.dims3()?;
         let device = x.device().clone();
         let dtype = x.dtype();
@@ -674,38 +703,52 @@ impl LinearAttn {
         // Promote the hidden state to F32 once so the whole GatedDeltaNet path
         // stays F32: QLinear::forward skips the output cast-back when input is
         // already F32, so projections return F32 naturally.
-        let x_f32 = x.to_dtype(DType::F32)?;
+        let x_f32 = {
+            nvtx_range!("gdn/cast_f32");
+            x.to_dtype(DType::F32)?
+        };
 
         // ── Projections ───────────────────────────────────────────────────────
-        let qkv = self.in_proj_qkv.forward(&x_f32)?; // [b, t, key_dim*2 + value_dim]
-        let z = self.in_proj_z.forward(&x_f32)?; // [b, t, value_dim]
-                                                 // P2: fuse in_proj_a + in_proj_b into a single dispatch.
-                                                 // Priority order:
-                                                 //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
-                                                 //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
-                                                 //   3. Fallback   — two separate forwards.
-        let (a_input, b_input) = 'proj: {
-            if let Some(ref ab_w) = self.in_proj_ab_weight {
-                let ab = x_f32.broadcast_matmul(&ab_w.t()?)?;
-                let a = ab.narrow(2, 0, self.n_value_heads)?;
-                let b = ab.narrow(2, self.n_value_heads, self.n_value_heads)?;
-                break 'proj (a.contiguous()?, b.contiguous()?);
-            }
-            #[cfg(feature = "metal")]
-            if t == 1 {
-                if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &x_f32) {
-                    let (a_f32, b_f32) = result?;
-                    break 'proj (a_f32, b_f32);
+        let (qkv, z) = {
+            nvtx_range!("gdn/in_proj_qkv_z");
+            let qkv = self.in_proj_qkv.forward(&x_f32)?; // [b, t, key_dim*2 + value_dim]
+            let z = self.in_proj_z.forward(&x_f32)?; // [b, t, value_dim]
+            (qkv, z)
+        };
+        // P2: fuse in_proj_a + in_proj_b into a single dispatch.
+        // Priority order:
+        //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
+        //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
+        //   3. Fallback   — two separate forwards.
+        let (a_input, b_input) = {
+            nvtx_range!("gdn/in_proj_ab");
+            'proj: {
+                if let Some(ref ab_w) = self.in_proj_ab_weight {
+                    let ab = x_f32.broadcast_matmul(&ab_w.t()?)?;
+                    let a = ab.narrow(2, 0, self.n_value_heads)?;
+                    let b = ab.narrow(2, self.n_value_heads, self.n_value_heads)?;
+                    break 'proj (a.contiguous()?, b.contiguous()?);
                 }
+                #[cfg(feature = "metal")]
+                if t == 1 {
+                    if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &x_f32)
+                    {
+                        let (a_f32, b_f32) = result?;
+                        break 'proj (a_f32, b_f32);
+                    }
+                }
+                (
+                    self.in_proj_a.forward(&x_f32)?,
+                    self.in_proj_b.forward(&x_f32)?,
+                )
             }
-            (
-                self.in_proj_a.forward(&x_f32)?,
-                self.in_proj_b.forward(&x_f32)?,
-            )
         };
 
         // ── Depthwise causal conv1d on qkv, then SiLU ────────────────────────
-        let qkv = self.apply_conv1d_silu(&qkv)?; // [b, t, key_dim*2 + value_dim]
+        let qkv = {
+            nvtx_range!("gdn/conv1d_silu");
+            self.apply_conv1d_silu(&qkv)? // [b, t, key_dim*2 + value_dim]
+        };
 
         // Split: q and k are in key space, v is in value space
         let q = qkv.narrow(2, 0, self.key_dim)?; // [b, t, key_dim]
@@ -718,10 +761,14 @@ impl LinearAttn {
         let v = v.reshape((b, t, self.n_value_heads, self.head_v_dim))?;
 
         // ── L2-normalize q and k, then scale q ───────────────────────────────
-        let q = self.l2norm(&q)?;
-        let k = self.l2norm(&k)?;
-        let scale = (self.head_k_dim as f64).sqrt().recip();
-        let q = q.affine(scale, 0.0)?;
+        let (q, k) = {
+            nvtx_range!("gdn/l2norm_qk");
+            let q = self.l2norm(&q)?;
+            let k = self.l2norm(&k)?;
+            let scale = (self.head_k_dim as f64).sqrt().recip();
+            let q = q.affine(scale, 0.0)?;
+            (q, k)
+        };
 
         // ── Repeat q and k to n_value_heads (GQA-style expansion) ────────────
         // Each key head serves `kv_group_ratio` value heads. Expand after L2norm
@@ -746,7 +793,10 @@ impl LinearAttn {
 
         // ── beta = sigmoid(b_input) ───────────────────────────────────────────
         // sigmoid(x) = 1 / (1 + exp(-x))
-        let beta = candle_nn::ops::sigmoid(&b_input)?;
+        let beta = {
+            nvtx_range!("gdn/beta_sigmoid");
+            candle_nn::ops::sigmoid(&b_input)?
+        };
 
         // ── Initialise recurrent state ────────────────────────────────────────
         // state: [b, n_value_heads, head_k_dim, head_v_dim]  F32
@@ -790,48 +840,58 @@ impl LinearAttn {
             //   exp→log round-trip is unsafe because FTZ flushes subnormals
             //   produced by exp(large_negative) to 0, and log(0) = -inf
             //   propagates as NaN through the chunked WY scan.
-            let use_fused_gate = matches!(a_input.device(), Device::Metal(_));
-            let fused_g = if use_fused_gate {
-                candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
-            } else {
-                None
+            let log_g = {
+                nvtx_range!("gdn/log_g");
+                let use_fused_gate = matches!(a_input.device(), Device::Metal(_));
+                let fused_g = if use_fused_gate {
+                    candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
+                } else {
+                    None
+                };
+                if let Some(g) = fused_g {
+                    g?.log()? // [b, t, n_value_heads] F32
+                } else {
+                    let a_f32 = a_input.to_dtype(DType::F32)?;
+                    let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_value_heads))?;
+                    let sp = softplus(&a_f32.broadcast_add(&dt_bias_bc)?)?;
+                    let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
+                    a_exp_bc.broadcast_mul(&sp)?.neg()? // log_g = -(a_exp * sp), finite
+                }
             };
-            let log_g = if let Some(g) = fused_g {
-                g?.log()? // [b, t, n_value_heads] F32
-            } else {
-                let a_f32 = a_input.to_dtype(DType::F32)?;
-                let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_value_heads))?;
-                let sp = softplus(&a_f32.broadcast_add(&dt_bias_bc)?)?;
-                let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
-                a_exp_bc.broadcast_mul(&sp)?.neg()? // log_g = -(a_exp * sp), finite
+            let out = {
+                nvtx_range!("gdn/wy_scan");
+                gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state)?
             };
-            let out = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out // already [b, t, n_h, hv]
         };
 
         // ── Gated RMSNorm: norm(out) * silu(z) ───────────────────────────────
-        // Reshape for norm: [b*t*n_value_heads, head_v_dim]
-        let out_flat = out_raw
-            .contiguous()?
-            .reshape((b * t * self.n_value_heads, self.head_v_dim))?; // F32
+        let out = {
+            nvtx_range!("gdn/output_gate");
+            // Reshape for norm: [b*t*n_value_heads, head_v_dim]
+            let out_flat = out_raw
+                .contiguous()?
+                .reshape((b * t * self.n_value_heads, self.head_v_dim))?; // F32
 
-        // RMSNorm over head_v_dim
-        let out_normed = candle_nn::ops::rms_norm(&out_flat, &self.norm_weight, 1e-6)?;
+            // RMSNorm over head_v_dim
+            let out_normed = candle_nn::ops::rms_norm(&out_flat, &self.norm_weight, 1e-6)?;
 
-        // z gate: [b, t, value_dim] -> [b*t*n_value_heads, head_v_dim], then silu
-        let z_flat = z
-            .contiguous()?
-            .reshape((b * t * self.n_value_heads, self.head_v_dim))?;
-        let z_gate = z_flat.silu()?; // F32
+            // z gate: [b, t, value_dim] -> [b*t*n_value_heads, head_v_dim], then silu
+            let z_flat = z
+                .contiguous()?
+                .reshape((b * t * self.n_value_heads, self.head_v_dim))?;
+            let z_gate = z_flat.silu()?; // F32
 
-        // Gated output: [b*t*n_value_heads, head_v_dim]  F32
-        let out_gated = (out_normed * z_gate)?;
+            // Gated output: [b*t*n_value_heads, head_v_dim]  F32
+            let out_gated = (out_normed * z_gate)?;
 
-        // Reshape back: [b, t, value_dim] and cast to model dtype
-        let out = out_gated.reshape((b, t, self.value_dim))?.to_dtype(dtype)?;
+            // Reshape back: [b, t, value_dim] and cast to model dtype
+            out_gated.reshape((b, t, self.value_dim))?.to_dtype(dtype)?
+        };
 
         // ── Output projection: value_dim -> hidden ────────────────────────────
+        nvtx_range!("gdn/out_proj");
         self.out_proj.forward(&out).map_err(Into::into)
     }
 
@@ -1113,16 +1173,26 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        nvtx_range!("decoder_layer");
         let residual = x.clone();
-        let normed = self.input_layernorm.forward(x)?;
+        let normed = {
+            nvtx_range!("input_layernorm");
+            self.input_layernorm.forward(x)?
+        };
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward(&normed, seqlen_offset, cos, sin)?,
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
         let x = (residual + attn_out)?;
         let residual = x.clone();
-        let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
+        let normed = {
+            nvtx_range!("post_attention_layernorm");
+            self.post_attention_layernorm.forward(&x)?
+        };
+        let mlp_out = {
+            nvtx_range!("mlp");
+            self.mlp.forward(&normed)?
+        };
         (residual + mlp_out).map_err(Into::into)
     }
 
@@ -1365,16 +1435,36 @@ impl Qwen35Model {
     /// input_ids: [batch, seq_len]
     /// Returns logits for the last position: [batch, 1, vocab_size]
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
+        let t = input_ids.dim(1).unwrap_or(0);
+        let _phase = if t > 1 {
+            crate::nvtx_marker::push("prefill")
+        } else {
+            crate::nvtx_marker::push("decode")
+        };
+        let mut x = {
+            nvtx_range!("embed");
+            self.embed_tokens.forward(input_ids)? // [b, t, hidden]
+        };
 
-        for layer in self.layers.iter_mut() {
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            let name = match layer.attn {
+                LayerAttn::Full(_) => format!("layer_{idx}_full"),
+                LayerAttn::Linear(_) => format!("layer_{idx}_linear"),
+            };
+            let _g = crate::nvtx_marker::push(&name);
             x = layer.forward(&x, seqlen_offset, &self.cos, &self.sin)?;
         }
 
-        x = self.norm.forward(&x)?;
+        x = {
+            nvtx_range!("final_norm");
+            self.norm.forward(&x)?
+        };
         let (_b, t, _h) = x.dims3()?;
         let last = x.narrow(1, t - 1, 1)?.squeeze(1)?.contiguous()?;
-        let logits = last.apply(&self.lm_head)?;
+        let logits = {
+            nvtx_range!("lm_head");
+            last.apply(&self.lm_head)?
+        };
         logits.unsqueeze(1).map_err(Into::into)
     }
 

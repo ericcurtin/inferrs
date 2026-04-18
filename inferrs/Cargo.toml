@@ -28,6 +28,7 @@ metal = [
     "candle-transformers/metal",
     "inferrs-models/metal",
 ]
+nvtx = ["inferrs-models/nvtx"]
 
 # On macOS always enable Metal: the framework ships with every macOS install
 # so there is no toolchain concern like there is with CUDA.  The `metal`

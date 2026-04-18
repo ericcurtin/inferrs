@@ -10,4 +10,5 @@ pub mod kv_cache;
 pub mod models;
 pub mod multimodal_plugin;
 pub mod nvfp4;
+pub mod nvtx_marker;
 pub mod turbo_quant;
