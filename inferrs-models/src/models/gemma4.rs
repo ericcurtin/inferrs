@@ -1678,9 +1678,9 @@ impl Attention {
             //   - softcapping=sc if softcapping is set, else 1.0 (no-op)
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
 
-            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) is disabled — correctness
-            // bug causes early EOS. The standard sdpa_vector path handles GQA correctly
-            // via gqa_factor broadcast within a single dispatch.
+            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) benchmarks slower
+            // than the standard sdpa_vector path for typical decode sequences.
+            // The standard path is more efficient for small KV lengths (≤1024).
 
             // 1-pass for N ≤ 1024; pre-allocated 2-pass for N > 1024.
             {
@@ -1835,15 +1835,28 @@ impl Attention {
         #[cfg(feature = "metal")]
         let q_raw_metal_opt = if need_pre_convert && is_metal_bf16_decode {
             let orig_dtype = xs.dtype();
-            Some(if let Some(out) = self.q_proj.forward_bf16i(xs) {
-                out?.to_dtype(orig_dtype)?
-                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            } else {
-                self.q_proj
-                    .forward_f32(&xs.to_dtype(DType::F32)?)?
-                    .to_dtype(orig_dtype)?
-                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            })
+            // For Q-only decode (shared KV layers): try BF16i→BF16 kernels first
+            // (Q8_0 E2B: 1 dispatch, BF16→BF16), then Q4K BF16i→F32 (1 dispatch + back-cast),
+            // then standard F32 path.
+            Some(
+                if let Some(out) = self.q_proj.forward_q8_0_bf16i_to_bf16(xs) {
+                    // Q8_0 (E2B): BF16→BF16 in 1 dispatch, no back-cast needed.
+                    out?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                } else if let Some(out) = self.q_proj.forward_bf16i(xs) {
+                    // Q4K (E4B): BF16→F32 + back-cast.
+                    out?.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_heads,
+                        self.head_dim,
+                    ))?
+                } else {
+                    self.q_proj
+                        .forward_f32(&xs.to_dtype(DType::F32)?)?
+                        .to_dtype(orig_dtype)?
+                        .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                },
+            )
         } else {
             None
         };
@@ -1880,8 +1893,8 @@ impl Attention {
         if self.use_sdpa && q_len == 1 && attention_mask.is_none() {
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
 
-            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) is disabled — correctness
-            // bug causes early EOS. The standard sdpa_vector path handles GQA correctly.
+            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) benchmarks slower
+            // than sdpa_vector for typical decode sequences (≤1024 KV tokens).
 
             // ── Flash attention (llama.cpp flash_attn_ext_vec) ─────────────────────
             // 32 parallel workgroups, BF16 + head_dim=256, single-token decode.
