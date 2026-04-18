@@ -1295,18 +1295,31 @@ impl Attention {
                 rotary_dim,
             )?;
         }
-        // K: standard narrow+contiguous+rope+slice_set path.
-        let k_rot = candle_nn::rotary_emb::rope(
-            &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        k_out.slice_set(&k_rot, D::Minus1, 0)?;
-        k_out.slice_set(
-            &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
+        // K: try fused partial_rope_inplace_bf16 first (saves 4 dispatches vs
+        // narrow+contiguous+rope+2×slice_set); fall back to standard path if
+        // unavailable (non-Metal, non-BF16).
+        #[cfg(feature = "metal")]
+        let k_fused =
+            if k.dtype() == DType::BF16 && matches!(k.device(), candle_core::Device::Metal(_)) {
+                candle_nn::rotary_emb::partial_rope_inplace_bf16(k, &cos, &sin, k_out, rotary_dim)?
+            } else {
+                false
+            };
+        #[cfg(not(feature = "metal"))]
+        let k_fused = false;
+        if !k_fused {
+            let k_rot = candle_nn::rotary_emb::rope(
+                &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            k_out.slice_set(&k_rot, D::Minus1, 0)?;
+            k_out.slice_set(
+                &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
 
         Ok((q_out.clone(), k_out.clone()))
     }
@@ -1403,6 +1416,7 @@ impl Attention {
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
                 // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast.
+                // Q4K (E4B): bf16i overhead > dispatch savings — use bf16o path instead.
                 self.q_proj
                     .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
             } else {
