@@ -1410,7 +1410,6 @@ impl Attention {
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
                 // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast.
-                // Q4K (E4B): disabled — benchmark shows no improvement vs bf16o path.
                 self.q_proj
                     .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
             } else {
