@@ -919,11 +919,23 @@ impl LinearAttn {
             Some(prev) => Tensor::cat(&[prev, x], 1)?,
         };
 
-        // Update conv state: keep last pad_len tokens (must be contiguous for Metal)
+        // Update conv state: keep last pad_len tokens (must be contiguous to avoid
+        // retaining the full padded allocation via the narrow view's Arc reference).
         let total = padded.dim(1)?;
         self.conv_state = Some(padded.narrow(1, total - pad_len, pad_len)?.contiguous()?);
 
-        // Use candle's native conv1d (Metal-accelerated depthwise: groups = c).
+        // CUDA: native [b,t,c] kernel — no transposes needed.
+        #[cfg(feature = "cuda")]
+        if matches!(device, candle_core::Device::Cuda(_)) {
+            return candle_core::cuda_conv1d_depthwise_btc::cuda_conv1d_depthwise_btc(
+                &padded,
+                &self.conv1d_weight,
+            )?
+            .silu()
+            .map_err(Into::into);
+        }
+
+        // Metal / CPU: standard [b,c,t] path (Metal-accelerated depthwise).
         // conv1d_weight is pre-computed in F32 at construction time.
         let inp = padded.transpose(1, 2)?.contiguous()?;
         let out = inp.conv1d(&self.conv1d_weight, 0, 1, 1, c)?; // [b, c, t]
