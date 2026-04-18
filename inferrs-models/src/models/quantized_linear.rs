@@ -213,6 +213,23 @@ impl QLinear {
         }
     }
 
+    /// Q8_0 GEMV: BF16 input → F32 output. Eliminates the BF16→F32 pre-cast.
+    /// Used for PLI gate and similar paths that need F32 output for subsequent ops.
+    pub fn forward_q8_0_bf16i_f32(&self, xs_bf16: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_q8_0_bf16i_f32(xs_bf16) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output.
     /// Eliminates both the BF16→F32 pre-cast and the F32→BF16 post-cast.
     /// Used for o_proj and PLI projection in the decode path.
