@@ -614,3 +614,68 @@ pub fn call_partial_rope_bf16(
     encoder.dispatch_thread_groups(tgc, tgs);
     Ok(())
 }
+
+/// Fused RMSNorm + partial-RoPE for BF16 single-token decode.
+///
+/// Saves 1 dispatch per head per global attention layer by combining the
+/// `rms_norm` and `partial_rope_bf16` kernels into one.
+///
+/// `n_heads × head_dim` threads total; `head_dim` threads per threadgroup.
+/// Requires `head_dim ≤ 1024`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_partial_rope_bf16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src: &Buffer,
+    src_offset: usize,
+    norm_weight: &Buffer,
+    norm_weight_offset: usize,
+    cos: &Buffer,
+    cos_offset: usize,
+    sin: &Buffer,
+    sin_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    eps: f32,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, "rms_norm_partial_rope_bf16")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (src, src_offset),
+            (norm_weight, norm_weight_offset),
+            (cos, cos_offset),
+            (sin, sin_offset),
+            (dst, dst_offset),
+            n_heads,
+            head_dim,
+            rotary_dim,
+            eps
+        )
+    );
+    // One threadgroup per head, head_dim threads per threadgroup.
+    let tg_size = MTLSize {
+        width: head_dim as usize,
+        height: 1,
+        depth: 1,
+    };
+    let tg_count = MTLSize {
+        width: n_heads as usize,
+        height: 1,
+        depth: 1,
+    };
+    encoder.use_resource(src, MTLResourceUsage::Read);
+    encoder.use_resource(norm_weight, MTLResourceUsage::Read);
+    encoder.use_resource(cos, MTLResourceUsage::Read);
+    encoder.use_resource(sin, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tg_count, tg_size);
+    Ok(())
+}

@@ -1839,4 +1839,83 @@ kernel void partial_rope_bf16(
         }
     }
 }
+
+/// Fused RMSNorm + partial-RoPE for BF16 tensors (single-token decode).
+///
+/// Combines `rms_norm` + `partial_rope_bf16` into one dispatch, saving 1
+/// dispatch per head per global attention layer.
+///
+/// One threadgroup per head, with `head_dim` threads per threadgroup.
+/// Requires `head_dim ≤ 1024` (threadgroup size limit).
+///
+/// src:        [n_heads, head_dim]  BF16 (flattened from [1, n_heads, 1, head_dim])
+/// norm_weight:[head_dim]           BF16 (per-element scale from RMSNorm)
+/// cos:        [rotary_dim/2]       BF16
+/// sin:        [rotary_dim/2]       BF16
+/// dst:        [n_heads, head_dim]  BF16 output (pre-allocated buffer)
+[[host_name("rms_norm_partial_rope_bf16")]]
+kernel void rms_norm_partial_rope_bf16(
+    device const bfloat   * src,           // [n_heads, head_dim]
+    device const bfloat   * norm_weight,   // [head_dim]
+    device const bfloat   * cos,           // [rotary_dim/2]
+    device const bfloat   * sin,           // [rotary_dim/2]
+    device       bfloat   * dst,           // [n_heads, head_dim] output
+    constant uint32_t     & n_heads,
+    constant uint32_t     & head_dim,
+    constant uint32_t     & rotary_dim,    // must be <= head_dim, even
+    constant float        & eps,
+    uint  tgpig  [[threadgroup_position_in_grid]],  // head_idx
+    uint  tiisg  [[thread_index_in_threadgroup]],   // d_idx within head
+    uint  tgsize [[threads_per_threadgroup]]
+) {
+    const uint h = tgpig;
+    if (h >= n_heads) return;
+
+    const uint d = tiisg;
+    const device bfloat * src_head = src + h * head_dim;
+    device bfloat       * dst_head = dst + h * head_dim;
+
+    // --- Pass 1: compute sum of squares for this head ---
+    threadgroup float shared_sos[1024];
+    float local_sos = 0.0f;
+    if (d < head_dim) {
+        float v = float(src_head[d]);
+        local_sos = v * v;
+    }
+    shared_sos[d < 1024 ? d : 0] = local_sos;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel reduction.
+    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
+        if (d < stride) shared_sos[d] += shared_sos[d + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_rms = rsqrt(shared_sos[0] / float(head_dim) + eps);
+
+    // --- Pass 2: normalize + scale + partial RoPE ---
+    if (d >= head_dim) return;
+
+    // Normalized + scaled value.
+    const float normed = float(src_head[d]) * inv_rms * float(norm_weight[d]);
+
+    if (d >= rotary_dim) {
+        // Passthrough region: write normalized value directly.
+        dst_head[d] = (bfloat)normed;
+    } else {
+        // RoPE region.
+        const uint rdim2 = rotary_dim / 2;
+        const uint rot_pair = d % rdim2;
+        const float c = float(cos[rot_pair]);
+        const float s = float(sin[rot_pair]);
+        if (d < rdim2) {
+            // First rdim2: x*cos - y*sin (x=normed, y=normed pair)
+            const float y_normed = float(src_head[d + rdim2]) * inv_rms * float(norm_weight[d + rdim2]);
+            dst_head[d] = (bfloat)(normed * c - y_normed * s);
+        } else {
+            // Second rdim2: x*sin + y*cos
+            const float x_normed = float(src_head[d - rdim2]) * inv_rms * float(norm_weight[d - rdim2]);
+            dst_head[d] = (bfloat)(x_normed * s + normed * c);
+        }
+    }
+}
 #endif
