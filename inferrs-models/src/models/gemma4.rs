@@ -1585,16 +1585,18 @@ impl Attention {
             };
             let v_normed = apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?;
             let v_states = v_normed.reshape((b_sz, self.num_kv_heads, 1, self.head_dim))?;
-            // Q and K: try fused norm+partial-RoPE (Metal BF16 global attention only).
-            // Falls back to separate norm + RoPE for non-Metal, non-BF16, or full-RoPE.
+            // Q and K: try fused norm+RoPE (Metal BF16, all attention layers).
+            // Works for both partial RoPE (global, rotary_dim < head_dim) and full RoPE
+            // (sliding, rotary_dim == head_dim). The kernel handles both by treating
+            // rotary_dim == head_dim as all-elements-rotated.
             let rotary_dim = self.rotary_emb.rotary_dim;
             let head_dim = self.head_dim;
-            // Try fused norm+rope on Metal BF16 partial-RoPE layers.
+            // Try fused norm+rope on Metal BF16 for all decode layers.
             #[cfg(feature = "metal")]
             {
                 if q_raw.dtype() == DType::BF16
                     && matches!(q_raw.device(), candle_core::Device::Metal(_))
-                    && rotary_dim < head_dim
+                    && rotary_dim <= head_dim
                     && head_dim <= 1024
                 {
                     // Ensure output buffers exist.

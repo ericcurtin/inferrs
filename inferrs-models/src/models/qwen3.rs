@@ -66,6 +66,16 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// TurboQuant compressed KV cache (used instead of `kv_cache` when enabled).
     tq_cache: Option<TurboQuantKvCache>,
+    /// Use fused SDPA vector kernel for decode (Metal only).
+    use_sdpa: bool,
+    /// Pre-allocated 2-pass SDPA intermediate buffer [n_heads, NBLOCKS, head_dim] F32.
+    sdpa_2pass_intermediate: Option<Tensor>,
+    /// Pre-allocated 2-pass SDPA sums [n_heads, NBLOCKS] F32.
+    sdpa_2pass_sums: Option<Tensor>,
+    /// Pre-allocated 2-pass SDPA maxs [n_heads, NBLOCKS] F32.
+    sdpa_2pass_maxs: Option<Tensor>,
+    /// Pre-allocated 2-pass SDPA output [1, n_heads, 1, head_dim] BF16.
+    sdpa_2pass_out: Option<Tensor>,
 }
 
 impl Attention {
@@ -84,6 +94,13 @@ impl Attention {
             TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
         });
 
+        // Enable fused SDPA vector kernel on Metal for supported head dims.
+        // This replaces the unfused matmul+affine+softmax+matmul sequence (5 dispatches)
+        // with a single kernel call, saving ~4 Metal encoder roundtrips per attention
+        // layer per decode step.
+        let use_sdpa = matches!(cfg.device, Device::Metal(_))
+            && matches!(cfg.head_dim, 32 | 64 | 96 | 128 | 256 | 512);
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -96,6 +113,11 @@ impl Attention {
             head_dim: cfg.head_dim,
             kv_cache: None,
             tq_cache,
+            use_sdpa,
+            sdpa_2pass_intermediate: None,
+            sdpa_2pass_sums: None,
+            sdpa_2pass_maxs: None,
+            sdpa_2pass_out: None,
         })
     }
 
@@ -161,18 +183,69 @@ impl Attention {
         };
 
         let kv_len = k.dim(2)?;
+        let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
 
+        // Fused SDPA decode path: single Metal kernel instead of 5 separate dispatches.
+        // Use when: Metal device, supported head_dim, single decode token, BF16.
+        // The sdpa kernel handles GQA internally, so no repeat_kv needed.
+        if self.use_sdpa && t == 1 && q.dtype() == DType::BF16 {
+            const SDPA_TWO_PASS_THRESHOLD: usize = 1024;
+            // Try pre-allocated 2-pass for long KV sequences.
+            if kv_len > SDPA_TWO_PASS_THRESHOLD {
+                if self.sdpa_2pass_intermediate.is_none() {
+                    const NBLOCKS: usize = 32;
+                    let dev = q.device();
+                    self.sdpa_2pass_intermediate = Some(Tensor::zeros(
+                        (self.num_heads, NBLOCKS, self.head_dim),
+                        DType::F32,
+                        dev,
+                    )?);
+                    self.sdpa_2pass_sums =
+                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                    self.sdpa_2pass_maxs =
+                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                    self.sdpa_2pass_out = Some(Tensor::zeros(
+                        (b, self.num_heads, 1usize, self.head_dim),
+                        DType::BF16,
+                        dev,
+                    )?);
+                }
+                if let (Some(interm), Some(sums), Some(maxs), Some(out_buf)) = (
+                    &self.sdpa_2pass_intermediate,
+                    &self.sdpa_2pass_sums,
+                    &self.sdpa_2pass_maxs,
+                    &self.sdpa_2pass_out,
+                ) {
+                    #[cfg(feature = "metal")]
+                    {
+                        let used = candle_nn::ops::sdpa_2pass_prealloc_full(
+                            &q, &k, &v, scale, 1.0_f32, interm, sums, maxs, out_buf,
+                        )?;
+                        if used {
+                            // [b, n_heads, 1, head_dim] → [b, 1, n_heads*head_dim]
+                            let out = out_buf.reshape((b, t, self.num_heads * self.head_dim))?;
+                            return self.o_proj.forward(&out).map_err(Into::into);
+                        }
+                    }
+                }
+            }
+            // 1-pass sdpa for short KV sequences (or fallback if 2-pass wasn't used).
+            let attn_out = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)?;
+            // [b, n_heads, 1, head_dim] → [b, 1, n_heads*head_dim] (same memory layout for t=1)
+            let out = attn_out.reshape((b, t, self.num_heads * self.head_dim))?;
+            return self.o_proj.forward(&out).map_err(Into::into);
+        }
+
+        // Fallback path (prefill, non-Metal, or non-BF16):
         // GQA: repeat each kv_head consecutively to match query head count
         let groups = self.num_heads / self.num_kv_heads;
         let k = repeat_kv(k, groups)?;
         let v = repeat_kv(v, groups)?;
 
-        // Scaled dot-product attention
-        let scale = (self.head_dim as f64).sqrt();
         let attn = q
             .contiguous()?
             .matmul(&k.transpose(2, 3)?.contiguous()?)?
-            .affine(1.0 / scale, 0.0)?;
+            .affine(scale as f64, 0.0)?;
 
         // Causal mask (only needed for prefill)
         let attn = if t > 1 {
