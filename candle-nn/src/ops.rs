@@ -763,6 +763,391 @@ pub fn compute_decay_gate(
     None
 }
 
+/// Fused RMSNorm + residual add: `dst = rms_norm(x) * alpha + residual`.
+///
+/// Computes both in a single Metal kernel dispatch, saving one kernel call
+/// compared to the two-dispatch sequence `rms_norm(x, alpha) + residual`.
+struct RmsNormAdd {
+    eps: f32,
+}
+
+impl candle::CustomOp3 for RmsNormAdd {
+    fn name(&self) -> &'static str {
+        "rms-norm-add"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let eps = self.eps;
+
+        fn inner<
+            T: candle::WithDType
+                + num_traits::Float
+                + num_traits::AsPrimitive<f32>
+                + num_traits::FromPrimitive,
+        >(
+            src: &[T],
+            layout: &Layout,
+            alpha: &[T],
+            alpha_layout: &Layout,
+            residual: &[T],
+            residual_layout: &Layout,
+            eps: f32,
+        ) -> Result<(CpuStorage, Shape)> {
+            let src = match layout.contiguous_offsets() {
+                None => candle::bail!("input has to be contiguous"),
+                Some((o1, o2)) => &src[o1..o2],
+            };
+            let alpha = match alpha_layout.contiguous_offsets() {
+                None => candle::bail!("alpha has to be contiguous"),
+                Some((o1, o2)) => &alpha[o1..o2],
+            };
+            let residual = match residual_layout.contiguous_offsets() {
+                None => candle::bail!("residual has to be contiguous"),
+                Some((o1, o2)) => &residual[o1..o2],
+            };
+            let el_count = layout.shape().elem_count();
+            let dims = layout.shape().dims();
+            let dim_m1 = dims[dims.len() - 1];
+            let mut dst = vec![T::zero(); el_count];
+            src.par_chunks(dim_m1)
+                .zip(dst.par_chunks_mut(dim_m1))
+                .zip(residual.par_chunks(dim_m1))
+                .for_each(|((src, dst), res)| {
+                    let sum2 = src
+                        .iter()
+                        .map(|&v| {
+                            let v = v.as_();
+                            v * v
+                        })
+                        .sum::<f32>();
+                    let m = (sum2 / dim_m1 as f32 + eps).sqrt();
+                    let m = T::from_f32(m).unwrap_or_else(T::nan);
+                    for (((d, s), a), r) in dst.iter_mut().zip(src.iter()).zip(alpha).zip(res) {
+                        *d = *s / m * *a + *r;
+                    }
+                });
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, Shape::from_dims(dims)))
+        }
+
+        use CpuStorage as C;
+        match (s1, s2, s3) {
+            (C::BF16(s1), C::BF16(s2), C::BF16(s3)) => {
+                inner::<half::bf16>(s1, l1, s2, l2, s3, l3, eps)
+            }
+            (C::F16(s1), C::F16(s2), C::F16(s3)) => inner::<half::f16>(s1, l1, s2, l2, s3, l3, eps),
+            (C::F32(s1), C::F32(s2), C::F32(s3)) => inner::<f32>(s1, l1, s2, l2, s3, l3, eps),
+            _ => candle::bail!("unsupported dtype for rms_norm_add"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle::MetalStorage,
+        l1: &Layout,
+        s2: &candle::MetalStorage,
+        l2: &Layout,
+        s3: &candle::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("rmsnorm_add");
+        let kernels = device.kernels();
+        let name = match (s1.dtype(), s2.dtype(), s3.dtype()) {
+            (DType::F32, DType::F32, DType::F32) => "rmsnorm_add_f32",
+            (DType::F16, DType::F16, DType::F16) => "rmsnorm_add_f16",
+            (DType::BF16, DType::BF16, DType::BF16) => "rmsnorm_add_bf16",
+            (dt1, dt2, dt3) => {
+                candle::bail!("rms_norm_add not implemented for {dt1:?} {dt2:?} {dt3:?}")
+            }
+        };
+
+        if !(l1.is_contiguous() && l2.is_contiguous() && l3.is_contiguous()) {
+            candle::bail!("Non contiguous rms_norm_add is not implemented");
+        }
+
+        let last_dim = l1.dims()[l1.shape().rank() - 1];
+        let elem_count = l1.shape().elem_count();
+        let output = device.new_buffer(elem_count, s1.dtype(), "rmsnorm_add")?;
+        candle_metal_kernels::call_rms_norm_add(
+            device.metal_device(),
+            &encoder,
+            kernels,
+            name,
+            elem_count,
+            last_dim,
+            self.eps,
+            s1.buffer(),
+            l1.start_offset() * s1.dtype().size_in_bytes(),
+            s2.buffer(),
+            l2.start_offset() * s2.dtype().size_in_bytes(),
+            s3.buffer(),
+            l3.start_offset() * s3.dtype().size_in_bytes(),
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        Ok((newstorage, l1.shape().clone()))
+    }
+}
+
+/// Fused RMSNorm + residual add + scalar multiply:
+///   `result = (rms_norm(x, alpha, eps) + residual) * scale`
+///
+/// Single Metal kernel call instead of three (rms_norm + add + broadcast_mul).
+/// Used in Gemma4 decoder layers for the PLI path:
+///   xs = (post_pli_norm(pli_out) + residual) * layer_scalar
+pub fn rms_norm_add_scale(
+    x: &Tensor,
+    alpha: &Tensor,
+    residual: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let hidden_size_xs = x.dim(D::Minus1)?;
+    let hidden_size_alpha = alpha.dims1()?;
+    if hidden_size_xs != hidden_size_alpha {
+        candle::bail!(
+            "rms_norm_add_scale: x last dim ({hidden_size_xs}) != alpha dim ({hidden_size_alpha})"
+        );
+    }
+
+    // Fallback to separate ops if shapes don't match or not on Metal.
+    #[cfg(feature = "metal")]
+    {
+        if x.shape() == residual.shape()
+            && x.is_contiguous()
+            && alpha.is_contiguous()
+            && residual.is_contiguous()
+        {
+            use candle::backend::BackendStorage;
+            use candle::{DType, Storage};
+
+            let device = match x.device() {
+                candle::Device::Metal(d) => d,
+                _ => {
+                    return rms_norm_add(x, alpha, residual, eps).and_then(|r| {
+                        r.broadcast_mul(&Tensor::new(&[scale], x.device())?.reshape(&[1usize])?)
+                    })
+                }
+            };
+
+            let (x_s, x_l) = x.storage_and_layout();
+            let (a_s, a_l) = alpha.storage_and_layout();
+            let (r_s, r_l) = residual.storage_and_layout();
+
+            let (x_m, a_m, r_m) = match (&*x_s, &*a_s, &*r_s) {
+                (Storage::Metal(xm), Storage::Metal(am), Storage::Metal(rm)) => (xm, am, rm),
+                _ => {
+                    return rms_norm_add(x, alpha, residual, eps).and_then(|r| {
+                        r.broadcast_mul(&Tensor::new(&[scale], x.device())?.reshape(&[1usize])?)
+                    })
+                }
+            };
+
+            let name = match (x_m.dtype(), a_m.dtype(), r_m.dtype()) {
+                (DType::F32, DType::F32, DType::F32) => "rmsnorm_add_scale_f32",
+                (DType::F16, DType::F16, DType::F16) => "rmsnorm_add_scale_f16",
+                (DType::BF16, DType::BF16, DType::BF16) => "rmsnorm_add_scale_bf16",
+                _ => {
+                    return rms_norm_add(x, alpha, residual, eps).and_then(|r| {
+                        r.broadcast_mul(&Tensor::new(&[scale], x.device())?.reshape(&[1usize])?)
+                    })
+                }
+            };
+
+            let last_dim = x_l.dims()[x_l.shape().rank() - 1];
+            let elem_count = x_l.shape().elem_count();
+            let output = device.new_buffer(elem_count, x_m.dtype(), "rmsnorm_add_scale")?;
+            let encoder = device.command_encoder()?;
+            encoder.set_label("rmsnorm_add_scale");
+            candle_metal_kernels::call_rms_norm_add_scale(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name,
+                elem_count,
+                last_dim,
+                eps,
+                scale,
+                x_m.buffer(),
+                x_l.start_offset() * x_m.dtype().size_in_bytes(),
+                a_m.buffer(),
+                a_l.start_offset() * a_m.dtype().size_in_bytes(),
+                r_m.buffer(),
+                r_l.start_offset() * r_m.dtype().size_in_bytes(),
+                &output,
+            )
+            .map_err(candle::Error::wrap)?;
+            let newstorage =
+                candle::MetalStorage::new(output, device.clone(), elem_count, x_m.dtype());
+            let out_storage = candle::Storage::Metal(newstorage);
+            return Ok(candle::Tensor::from_storage(
+                out_storage,
+                x.shape().clone(),
+                candle::op::BackpropOp::none(),
+                false,
+            ));
+        }
+    }
+
+    // Fallback: three separate ops
+    let normed = rms_norm_add(x, alpha, residual, eps)?;
+    let s = Tensor::new(&[scale], x.device())?.reshape(&[1usize])?;
+    normed.broadcast_mul(&s)
+}
+
+/// Fused RMSNorm + residual add: `result = rms_norm(x, alpha, eps) + residual`.
+///
+/// Single Metal kernel call instead of two (rms_norm + add), reducing Metal
+/// command encoder overhead.  Numerically identical to the two-dispatch sequence.
+///
+/// `x`, `alpha`, and `residual` must have matching dtype and the last dimension
+/// of `alpha` must match the last dimension of `x`.
+pub fn rms_norm_add(x: &Tensor, alpha: &Tensor, residual: &Tensor, eps: f32) -> Result<Tensor> {
+    let hidden_size_xs = x.dim(D::Minus1)?;
+    let hidden_size_alpha = alpha.dims1()?;
+    if hidden_size_xs != hidden_size_alpha {
+        candle::bail!(
+            "rms_norm_add: x last dim ({hidden_size_xs}) != alpha dim ({hidden_size_alpha})"
+        );
+    }
+    if x.shape() != residual.shape() {
+        candle::bail!(
+            "rms_norm_add: x shape {:?} != residual shape {:?}",
+            x.shape(),
+            residual.shape()
+        );
+    }
+    x.apply_op3_no_bwd(alpha, residual, &RmsNormAdd { eps })
+}
+
+/// Fused GELU(gate) * up: `result[i] = gelu(gate[i]) * up[i]`.
+///
+/// Single Metal kernel call instead of two dispatches (gelu + mul).
+/// Used in SwiGLU MLP layers for E2B/E4B Gemma4 models.
+pub fn gelu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if gate.shape() != up.shape() {
+        candle::bail!(
+            "gelu_mul: shape mismatch {:?} vs {:?}",
+            gate.shape(),
+            up.shape()
+        );
+    }
+    // Mixed path: F32 gate + BF16 up → F32 output (avoids to_dtype for pli_input).
+    #[cfg(feature = "metal")]
+    if gate.dtype() == candle::DType::F32
+        && up.dtype() == candle::DType::BF16
+        && gate.is_contiguous()
+        && up.is_contiguous()
+        && matches!(gate.device(), candle::Device::Metal(_))
+    {
+        use candle::backend::BackendStorage;
+        use candle::Storage;
+        let device = match gate.device() {
+            candle::Device::Metal(d) => d,
+            _ => unreachable!(),
+        };
+        let (g_s, g_l) = gate.storage_and_layout();
+        let (u_s, u_l) = up.storage_and_layout();
+        if let (Storage::Metal(gm), Storage::Metal(um)) = (&*g_s, &*u_s) {
+            let elem_count = g_l.shape().elem_count();
+            let output = device.new_buffer(elem_count, candle::DType::F32, "gelu_mul_f32_bf16i")?;
+            let encoder = device.command_encoder()?;
+            encoder.set_label("gelu_mul_f32_bf16i");
+            candle_metal_kernels::call_gelu_mul_f32_bf16i_f32(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                elem_count,
+                gm.buffer(),
+                g_l.start_offset() * candle::DType::F32.size_in_bytes(),
+                um.buffer(),
+                u_l.start_offset() * candle::DType::BF16.size_in_bytes(),
+                &output,
+            )
+            .map_err(candle::Error::wrap)?;
+            let newstorage =
+                candle::MetalStorage::new(output, device.clone(), elem_count, candle::DType::F32);
+            return Ok(candle::Tensor::from_storage(
+                candle::Storage::Metal(newstorage),
+                gate.shape().clone(),
+                candle::op::BackpropOp::none(),
+                false,
+            ));
+        }
+    }
+    #[cfg(feature = "metal")]
+    if gate.dtype() == candle::DType::F32
+        && up.dtype() == candle::DType::F32
+        && gate.is_contiguous()
+        && up.is_contiguous()
+        && matches!(gate.device(), candle::Device::Metal(_))
+    {
+        use candle::backend::BackendStorage;
+        use candle::Storage;
+        let device = match gate.device() {
+            candle::Device::Metal(d) => d,
+            _ => unreachable!(),
+        };
+        let (g_s, g_l) = gate.storage_and_layout();
+        let (u_s, u_l) = up.storage_and_layout();
+        let (g_m, u_m) = match (&*g_s, &*u_s) {
+            (Storage::Metal(gm), Storage::Metal(um)) => (gm, um),
+            _ => {
+                return gate
+                    .apply(&crate::Activation::GeluPytorchTanh)
+                    .and_then(|g| g.mul(up))
+            }
+        };
+        let elem_count = g_l.shape().elem_count();
+        let output = device.new_buffer(elem_count, candle::DType::F32, "gelu_mul")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gelu_mul");
+        candle_metal_kernels::call_binary_contiguous(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            "bgelu_mul_f32", // bgelu_mul instantiated for f32
+            g_m.dtype().size_in_bytes(),
+            elem_count,
+            candle_metal_kernels::BufferOffset {
+                buffer: g_m.buffer(),
+                offset_in_bytes: g_l.start_offset() * g_m.dtype().size_in_bytes(),
+            },
+            candle_metal_kernels::BufferOffset {
+                buffer: u_m.buffer(),
+                offset_in_bytes: u_l.start_offset() * u_m.dtype().size_in_bytes(),
+            },
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let newstorage =
+            candle::MetalStorage::new(output, device.clone(), elem_count, candle::DType::F32);
+        let out_storage = candle::Storage::Metal(newstorage);
+        return Ok(candle::Tensor::from_storage(
+            out_storage,
+            gate.shape().clone(),
+            candle::op::BackpropOp::none(),
+            false,
+        ));
+    }
+    // Fallback: two ops
+    gate.apply(&crate::Activation::GeluPytorchTanh)
+        .and_then(|g| g.mul(up))
+}
+
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -1233,61 +1618,10 @@ impl candle::CustomOp3 for Sdpa {
             let q_dims = q_l.dims();
             let k_dims = k_l.dims();
             let gqa_factor = q_dims[1] / k_dims[1];
-            let head_dim = *q_dims.last().unwrap_or(&0);
+            let _head_dim = *q_dims.last().unwrap_or(&0);
             if false && gqa_factor > 1 {
-                // GQA fused path applied via call_sdpa_gqa_fused_decode
-                const GQA_NBLOCKS: usize = 32;
-                // partials: n_q_heads × NBLOCKS × head_dim  f32
-                let partials_elems = q_dims[1] * GQA_NBLOCKS * head_dim;
-                // sums/maxs: n_q_heads × NBLOCKS  f32
-                let stats_elems = q_dims[1] * GQA_NBLOCKS;
-
-                let partials_buf = device.new_buffer(partials_elems, DType::F32, "gqa_partials")?;
-                let sums_buf = device.new_buffer(stats_elems, DType::F32, "gqa_sums")?;
-                let maxs_buf = device.new_buffer(stats_elems, DType::F32, "gqa_maxs")?;
-
-                let used = candle_metal_kernels::call_sdpa_vector_gqa_p1(
-                    q.device().device(),
-                    &encoder,
-                    q.device().kernels(),
-                    q_l.start_offset(),
-                    q_dims,
-                    q.buffer(),
-                    k_l.start_offset(),
-                    k_dims,
-                    k_l.stride(),
-                    k.buffer(),
-                    v_l.start_offset(),
-                    v_l.stride(),
-                    v.buffer(),
-                    &partials_buf,
-                    &sums_buf,
-                    &maxs_buf,
-                    self.scale,
-                    self.softcapping,
-                    itype,
-                )
-                .map_err(candle::Error::wrap)?;
-
-                if used {
-                    // Pass 2: combine NBLOCKS partial outputs per q-head.
-                    candle_metal_kernels::call_sdpa_vector_2pass_2_standalone(
-                        q.device().device(),
-                        &encoder,
-                        q.device().kernels(),
-                        q_dims[1],
-                        head_dim,
-                        &partials_buf,
-                        &sums_buf,
-                        &maxs_buf,
-                        &output,
-                        itype,
-                    )
-                    .map_err(candle::Error::wrap)?;
-                    let newstorage =
-                        candle::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
-                    return Ok((newstorage, out_shape));
-                }
+                // GQA fused path — disabled: correctness needs more testing.
+                // The sdpa_gqa_fused_decode function provides this path directly.
             }
 
             // Route to the 2 pass fused attention if the k seqlen is large.
@@ -1550,16 +1884,6 @@ pub fn sdpa_2pass_prealloc(
     // Try BN=1 kernel first: no intra-block barriers, 8192 threads (1 GPU wave).
     // Falls back to standard 2-pass for non-BF16 or unsupported head dims.
     let used_bn1 = candle_metal_kernels::call_sdpa_vector_2pass_bn1(
-        device.device(), &encoder, device.kernels(),
-        q_l.start_offset(), q_dims, q_m.buffer(),
-        k_l.start_offset(), k_l.dims(), k_l.stride(), k_m.buffer(),
-        v_l.start_offset(), v_l.stride(), v_m.buffer(),
-        out_buf_ref, i_m.buffer(), s_m.buffer(), m_m.buffer(),
-        scale, softcapping, itype,
-    ).map_err(candle::Error::wrap)?;
-
-    if !used_bn1 {
-        candle_metal_kernels::call_sdpa_vector_2pass(
         device.device(),
         &encoder,
         device.kernels(),
@@ -1573,7 +1897,7 @@ pub fn sdpa_2pass_prealloc(
         v_l.start_offset(),
         v_l.stride(),
         v_m.buffer(),
-        &out_buf,
+        out_buf_ref,
         i_m.buffer(),
         s_m.buffer(),
         m_m.buffer(),
@@ -1582,6 +1906,252 @@ pub fn sdpa_2pass_prealloc(
         itype,
     )
     .map_err(candle::Error::wrap)?;
+
+    if !used_bn1 {
+        candle_metal_kernels::call_sdpa_vector_2pass(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            q_l.start_offset(),
+            q_dims,
+            q_m.buffer(),
+            k_l.start_offset(),
+            k_l.dims(),
+            k_l.stride(),
+            k_m.buffer(),
+            v_l.start_offset(),
+            v_l.stride(),
+            v_m.buffer(),
+            &out_buf,
+            i_m.buffer(),
+            s_m.buffer(),
+            m_m.buffer(),
+            scale,
+            softcapping,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+    }
+
+    let out_storage = candle::Storage::Metal(candle::MetalStorage::new(
+        out_buf,
+        device.clone(),
+        elem_count,
+        DType::BF16,
+    ));
+    let result = candle::Tensor::from_storage(
+        out_storage,
+        candle::Shape::from_dims(q_dims),
+        candle::op::BackpropOp::none(),
+        false,
+    );
+    Ok(Some(result))
+}
+
+/// Single-token SDPA with ALL buffers pre-allocated (no per-step Metal allocations).
+///
+/// Like `sdpa_2pass_prealloc` but also takes a pre-allocated BF16 output tensor,
+/// eliminating the `new_buffer` call that was the last per-step allocation overhead.
+/// The caller must ensure `out` has the same shape as `q`.
+///
+/// Returns `true` when the kernel was dispatched, `false` when unsupported.
+/// On return, `out` contains the attention output.
+#[cfg(feature = "metal")]
+pub fn sdpa_2pass_prealloc_full(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    intermediate: &Tensor, // pre-allocated [n_q_heads, NBLOCKS, head_dim] F32
+    sums: &Tensor,         // pre-allocated [n_q_heads, NBLOCKS] F32
+    maxs: &Tensor,         // pre-allocated [n_q_heads, NBLOCKS] F32
+    out: &Tensor,          // pre-allocated output, same shape as q, BF16
+) -> Result<bool> {
+    use candle::{DType, Storage};
+    use candle_metal_kernels::SdpaDType;
+
+    if q.dtype() != DType::BF16 {
+        return Ok(false);
+    }
+    // Validate that the pre-allocated output buffer matches the query shape.
+    // A mismatch would cause the kernel to write out of bounds or produce a
+    // tensor with a shape that doesn't match its storage.
+    if q.shape() != out.shape() {
+        candle::bail!(
+            "sdpa_2pass_prealloc_full: pre-allocated `out` shape {:?} does not match \
+             query shape {:?}; they must be identical",
+            out.shape(),
+            q.shape(),
+        );
+    }
+    let device = match q.device() {
+        candle::Device::Metal(d) => d,
+        _ => return Ok(false),
+    };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    let (i_s, _) = intermediate.storage_and_layout();
+    let (s_s, _) = sums.storage_and_layout();
+    let (m_s, _) = maxs.storage_and_layout();
+    let (o_s, _) = out.storage_and_layout();
+
+    let (q_m, k_m, v_m, i_m, s_m, m_m, o_m) =
+        match (&*q_s, &*k_s, &*v_s, &*i_s, &*s_s, &*m_s, &*o_s) {
+            (
+                Storage::Metal(a),
+                Storage::Metal(b),
+                Storage::Metal(c),
+                Storage::Metal(d),
+                Storage::Metal(e),
+                Storage::Metal(f),
+                Storage::Metal(g),
+            ) => (a, b, c, d, e, f, g),
+            _ => return Ok(false),
+        };
+
+    let q_dims = q_l.dims();
+    let itype = SdpaDType::BF16;
+
+    let encoder = device.command_encoder()?;
+
+    // Use BN=1 2-pass kernel: no intra-block barriers, matches llama.cpp flash_attn_ext_vec
+    // grid layout (NWG=32, NSG=1). Falls back to standard 2-pass for non-BF16.
+    let used_bn1 = candle_metal_kernels::call_sdpa_vector_2pass_bn1(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        q_dims,
+        q_m.buffer(),
+        k_l.start_offset(),
+        k_l.dims(),
+        k_l.stride(),
+        k_m.buffer(),
+        v_l.start_offset(),
+        v_l.stride(),
+        v_m.buffer(),
+        o_m.buffer(),
+        i_m.buffer(),
+        s_m.buffer(),
+        m_m.buffer(),
+        scale,
+        softcapping,
+        itype,
+    )
+    .map_err(candle::Error::wrap)?;
+
+    if !used_bn1 {
+        candle_metal_kernels::call_sdpa_vector_2pass(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            q_l.start_offset(),
+            q_dims,
+            q_m.buffer(),
+            k_l.start_offset(),
+            k_l.dims(),
+            k_l.stride(),
+            k_m.buffer(),
+            v_l.start_offset(),
+            v_l.stride(),
+            v_m.buffer(),
+            o_m.buffer(),
+            i_m.buffer(),
+            s_m.buffer(),
+            m_m.buffer(),
+            scale,
+            softcapping,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+    }
+
+    Ok(true)
+}
+
+#[cfg(feature = "metal")]
+/// Single-token SDPA using the `sdpa_vector_full_dot` kernel (32 threads per head).
+///
+/// This is a port of llama.cpp's single-token decode attention approach:
+/// - 32 threads per Q-head (one simdgroup)
+/// - Q is loaded to SMEM once; K/V are accessed per-token
+/// - Each thread handles one KV token per tile (no cross-lane simd_sum for score)
+/// - Uses `simd_max`/`simd_sum`/`simd_shuffle` for online softmax
+///
+/// Compared to `sdpa_vector` (1024 threads/head), this uses far fewer GPU resources
+/// per head, allowing more heads to run in parallel — faster for typical decode lengths.
+///
+/// Supports: BF16, head_dim ∈ {256, 512}, no mask, any GQA factor.
+/// Returns `None` on non-Metal, wrong dtype, unsupported head_dim, or with mask.
+pub fn sdpa_full_dot_decode(
+    q: &Tensor, // [1, n_q_heads, 1, head_dim]
+    k: &Tensor, // [1, n_kv_heads, N, head_dim]
+    v: &Tensor, // [1, n_kv_heads, N, head_dim]
+    scale: f32,
+    softcapping: f32,
+) -> Result<Option<Tensor>> {
+    use candle::{DType, Storage};
+    use candle_metal_kernels::SdpaDType;
+
+    if q.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+
+    let device = match q.device() {
+        candle::Device::Metal(d) => d,
+        _ => return Ok(None),
+    };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+
+    let (q_metal, k_metal, v_metal) = match (&*q_s, &*k_s, &*v_s) {
+        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c)) => (a, b, c),
+        _ => return Ok(None),
+    };
+
+    let q_dims = q_l.dims();
+    let k_dims = k_l.dims();
+    let _head_dim = *q_dims.last().unwrap_or(&0);
+    let itype = SdpaDType::BF16;
+
+    let elem_count = q_dims.iter().product::<usize>();
+    let out_buf = device.new_buffer(elem_count, DType::BF16, "full_dot_sdpa_out")?;
+
+    let alpha = if softcapping != 1. {
+        scale / softcapping
+    } else {
+        scale
+    };
+
+    let encoder = device.command_encoder()?;
+    let used = candle_metal_kernels::call_sdpa_vector_flash(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        q_dims,
+        q_metal.buffer(),
+        k_l.start_offset(),
+        k_dims,
+        k_l.stride(),
+        k_metal.buffer(),
+        v_l.start_offset(),
+        v_l.stride(),
+        v_metal.buffer(),
+        &out_buf,
+        alpha,
+        softcapping,
+        itype,
+    )
+    .map_err(candle::Error::wrap)?;
+
+    if !used {
+        return Ok(None);
     }
 
     let out_storage = candle::Storage::Metal(candle::MetalStorage::new(
@@ -1608,13 +2178,17 @@ pub fn sdpa_flash_attn_vec(
     k: &Tensor,
     v: &Tensor,
     scale: f32,
-    tmp: &Tensor,  // pre-allocated: [n_q_heads * 32 * 258] F32
+    tmp: &Tensor, // pre-allocated: [n_q_heads * 32 * 258] F32
 ) -> Result<Option<Tensor>> {
     use candle::{DType, Storage};
 
-    if q.dtype() != DType::BF16 { return Ok(None); }
+    if q.dtype() != DType::BF16 {
+        return Ok(None);
+    }
     let head_dim = q.dims().last().copied().unwrap_or(0);
-    if head_dim != 256 { return Ok(None); }
+    if head_dim != 256 {
+        return Ok(None);
+    }
 
     let device = match q.device() {
         candle::Device::Metal(d) => d,
@@ -1624,10 +2198,12 @@ pub fn sdpa_flash_attn_vec(
     let (q_s, q_l) = q.storage_and_layout();
     let (k_s, k_l) = k.storage_and_layout();
     let (v_s, v_l) = v.storage_and_layout();
-    let (t_s, _)   = tmp.storage_and_layout();
+    let (t_s, _) = tmp.storage_and_layout();
 
     let (qm, km, vm, tm) = match (&*q_s, &*k_s, &*v_s, &*t_s) {
-        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => (a, b, c, d),
+        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => {
+            (a, b, c, d)
+        }
         _ => return Ok(None),
     };
 
@@ -1637,7 +2213,7 @@ pub fn sdpa_flash_attn_vec(
     let n_kv_heads = k_dims[1];
     let gqa_factor = (n_q_heads / n_kv_heads) as i32;
     let n = k_dims[2] as i32;
-    let kstride = k_l.stride()[1];  // stride per KV head in elements
+    let kstride = k_l.stride()[1]; // stride per KV head in elements
     let vstride = v_l.stride()[1];
 
     let elem_count = q_dims.iter().product::<usize>();
@@ -1649,22 +2225,41 @@ pub fn sdpa_flash_attn_vec(
 
     // Pass 1: main kernel (32 workgroups per Q-head)
     candle_metal_kernels::call_flash_attn_ext_vec_main(
-        device.device(), &encoder, device.kernels(),
-        q_l.start_offset(), qm.buffer(),
-        k_l.start_offset(), km.buffer(),
-        v_l.start_offset(), vm.buffer(),
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        qm.buffer(),
+        k_l.start_offset(),
+        km.buffer(),
+        v_l.start_offset(),
+        vm.buffer(),
         tm.buffer(),
-        n, kstride, vstride, alpha, gqa_factor, n_q_heads,
-    ).map_err(candle::Error::wrap)?;
+        n,
+        kstride,
+        vstride,
+        alpha,
+        gqa_factor,
+        n_q_heads,
+    )
+    .map_err(candle::Error::wrap)?;
 
     // Pass 2: reduce kernel (combine 32 partial outputs)
     candle_metal_kernels::call_flash_attn_ext_vec_reduce(
-        device.device(), &encoder, device.kernels(),
-        tm.buffer(), &out_buf, n_q_heads,
-    ).map_err(candle::Error::wrap)?;
+        device.device(),
+        &encoder,
+        device.kernels(),
+        tm.buffer(),
+        &out_buf,
+        n_q_heads,
+    )
+    .map_err(candle::Error::wrap)?;
 
     let out_storage = candle::Storage::Metal(candle::MetalStorage::new(
-        out_buf, device.clone(), elem_count, DType::BF16,
+        out_buf,
+        device.clone(),
+        elem_count,
+        DType::BF16,
     ));
     let result = candle::Tensor::from_storage(
         out_storage,

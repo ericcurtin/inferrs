@@ -6,6 +6,7 @@ mod grammar;
 mod hub;
 mod list;
 mod modelpack;
+mod gguf_meta;
 mod pull;
 mod quantize;
 mod rm;

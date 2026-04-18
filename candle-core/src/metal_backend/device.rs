@@ -234,12 +234,17 @@ impl MetalDevice {
     }
 
     /// Returns (buffer, offset=0) for compatibility with arena-aware callers.
-    pub fn new_buffer_with_data_untracked_offset<T>(&self, data: &[T]) -> Result<(Arc<Buffer>, usize)> {
+    pub fn new_buffer_with_data_untracked_offset<T>(
+        &self,
+        data: &[T],
+    ) -> Result<(Arc<Buffer>, usize)> {
         Ok((self.new_buffer_with_data_untracked(data)?, 0))
     }
 
     /// Placeholder for future batch weight-loading optimization.
-    pub fn begin_weight_arena(&self, _total_bytes: usize) -> Result<()> { Ok(()) }
+    pub fn begin_weight_arena(&self, _total_bytes: usize) -> Result<()> {
+        Ok(())
+    }
     pub fn end_weight_arena(&self) {}
 
     /// Creates a Metal buffer wrapping existing memory WITHOUT copying.
@@ -318,10 +323,21 @@ fn buf_size(size: usize) -> usize {
 }
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+    // Fast path: check the rounded-up size first (most common case during steady-state decode
+    // where the same tensor shapes recur every step, always allocated at buf_size(n)).
+    let rounded = buf_size(size);
+    if let Some(subbuffers) = buffers.get(&rounded) {
+        for sub in subbuffers {
+            if Arc::strong_count(sub) == 1 {
+                return Some(sub.clone());
+            }
+        }
+    }
+    // Slow path: find the smallest available buffer > rounded (larger size class).
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size {
+        if buffer_size > &rounded && buffer_size < &best_buffer_size {
             for sub in subbuffers {
                 if Arc::strong_count(sub) == 1 {
                     best_buffer = Some(sub);

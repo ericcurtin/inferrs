@@ -122,6 +122,13 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         }
     };
     let quant_dtype = args.resolve_quant_dtype()?;
+    // Detect `--quantize=none` / `--quantize=false`: the user explicitly wants
+    // raw BF16 weights, not auto-detect or auto-recipe.
+    let force_bf16 = args
+        .quantize
+        .as_deref()
+        .map(|s| matches!(s.to_lowercase().as_str(), "none" | "false"))
+        .unwrap_or(false);
 
     let model_id = args
         .model
@@ -133,6 +140,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         args.gguf_file.as_deref(),
         args.tokenizer_source.as_deref(),
         quant_dtype,
+        force_bf16,
     )?;
 
     let raw_config = RawConfig::from_file(&model_files.config_path)?;

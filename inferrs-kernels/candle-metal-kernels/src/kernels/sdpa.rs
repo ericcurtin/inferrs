@@ -745,6 +745,8 @@ pub fn call_flash_attn_ext_vec_reduce(
 pub const SDPA_2PASS_BLOCKS: usize = 32;
 /// For N<=512: fewer blocks = more tokens/simdgroup = better GPU utilization
 pub const SDPA_2PASS_BLOCKS_OPT: usize = 8; // unused
+/// KV sequence length threshold below which single-pass sdpa_vector is preferred.
+pub const SDPA_2PASS_K_THRESHOLD: usize = 1024;
 
 /// BN=1 2-pass: single simdgroup per block, no intra-block barriers.
 /// Matches llama.cpp flash_attn_ext_vec architecture for optimal GPU wave occupancy.

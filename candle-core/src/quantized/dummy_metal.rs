@@ -78,6 +78,24 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    pub fn fwd_mv_q4k_bf16o(
+        &self,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(MetalStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv_q8_0_bf16o(
+        &self,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(MetalStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn fwd_mv_bf16i(
         &self,
         _self_shape: &crate::Shape,
@@ -94,6 +112,110 @@ impl QMetalStorage {
         _storage: &MetalStorage,
         _layout: &crate::Layout,
     ) -> Result<((MetalStorage, crate::Shape), (MetalStorage, crate::Shape))> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv2_q8_0(
+        &self,
+        _other: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<((MetalStorage, crate::Shape), (MetalStorage, crate::Shape))> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv2_q3k(
+        &self,
+        _other: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<((MetalStorage, crate::Shape), (MetalStorage, crate::Shape))> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv2_q4k_bf16i(
+        &self,
+        _other: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<((MetalStorage, crate::Shape), (MetalStorage, crate::Shape))> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv3_q8_0_bf16o(
+        &self,
+        _kw: &QMetalStorage,
+        _vw: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _kv_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+    )> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv2_q8_0_bf16i(
+        &self,
+        _other: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<((MetalStorage, crate::Shape), (MetalStorage, crate::Shape))> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv3_q8_0_bf16i(
+        &self,
+        _kw: &QMetalStorage,
+        _vw: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _kv_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+    )> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv3_q4k_bf16o(
+        &self,
+        _kw: &QMetalStorage,
+        _vw: &QMetalStorage,
+        _ss: &crate::Shape,
+        _ks: &crate::Shape,
+        _st: &MetalStorage,
+        _l: &crate::Layout,
+    ) -> Result<(
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+    )> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv3_q8_0(
+        &self,
+        _kw: &QMetalStorage,
+        _vw: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _kv_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+    )> {
         Err(Error::NotCompiledWithMetalSupport)
     }
 

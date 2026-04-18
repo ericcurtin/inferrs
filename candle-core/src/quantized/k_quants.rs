@@ -2505,3 +2505,126 @@ verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
     BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
 );
+
+// ── TQ2_0 (ternary 2-bit, 2.0625 bpw) ────────────────────────────────────────
+//
+// Matches llama.cpp block_tq2_0 exactly (GGUF type 35):
+//   struct block_tq2_0 { uint8_t qs[QK_K/4]; ggml_half d; };  // 66 bytes
+//
+// Packing: 4 ternary weights per byte, 2 bits each.
+//   Ternary {-1,0,+1} stored as {0,1,2} (biased by +1).
+//   bits 1:0 → weight 0,  bits 3:2 → weight 1,
+//   bits 5:4 → weight 2,  bits 7:6 → weight 3.
+//
+// The *interleaved* layout for a 128-weight chunk at byte offset j:
+//   bytes qs[j..j+32]: each byte holds one weight from each of the 4 lanes.
+//   Lane l (0..4) holds weights at positions (m + l*32) for m in 0..32.
+//   This matches llama.cpp's quantize_row_tq2_0_ref exactly.
+
+/// Block size for TQ2_0 (ternary 2-bit quantization).
+/// 256 weights per block → 64 bytes of qs + 2 bytes of f16 scale = 66 bytes total.
+pub const QK_TQ2_0: usize = QK_K; // 256
+
+/// TQ2_0 block: 256 ternary weights packed at 2 bits each, plus one f16 scale.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockTq2_0 {
+    /// Packed ternary weights: 4 values per byte (2 bits each, biased by +1).
+    /// Layout mirrors llama.cpp block_tq2_0.qs[QK_K/4].
+    pub(crate) qs: [u8; QK_K / 4],
+    /// Block scale factor (f16).  Weights reconstruct as (stored - 1) * d.
+    pub(crate) d: f16,
+}
+// Ensure the struct is exactly 66 bytes, matching llama.cpp.
+const _: () = assert!(QK_K / 4 + 2 == std::mem::size_of::<BlockTq2_0>());
+
+impl GgmlType for BlockTq2_0 {
+    const DTYPE: GgmlDType = GgmlDType::TQ2_0;
+    const BLCK_SIZE: usize = QK_TQ2_0;
+    // Use self as VecDotType (satisfies the trait bound; actual dot products
+    // go through dequantize + f32 matmul, not vec_dot).
+    type VecDotType = BlockTq2_0;
+
+    /// Dequantise: mirrors llama.cpp dequantize_row_tq2_0.
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        debug_assert!(
+            ys.len().is_multiple_of(QK_TQ2_0),
+            "dequantize_row_tq2_0: {} not divisible by {QK_TQ2_0}",
+            ys.len()
+        );
+        let mut out = 0usize;
+        for block in xs {
+            let d = f16::to_f32(block.d);
+            // Process 2 chunks of 32 bytes (= 2 × 128 weights = 256 weights total).
+            for chunk in block.qs.chunks_exact(32) {
+                // 4 lanes per chunk: lane l extracts bits (2*l)..(2*l+1) from each byte.
+                for lane in 0..4usize {
+                    let shift = lane * 2;
+                    for &byte in chunk {
+                        let stored = (byte >> shift) & 3;
+                        ys[out] = (stored as i8 - 1) as f32 * d;
+                        out += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Quantise: mirrors llama.cpp quantize_row_tq2_0_ref.
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        debug_assert!(
+            xs.len().is_multiple_of(QK_TQ2_0),
+            "quantize_row_tq2_0: {} not divisible by {QK_TQ2_0}",
+            xs.len()
+        );
+        for (i, block) in ys.iter_mut().enumerate() {
+            let src = &xs[i * QK_TQ2_0..(i + 1) * QK_TQ2_0];
+
+            // Scale = absolute maximum of the block.
+            let amax = src.iter().map(|x| x.abs()).fold(0f32, f32::max);
+            let id = if amax == 0.0 { 0.0 } else { 1.0 / amax };
+            block.d = f16::from_f32(amax);
+
+            // Pack 4 ternary weights per byte using the interleaved layout.
+            // Outer iteration: groups of 32 bytes (= 128 weights per chunk).
+            // For each group the 128 input floats are at positions:
+            //   m + 0*32, m + 1*32, m + 2*32, m + 3*32  for m in 0..32.
+            let mut x_off = 0usize;
+            for qs_chunk in block.qs.chunks_exact_mut(32) {
+                // Within each 32-byte run, byte m holds one weight from each of
+                // the 4 lanes (= 4 non-consecutive positions in the source).
+                for m in 0..32usize {
+                    let mut q: u8 = 0;
+                    for n in 0..4usize {
+                        let xi = (src[x_off + m + n * 32] * id).round() as i32 + 1;
+                        // Clamp to {0,1,2} and pack.
+                        q |= ((xi & 3) as u8) << (2 * n);
+                    }
+                    qs_chunk[m] = q;
+                }
+                x_off += 4 * 32;
+            }
+        }
+    }
+
+    /// Scalar dot product (TQ2_0 × f32 reference path).
+    /// Used for CPU matmul; the Metal path will call the dedicated GEMV kernel.
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        // For TQ2_0 × TQ2_0 (dummy path) — dequantize both and dot.
+        debug_assert!(
+            n.is_multiple_of(QK_TQ2_0),
+            "vec_dot_tq2_0: {n} not divisible by {QK_TQ2_0}"
+        );
+        let mut out_x = vec![0f32; n];
+        let mut out_y = vec![0f32; n];
+        Self::to_float(xs, &mut out_x);
+        Self::to_float(ys, &mut out_y);
+        out_x.iter().zip(out_y.iter()).map(|(a, b)| a * b).sum()
+    }
+}
+
+verify_block_sizes!(BlockTq2_0);

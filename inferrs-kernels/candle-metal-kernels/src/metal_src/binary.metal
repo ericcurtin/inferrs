@@ -164,6 +164,15 @@ struct name {                               \
     }                                       \
 };
 
+// GELU helper (pytorch tanh variant): x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+template <typename T> METAL_FUNC T gelu_tanh(T x) {
+    constexpr float kAlpha = 0.7978845608028654f;   // sqrt(2/pi)
+    constexpr float kBeta  = 0.044715f;
+    float xf = (float)x;
+    float t  = kAlpha * (xf + kBeta * xf * xf * xf);
+    return static_cast<T>(0.5f * xf * (1.0f + precise::tanh(t)));
+}
+
 // Define binary ops
 define_binary_op(badd, x + y);
 define_binary_op(bsub, x - y);
@@ -171,6 +180,15 @@ define_binary_op(bmul, x * y);
 define_binary_op(bdiv, x / y);
 define_binary_op(bminimum, MIN(x, y));
 define_binary_op(bmaximum, MAX(x, y));
+
+/// Fused GELU(gate) * up: used in SwiGLU MLP layers.
+/// Replaces two dispatches (gelu(gate) + elementwise_mul) with one.
+struct bgelu_mul {
+    template <typename T>
+    METAL_FUNC T operator()(T x, T y) {
+        return static_cast<T>((float)gelu_tanh(x) * (float)y);
+    }
+};
 
 // Define binary ops that return a bool
 define_binary_bool_op(beq, x == y);
@@ -187,6 +205,22 @@ init_binary(bmul);
 init_binary(bdiv);
 init_binary(bminimum);
 init_binary(bmaximum);
+init_binary(bgelu_mul);
+
+/// Fused GELU-multiply with mixed types: F32 gate, BF16 up → F32 output.
+/// Eliminates the BF16→F32 to_dtype dispatch for pli_input in the PLI path.
+[[host_name("bgelu_mul_f32_bf16i_f32")]]
+kernel void bgelu_mul_f32_bf16i_f32(
+    device const float   * gate     [[buffer(0)]],
+    device const bfloat  * up_bf16  [[buffer(1)]],
+    device       float   * output   [[buffer(2)]],
+    constant     uint    & dim      [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid >= dim) return;
+    const float g = gate[tid];
+    const float u = (float)up_bf16[tid];
+    output[tid] = (float)gelu_tanh(g) * u;
+}
 
 init_boolean_binary(eq, beq);
 init_boolean_binary(ne, bne);

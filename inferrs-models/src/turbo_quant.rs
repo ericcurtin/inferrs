@@ -1066,11 +1066,14 @@ impl TurboQuantKvCache {
                 // Buffer exactly fits valid tokens — narrow is contiguous.
                 return Ok((kb.clone(), vb.clone()));
             }
-            // Cap > len: narrow would be non-contiguous. Return a contiguous copy.
-            // This costs one GPU copy per dequantize call during prefill, but
-            // saves 35 implicit cuBLAS copies during the attention matmuls.
-            let k = kb.narrow(2, 0, len)?.contiguous()?;
-            let v = vb.narrow(2, 0, len)?.contiguous()?;
+            // Cap > len: narrow produces a non-contiguous view (stride[1] = cap*head_dim
+            // instead of len*head_dim).  All downstream Metal SDPA and GEMV kernels
+            // accept non-contiguous K/V via the k_stride parameter, so no contiguous()
+            // copy is needed here.  On CUDA the previous comment noted "cuBLAS copies",
+            // but Metal handles strides natively — we intentionally skip the copy to
+            // avoid 7–22 GPU buffer allocations and copies per decode step for E4B/E2B.
+            let k = kb.narrow(2, 0, len)?;
+            let v = vb.narrow(2, 0, len)?;
             return Ok((k, v));
         }
 

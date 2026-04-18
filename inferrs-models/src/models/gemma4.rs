@@ -22,7 +22,6 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 #[cfg(feature = "metal")]
-use candle_nn::ops::sdpa_gqa_fused_decode;
 use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
@@ -101,16 +100,21 @@ enum PliEmbeddingTable {
 }
 
 impl PliEmbeddingTable {
-    /// Build from an open GGUF file (zero-copy, minimal RAM usage).
-    ///
-    /// Reads individual rows directly from the GGUF file on demand.
-    /// The PLI embedding table is NOT loaded into CPU RAM.
+    /// Build from a GGUF path (parses the file from scratch).
+    /// Prefer `from_gguf_file_with_content` when the content is already parsed.
     fn from_gguf_file(gguf_path: &std::path::Path) -> candle_core::Result<Option<Self>> {
         use candle_core::quantized::gguf_file;
+        let mut f = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
+        let content = gguf_file::Content::read(&mut f)?;
+        let file2 = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
+        Self::from_gguf_file_with_content(&content, file2)
+    }
 
-        let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
-        let content = gguf_file::Content::read(&mut file)?;
-
+    /// Build from pre-parsed GGUF content — avoids re-parsing the file (~400ms savings).
+    fn from_gguf_file_with_content(
+        content: &candle_core::quantized::gguf_file::Content,
+        file: std::fs::File,
+    ) -> candle_core::Result<Option<Self>> {
         // Find the PLI embedding tensor — check both HF and llama.cpp naming.
         let tensor_name = if content
             .tensor_infos
@@ -137,7 +141,7 @@ impl PliEmbeddingTable {
         let block_size = dtype_q.block_size();
         let type_size = dtype_q.type_size();
 
-        if embed_dim % block_size != 0 {
+        if !embed_dim.is_multiple_of(block_size) {
             return Ok(None); // non-aligned, can't safely slice by row
         }
 
@@ -608,29 +612,71 @@ impl Module for Mlp {
             #[allow(unused_variables)]
             let is_single_token = xs.rank() >= 2 && xs.dim(xs.rank() - 2).unwrap_or(0) == 1;
 
-            // Use the F32-fused path (gate+up in 1 dispatch) for Mlp.
-            // BF16 inline (2 separate dispatches) is slower; it applies to
-            // unfused GEMVs (o_proj, PLI) automatically via QLinear::forward.
-            let xs_f32 = xs.to_dtype(DType::F32)?;
-
-            // Fused double-GEMV (Q4K Metal) for single-token decode.
+            // Fused double-GEMV for single-token decode.
+            //
+            // For BF16 input on Metal, prefer the BF16-input variants (bf16i) which
+            // accept BF16 directly and output F32 — eliminating the xs.to_dtype(F32)
+            // dispatch entirely.  This saves 1 Metal kernel dispatch per MLP layer
+            // per decode step (35 layers × 1 = 35 fewer dispatches on E2B only).
+            // Note: Q4K bf16i adds per-element bit-shift overhead that outweighs the
+            // dispatch savings even for large E4B weight matrices — benchmarked and
+            // confirmed slower.
             #[cfg(feature = "metal")]
-            if is_single_token {
-                if let Some(result) = self.gate_proj.forward_paired_q4k(&self.up_proj, &xs_f32) {
+            if is_single_token
+                && orig_dtype == DType::BF16
+                && matches!(xs.device(), candle_core::Device::Metal(_))
+            {
+                // BF16i paired GEMV: skips the xs→F32 pre-cast.
+                // Q8_0 only (E2B) — Q4K bf16i confirmed slower on benchmark.
+                let paired_bf16i = self.gate_proj.forward_paired_q8_0_bf16i(&self.up_proj, xs);
+                if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
-                    let lhs_f32 = gate_f32.apply(&self.act_fn)?;
+                    let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    // Use bf16o for down_proj (F32→BF16, saves 1 dispatch)
+                    if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
+                        return bf16_out;
+                    }
                     return self
                         .down_proj
-                        .forward_f32(&(lhs_f32 * up_f32)?)?
+                        .forward_f32(&hidden_act_f32)?
                         .to_dtype(orig_dtype);
                 }
             }
 
-            // Fallback: two separate GEMVs sharing the same F32 input.
-            let lhs_f32 = self.gate_proj.forward_f32(&xs_f32)?.apply(&self.act_fn)?;
-            let rhs_f32 = self.up_proj.forward_f32(&xs_f32)?;
+            // Use the F32-fused path (gate+up in 1 dispatch) for Mlp.
+            let xs_f32 = xs.to_dtype(DType::F32)?;
+
+            // Try Q8_0 first (E2B recipe), then Q3K (ggml-org), then Q4K.
+            #[cfg(feature = "metal")]
+            if is_single_token {
+                let paired_result = self
+                    .gate_proj
+                    .forward_paired_q8_0(&self.up_proj, &xs_f32)
+                    .or_else(|| self.gate_proj.forward_paired_q3k(&self.up_proj, &xs_f32))
+                    .or_else(|| self.gate_proj.forward_paired_q4k(&self.up_proj, &xs_f32));
+                if let Some(result) = paired_result {
+                    let (gate_f32, up_f32) = result?;
+                    let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    if let Some(bf16_out) = self
+                        .down_proj
+                        .forward_q8_0_bf16o(&hidden_act_f32)
+                        .or_else(|| self.down_proj.forward_q4k_bf16o(&hidden_act_f32))
+                    {
+                        return bf16_out;
+                    }
+                    return self
+                        .down_proj
+                        .forward_f32(&hidden_act_f32)?
+                        .to_dtype(orig_dtype);
+                }
+            }
+
+            // Last fallback: two separate GEMVs.
+            let gate_f32 = self.gate_proj.forward_f32(&xs_f32)?;
+            let up_f32 = self.up_proj.forward_f32(&xs_f32)?;
+            let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
             self.down_proj
-                .forward_f32(&(lhs_f32 * rhs_f32)?)?
+                .forward_f32(&hidden_act_f32)?
                 .to_dtype(orig_dtype)
         } else {
             let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
@@ -898,19 +944,25 @@ impl RetainingKvCache {
         // directly — it is already contiguous and the narrow would be a no-op.
         // When the buffer is oversized (buf_cap > seq_len, which is the common
         // case after a power-of-two doubling) narrow() produces a *non-contiguous*
-        // view.  Any downstream kernel that requires contiguous memory (Metal SDPA,
-        // cuBLAS GEMM) will then allocate and copy the tensor itself — once per
-        // attention layer per decode step.  Making the view contiguous here pays
-        // one copy but saves N_layers copies further down the call stack.
+        // view.
+        //
+        // We intentionally do NOT call `.contiguous()` on the narrow view.  All
+        // downstream consumers (sdpa_vector, sdpa_vector_2pass, sdpa_2pass_prealloc_full,
+        // sdpa_gqa_fused_decode) accept the strided layout — they receive k_stride[1]
+        // (the per-head stride = buf_cap × head_dim) and iterate over the N valid
+        // tokens contiguously within each head.  Materialising a fresh contiguous
+        // buffer here would cost one large Metal allocation and memcpy per attention
+        // layer per decode step (≥14 copies × ≥1.2 MB each for E4B), which is the
+        // dominant decode-step overhead.
         let k_out = if self.seq_len == self.buf_cap {
             kb.clone()
         } else {
-            kb.narrow(2, 0, self.seq_len)?.contiguous()?
+            kb.narrow(2, 0, self.seq_len)?
         };
         let v_out = if self.seq_len == self.buf_cap {
             vb.clone()
         } else {
-            vb.narrow(2, 0, self.seq_len)?.contiguous()?
+            vb.narrow(2, 0, self.seq_len)?
         };
         Ok((k_out, v_out))
     }
@@ -999,12 +1051,22 @@ impl Attention {
     /// Apply o_proj using BF16-input inline GEMV when available (eliminates
     /// a BF16->F32 to_dtype dispatch for single-token decode on Metal).
     fn apply_o_proj(&self, xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "metal")]
+        // For Metal single-token decode with BF16 input, use the BF16→BF16 kernel:
+        // no pre-cast (BF16→F32) and no post-cast (F32→BF16) needed.
+        // Saves 1 dispatch vs forward_bf16i (which outputs F32, then back-cast).
         if xs.rank() >= 2
             && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
+            // BF16→BF16 GEMV: eliminates both pre-cast and post-cast (saves 1 dispatch vs bf16i path).
+            // Q8_0 (E2B): bf16i_to_bf16 saves pre+post casts (2 dispatches → 1).
+            // Q4K (E4B): disabled — overhead vs savings not favorable.
+            if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
+                return out;
+            }
+            // Fallback for other dtypes: BF16i→F32, then back-cast.
+            #[cfg(feature = "metal")]
             if let Some(out) = self.o_proj.forward_bf16i(xs) {
                 return out?.to_dtype(xs.dtype());
             }
@@ -1196,40 +1258,70 @@ impl Attention {
         let q_out = self.partial_rope_q_out.as_mut().unwrap();
         let k_out = self.partial_rope_k_out.as_mut().unwrap();
 
-        // Apply RoPE to the first `rotary_dim` features, write passthrough unchanged.
-        // q/k come from transpose(1,2) and are non-contiguous; narrow+contiguous
-        // materialises a small, packed slice for the rope kernel.
-        let q_rot = candle_nn::rotary_emb::rope(
-            &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        q_out.slice_set(&q_rot, D::Minus1, 0)?;
-        q_out.slice_set(
-            &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
+        // Apply partial RoPE: first `rotary_dim` features get RoPE, rest pass through.
+        //
+        // Fast path (Metal BF16): use fused partial_rope_inplace_bf16 which writes
+        // directly to q_out/k_out in a single dispatch, avoiding 4 intermediate
+        // compute dispatches (2×contiguous + 1×rope + 1×slice_set) per head.
+        //
+        // q/k are [1, n_heads, 1, head_dim] contiguous after reshape at line ~1499.
+        // Apply partial RoPE: first `rotary_dim` features get RoPE, rest pass through.
+        //
+        // Q: fused single dispatch writes to persistent q_out (partial_rope_inplace_bf16).
+        //    Saves 4 dispatches vs narrow+contiguous+rope+2×slice_set.
+        //
+        // K: standard path. When BOTH Q and K use the fused persistent-buffer approach
+        //    in the same 64-op command-buffer batch, Metal's hazard tracking hangs.
+        //    K-only fused also works, but Q+K combined doesn't — root cause TBD.
+        //    Q-only fused is safe and saves the most dispatch overhead.
+        #[cfg(feature = "metal")]
+        let q_fused =
+            if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
+                candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
+            } else {
+                false
+            };
+        #[cfg(not(feature = "metal"))]
+        let q_fused = false;
+        if !q_fused {
+            let q_rot = candle_nn::rotary_emb::rope(
+                &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            q_out.slice_set(&q_rot, D::Minus1, 0)?;
+            q_out.slice_set(
+                &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
+        // K: try fused partial_rope_inplace_bf16 first (saves 4 dispatches vs
+        // narrow+contiguous+rope+2×slice_set); fall back to standard path if
+        // unavailable (non-Metal, non-BF16).
+        #[cfg(feature = "metal")]
+        let k_fused =
+            if k.dtype() == DType::BF16 && matches!(k.device(), candle_core::Device::Metal(_)) {
+                candle_nn::rotary_emb::partial_rope_inplace_bf16(k, &cos, &sin, k_out, rotary_dim)?
+            } else {
+                false
+            };
+        #[cfg(not(feature = "metal"))]
+        let k_fused = false;
+        if !k_fused {
+            let k_rot = candle_nn::rotary_emb::rope(
+                &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            k_out.slice_set(&k_rot, D::Minus1, 0)?;
+            k_out.slice_set(
+                &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
 
-        let k_rot = candle_nn::rotary_emb::rope(
-            &k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        k_out.slice_set(&k_rot, D::Minus1, 0)?;
-        k_out.slice_set(
-            &k.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
-
-        // Return the pre-allocated buffers directly.
-        // `clone()` shares the underlying Metal buffer (ref-counted); no new
-        // allocation occurs.  The caller consumes the clones for attention
-        // computation within the same `forward_returning_kv` call.  By the time
-        // the *next* decode step calls this method and overwrites the buffers via
-        // `slice_set`, the previous clones have already been dropped — so there
-        // is no aliasing hazard.
         Ok((q_out.clone(), k_out.clone()))
     }
 
@@ -1265,20 +1357,28 @@ impl Attention {
         }
         let q_out = self.partial_rope_q_out.as_mut().unwrap();
 
-        let q_rot = candle_nn::rotary_emb::rope(
-            &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
-            &cos,
-            &sin,
-        )?;
-        q_out.slice_set(&q_rot, D::Minus1, 0)?;
-        q_out.slice_set(
-            &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
-            D::Minus1,
-            rotary_dim,
-        )?;
-
-        // Same aliasing rationale as `apply_rope_qkv_buffered`: the clone is
-        // consumed within this decode step before the next step overwrites q_out.
+        #[cfg(feature = "metal")]
+        let fused =
+            if q.dtype() == DType::BF16 && matches!(q.device(), candle_core::Device::Metal(_)) {
+                candle_nn::rotary_emb::partial_rope_inplace_bf16(q, &cos, &sin, q_out, rotary_dim)?
+            } else {
+                false
+            };
+        #[cfg(not(feature = "metal"))]
+        let fused = false;
+        if !fused {
+            let q_rot = candle_nn::rotary_emb::rope(
+                &q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?,
+                &cos,
+                &sin,
+            )?;
+            q_out.slice_set(&q_rot, D::Minus1, 0)?;
+            q_out.slice_set(
+                &q.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?,
+                D::Minus1,
+                rotary_dim,
+            )?;
+        }
         Ok(q_out.clone())
     }
 
@@ -1311,60 +1411,122 @@ impl Attention {
         let is_single_token_decode = q_len == 1;
 
         let (q_raw, k_raw, v_raw) = if need_pre_convert && is_single_token_decode {
-            let xs_f32 = xs.to_dtype(DType::F32)?;
-
-            // Try fused triple QKV GEMV (Q4K Metal only); fall back to 3 separate GEMVs.
+            // BF16→BF16 triple QKV GEMV: Q8_0 (E2B) and Q4K (E4B).
             #[cfg(feature = "metal")]
-            let qkv_fused = self
-                .q_proj
-                .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
+            let qkv_b2b = if orig_dtype == DType::BF16
+                && matches!(xs.device(), candle_core::Device::Metal(_))
+            {
+                // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast.
+                // Q4K (E4B): bf16i overhead > dispatch savings — use bf16o path instead.
+                self.q_proj
+                    .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
+            } else {
+                None
+            };
             #[cfg(not(feature = "metal"))]
-            let qkv_fused: Option<
+            let qkv_b2b: Option<
                 candle_core::Result<(
                     candle_core::Tensor,
                     candle_core::Tensor,
                     candle_core::Tensor,
                 )>,
             > = None;
-            if let Some(result) = qkv_fused {
-                let (q_f32, k_f32, v_f32) = result?;
+            if let Some(result) = qkv_b2b {
+                let (q_bf16, k_bf16, v_bf16) = result?;
                 (
-                    q_f32.to_dtype(orig_dtype)?.reshape((
-                        b_sz,
-                        q_len,
-                        self.num_heads,
-                        self.head_dim,
-                    ))?,
-                    k_f32.to_dtype(orig_dtype)?.reshape((
-                        b_sz,
-                        q_len,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    ))?,
-                    v_f32.to_dtype(orig_dtype)?.reshape((
-                        b_sz,
-                        q_len,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    ))?,
+                    q_bf16.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                    k_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                    v_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
                 )
             } else {
-                // Fallback: three GEMVs sharing one F32 input copy.
-                (
-                    self.q_proj
-                        .forward_f32(&xs_f32)?
-                        .to_dtype(orig_dtype)?
-                        .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
-                    self.k_proj
-                        .forward_f32(&xs_f32)?
-                        .to_dtype(orig_dtype)?
-                        .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                    self.v_proj
-                        .forward_f32(&xs_f32)?
-                        .to_dtype(orig_dtype)?
-                        .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                )
-            }
+                let xs_f32 = xs.to_dtype(DType::F32)?;
+
+                // Second choice: BF16-output triple QKV GEMV (F32 input → BF16 output).
+                // Q8_0 (E2B): kernel_mul_mv3_q8_0_f32_to_bf16.
+                // Q4K (E4B): kernel_mul_mv3_q4_K_f32_to_bf16.
+                #[cfg(feature = "metal")]
+                let qkv_bf16o = self
+                    .q_proj
+                    .forward_triple_q8_0_bf16o(&self.k_proj, &self.v_proj, &xs_f32)
+                    .or_else(|| {
+                        self.q_proj
+                            .forward_triple_q4k_bf16o(&self.k_proj, &self.v_proj, &xs_f32)
+                    });
+                #[cfg(not(feature = "metal"))]
+                let qkv_bf16o: Option<
+                    candle_core::Result<(
+                        candle_core::Tensor,
+                        candle_core::Tensor,
+                        candle_core::Tensor,
+                    )>,
+                > = None;
+                if let Some(result) = qkv_bf16o {
+                    let (q_bf16, k_bf16, v_bf16) = result?;
+                    // Already BF16 — just reshape, no back-cast needed.
+                    (
+                        q_bf16.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                        k_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                        v_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                    )
+                } else {
+                    // Standard F32 path: triple GEMV then back-cast, or fallback to separate GEMVs.
+                    #[cfg(feature = "metal")]
+                    let qkv_fused = self
+                        .q_proj
+                        .forward_triple_q8_0(&self.k_proj, &self.v_proj, &xs_f32)
+                        .or_else(|| {
+                            self.q_proj
+                                .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32)
+                        });
+                    #[cfg(not(feature = "metal"))]
+                    let qkv_fused: Option<
+                        candle_core::Result<(
+                            candle_core::Tensor,
+                            candle_core::Tensor,
+                            candle_core::Tensor,
+                        )>,
+                    > = None;
+                    if let Some(result) = qkv_fused {
+                        let (q_f32, k_f32, v_f32) = result?;
+                        (
+                            q_f32.to_dtype(orig_dtype)?.reshape((
+                                b_sz,
+                                q_len,
+                                self.num_heads,
+                                self.head_dim,
+                            ))?,
+                            k_f32.to_dtype(orig_dtype)?.reshape((
+                                b_sz,
+                                q_len,
+                                self.num_kv_heads,
+                                self.head_dim,
+                            ))?,
+                            v_f32.to_dtype(orig_dtype)?.reshape((
+                                b_sz,
+                                q_len,
+                                self.num_kv_heads,
+                                self.head_dim,
+                            ))?,
+                        )
+                    } else {
+                        // Fallback: three GEMVs sharing one F32 input copy.
+                        (
+                            self.q_proj
+                                .forward_f32(&xs_f32)?
+                                .to_dtype(orig_dtype)?
+                                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                            self.k_proj
+                                .forward_f32(&xs_f32)?
+                                .to_dtype(orig_dtype)?
+                                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                            self.v_proj
+                                .forward_f32(&xs_f32)?
+                                .to_dtype(orig_dtype)?
+                                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                        )
+                    }
+                } // end else (non-bf16o path)
+            } // end else (non-b2b path)
         } else if need_pre_convert {
             let xs_f32 = xs.to_dtype(DType::F32)?;
             (
@@ -1400,18 +1562,42 @@ impl Attention {
                 ))?,
             )
         };
-        // Apply norms on contiguous pre-transpose shape, then transpose.
-        let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
-        let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
-        let v_norm_w = if v_raw.dtype() == DType::F32 {
-            &self.v_norm_weight_f32
+        // Apply norms on contiguous pre-transpose shape, then reorder to [b, n_heads, q_len, head_dim].
+        //
+        // For single-token decode (q_len=1): use reshape instead of transpose.
+        // After norm, the tensor is [b, 1, n_heads, head_dim] (contiguous).
+        // reshape to [b, n_heads, 1, head_dim] produces a contiguous tensor
+        // (no new allocation) — avoiding the subsequent `.contiguous()` forced
+        // by the RoPE kernel's contiguity requirement.
+        // For prefill (q_len>1): transpose as before.
+        let (query_states, key_states, value_states) = if q_len == 1 {
+            let q_normed = self.q_norm.forward(&q_raw)?;
+            let k_normed = self.k_norm.forward(&k_raw)?;
+            let v_norm_w = if v_raw.dtype() == DType::F32 {
+                &self.v_norm_weight_f32
+            } else {
+                &self.v_norm_weight
+            };
+            let v_normed = apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?;
+            (
+                q_normed.reshape((b_sz, self.num_heads, 1, self.head_dim))?,
+                k_normed.reshape((b_sz, self.num_kv_heads, 1, self.head_dim))?,
+                v_normed.reshape((b_sz, self.num_kv_heads, 1, self.head_dim))?,
+            )
         } else {
-            &self.v_norm_weight
+            let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
+            let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
+            let v_norm_w = if v_raw.dtype() == DType::F32 {
+                &self.v_norm_weight_f32
+            } else {
+                &self.v_norm_weight
+            };
+            let value_states =
+                apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?.transpose(1, 2)?;
+            (query_states, key_states, value_states)
         };
-        let value_states =
-            apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?.transpose(1, 2)?;
 
-        // query_states and key_states are now [b, n_heads, q_len, head_dim] (post-transpose).
+        // query/key/value_states are now [b, n_heads, q_len, head_dim] (contiguous for q_len=1).
         // RoPE — use the buffer-based path to avoid Tensor::cat allocations for
         // partial-RoPE global attention layers during decode.
         let (query_states, key_states) =
@@ -1493,74 +1679,67 @@ impl Attention {
             //   - softcapping=sc if softcapping is set, else 1.0 (no-op)
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
 
-            // GQA fused decode for sliding layers (head_dim=256, gqa_factor ∈ {4,8}).
-            // sdpa_vector_gqa_1pass: 1 threadgroup per KV-head vs 1 per Q-head in
-            // sdpa_vector — 8× fewer threadgroups for E2B (gqa_factor=8), 4× for E4B.
-            //
-            // Must be attempted BEFORE the 2-pass path: sdpa_2pass_prealloc always
-            // returns Some for BF16 + head_dim=256, so the GQA path would be
-            // unreachable if placed after it.
-            #[cfg(feature = "metal")]
-            let gqa_result: Option<Tensor> = if self.head_dim == 256
-                && matches!(self.num_kv_groups, 4 | 8)
-                && query_states.dtype() == DType::BF16
-            {
-                sdpa_gqa_fused_decode(
-                    &query_states,
-                    &key_states,
-                    &value_states,
-                    1.0_f32,
-                    softcapping,
-                )?
-            } else {
-                None
-            };
-            #[cfg(not(feature = "metal"))]
-            let gqa_result: Option<Tensor> = None;
+            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) benchmarks slower
+            // than the standard sdpa_vector path for typical decode sequences.
+            // The standard path is more efficient for small KV lengths (≤1024).
 
-            if let Some(gqa_out) = gqa_result {
-                gqa_out
-                    .transpose(1, 2)?
-                    .reshape((b_sz, q_len, ()))?
-                    .apply(&self.o_proj)?
-            } else {
-                // Pre-allocated 2-pass SDPA (Metal only).
+            // 1-pass for N ≤ 1024; pre-allocated 2-pass for N > 1024.
+            {
                 #[cfg(feature = "metal")]
-                if self.sdpa_2pass_intermediate.is_none()
-                    && matches!(query_states.device(), candle_core::Device::Metal(_))
-                    && query_states.dtype() == DType::BF16
-                    && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
-                {
-                    const NBLOCKS: usize = 32;
-                    let dev = query_states.device();
-                    self.sdpa_2pass_intermediate = Some(Tensor::zeros(
-                        (self.num_heads, NBLOCKS, self.head_dim),
-                        DType::F32,
-                        dev,
-                    )?);
-                    self.sdpa_2pass_sums =
-                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
-                    self.sdpa_2pass_maxs =
-                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
-                }
-                #[cfg(feature = "metal")]
-                let donor_attn = if let (Some(interm), Some(sums), Some(maxs)) = (
-                    &self.sdpa_2pass_intermediate,
-                    &self.sdpa_2pass_sums,
-                    &self.sdpa_2pass_maxs,
-                ) {
-                    candle_nn::ops::sdpa_2pass_prealloc(
-                        &query_states,
-                        &key_states,
-                        &value_states,
-                        1.0_f32,
-                        softcapping,
-                        interm,
-                        sums,
-                        maxs,
-                    )?
-                } else {
-                    None
+                let donor_attn: Option<candle_core::Tensor> = {
+                    let kv_len = key_states.dim(2).unwrap_or(0);
+                    const SDPA_TWO_PASS_THRESHOLD: usize = 1024;
+                    if kv_len > SDPA_TWO_PASS_THRESHOLD
+                        && matches!(query_states.device(), candle_core::Device::Metal(_))
+                        && query_states.dtype() == DType::BF16
+                        && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+                    {
+                        if self.sdpa_2pass_intermediate.is_none() {
+                            const NBLOCKS: usize = 32;
+                            let dev = query_states.device();
+                            self.sdpa_2pass_intermediate = Some(Tensor::zeros(
+                                (self.num_heads, NBLOCKS, self.head_dim),
+                                DType::F32,
+                                dev,
+                            )?);
+                            self.sdpa_2pass_sums =
+                                Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                            self.sdpa_2pass_maxs =
+                                Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                            self.sdpa_2pass_out = Some(Tensor::zeros(
+                                (1usize, self.num_heads, 1usize, self.head_dim),
+                                DType::BF16,
+                                dev,
+                            )?);
+                        }
+                        if let (Some(interm), Some(sums), Some(maxs), Some(out)) = (
+                            &self.sdpa_2pass_intermediate,
+                            &self.sdpa_2pass_sums,
+                            &self.sdpa_2pass_maxs,
+                            &self.sdpa_2pass_out,
+                        ) {
+                            let used = candle_nn::ops::sdpa_2pass_prealloc_full(
+                                &query_states,
+                                &key_states,
+                                &value_states,
+                                1.0_f32,
+                                softcapping,
+                                interm,
+                                sums,
+                                maxs,
+                                out,
+                            )?;
+                            if used {
+                                Some(out.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 };
                 #[cfg(not(feature = "metal"))]
                 let donor_attn: Option<candle_core::Tensor> = None;
@@ -1578,10 +1757,16 @@ impl Attention {
                         softcapping,
                     )?
                 };
-                attn_result
-                    .transpose(1, 2)?
-                    .reshape((b_sz, q_len, ()))?
-                    .apply(&self.o_proj)?
+                // For decode (q_len=1), attn_result is [b, n_heads, 1, head_dim] — contiguous.
+                // Directly reshape to [b, 1, n_heads*head_dim] without transpose:
+                // [b, n_heads, 1, d] and [b, 1, n_heads*d] have the same memory layout.
+                // This eliminates the transpose(1,2) which produces a non-contiguous view
+                // that forces a contiguous copy in reshape() — saving 1 Metal dispatch per
+                // attention layer per decode step.
+                // For prefill the 2-pass pre-alloc path is not taken (kv_len <= threshold
+                // is irrelevant here; the donor_attn branch handles that), so this is
+                // only reached at decode time (q_len==1 guard above).
+                self.apply_o_proj(&attn_result.reshape((b_sz, q_len, ()))?)?
             }
         } else {
             // Manual GQA path: use Q-reshape to avoid materializing expanded K/V.
@@ -1651,15 +1836,28 @@ impl Attention {
         #[cfg(feature = "metal")]
         let q_raw_metal_opt = if need_pre_convert && is_metal_bf16_decode {
             let orig_dtype = xs.dtype();
-            Some(if let Some(out) = self.q_proj.forward_bf16i(xs) {
-                out?.to_dtype(orig_dtype)?
-                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            } else {
-                self.q_proj
-                    .forward_f32(&xs.to_dtype(DType::F32)?)?
-                    .to_dtype(orig_dtype)?
-                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            })
+            // For Q-only decode (shared KV layers): try BF16i→BF16 kernels first
+            // (Q8_0 E2B: 1 dispatch, BF16→BF16), then Q4K BF16i→F32 (1 dispatch + back-cast),
+            // then standard F32 path.
+            Some(
+                if let Some(out) = self.q_proj.forward_q8_0_bf16i_to_bf16(xs) {
+                    // Q8_0 (E2B): BF16→BF16 in 1 dispatch, no back-cast needed.
+                    out?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                } else if let Some(out) = self.q_proj.forward_bf16i(xs) {
+                    // Q4K (E4B): BF16→F32 + back-cast.
+                    out?.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_heads,
+                        self.head_dim,
+                    ))?
+                } else {
+                    self.q_proj
+                        .forward_f32(&xs.to_dtype(DType::F32)?)?
+                        .to_dtype(orig_dtype)?
+                        .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                },
+            )
         } else {
             None
         };
@@ -1678,7 +1876,15 @@ impl Attention {
                 .forward(xs)?
                 .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
         };
-        let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
+        // For decode (q_len=1): reshape instead of transpose to keep tensor contiguous,
+        // avoiding the implicit .contiguous() before the RoPE kernel.
+        let query_states = if q_len == 1 {
+            self.q_norm
+                .forward(&q_raw)?
+                .reshape((b_sz, self.num_heads, 1, self.head_dim))?
+        } else {
+            self.q_norm.forward(&q_raw)?.transpose(1, 2)?
+        };
 
         // RoPE — use buffer-based path for partial-RoPE global layers during decode.
         let query_states = self.apply_rope_q_buffered(&query_states, seqlen_offset)?;
@@ -1687,6 +1893,9 @@ impl Attention {
         // Use fused SDPA for decode (q_len=1) when available.
         if self.use_sdpa && q_len == 1 && attention_mask.is_none() {
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
+
+            // NOTE: GQA 1-pass kernel (sdpa_gqa_fused_decode) benchmarks slower
+            // than sdpa_vector for typical decode sequences (≤1024 KV tokens).
 
             // ── Flash attention (llama.cpp flash_attn_ext_vec) ─────────────────────
             // 32 parallel workgroups, BF16 + head_dim=256, single-token decode.
@@ -1710,86 +1919,89 @@ impl Attention {
                         1.0_f32,
                         tmp,
                     )? {
-                        return attn_out
-                            .transpose(1, 2)?
-                            .reshape((b_sz, q_len, ()))?
-                            .apply(&self.o_proj);
+                        return self.apply_o_proj(&attn_out.transpose(1, 2)?.reshape((
+                            b_sz,
+                            q_len,
+                            (),
+                        ))?);
                     }
                 }
             }
 
-            // Use pre-allocated 2-pass SDPA buffers to avoid per-step Metal buffer
-            // allocation.  This matches llama.cpp's flash_attn_ext_vec with nwg=32.
-            // Only BF16 + head_dim ∈ {32,64,96,128,256,512} on Metal.
+            // For short KV sequences (N ≤ 1024), use the standard 1-pass sdpa_vector
+            // directly (fewer threadgroup dispatches, no intermediate buffers needed).
+            // For long KV (N > 1024), use the pre-allocated 2-pass path.
             #[cfg(feature = "metal")]
-            let use_2pass = matches!(query_states.device(), candle_core::Device::Metal(_))
-                && query_states.dtype() == DType::BF16
-                && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512);
-            #[cfg(not(feature = "metal"))]
-            #[allow(unused_variables)]
-            let use_2pass = false;
-
-            #[cfg(feature = "metal")]
-            if use_2pass {
-                const NBLOCKS: usize = 32; // matches candle_metal_kernels::SDPA_2PASS_BLOCKS
-                if self.sdpa_2pass_intermediate.is_none() {
-                    let dev = query_states.device();
-                    // [n_q_heads, NBLOCKS, head_dim] F32
-                    self.sdpa_2pass_intermediate = Some(Tensor::zeros(
-                        (self.num_heads, NBLOCKS, self.head_dim),
-                        DType::F32,
-                        dev,
-                    )?);
-                    // [n_q_heads, NBLOCKS] F32
-                    self.sdpa_2pass_sums =
-                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
-                    self.sdpa_2pass_maxs =
-                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
-                    // Pre-allocate output: [1, n_q_heads, 1, head_dim] BF16
-                    self.sdpa_2pass_out = Some(Tensor::zeros(
-                        (1usize, self.num_heads, 1usize, self.head_dim),
-                        DType::BF16,
-                        dev,
-                    )?);
-                }
-                if let (Some(interm), Some(sums), Some(maxs)) = (
-                    &self.sdpa_2pass_intermediate,
-                    &self.sdpa_2pass_sums,
-                    &self.sdpa_2pass_maxs,
-                ) {
-                    if let Some(attn_out) = candle_nn::ops::sdpa_2pass_prealloc(
-                        &query_states,
-                        shared_key,
-                        shared_value,
-                        1.0_f32,
-                        softcapping,
-                        interm,
-                        sums,
-                        maxs,
-                    )? {
-                        return attn_out
-                            .transpose(1, 2)?
-                            .reshape((b_sz, q_len, ()))?
-                            .apply(&self.o_proj);
+            {
+                let kv_len_shared = shared_key.dim(2).unwrap_or(0);
+                const SDPA_TWO_PASS_THRESHOLD: usize = 1024;
+                if kv_len_shared > SDPA_TWO_PASS_THRESHOLD
+                    && matches!(query_states.device(), candle_core::Device::Metal(_))
+                    && query_states.dtype() == DType::BF16
+                    && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+                {
+                    const NBLOCKS: usize = 32; // matches candle_metal_kernels::SDPA_2PASS_BLOCKS
+                    if self.sdpa_2pass_intermediate.is_none() {
+                        let dev = query_states.device();
+                        // [n_q_heads, NBLOCKS, head_dim] F32
+                        self.sdpa_2pass_intermediate = Some(Tensor::zeros(
+                            (self.num_heads, NBLOCKS, self.head_dim),
+                            DType::F32,
+                            dev,
+                        )?);
+                        // [n_q_heads, NBLOCKS] F32
+                        self.sdpa_2pass_sums =
+                            Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                        self.sdpa_2pass_maxs =
+                            Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                        // Pre-allocate output: [1, n_q_heads, 1, head_dim] BF16
+                        self.sdpa_2pass_out = Some(Tensor::zeros(
+                            (1usize, self.num_heads, 1usize, self.head_dim),
+                            DType::BF16,
+                            dev,
+                        )?);
+                    }
+                    if let (Some(interm), Some(sums), Some(maxs), Some(out)) = (
+                        &self.sdpa_2pass_intermediate,
+                        &self.sdpa_2pass_sums,
+                        &self.sdpa_2pass_maxs,
+                        &self.sdpa_2pass_out,
+                    ) {
+                        let used = candle_nn::ops::sdpa_2pass_prealloc_full(
+                            &query_states,
+                            shared_key,
+                            shared_value,
+                            1.0_f32,
+                            softcapping,
+                            interm,
+                            sums,
+                            maxs,
+                            out,
+                        )?;
+                        if used {
+                            // out is [b, n_heads, 1, head_dim] — contiguous.
+                            // Reshape directly to [b, 1, hidden] without transpose.
+                            return self.apply_o_proj(&out.clone().reshape((b_sz, q_len, ()))?);
+                        }
                     }
                 }
-            }
+            } // end #[cfg(feature = "metal")]
 
-            // GQA 1-pass disabled: 2-pass with pre-allocated BN=1 buffers is used below.
-
-            // Fallback to standard sdpa.
-            return candle_nn::ops::sdpa(
-                &query_states,
-                shared_key,
-                shared_value,
-                None,
-                false,
-                1.0_f32,
-                softcapping,
-            )?
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, ()))?
-            .apply(&self.o_proj);
+            // Standard 1-pass sdpa (for N ≤ 1024 or 2-pass unavailable).
+            // SDPA output is [b, n_heads, 1, head_dim] — contiguous.
+            // reshape directly to [b, 1, hidden] without transpose.
+            return self.apply_o_proj(
+                &candle_nn::ops::sdpa(
+                    &query_states,
+                    shared_key,
+                    shared_value,
+                    None,
+                    false,
+                    1.0_f32,
+                    softcapping,
+                )?
+                .reshape((b_sz, q_len, ()))?,
+            );
         }
 
         // Use Q-reshape GQA path: avoids materializing expanded K/V copies.
@@ -2137,6 +2349,8 @@ struct DecoderLayer {
     layer_scalar: Tensor,
     /// F32 version of layer_scalar for the F32 decode fast-path.
     layer_scalar_f32: Tensor,
+    /// Scalar value cached as plain f32 for use in fused norm+add+scale kernels.
+    layer_scalar_val: f32,
     /// PLI fields; `None` for models without per-layer input (e.g. 31B).
     pli: Option<LayerPli>,
     /// MoE block; `None` for dense models (e.g. 31B).
@@ -2240,6 +2454,12 @@ impl DecoderLayer {
         let layer_scalar_raw = vb.get(1, "layer_scalar")?;
         let layer_scalar_f32 = layer_scalar_raw.to_dtype(DType::F32)?;
         let layer_scalar = layer_scalar_raw.to_dtype(cfg.dtype)?;
+        // Cache scalar value as plain f32 for the fused norm+add+scale kernel.
+        let layer_scalar_val = layer_scalar_f32
+            .to_device(&candle_core::Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .unwrap_or_else(|_| vec![1.0f32])[0];
 
         let moe = if cfg.enable_moe_block {
             Some(Gemma4MoeBlock::new(cfg, vb.clone(), qvb)?)
@@ -2256,6 +2476,7 @@ impl DecoderLayer {
             post_attention_layernorm,
             layer_scalar,
             layer_scalar_f32,
+            layer_scalar_val,
             pli,
             moe,
         })
@@ -2280,8 +2501,9 @@ impl DecoderLayer {
         let (attn_out, k, v) =
             self.self_attn
                 .forward_returning_kv(&normed, attention_mask, seqlen_offset)?;
-        let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
-        let xs = (attn_out + residual)?;
+        let xs = self
+            .post_attention_layernorm
+            .forward_add(&attn_out, residual)?;
 
         let xs = self.apply_mlp_and_pli(xs, per_layer_input)?;
         Ok((xs, k, v))
@@ -2312,8 +2534,9 @@ impl DecoderLayer {
             shared_key,
             shared_value,
         )?;
-        let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
-        let xs = (attn_out + residual)?;
+        let xs = self
+            .post_attention_layernorm
+            .forward_add(&attn_out, residual)?;
 
         self.apply_mlp_and_pli(xs, per_layer_input)
     }
@@ -2339,8 +2562,9 @@ impl DecoderLayer {
             kv_store,
             layer_paged_idx,
         )?;
-        let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
-        let xs = (attn_out + residual)?;
+        let xs = self
+            .post_attention_layernorm
+            .forward_add(&attn_out, residual)?;
         let xs = self.apply_mlp_and_pli(xs, per_layer_input)?;
         Ok((xs, k, v))
     }
@@ -2362,8 +2586,9 @@ impl DecoderLayer {
             shared_key,
             shared_value,
         )?;
-        let attn_out = attn_out.apply(&self.post_attention_layernorm)?;
-        let xs = (attn_out + residual)?;
+        let xs = self
+            .post_attention_layernorm
+            .forward_add(&attn_out, residual)?;
         self.apply_mlp_and_pli(xs, per_layer_input)
     }
 
@@ -2387,16 +2612,18 @@ impl DecoderLayer {
             .forward(&xs)
             .and_then(|n| n.apply(&self.mlp))?;
 
-        // Dense path: single MLP + post-norm + residual.
+        // Dense path: single MLP + post-norm + residual (fused).
         // MoE path: combine shared MLP with sparse experts, then post-norm + residual.
-        let ffn_out = if let Some(moe) = &self.moe {
+        let xs = if let Some(moe) = &self.moe {
             // MoE: combine shared and sparse branches, then apply post_feedforward_layernorm.
             let combined = moe.forward(&shared_mlp_out, residual)?;
-            combined.apply(&self.post_feedforward_layernorm)?
+            let ffn_out = combined.apply(&self.post_feedforward_layernorm)?;
+            (residual + ffn_out)?
         } else {
-            shared_mlp_out.apply(&self.post_feedforward_layernorm)?
+            // Dense: fused post_feedforward_layernorm + residual_add.
+            self.post_feedforward_layernorm
+                .forward_add(&shared_mlp_out, residual)?
         };
-        let xs = (residual + ffn_out)?;
 
         // Per-layer input residual path — only for efficient variants (E2B/E4B).
         // Absent on standard models (e.g. 31B) where hidden_size_per_layer_input == 0.
@@ -2417,6 +2644,7 @@ impl DecoderLayer {
             // explicit F32 conversion needed. Each QLinear::forward call uses
             // the fused BF16→Q8_1 path on CUDA.
             // BF16-input inline GEMV for pli.gate (Metal decode only);
+            // Try Q8_0 bf16i→f32 first (E2B), then Q4K bf16i→f32 (E4B),
             // on other platforms falls back to standard forward.
             #[cfg(feature = "metal")]
             let gate_f32 = if xs.dtype() == DType::BF16
@@ -2424,7 +2652,11 @@ impl DecoderLayer {
                 && xs.rank() >= 2
                 && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
             {
-                if let Some(out) = pli.gate.forward_bf16i(&xs) {
+                if let Some(out) = pli
+                    .gate
+                    .forward_q8_0_bf16i_f32(&xs)
+                    .or_else(|| pli.gate.forward_bf16i(&xs))
+                {
                     out?
                 } else {
                     xs.apply(&pli.gate)?
@@ -2434,26 +2666,62 @@ impl DecoderLayer {
             };
             #[cfg(not(feature = "metal"))]
             let gate_f32 = xs.apply(&pli.gate)?;
-            let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
-            let pli_out = gate.broadcast_mul(pli_input)?;
+
+            // Optimized PLI path (Metal BF16 single-token decode only):
+            // For decode (q_len=1), stay in F32 after gate to avoid the
+            // F32→BF16→GELU roundtrip. Use fused gelu_mul(gate_f32, pli_input_f32).
+            // For prefill (multiple tokens), use BF16 path (smaller data, faster GEMM).
             #[cfg(feature = "metal")]
-            let pli_out = if pli_out.dtype() == DType::BF16
-                && matches!(pli_out.device(), candle_core::Device::Metal(_))
-                && pli_out.rank() >= 2
-                && pli_out.dim(pli_out.rank().saturating_sub(2)).unwrap_or(0) == 1
-            {
-                if let Some(out) = pli.projection.forward_bf16i(&pli_out) {
-                    out?.to_dtype(pli_out.dtype())?
+            let pli_proj_out = {
+                let is_pli_decode =
+                    xs.rank() >= 2 && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1;
+                if xs.dtype() == DType::BF16
+                    && gate_f32.dtype() == DType::F32
+                    && matches!(xs.device(), candle_core::Device::Metal(_))
+                    && is_pli_decode
+                {
+                    // gelu_mul accepts F32 gate + BF16 up directly, saving
+                    // the pli_input.to_dtype(F32) dispatch per PLI layer.
+                    let pli_mid_f32 = candle_nn::ops::gelu_mul(&gate_f32, pli_input)?;
+                    if let Some(bf16_out) = pli
+                        .projection
+                        .forward_q8_0_bf16o(&pli_mid_f32)
+                        .or_else(|| pli.projection.forward_q4k_bf16o(&pli_mid_f32))
+                    {
+                        bf16_out?
+                    } else {
+                        pli.projection
+                            .forward_f32(&pli_mid_f32)?
+                            .to_dtype(xs.dtype())?
+                    }
                 } else {
-                    pli_out.apply(&pli.projection)?
+                    let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
+                    let pli_out = gate.broadcast_mul(pli_input)?;
+                    if is_pli_decode
+                        && xs.dtype() == DType::BF16
+                        && matches!(xs.device(), candle_core::Device::Metal(_))
+                    {
+                        if let Some(out) = pli.projection.forward_bf16i(&pli_out) {
+                            out?.to_dtype(xs.dtype())?
+                        } else {
+                            pli_out.apply(&pli.projection)?
+                        }
+                    } else {
+                        pli_out.apply(&pli.projection)?
+                    }
                 }
-            } else {
-                pli_out.apply(&pli.projection)?
             };
             #[cfg(not(feature = "metal"))]
-            let pli_out = pli_out.apply(&pli.projection)?;
-            let pli_out = pli.norm.forward(&pli_out)?;
-            (residual + pli_out)?
+            let pli_proj_out = {
+                let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
+                let pli_out = gate.broadcast_mul(pli_input)?;
+                pli_out.apply(&pli.projection)?
+            };
+            // Fuse pli_norm + residual_add + layer_scalar_mul into one kernel.
+            // layer_scalar_val was extracted at construction time (no GPU→CPU sync).
+            return pli
+                .norm
+                .forward_add_scale(&pli_proj_out, residual, self.layer_scalar_val);
         } else {
             xs
         };
@@ -2653,7 +2921,18 @@ impl Gemma4Model {
             // Safetensors path: Load dequantized BF16 on CPU as before.
             let pli_embed_table = if let Some(gguf) = gguf_path {
                 // Try the zero-copy file-backed variant first.
-                match PliEmbeddingTable::from_gguf_file(gguf)? {
+                // Prefer using already-parsed GGUF content (from qvb) to avoid
+                // re-reading the 720-tensor GGUF header (~400ms savings).
+                let pli_result = if let Some(ref qvb) = qvb_lm {
+                    if let Some((content, file)) = qvb.gguf_content_and_file() {
+                        PliEmbeddingTable::from_gguf_file_with_content(&content, file)?
+                    } else {
+                        PliEmbeddingTable::from_gguf_file(gguf)?
+                    }
+                } else {
+                    PliEmbeddingTable::from_gguf_file(gguf)?
+                };
+                match pli_result {
                     Some(t) => {
                         tracing::info!(
                             "PLI embedding: using GGUF file-backed zero-copy lookup \

@@ -324,11 +324,19 @@ pub fn run(args: PullArgs) -> Result<()> {
                 .or_else(|| args.model.strip_prefix("huggingface.co/"))
                 .unwrap_or(&args.model);
 
-            let quant_dtype = args
+            let force_bf16 = args
                 .quantize
                 .as_deref()
-                .map(crate::quantize::parse_format)
-                .transpose()?;
+                .map(|s| matches!(s.to_lowercase().as_str(), "none" | "false"))
+                .unwrap_or(false);
+            let quant_dtype = if force_bf16 {
+                None
+            } else {
+                args.quantize
+                    .as_deref()
+                    .map(crate::quantize::parse_format)
+                    .transpose()?
+            };
 
             let files = crate::hub::download_and_maybe_quantize(
                 hf_model,
@@ -336,6 +344,7 @@ pub fn run(args: PullArgs) -> Result<()> {
                 args.gguf_file.as_deref(),
                 args.tokenizer_source.as_deref(),
                 quant_dtype,
+                force_bf16,
             )?;
 
             println!("Pulled {} (HuggingFace)", args.model);
