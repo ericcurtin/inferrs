@@ -1227,6 +1227,15 @@ impl Qwen35Model {
                         "MTP draft module loaded ({} block(s))",
                         cfg.mtp_num_hidden_layers
                     );
+                    #[cfg(target_os = "macos")]
+                    if matches!(
+                        embed_tokens.embeddings().device(),
+                        candle_core::Device::Metal(_)
+                    ) {
+                        tracing::info!(
+                            "MTP speculative decoding disabled on Metal (dispatch overhead)"
+                        );
+                    }
                     Some(m)
                 }
                 Err(e) => {

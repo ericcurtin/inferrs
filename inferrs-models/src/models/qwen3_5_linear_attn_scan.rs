@@ -146,9 +146,21 @@ pub fn gated_delta_rule_chunked(
     // ── Candle CPU path: ensure F32 ───────────────────────────────────────────
     // The CUDA fast path above handles BF16 natively and has already returned.
     // The candle ops below require F32; cast here once rather than at each use.
-    let q_c = if q_c.dtype() != DType::F32 { q_c.to_dtype(DType::F32)? } else { q_c };
-    let k_c = if k_c.dtype() != DType::F32 { k_c.to_dtype(DType::F32)? } else { k_c };
-    let v_c = if v_c.dtype() != DType::F32 { v_c.to_dtype(DType::F32)? } else { v_c };
+    let q_c = if q_c.dtype() != DType::F32 {
+        q_c.to_dtype(DType::F32)?
+    } else {
+        q_c
+    };
+    let k_c = if k_c.dtype() != DType::F32 {
+        k_c.to_dtype(DType::F32)?
+    } else {
+        k_c
+    };
+    let v_c = if v_c.dtype() != DType::F32 {
+        v_c.to_dtype(DType::F32)?
+    } else {
+        v_c
+    };
 
     // ── Step 3a: Log-decay cumsum + decay mask ────────────────────────────
     // g_cumsum[i] = sum(log_g[0..i+1]) within each chunk

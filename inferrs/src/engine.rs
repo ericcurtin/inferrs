@@ -1512,11 +1512,16 @@ impl Engine {
                 // Active only for single-sequence batches without grammar
                 // constraints (grammar masking is incompatible with multi-token
                 // verification) and only during the decode phase.
+                #[cfg(target_os = "macos")]
+                let on_metal = matches!(device, candle_core::Device::Metal(_));
+                #[cfg(not(target_os = "macos"))]
+                let on_metal = false;
                 let use_mtp = seq.prefilled
                     && active_count == 1   // single-sequence: no shared-KV conflicts
                     && seq.grammar_fsm.is_none()
                     && !seq.sampling_params.logprobs  // logprobs not supported with MTP
-                    && paged.is_none(); // MTP forward calls use internal concat-KV, not PagedKvStore
+                    && paged.is_none() // MTP forward calls use internal concat-KV, not PagedKvStore
+                    && !on_metal; // Metal dispatch overhead makes MTP slower than baseline
 
                 if use_mtp {
                     let last_token = match seq.output_tokens.last() {
