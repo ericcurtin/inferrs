@@ -16,8 +16,17 @@ pub fn flash_attn_decode_cuda(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) ->
         _ => crate::bail!("flash_attn_decode_cuda requires CUDA device"),
     };
 
-    let (_, n_q, q_len, head_dim) = q.dims4()?;
-    let (_, n_kv, kv_len, _) = k.dims4()?;
+    let (batch, n_q, q_len, head_dim) = q.dims4()?;
+    let (batch_k, n_kv, kv_len, _) = k.dims4()?;
+    let (batch_v, _, _, _) = v.dims4()?;
+    if batch_k != batch || batch_v != batch {
+        crate::bail!(
+            "flash_attn_decode_cuda: batch mismatch q={} k={} v={}",
+            batch,
+            batch_k,
+            batch_v
+        );
+    }
 
     if q_len != 1 {
         crate::bail!("flash_attn_decode_cuda: q_len={} must be 1", q_len);
@@ -148,7 +157,16 @@ pub fn flash_attn_prefill_cuda(
     };
 
     let (batch, n_q, q_len, head_dim) = q.dims4()?;
-    let (_, n_kv, kv_len, _) = k.dims4()?;
+    let (batch_k, n_kv, kv_len, _) = k.dims4()?;
+    let (batch_v, _, _, _) = v.dims4()?;
+    if batch_k != batch || batch_v != batch {
+        crate::bail!(
+            "flash_attn_prefill_cuda: batch mismatch q={} k={} v={}",
+            batch,
+            batch_k,
+            batch_v
+        );
+    }
 
     if q_len <= 1 {
         crate::bail!("flash_attn_prefill_cuda: q_len={} must be > 1", q_len);
@@ -246,12 +264,13 @@ pub fn flash_attn_prefill_cuda(
     let n_warps = (head_dim as u32) / 32;
     let shared_mem_bytes = BR * BK * n_warps * std::mem::size_of::<f32>() as u32;
 
-    // Total SMEM per block ≈ 42 KB static + shared_mem_bytes dynamic.
+    // Static SMEM read directly from each kernel's __shared__ declarations:
+    //   scalar kernel: q_smem[Br][D] + k_smem[Bk][D] + v_smem[Bk][D] + scores[Br][Bk] + m/l/rsc[Br]
+    //   WMMA kernel:   q_stage[Br][D] + k_smem[Bk][D] + v_smem[Bk][D] + scores[Br][Bk] + m/l/rsc[Br]
+    // Both kernels now have the same static footprint (q_stage == q_smem in size).
     // Only request carveout + max_dynamic when total exceeds default 48 KB.
-    let static_smem_approx = head_dim as u32 * (BR + 2 * BK) * 2 // q/k/v BF16
-        + BR * BK * 4 // scores
-        + 3 * BR * 4; // m, l, rsc
-    if static_smem_approx + shared_mem_bytes > 48 * 1024 {
+    let static_smem_bytes = head_dim as u32 * (BR + 2 * BK) * 2 + BR * BK * 4 + 3 * BR * 4;
+    if static_smem_bytes + shared_mem_bytes > 48 * 1024 {
         func.set_attribute(
             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
             100,
@@ -266,8 +285,8 @@ pub fn flash_attn_prefill_cuda(
 
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (
-            (batch * n_q) as u32,
             q_len.div_ceil(BR as usize) as u32,
+            (batch * n_q) as u32,
             1,
         ),
         block_dim: (head_dim as u32, 1, 1),
@@ -291,7 +310,7 @@ pub fn flash_attn_prefill_cuda(
         unsafe { b.launch(cfg) }.map_err(|e| {
             crate::Error::msg(format!(
                 "FA prefill: launch failed grid=({},{},1) block=({},1,1) smem={} n_kv_groups={} q_len={} kv_len={} seqlen_offset={} scale={:?}: {:?}",
-                (batch * n_q) as u32, q_len.div_ceil(BR as usize) as u32,
+                q_len.div_ceil(BR as usize) as u32, (batch * n_q) as u32,
                 head_dim as u32, shared_mem_bytes,
                 n_kv_groups, q_len_i, kv_len_i, seqlen_offset_i, scale, e
             ))

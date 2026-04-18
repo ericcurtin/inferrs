@@ -20,7 +20,7 @@ __device__ void conv1d(
   const size_t *src_s = info + 3;
   const size_t *k_dims = info + 6;
   const size_t *k_s = info + 9;
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   const size_t k_size = k_dims[2];
   const size_t c_out = k_dims[0];
   const size_t c_in = src_dims[1];
@@ -73,7 +73,7 @@ __device__ void conv1d_depthwise(
     const T *kernel,
     T *dst
 ) {
-    const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (dst_i >= b_size * c_size * l_out) return;
 
     const size_t l_idx = dst_i % l_out;
@@ -92,6 +92,49 @@ __device__ void conv1d_depthwise(
         d += static_cast<A>(src[src_idx]) * static_cast<A>(kernel[k_idx]);
     }
     dst[dst_i] = static_cast<T>(d);
+}
+
+// Depthwise conv1d in BTC layout: one thread per output element (b, l_out, c).
+// Input  [b, l_in, c]  — strides passed explicitly (src_b_stride, src_t_stride, src_c_stride).
+// Kernel [c, k_size]   — contiguous (squeezed from [c, 1, k_size] at Rust level).
+// Output [b, l_out, c] — contiguous.
+// Avoids the two transpose+contiguous copies needed when using conv1d_depthwise on BCL input.
+template <typename T, typename A>
+__device__ void conv1d_depthwise_btc(
+    const size_t b_size,
+    const size_t c_size,
+    const size_t l_in,
+    const size_t l_out,
+    const size_t k_size,
+    const size_t stride,
+    const size_t padding,
+    const size_t dilation,
+    const size_t src_b_stride,
+    const size_t src_t_stride,
+    const size_t src_c_stride,
+    const T *src,
+    const T *kernel,
+    T *dst
+) {
+    const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (dst_i >= b_size * l_out * c_size) return;
+
+    const size_t c_idx = dst_i % c_size;
+    const size_t l_idx = (dst_i / c_size) % l_out;
+    const size_t b_idx = dst_i / (l_out * c_size);
+
+    A d = 0;
+    for (size_t k = 0; k < k_size; k++) {
+        const size_t src_l_raw = l_idx * stride + k * dilation;
+        if (src_l_raw < padding || src_l_raw >= padding + l_in) continue;
+        const size_t src_l = src_l_raw - padding;
+        const size_t src_idx = b_idx * src_b_stride
+                             + src_l * src_t_stride
+                             + c_idx * src_c_stride;
+        const size_t k_idx = c_idx * k_size + k;
+        d += static_cast<A>(src[src_idx]) * static_cast<A>(kernel[k_idx]);
+    }
+    dst[b_idx * l_out * c_size + l_idx * c_size + c_idx] = static_cast<T>(d);
 }
 
 template <typename T>
@@ -151,7 +194,7 @@ __device__ void col2im1d(
     const T *src,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, l_in, c_out, l_k)
   // dst: (b_size, c_out, l_out)
   if (dst_i >= dst_el) {
@@ -198,7 +241,7 @@ __device__ void im2col(
     const T *src,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // dst: (b_size, h_out, w_out, c_in, h_k, w_k)
   // src: (b_size, c_in, h_in, w_in)
   if (dst_i >= dst_numel) {
@@ -262,7 +305,7 @@ __device__ void conv2d(
     const T *kernel,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, c_in, h_in, w_in)
   // k: (c_out, c_in, h_k, w_k)
   const size_t *src_dims = info;
@@ -324,7 +367,7 @@ __device__ void conv_transpose1d(
     const T *kernel,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, c_in, l_in)
   // k: (c_in, c_out, l_k)
   const size_t *src_dims = info;
@@ -379,7 +422,7 @@ __device__ void conv_transpose2d(
     const T *kernel,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, c_in, h_in, w_in)
   // k: (c_in, c_out, h_k, w_k)
   const size_t *src_dims = info;
@@ -441,7 +484,7 @@ __device__ void avg_pool2d(
     const T *src,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, c_in, w_in, h_in)
   const size_t *src_dims = info;
   const size_t *src_s = info + 4;
@@ -493,7 +536,7 @@ __device__ void max_pool2d(
     const T *src,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, c_in, w_in, h_in)
   const size_t *src_dims = info;
   const size_t *src_s = info + 4;
@@ -550,7 +593,7 @@ __device__ void upsample_nearest2d(
     const T *src,
     T *dst
 ) {
-  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   // src: (b_size, c_in, w_in, h_in)
   const size_t *src_dims = info;
   const size_t *src_s = info + 4;
@@ -595,7 +638,7 @@ __device__ void upsample_bilinear2d(
     const scalar_t *src,
     scalar_t *dst
 ) {
-    const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t dst_i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     
     // src: (b_size, c_in, h_in, w_in)  // Standard NCHW layout
     const size_t *src_dims = info;
@@ -711,6 +754,28 @@ extern "C" __global__ void FN_NAME( \
   conv1d_depthwise<TYPENAME, TYPEACC>( \
     b_size, c_size, l_in, l_out, k_size, stride, padding, dilation, \
     src_b_stride, src_c_stride, src_l_stride, src, kernel, dst); \
+} \
+
+#define CONV1D_DEPTHWISE_BTC_OP(TYPENAME, TYPEACC, FN_NAME) \
+extern "C" __global__ void FN_NAME( \
+    const size_t b_size, \
+    const size_t c_size, \
+    const size_t l_in, \
+    const size_t l_out, \
+    const size_t k_size, \
+    const size_t stride, \
+    const size_t padding, \
+    const size_t dilation, \
+    const size_t src_b_stride, \
+    const size_t src_t_stride, \
+    const size_t src_c_stride, \
+    const TYPENAME *src, \
+    const TYPENAME *kernel, \
+    TYPENAME *dst \
+) { \
+  conv1d_depthwise_btc<TYPENAME, TYPEACC>( \
+    b_size, c_size, l_in, l_out, k_size, stride, padding, dilation, \
+    src_b_stride, src_t_stride, src_c_stride, src, kernel, dst); \
 } \
 
 #define CONV2D_OP(TYPENAME, TYPEACC, FN_NAME) \
@@ -909,6 +974,7 @@ COL2IM1D_OP(__half, col2im1d_f16)
 
 CONV1D_OP(float, float, conv1d_f32)
 CONV1D_DEPTHWISE_OP(float, float, conv1d_depthwise_f32)
+CONV1D_DEPTHWISE_BTC_OP(float, float, conv1d_depthwise_btc_f32)
 CONV1D_OP(double, double, conv1d_f64)
 CONV1D_DEPTHWISE_OP(double, double, conv1d_depthwise_f64)
 CONV1D_OP(uint8_t, uint8_t, conv1d_u8)

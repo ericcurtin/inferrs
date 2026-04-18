@@ -43,9 +43,9 @@ static __device__ void flash_attn_decode_clean(
     const int kv_head = q_head / n_kv_groups;
     const int d       = threadIdx.x;
 
-    const __nv_bfloat16* q_ptr = Q + q_head * D;
-    const __nv_bfloat16* k_ptr = K + kv_head * kv_len * D;
-    const __nv_bfloat16* v_ptr = V + kv_head * kv_len * D;
+    const __nv_bfloat16* q_ptr = Q + (size_t)q_head * D;
+    const __nv_bfloat16* k_ptr = K + (size_t)kv_head * kv_len * D;
+    const __nv_bfloat16* v_ptr = V + (size_t)kv_head * kv_len * D;
 
     float q_val = bf16_to_f32(q_ptr[d]);
 
@@ -66,7 +66,7 @@ static __device__ void flash_attn_decode_clean(
         // Compute scores[j] = (Q · K[j]) * scale  for j in tile.
         for (int j = 0; j < tile_size; j++) {
             int pos = tile_start + j;
-            float k_val = bf16_to_f32(k_ptr[pos * D + d]);
+            float k_val = bf16_to_f32(k_ptr[(size_t)pos * D + d]);
             float partial = q_val * k_val;
 
             // Step 1: warp reduce within each warp.
@@ -94,7 +94,7 @@ static __device__ void flash_attn_decode_clean(
         for (int j = 0; j < tile_size; j++) {
             float e = __expf(smem_scores[j] - m_new);
             l_new += e;
-            acc += e * bf16_to_f32(v_ptr[(tile_start + j) * D + d]);
+            acc += e * bf16_to_f32(v_ptr[(size_t)(tile_start + j) * D + d]);
         }
 
         m_old = m_new;
@@ -139,7 +139,7 @@ DEF_FA_KERNEL(512)
 //   V:   [batch * n_kv_heads, kv_len, D]  BF16
 //   out: [batch * n_q_heads,  q_len,  D]  BF16
 //
-// Grid:  (batch * n_q_heads, ceil(q_len / Br), 1)
+// Grid:  (ceil(q_len / Br), batch * n_q_heads, 1)
 // Block: (D, 1, 1)
 //
 // SMEM:
@@ -169,8 +169,8 @@ static __device__ void flash_attn_prefill_bf16_impl(
     int seqlen_offset,
     float scale
 ) {
-    const int head    = blockIdx.x;
-    const int q_tile  = blockIdx.y;
+    const int q_tile  = blockIdx.x;
+    const int head    = blockIdx.y;
     const int d       = threadIdx.x;
     const int kv_head = head / n_kv_groups;
     const int q_start = q_tile * Br;
@@ -196,7 +196,7 @@ static __device__ void flash_attn_prefill_bf16_impl(
     for (int i = 0; i < Br; i++) {
         int q_pos = q_start + i;
         q_smem[i][d] = (q_pos < q_len)
-            ? Q[head * q_len * D + q_pos * D + d]
+            ? Q[(size_t)head * q_len * D + (size_t)q_pos * D + d]
             : __float2bfloat16(0.f);
     }
     if (d < Br) {
@@ -217,10 +217,10 @@ static __device__ void flash_attn_prefill_bf16_impl(
         for (int j = 0; j < Bk; j++) {
             int kv_pos = kv_s + j;
             k_smem[j][d] = (kv_pos < kv_len)
-                ? K[kv_head * kv_len * D + kv_pos * D + d]
+                ? K[(size_t)kv_head * kv_len * D + (size_t)kv_pos * D + d]
                 : __float2bfloat16(0.f);
             v_smem[j][d] = (kv_pos < kv_len)
-                ? V[kv_head * kv_len * D + kv_pos * D + d]
+                ? V[(size_t)kv_head * kv_len * D + (size_t)kv_pos * D + d]
                 : __float2bfloat16(0.f);
         }
         __syncthreads();  // SYNC 1
@@ -297,7 +297,7 @@ static __device__ void flash_attn_prefill_bf16_impl(
         const int q_pos = q_start + i;
         if (q_pos < q_len) {
             const float l = l_smem[i];
-            out[head * q_len * D + q_pos * D + d] =
+            out[(size_t)head * q_len * D + (size_t)q_pos * D + d] =
                 __float2bfloat16(l > 0.f ? acc[i] / l : 0.f);
         }
     }

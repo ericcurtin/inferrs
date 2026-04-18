@@ -5,11 +5,12 @@
 // module containing WMMA instructions, breaking the existing decode kernels too.
 //
 // Differences vs flash_attn_prefill_bf16_impl:
-//   - q_smem removed (-8 KB static SMEM): Q loaded via wmma::load_matrix_sync
-//     directly from global memory (L2-hot after first KV tile).
+//   - q_smem[Br][D] added back as q_stage (8 KB) for partial last tile only;
+//     complete tiles still load Q directly from global (L2-hot after first KV tile).
 //   - SYNC 2 replaced by WMMA mma_sync: 4 ops/warp/tile vs 512 FMA+shuffles.
-//   - SMEM D=256: ~34 KB static + 16 KB dynamic = 50 KB → 2 blocks/SM on RTX 3090.
-//   - __launch_bounds__(D, 2): hints allocator to allow up to 128 regs/thread.
+//   - SMEM D=256: ~42 KB static + 16 KB dynamic = 58 KB → 1 block/SM on RTX 3090.
+//     (was 50 KB / 2 blocks before q_stage was added for OOB safety)
+//   - __launch_bounds__(D): register hint without minBlocks (2-block occupancy lost).
 //
 // cp.async for K/V is NOT used here: __pipeline_memcpy_async requires 4+ byte
 // transfers; BF16 (2 bytes) does not qualify. cg::memcpy_async would require
@@ -33,8 +34,8 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
     int seqlen_offset,
     float scale
 ) {
-    const int head    = blockIdx.x;
-    const int q_tile  = blockIdx.y;
+    const int q_tile  = blockIdx.x;
+    const int head    = blockIdx.y;
     const int d       = threadIdx.x;
     const int kv_head = head / n_kv_groups;
     const int q_start = q_tile * Br;
@@ -43,13 +44,16 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
     // K_TILES_PER_WARP = (D/16) / n_warps = (D/16) / (D/32) = 2, always.
     constexpr int K_TILES_PER_WARP = 2;
 
-    // Static SMEM: K/V tiles + score matrix + softmax stats (no q_smem).
+    // Static SMEM: K/V tiles + score matrix + softmax stats + Q staging buffer.
     __shared__ __nv_bfloat16 k_smem[Bk][D];
     __shared__ __nv_bfloat16 v_smem[Bk][D];
     __shared__ float scores[Br][Bk];
     __shared__ float m_smem[Br];
     __shared__ float l_smem[Br];
     __shared__ float rsc_smem[Br];
+    // q_stage: used only for the last (partial) Q-tile to zero-pad OOB rows before
+    // wmma::load_matrix_sync, avoiding undefined behaviour on global OOB reads.
+    __shared__ __nv_bfloat16 q_stage[Br][D];
 
     // Dynamic SMEM: WMMA partial results, layout [n_warps][Br][Bk].
     // Each warp writes its partial Q×K^T accumulation here before SYNC 3 reduces.
@@ -64,6 +68,21 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
     #pragma unroll
     for (int i = 0; i < Br; i++) acc[i] = 0.f;
 
+    // Populate q_stage for the last partial tile (q_start + Br > q_len).
+    // Thread d fills all Br rows of column d with bounds-checked Q values.
+    // Complete tiles (common case) load directly from global inside the KV loop.
+    const bool partial_tile = (q_start + Br > q_len);
+    if (partial_tile) {
+        #pragma unroll
+        for (int i = 0; i < Br; i++) {
+            const int q_pos = q_start + i;
+            q_stage[i][d] = (q_pos < q_len)
+                ? Q[(size_t)head * q_len * D + (size_t)q_pos * D + d]
+                : __float2bfloat16(0.f);
+        }
+    }
+    __syncthreads();  // SYNC 0: q_stage ready (if partial_tile) before KV loop
+
     for (int kv_s = 0; kv_s < kv_len; kv_s += Bk) {
 
         // ── SYNC 1: load K and V tiles ────────────────────────────────────────
@@ -72,10 +91,10 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
         for (int j = 0; j < Bk; j++) {
             const int kv_pos = kv_s + j;
             k_smem[j][d] = (kv_pos < kv_len)
-                ? K[kv_head * kv_len * D + kv_pos * D + d]
+                ? K[(size_t)kv_head * kv_len * D + (size_t)kv_pos * D + d]
                 : __float2bfloat16(0.f);
             v_smem[j][d] = (kv_pos < kv_len)
-                ? V[kv_head * kv_len * D + kv_pos * D + d]
+                ? V[(size_t)kv_head * kv_len * D + (size_t)kv_pos * D + d]
                 : __float2bfloat16(0.f);
         }
         __syncthreads();  // SYNC 1
@@ -83,8 +102,8 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
         // ── SYNC 2: WMMA Q×K^T → warp_sums_dyn[warp][Br][Bk] ──────────────
         //
         // Layout trick (K^T without transposing):
-        //   A (Q):   q_smem[Br][D] row_major, stride D
-        //            → load_matrix_sync(q_frag, &Q[...+k_off], D) : matrix_a row_major
+        //   A (Q):   q_stage[Br][D] (partial tile) or Q global (complete tile), row_major, stride D
+        //            → load_matrix_sync(q_frag, q_src, D) : matrix_a row_major
         //   B (K^T): k_smem[Bk][D] row_major stored with stride D
         //            → k_smem[n_off][k_off] col_major, stride D gives K^T correctly
         //              (ptr[col*D+row] = k_smem[n_off+col][k_off+row] = K^T[k+row][n+col])
@@ -103,9 +122,12 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
             #pragma unroll
             for (int kk = 0; kk < K_TILES_PER_WARP; kk++) {
                 const int k_off = (warp_id * K_TILES_PER_WARP + kk) * 16;
-                // Q loaded from global (L2-hot after first KV tile, 8 KB fits in L2).
-                wmma::load_matrix_sync(q_frag,
-                    &Q[head * q_len * D + q_start * D + k_off], D);
+                // Complete tiles: load Q directly from global (L2-hot, fast path).
+                // Partial last tile: load from q_stage (zero-padded, set in SYNC 0).
+                const __nv_bfloat16* q_src = partial_tile
+                    ? &q_stage[0][k_off]
+                    : &Q[(size_t)head * q_len * D + (size_t)q_start * D + k_off];
+                wmma::load_matrix_sync(q_frag, q_src, D);
                 #pragma unroll
                 for (int n = 0; n < Bk / 16; n++) {
                     const int n_off = n * 16;
@@ -178,7 +200,7 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
         const int q_pos = q_start + i;
         if (q_pos < q_len) {
             const float l = l_smem[i];
-            out[head * q_len * D + q_pos * D + d] =
+            out[(size_t)head * q_len * D + (size_t)q_pos * D + d] =
                 __float2bfloat16(l > 0.f ? acc[i] / l : 0.f);
         }
     }
@@ -186,7 +208,7 @@ static __device__ void flash_attn_prefill_wmma_bf16_impl(
 
 #define DEF_FA_PREFILL_WMMA_KERNEL(D_VAL)                                              \
 extern "C" __global__                                                                  \
-__launch_bounds__(D_VAL, 2)                                                            \
+__launch_bounds__(D_VAL)                                                               \
 void flash_attn_prefill_wmma_bf16_d##D_VAL(                                            \
     const __nv_bfloat16* Q,                                                            \
     const __nv_bfloat16* K,                                                            \
