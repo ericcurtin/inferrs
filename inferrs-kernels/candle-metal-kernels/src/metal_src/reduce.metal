@@ -1943,6 +1943,101 @@ kernel void rmsnorm_add_bf16i_f32o(
     }
 }
 
+/// Fused double-RMSNorm kernel (BF16 inputs and outputs): post_attn_norm_add + pre_ffn_norm.
+///
+/// For Q8_0 (E2B) decode: both norms output BF16, allowing the Q8_0 bf16i GEMV
+/// to accept BF16 input directly.  Eliminates one Metal dispatch per decoder
+/// layer during single-token decode (35 dispatches saved for E2B per step).
+///
+/// Computation (per row):
+///   bf16_out[i] = rms_norm(src[i]) * alpha1[i] + residual[i]  [BF16]
+///   bf16_norm[i] = rms_norm(bf16_out[i]) * alpha2[i]          [BF16]
+///
+/// Buffer layout:
+///   0: src_numel   (uint)       total elements = rows × el_per_block
+///   1: el_per_block (uint)      hidden_size (e.g. 2048)
+///   2: src         (bfloat*)    attn_out [BF16, read]
+///   3: alpha1      (bfloat*)    post_attn_norm weight [BF16, read]
+///   4: residual    (bfloat*)    residual [BF16, read]
+///   5: bf16_out    (bfloat*)    xs = norm1(src)*w1 + residual [BF16, write+read]
+///   6: alpha2      (bfloat*)    pre_ffn_norm weight [BF16, read]
+///   7: bf16_norm   (bfloat*)    norm2(xs)*w2 [BF16, write]
+///   8: eps         (float)      epsilon for both norms
+#define rmsnorm_add_bf16_then_rmsnorm_bf16_case(N)                            \
+case N: {                                                                     \
+    threadgroup RMS<float> shared[N];                                         \
+    threadgroup float total;                                                  \
+    const uint offset = dst_id * el_per_block;                                \
+    const uint stop   = min(el_per_block + offset, src_numel);               \
+    using Indexer = indexer_t<uint, false>;                                   \
+    Indexer indexer;                                                          \
+    Divide fast_div;                                                          \
+    /* --- Pass 1: RMS of src, write bf16_out --- */                          \
+    {                                                                         \
+        loader<bfloat, RMS<float>, RMSLoadOp<float>, N, Indexer, uint> load; \
+        block_reducer<RMS<float>, RMSReduceOp<float>, N> reduce(shared);     \
+        RMS<float> v = load(RMSLoadOp<float>::init(), indexer,               \
+                            src_numel, el_per_block, src, offset, tid);       \
+        RMS<float> r = {v.count, (float)v.mean};                              \
+        r = reduce(r, tid);                                                   \
+        if (tid == 0) total = rsqrt(fast_div(r.mean, float(el_per_block)) +  \
+                                    eps);                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                      \
+        for (uint i = tid + offset; i < stop; i += N) {                      \
+            float val = float(src[i]) * total * float(alpha1[i - offset]);   \
+            bf16_out[i] = bfloat(val + float(residual[i]));                  \
+        }                                                                     \
+    }                                                                         \
+    threadgroup_barrier(mem_flags::mem_device);                               \
+    /* --- Pass 2: RMS of bf16_out, write bf16_norm --- */                    \
+    {                                                                         \
+        loader<bfloat, RMS<float>, RMSLoadOp<float>, N, Indexer, uint> load; \
+        block_reducer<RMS<float>, RMSReduceOp<float>, N> reduce(shared);     \
+        RMS<float> v = load(RMSLoadOp<float>::init(), indexer,               \
+                            src_numel, el_per_block, bf16_out, offset, tid); \
+        RMS<float> r = {v.count, (float)v.mean};                              \
+        r = reduce(r, tid);                                                   \
+        if (tid == 0) total = rsqrt(fast_div(r.mean, float(el_per_block)) +  \
+                                    eps);                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                      \
+        for (uint i = tid + offset; i < stop; i += N) {                      \
+            bf16_norm[i] = bfloat(float(bf16_out[i]) * total *               \
+                                  float(alpha2[i - offset]));                 \
+        }                                                                     \
+    }                                                                         \
+    break;                                                                    \
+}
+
+[[host_name("rmsnorm_add_bf16_then_rmsnorm_bf16")]]
+kernel void rmsnorm_add_bf16_then_rmsnorm_bf16(
+    constant uint  &src_numel     [[ buffer(0) ]],
+    constant uint  &el_per_block  [[ buffer(1) ]],
+    device const bfloat *src      [[ buffer(2) ]],
+    device const bfloat *alpha1   [[ buffer(3) ]],
+    device const bfloat *residual [[ buffer(4) ]],
+    device       bfloat *bf16_out [[ buffer(5) ]],
+    device const bfloat *alpha2   [[ buffer(6) ]],
+    device       bfloat *bf16_norm [[ buffer(7) ]],
+    constant float      &eps      [[ buffer(8) ]],
+    uint tid     [[ thread_index_in_threadgroup ]],
+    uint dst_id  [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    switch (max_shared_mem<float>(block_dim)) {
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(1024);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case( 512);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case( 256);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case( 128);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(  64);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(  32);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(  16);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(   8);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(   4);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(   2);
+        rmsnorm_add_bf16_then_rmsnorm_bf16_case(   1);
+    }
+}
+
 /// Partial-RoPE kernel for BF16 tensors.
 ///
 /// Applied to a single-token decode tensor with shape [1, n_heads, 1, head_dim].
