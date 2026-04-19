@@ -2359,4 +2359,108 @@ kernel void rms_norm_partial_rope_qk_bf16(
         }
     }
 }
+
+/// Like rms_norm_partial_rope_qkv_bf16 but additionally writes K and V tokens
+/// directly into the KV cache buffers at position `kv_offset`, eliminating
+/// two separate slice_set dispatches per decode step.
+///
+/// K and V are written to BOTH the dense dst buffers (for attention computation)
+/// AND to the KV cache buffers at stride `kv_head_stride` per head.
+///
+/// q_src, k_src, v_src:    [n_{q,kv}_heads, head_dim] BF16
+/// q_dst, k_dst, v_dst:    dense output buffers [n_{q,kv}_heads, head_dim] BF16
+/// k_cache, v_cache:       KV cache buffers, head stride = kv_head_stride BF16 elements
+/// kv_offset:              token position within each head's slice (in BF16 elements)
+/// kv_head_stride:         stride between KV heads in cache (max_seq_len * head_dim)
+[[host_name("rms_norm_partial_rope_qkv_kvcache_bf16")]]
+kernel void rms_norm_partial_rope_qkv_kvcache_bf16(
+    device const bfloat   * q_src,
+    device const bfloat   * k_src,
+    device const bfloat   * v_src,
+    device const bfloat   * q_norm_weight,
+    device const bfloat   * k_norm_weight,
+    device const bfloat   * cos,
+    device const bfloat   * sin,
+    device       bfloat   * q_dst,
+    device       bfloat   * k_dst,
+    device       bfloat   * v_dst,
+    device       bfloat   * k_cache,
+    device       bfloat   * v_cache,
+    constant uint32_t     & n_q_heads,
+    constant uint32_t     & n_kv_heads,
+    constant uint32_t     & head_dim,
+    constant uint32_t     & rotary_dim,
+    constant float        & eps,
+    constant uint32_t     & kv_offset,      // token offset within each head slice
+    constant uint32_t     & kv_head_stride, // max_seq_len * head_dim elements per KV head
+    uint  tgpig  [[threadgroup_position_in_grid]],
+    uint  tiisg  [[thread_index_in_threadgroup]],
+    uint  tgsize [[threads_per_threadgroup]]
+) {
+    const bool is_q = tgpig < n_q_heads;
+    const bool is_v = !is_q && tgpig >= n_q_heads + n_kv_heads;
+    const uint local_h = is_q ? tgpig
+        : (is_v ? tgpig - n_q_heads - n_kv_heads : tgpig - n_q_heads);
+
+    const device bfloat * src_head = is_q ? (q_src + local_h * head_dim)
+        : is_v ? (v_src + local_h * head_dim)
+        : (k_src + local_h * head_dim);
+    device bfloat * dst_head = is_q ? (q_dst + local_h * head_dim)
+        : is_v ? (v_dst + local_h * head_dim)
+        : (k_dst + local_h * head_dim);
+    // Cache write pointer: cache[head * kv_head_stride + kv_offset + d]
+    device bfloat * cache_head = is_q ? nullptr
+        : is_v ? (v_cache + local_h * kv_head_stride + kv_offset)
+        : (k_cache + local_h * kv_head_stride + kv_offset);
+    const device bfloat * norm_weight = is_q ? q_norm_weight
+        : is_v ? nullptr
+        : k_norm_weight;
+
+    const uint d = tiisg;
+
+    // Pass 1: sum of squares for RMSNorm
+    threadgroup float shared_sos[1024];
+    float local_sos = 0.0f;
+    if (d < head_dim) {
+        float v = float(src_head[d]);
+        local_sos = v * v;
+    }
+    shared_sos[d < 1024 ? d : 0] = local_sos;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
+        if (d < stride) shared_sos[d] += shared_sos[d + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_rms = rsqrt(shared_sos[0] / float(head_dim) + eps);
+
+    // Pass 2: normalize + optional RoPE, then write to dst and cache
+    if (d >= head_dim) return;
+
+    const float w = (is_v || norm_weight == nullptr) ? 1.0f : float(norm_weight[d]);
+    const float normed = float(src_head[d]) * inv_rms * w;
+
+    bfloat out_val;
+    if (is_v || d >= rotary_dim) {
+        out_val = (bfloat)normed;
+    } else {
+        const uint rdim2 = rotary_dim / 2;
+        const uint rot_pair = d % rdim2;
+        const float c = float(cos[rot_pair]);
+        const float s = float(sin[rot_pair]);
+        if (d < rdim2) {
+            const float w2 = (norm_weight == nullptr) ? 1.0f : float(norm_weight[d + rdim2]);
+            const float y_normed = float(src_head[d + rdim2]) * inv_rms * w2;
+            out_val = (bfloat)(normed * c - y_normed * s);
+        } else {
+            const float w2 = (norm_weight == nullptr) ? 1.0f : float(norm_weight[d - rdim2]);
+            const float x_normed = float(src_head[d - rdim2]) * inv_rms * w2;
+            out_val = (bfloat)(x_normed * s + normed * c);
+        }
+    }
+    dst_head[d] = out_val;
+    // Write to KV cache (K and V only, not Q)
+    if (!is_q && cache_head != nullptr) {
+        cache_head[d] = out_val;
+    }
+}
 #endif
