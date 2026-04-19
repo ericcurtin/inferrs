@@ -2307,6 +2307,31 @@ impl Attention {
             // Standard 1-pass sdpa (for N ≤ 1024 or 2-pass unavailable).
             // SDPA output is [b, n_heads, 1, head_dim] — contiguous.
             // reshape directly to [b, 1, hidden] without transpose.
+            #[cfg(feature = "metal")]
+            {
+                if query_states.dtype() == DType::BF16
+                    && matches!(query_states.device(), candle_core::Device::Metal(_))
+                {
+                    let q_elem = query_states.elem_count();
+                    let needs_alloc = self.sdpa_1pass_out.as_ref()
+                        .is_none_or(|t| t.elem_count() != q_elem || t.dtype() != DType::BF16);
+                    if needs_alloc {
+                        self.sdpa_1pass_out = Some(Tensor::zeros(
+                            query_states.shape().dims(), DType::BF16, query_states.device())?);
+                    }
+                    let pa = self.sdpa_1pass_out.as_ref().unwrap();
+                    if candle_nn::ops::sdpa_vector_prealloc(
+                        &query_states,
+                        shared_key,
+                        shared_value,
+                        1.0_f32,
+                        softcapping,
+                        pa,
+                    ) {
+                        return self.apply_o_proj(&pa.clone().reshape((b_sz, q_len, ()))?);
+                    }
+                }
+            }
             return self.apply_o_proj(
                 &candle_nn::ops::sdpa(
                     &query_states,
