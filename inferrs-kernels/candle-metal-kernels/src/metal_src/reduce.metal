@@ -1984,4 +1984,89 @@ kernel void rms_norm_partial_rope_bf16(
         }
     }
 }
+
+/// Fused Q+K rms_norm + partial_rope in a single dispatch.
+///
+/// Combines two `rms_norm_partial_rope_bf16` dispatches (one for Q, one for K)
+/// into a single dispatch with `n_q_heads + n_kv_heads` threadgroups.
+/// Threadgroups [0, n_q_heads) process Q heads using q_norm_weight.
+/// Threadgroups [n_q_heads, n_q_heads+n_kv_heads) process K heads using k_norm_weight.
+/// Both use the same cos/sin tables and rotary_dim.
+///
+/// q_src:        [n_q_heads, head_dim]   BF16
+/// k_src:        [n_kv_heads, head_dim]  BF16
+/// q_norm_weight:[head_dim]              BF16
+/// k_norm_weight:[head_dim]              BF16
+/// cos:          [rotary_dim/2]          BF16
+/// sin:          [rotary_dim/2]          BF16
+/// q_dst:        [n_q_heads, head_dim]   BF16
+/// k_dst:        [n_kv_heads, head_dim]  BF16
+[[host_name("rms_norm_partial_rope_qk_bf16")]]
+kernel void rms_norm_partial_rope_qk_bf16(
+    device const bfloat   * q_src,          // [n_q_heads, head_dim]
+    device const bfloat   * k_src,          // [n_kv_heads, head_dim]
+    device const bfloat   * q_norm_weight,  // [head_dim]
+    device const bfloat   * k_norm_weight,  // [head_dim]
+    device const bfloat   * cos,            // [rotary_dim/2]
+    device const bfloat   * sin,            // [rotary_dim/2]
+    device       bfloat   * q_dst,          // [n_q_heads, head_dim]
+    device       bfloat   * k_dst,          // [n_kv_heads, head_dim]
+    constant uint32_t     & n_q_heads,
+    constant uint32_t     & n_kv_heads,
+    constant uint32_t     & head_dim,
+    constant uint32_t     & rotary_dim,
+    constant float        & eps,
+    uint  tgpig  [[threadgroup_position_in_grid]],  // head_idx (0..n_q_heads+n_kv_heads)
+    uint  tiisg  [[thread_index_in_threadgroup]],   // d_idx within head
+    uint  tgsize [[threads_per_threadgroup]]
+) {
+    const bool is_q = tgpig < n_q_heads;
+    const uint local_h = is_q ? tgpig : tgpig - n_q_heads;
+    const device bfloat * src_head = is_q
+        ? (q_src + local_h * head_dim)
+        : (k_src + local_h * head_dim);
+    device bfloat * dst_head = is_q
+        ? (q_dst + local_h * head_dim)
+        : (k_dst + local_h * head_dim);
+    const device bfloat * norm_weight = is_q ? q_norm_weight : k_norm_weight;
+
+    const uint d = tiisg;
+
+    // --- Pass 1: compute sum of squares for this head ---
+    threadgroup float shared_sos[1024];
+    float local_sos = 0.0f;
+    if (d < head_dim) {
+        float v = float(src_head[d]);
+        local_sos = v * v;
+    }
+    shared_sos[d < 1024 ? d : 0] = local_sos;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
+        if (d < stride) shared_sos[d] += shared_sos[d + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_rms = rsqrt(shared_sos[0] / float(head_dim) + eps);
+
+    // --- Pass 2: normalize + scale + partial RoPE ---
+    if (d >= head_dim) return;
+
+    const float normed = float(src_head[d]) * inv_rms * float(norm_weight[d]);
+
+    if (d >= rotary_dim) {
+        dst_head[d] = (bfloat)normed;
+    } else {
+        const uint rdim2 = rotary_dim / 2;
+        const uint rot_pair = d % rdim2;
+        const float c = float(cos[rot_pair]);
+        const float s = float(sin[rot_pair]);
+        if (d < rdim2) {
+            const float y_normed = float(src_head[d + rdim2]) * inv_rms * float(norm_weight[d + rdim2]);
+            dst_head[d] = (bfloat)(normed * c - y_normed * s);
+        } else {
+            const float x_normed = float(src_head[d - rdim2]) * inv_rms * float(norm_weight[d - rdim2]);
+            dst_head[d] = (bfloat)(x_normed * s + normed * c);
+        }
+    }
+}
 #endif

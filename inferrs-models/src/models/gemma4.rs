@@ -1632,26 +1632,44 @@ impl Attention {
                     let k_flat = k_raw.reshape((b_sz * self.num_kv_heads, head_dim))?;
                     let q_out_flat = q_out.reshape((b_sz * self.num_heads, head_dim))?;
                     let k_out_flat = k_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
-                    let q_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
+                    // Try fused Q+K dispatch first (saves 1 Metal kernel call per layer).
+                    let fused_ok = candle_nn::rotary_emb::rms_norm_partial_rope_qk_bf16(
                         &q_flat,
-                        q_norm_w,
-                        &cos,
-                        &sin,
-                        &q_out_flat,
-                        rotary_dim,
-                        1e-6_f32,
-                    )?;
-                    let k_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
                         &k_flat,
+                        q_norm_w,
                         k_norm_w,
                         &cos,
                         &sin,
+                        &q_out_flat,
                         &k_out_flat,
                         rotary_dim,
                         1e-6_f32,
                     )?;
-                    if q_ok && k_ok {
+                    if fused_ok {
                         qk_fused_norm_rope = true;
+                    } else {
+                        // Fallback: two separate dispatches.
+                        let q_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
+                            &q_flat,
+                            q_norm_w,
+                            &cos,
+                            &sin,
+                            &q_out_flat,
+                            rotary_dim,
+                            1e-6_f32,
+                        )?;
+                        let k_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
+                            &k_flat,
+                            k_norm_w,
+                            &cos,
+                            &sin,
+                            &k_out_flat,
+                            rotary_dim,
+                            1e-6_f32,
+                        )?;
+                        if q_ok && k_ok {
+                            qk_fused_norm_rope = true;
+                        }
                     }
                 }
             }

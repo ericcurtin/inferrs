@@ -981,6 +981,109 @@ pub fn rms_norm_partial_rope_inplace_bf16(
     Ok(true)
 }
 
+/// Fused Q+K rms_norm + partial_rope in a single Metal dispatch.
+/// Reduces 2 kernel dispatches to 1 per donor layer per decode step.
+/// Returns `Ok(true)` on success, `Ok(false)` when the fast path is unavailable.
+#[cfg(feature = "metal")]
+pub fn rms_norm_partial_rope_qk_bf16(
+    q_src: &candle::Tensor,
+    k_src: &candle::Tensor,
+    q_norm_weight: &candle::Tensor,
+    k_norm_weight: &candle::Tensor,
+    cos: &candle::Tensor,
+    sin: &candle::Tensor,
+    q_dst: &candle::Tensor,
+    k_dst: &candle::Tensor,
+    rotary_dim: usize,
+    eps: f32,
+) -> candle::Result<bool> {
+    use candle::{DType, Storage};
+    if q_src.dtype() != DType::BF16
+        || k_src.dtype() != DType::BF16
+        || q_norm_weight.dtype() != DType::BF16
+        || k_norm_weight.dtype() != DType::BF16
+        || cos.dtype() != DType::BF16
+        || sin.dtype() != DType::BF16
+    {
+        return Ok(false);
+    }
+    if !q_src.is_contiguous()
+        || !k_src.is_contiguous()
+        || !cos.is_contiguous()
+        || !sin.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let q_dims = q_src.dims();
+    let k_dims = k_src.dims();
+    if q_dims.len() < 2 || k_dims.len() < 2 {
+        return Ok(false);
+    }
+    let head_dim = *q_dims.last().unwrap();
+    if head_dim != *k_dims.last().unwrap() || head_dim > 1024 {
+        return Ok(false);
+    }
+    let n_q_heads: usize = q_dims.iter().rev().skip(1).product();
+    let n_kv_heads: usize = k_dims.iter().rev().skip(1).product();
+    if rotary_dim > head_dim || rotary_dim % 2 != 0 {
+        return Ok(false);
+    }
+    let (q_sg, q_l) = q_src.storage_and_layout();
+    let (k_sg, k_l) = k_src.storage_and_layout();
+    let (qnw_sg, qnw_l) = q_norm_weight.storage_and_layout();
+    let (knw_sg, knw_l) = k_norm_weight.storage_and_layout();
+    let (cos_sg, cos_l) = cos.storage_and_layout();
+    let (sin_sg, sin_l) = sin.storage_and_layout();
+    let (qd_sg, _qd_l) = q_dst.storage_and_layout();
+    let (kd_sg, _kd_l) = k_dst.storage_and_layout();
+    let (qm, km, qnwm, knwm, cosm, sinm, qdm, kdm) = match (
+        &*q_sg, &*k_sg, &*qnw_sg, &*knw_sg, &*cos_sg, &*sin_sg, &*qd_sg, &*kd_sg,
+    ) {
+        (
+            Storage::Metal(a),
+            Storage::Metal(b),
+            Storage::Metal(c),
+            Storage::Metal(d),
+            Storage::Metal(e),
+            Storage::Metal(f),
+            Storage::Metal(g),
+            Storage::Metal(h),
+        ) => (a, b, c, d, e, f, g, h),
+        _ => return Ok(false),
+    };
+    use candle::backend::BackendStorage;
+    let device = qm.device().clone();
+    let encoder = device.command_encoder().map_err(candle::Error::wrap)?;
+    candle_metal_kernels::call_rms_norm_partial_rope_qk_bf16(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        qm.buffer(),
+        q_l.start_offset() * DType::BF16.size_in_bytes(),
+        km.buffer(),
+        k_l.start_offset() * DType::BF16.size_in_bytes(),
+        qnwm.buffer(),
+        qnw_l.start_offset() * DType::BF16.size_in_bytes(),
+        knwm.buffer(),
+        knw_l.start_offset() * DType::BF16.size_in_bytes(),
+        cosm.buffer(),
+        cos_l.start_offset() * DType::BF16.size_in_bytes(),
+        sinm.buffer(),
+        sin_l.start_offset() * DType::BF16.size_in_bytes(),
+        qdm.buffer(),
+        0,
+        kdm.buffer(),
+        0,
+        n_q_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rotary_dim as u32,
+        eps,
+    )
+    .map_err(candle::Error::wrap)?;
+    Ok(true)
+}
+
 /// Writes directly into the pre-allocated `dst` persistent buffer.
 /// Use this ONLY when K is computed via the standard (non-fused) path,
 /// to avoid the Metal hazard-tracking hang that occurs when both Q and K
