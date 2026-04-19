@@ -646,6 +646,78 @@ impl RmsNorm {
         }
     }
 
+    /// Fused RMSNorm + residual add + scale writing into a pre-allocated output tensor.
+    ///
+    /// On Metal, writes `rms_norm(xs) * weight + residual * scale` into `out`.
+    /// Returns `true` when the prealloc path succeeded; `false` means the caller
+    /// must fall back to `forward_add_scale`.
+    #[cfg(feature = "metal")]
+    pub fn forward_add_scale_prealloc(
+        &self,
+        xs: &Tensor,
+        residual: &Tensor,
+        scale: f32,
+        out: &Tensor,
+    ) -> bool {
+        use candle::{DType, Storage};
+        if xs.dtype() != DType::BF16
+            || residual.dtype() != DType::BF16
+            || out.dtype() != DType::BF16
+            || self.0.weight.dtype() != DType::BF16
+            || !xs.is_contiguous()
+            || !residual.is_contiguous()
+            || xs.elem_count() != out.elem_count()
+            || xs.shape() != residual.shape()
+        {
+            return false;
+        }
+        let device = match xs.device() {
+            candle::Device::Metal(d) => d,
+            _ => return false,
+        };
+        let (xs_s, xs_l) = xs.storage_and_layout();
+        let (w_s, w_l) = self.0.weight.storage_and_layout();
+        let (res_s, res_l) = residual.storage_and_layout();
+        let (out_s, _) = out.storage_and_layout();
+        match (&*xs_s, &*w_s, &*res_s, &*out_s) {
+            (
+                Storage::Metal(xs_m),
+                Storage::Metal(w_m),
+                Storage::Metal(res_m),
+                Storage::Metal(out_m),
+            ) => {
+                if !xs_l.is_contiguous() || !res_l.is_contiguous() {
+                    return false;
+                }
+                let elem_count = xs_l.shape().elem_count();
+                let last_dim = xs_l.dims()[xs_l.shape().rank() - 1];
+                let encoder = match device.command_encoder() {
+                    Ok(e) => e,
+                    Err(_) => return false,
+                };
+                candle_metal_kernels::call_rms_norm_add_scale(
+                    device.metal_device(),
+                    &encoder,
+                    device.kernels(),
+                    "rmsnorm_add_scale_bf16",
+                    elem_count,
+                    last_dim,
+                    self.0.eps as f32,
+                    scale,
+                    xs_m.buffer(),
+                    xs_l.start_offset() * DType::BF16.size_in_bytes(),
+                    w_m.buffer(),
+                    w_l.start_offset() * DType::BF16.size_in_bytes(),
+                    res_m.buffer(),
+                    res_l.start_offset() * DType::BF16.size_in_bytes(),
+                    out_m.buffer(),
+                )
+                .is_ok()
+            }
+            _ => false,
+        }
+    }
+
     /// Fused RMSNorm + residual add writing into a pre-allocated output tensor.
     ///
     /// On Metal, writes directly into `out` without allocating a new buffer.

@@ -2636,6 +2636,9 @@ struct DecoderLayer {
     /// Pre-allocated BF16 output for input_layernorm.forward(xs).
     /// Shape [1,1,hidden_size], reused across decode steps.
     input_norm_out: Option<Tensor>,
+    /// Pre-allocated BF16 output for PLI norm_add_scale (apply_pli_scalar output).
+    /// Shape [1,1,hidden_size], reused across decode steps.
+    pli_output_buf: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -2764,6 +2767,7 @@ impl DecoderLayer {
             fused_norm_second_out: None,
             post_ffn_add_out: None,
             input_norm_out: None,
+            pli_output_buf: None,
         })
     }
 
@@ -2890,6 +2894,9 @@ impl DecoderLayer {
         layer_paged_idx: usize,
     ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
         let residual = xs;
+        #[cfg(feature = "metal")]
+        let normed = self.input_layernorm_prealloc(xs)?;
+        #[cfg(not(feature = "metal"))]
         let normed = self.input_layernorm.forward(xs)?;
         let (attn_out, k, v) = self.self_attn.forward_returning_kv_paged(
             &normed,
@@ -2929,6 +2936,9 @@ impl DecoderLayer {
         shared_value: &Tensor,
     ) -> candle_core::Result<Tensor> {
         let residual = xs;
+        #[cfg(feature = "metal")]
+        let normed = self.input_layernorm_prealloc(xs)?;
+        #[cfg(not(feature = "metal"))]
         let normed = self.input_layernorm.forward(xs)?;
         let attn_out = self.self_attn.forward_with_shared_kv_paged(
             &normed,
@@ -2955,7 +2965,7 @@ impl DecoderLayer {
     /// `try_fused_post_attn_mlp`.
     #[cfg(feature = "metal")]
     fn apply_pli_scalar(
-        &self,
+        &mut self,
         xs: Tensor,
         per_layer_input: Option<&Tensor>,
     ) -> Option<Result<Tensor>> {
@@ -3002,6 +3012,22 @@ impl DecoderLayer {
                 }
             };
 
+            // Use pre-allocated output buffer for PLI norm_add_scale.
+            let elem_count = xs.elem_count();
+            let needs_alloc = self.pli_output_buf.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::BF16);
+            if needs_alloc {
+                self.pli_output_buf = Some(match Tensor::zeros(
+                    xs.shape().dims(), DType::BF16, xs.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+            }
+            if let Some(pa) = self.pli_output_buf.as_ref() {
+                if pli.norm.forward_add_scale_prealloc(&pli_proj_out, &xs, self.layer_scalar_val, pa) {
+                    return Some(Ok(pa.clone()));
+                }
+            }
             Some(
                 pli.norm
                     .forward_add_scale(&pli_proj_out, &xs, self.layer_scalar_val),
