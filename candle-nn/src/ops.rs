@@ -1254,6 +1254,52 @@ pub fn gelu_mul_prealloc(gate: &Tensor, up: &Tensor, out: &Tensor) -> bool {
     }
 }
 
+/// `gelu_mul_f32_bf16i_prealloc`: F32 gate × BF16 up → F32 output (pre-allocated).
+/// Returns `true` on success; caller reuses `out`.
+#[cfg(feature = "metal")]
+pub fn gelu_mul_f32_bf16i_prealloc(gate: &Tensor, up: &Tensor, out: &Tensor) -> bool {
+    use candle::Storage;
+    use candle::DType;
+    if gate.dtype() != DType::F32
+        || up.dtype() != DType::BF16
+        || out.dtype() != DType::F32
+        || gate.elem_count() != out.elem_count()
+        || !gate.is_contiguous()
+        || !up.is_contiguous()
+    {
+        return false;
+    }
+    let device = match gate.device() {
+        candle::Device::Metal(d) => d,
+        _ => return false,
+    };
+    let (g_s, g_l) = gate.storage_and_layout();
+    let (u_s, u_l) = up.storage_and_layout();
+    let (o_s, _) = out.storage_and_layout();
+    match (&*g_s, &*u_s, &*o_s) {
+        (Storage::Metal(gm), Storage::Metal(um), Storage::Metal(om)) => {
+            use candle::backend::BackendStorage;
+            let elem_count = g_l.shape().elem_count();
+            let encoder = match device.command_encoder() {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            candle_metal_kernels::call_gelu_mul_f32_bf16i_f32(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                elem_count,
+                gm.buffer(),
+                g_l.start_offset() * DType::F32.size_in_bytes(),
+                um.buffer(),
+                u_l.start_offset() * DType::BF16.size_in_bytes(),
+                om.buffer(),
+            )
+            .is_ok()
+        }
+        _ => false,
+    }
+}
 
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();

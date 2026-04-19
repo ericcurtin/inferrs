@@ -2223,11 +2223,27 @@ impl Attention {
         #[cfg(feature = "metal")]
         let q_raw_metal_opt = if need_pre_convert && is_metal_bf16_decode {
             let orig_dtype = xs.dtype();
-            // For Q-only decode (shared KV layers): try BF16i→BF16 kernels first
+            // For Q-only decode (shared KV layers): try BF16i→BF16 kernels first.
             // (Q8_0 E2B: 1 dispatch, BF16→BF16), then Q4K BF16i→BF16 (1 dispatch, E4B),
             // then Q4K BF16i→F32 + back-cast, then standard F32 path.
+            // Use qkv_q_out as pre-allocated Q output (same shape as triple GEMV Q output).
             Some(
-                if let Some(out) = self.q_proj.forward_q8_0_bf16i_to_bf16(xs) {
+                if {
+                    // Try prealloc Q8_0 path (eliminates 1 Metal allocation per shared-KV layer/step).
+                    let q_elems = b_sz * q_len * self.num_heads * self.head_dim;
+                    let needs_alloc = self.qkv_q_out.as_ref()
+                        .is_none_or(|t| t.elem_count() != q_elems || t.dtype() != DType::BF16);
+                    if needs_alloc {
+                        self.qkv_q_out = Some(Tensor::zeros(
+                            (b_sz, q_len, self.num_heads * self.head_dim), DType::BF16, xs.device())?);
+                    }
+                    if let Some(oq) = self.qkv_q_out.as_ref() {
+                        self.q_proj.forward_q8_0_bf16i_to_bf16_prealloc(xs, oq)
+                    } else { false }
+                } {
+                    self.qkv_q_out.as_ref().unwrap()
+                        .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+                } else if let Some(out) = self.q_proj.forward_q8_0_bf16i_to_bf16(xs) {
                     // Q8_0 (E2B): BF16→BF16 in 1 dispatch, no back-cast needed.
                     out?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?
                 } else if let Some(out) = self.q_proj.forward_q4k_bf16i_to_bf16(xs) {
@@ -2236,10 +2252,7 @@ impl Attention {
                 } else if let Some(out) = self.q_proj.forward_bf16i(xs) {
                     // Other quant (fallback): BF16→F32 + back-cast.
                     out?.to_dtype(orig_dtype)?.reshape((
-                        b_sz,
-                        q_len,
-                        self.num_heads,
-                        self.head_dim,
+                        b_sz, q_len, self.num_heads, self.head_dim,
                     ))?
                 } else {
                     self.q_proj
@@ -2856,6 +2869,9 @@ struct DecoderLayer {
     /// Pre-allocated BF16 output for PLI projection GEMV (Q8_0 BF16o or Q4K BF16o).
     /// Shape [1,1,hidden_size], reused across decode steps.
     pli_proj_bf16_out: Option<Tensor>,
+    /// Pre-allocated F32 buffer for PLI gelu_mul intermediate.
+    /// Shape [1,1,hidden_size_per_layer_input], reused across decode steps.
+    pli_gelu_out: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -2987,6 +3003,7 @@ impl DecoderLayer {
             pli_output_buf: None,
             pli_gate_out: None,
             pli_proj_bf16_out: None,
+            pli_gelu_out: None,
         })
     }
 
@@ -3213,9 +3230,35 @@ impl DecoderLayer {
                 }
             };
 
-            let pli_mid_f32 = match candle_nn::ops::gelu_mul(&gate_f32, pli_input) {
-                Ok(o) => o,
-                Err(e) => return Some(Err(e)),
+            let pli_mid_f32 = {
+                // pli_input is BF16, gate_f32 is F32 → use F32×BF16→F32 prealloc path.
+                let gelu_elem = gate_f32.elem_count();
+                let needs_alloc = self.pli_gelu_out.as_ref()
+                    .is_none_or(|t| t.elem_count() != gelu_elem || t.dtype() != DType::F32);
+                if needs_alloc {
+                    self.pli_gelu_out = Some(match Tensor::zeros(
+                        gate_f32.shape().dims(), DType::F32, gate_f32.device()) {
+                        Ok(t) => t, Err(e) => return Some(Err(e)),
+                    });
+                }
+                if let Some(pa) = self.pli_gelu_out.as_ref() {
+                    let used = if pli_input.dtype() == DType::BF16 {
+                        candle_nn::ops::gelu_mul_f32_bf16i_prealloc(&gate_f32, pli_input, pa)
+                    } else {
+                        candle_nn::ops::gelu_mul_prealloc(&gate_f32, pli_input, pa)
+                    };
+                    if used {
+                        pa.clone()
+                    } else {
+                        match candle_nn::ops::gelu_mul(&gate_f32, pli_input) {
+                            Ok(o) => o, Err(e) => return Some(Err(e)),
+                        }
+                    }
+                } else {
+                    match candle_nn::ops::gelu_mul(&gate_f32, pli_input) {
+                        Ok(o) => o, Err(e) => return Some(Err(e)),
+                    }
+                }
             };
 
             // PLI projection: F32→BF16 GEMV.
