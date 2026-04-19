@@ -2588,12 +2588,15 @@ struct DecoderLayer {
     pli: Option<LayerPli>,
     /// MoE block; `None` for dense models (e.g. 31B).
     moe: Option<Gemma4MoeBlock>,
-    /// Pre-allocated BF16 output buffer for fused post_attn_norm_add (shape [hidden_size]).
+    /// Pre-allocated BF16 output buffer for fused post_attn_norm_add (shape [1,1,hidden_size]).
     /// Reused across decode steps to eliminate per-step Metal buffer allocations.
     fused_norm_bf16_out: Option<Tensor>,
     /// Pre-allocated second output buffer for fused pre_ffn_norm.
     /// BF16 for E2B (Q8_0 bf16i path), F32 for E4B (Q4K path).
     fused_norm_second_out: Option<Tensor>,
+    /// Pre-allocated BF16 output for post_feedforward_layernorm.forward_add.
+    /// Shape [1,1,hidden_size], reused across decode steps.
+    post_ffn_add_out: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -2720,6 +2723,7 @@ impl DecoderLayer {
             moe,
             fused_norm_bf16_out: None,
             fused_norm_second_out: None,
+            post_ffn_add_out: None,
         })
     }
 
@@ -3018,9 +3022,30 @@ impl DecoderLayer {
             } else {
                 mlp_out
             };
-            let xs = match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
-                Ok(o) => o,
-                Err(e) => return Some(Err(e)),
+            // Pre-allocate post_ffn_add output buffer (hidden_size BF16).
+            let needs_pfn_alloc = self.post_ffn_add_out.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::BF16);
+            if needs_pfn_alloc {
+                self.post_ffn_add_out = Some(match Tensor::zeros(
+                    attn_shape.dims(), DType::BF16, attn_out.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+            }
+            let xs = if let Some(pfn_out) = self.post_ffn_add_out.as_ref() {
+                if self.post_feedforward_layernorm.forward_add_prealloc(&mlp_out, &xs_residual, pfn_out) {
+                    pfn_out.clone()
+                } else {
+                    match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                        Ok(o) => o,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            } else {
+                match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                    Ok(o) => o,
+                    Err(e) => return Some(Err(e)),
+                }
             };
             self.apply_pli_scalar(xs, per_layer_input)
         } else {
@@ -3067,9 +3092,29 @@ impl DecoderLayer {
             } else {
                 mlp_out
             };
-            let xs = match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
-                Ok(o) => o,
-                Err(e) => return Some(Err(e)),
+            let needs_pfn_alloc_q4k = self.post_ffn_add_out.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::BF16);
+            if needs_pfn_alloc_q4k {
+                self.post_ffn_add_out = Some(match Tensor::zeros(
+                    attn_shape.dims(), DType::BF16, attn_out.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+            }
+            let xs = if let Some(pfn_out) = self.post_ffn_add_out.as_ref() {
+                if self.post_feedforward_layernorm.forward_add_prealloc(&mlp_out, &xs_residual, pfn_out) {
+                    pfn_out.clone()
+                } else {
+                    match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                        Ok(o) => o,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            } else {
+                match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                    Ok(o) => o,
+                    Err(e) => return Some(Err(e)),
+                }
             };
             self.apply_pli_scalar(xs, per_layer_input)
         }
