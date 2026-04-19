@@ -312,6 +312,63 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q4K GEMV: F32 input → BF16 output, writing into a pre-allocated destination buffer.
+    /// Returns `true` if the dispatch succeeded; caller reuses `dst`.
+    /// Saves 1 Metal buffer allocation per decode step vs `fwd_mv_q4k_bf16o`.
+    pub fn fwd_mv_q4k_bf16o_prealloc(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &Buffer,
+        dst_offset_bytes: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            return Ok(false);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes();
+            let d_off = dst_offset_bytes + batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16o(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                d_off,
+                dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Q4K GEMV v2: float4 dequantization + dot() hardware instruction.
     /// Accepts F32 input, outputs F32. Uses `kernel_mul_mv_q4_K_f32_v2`.
     /// Alternative to standard Q4K GEMV — may be faster due to vectorized dot().
@@ -710,6 +767,60 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q4K GEMV: BF16 input → BF16 output, writing into a pre-allocated destination buffer.
+    /// Returns `true` if the dispatch succeeded; caller reuses `dst`.
+    /// Saves 1 Metal buffer allocation per decode step vs `fwd_mv_q4k_bf16i_to_bf16`.
+    pub fn fwd_mv_q4k_bf16i_to_bf16_prealloc(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &Buffer,
+        dst_offset_bytes: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let d_off = dst_offset_bytes + batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16i_to_bf16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                d_off,
+                dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output.
     /// Eliminates both the pre-cast (BF16→F32) and post-cast (F32→BF16).
     pub fn fwd_mv_q8_0_bf16i_to_bf16(
@@ -976,6 +1087,70 @@ impl QMetalStorage {
             crate::MetalStorage::new(dst_b, device, dst_shape.elem_count(), DType::F32);
         Ok(((da_storage, dst_shape.clone()), (db_storage, dst_shape)))
     }
+
+    /// Paired Q4K GEMV into pre-allocated F32 buffers.
+    /// Returns `true` if dispatch succeeded; caller reuses `dst_a` and `dst_b`.
+    pub fn fwd_mv2_q4k_prealloc(
+        &self,
+        other: &QMetalStorage,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst_a: &Buffer,
+        dst_b: &Buffer,
+        dst_elem_count: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        if self.dtype != GgmlDType::Q4K || other.dtype != GgmlDType::Q4K {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            return Ok(false);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        if dst_elem_count != m * n {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let src1_offset =
+                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes();
+            let dst_offset = batch_id * n * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv2_q4k(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                src1_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                dst_a,
+                &other.buffer,
+                other.offset,
+                dst_offset,
+                dst_b,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Paired Q8_0 GEMV: computes (self @ xs, other @ xs) in one Metal dispatch.
     /// Used for fused gate+up MLP with Q8_0 weights (E2B Q8_0_full recipe).
     pub fn fwd_mv2_q8_0(

@@ -236,6 +236,20 @@ impl QLinear {
         }
     }
 
+    /// Q4K GEMV: F32 → BF16 into a pre-allocated BF16 tensor.
+    /// Returns `true` on success; caller reuses `out`.
+    /// Saves 1 Metal allocation per decode step vs `forward_q4k_bf16o`.
+    pub fn forward_q4k_bf16o_prealloc(&self, xs_f32: &Tensor, out: &Tensor) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q4k_bf16o_prealloc(xs_f32, out).unwrap_or(false)
+    }
+
     /// Q8_0 GEMV: F32 → BF16 into a pre-allocated BF16 tensor.
     /// Returns `true` on success; caller reuses `out`.
     #[cfg(feature = "metal")]
@@ -507,6 +521,26 @@ impl QLinear {
             .unwrap_or(false)
     }
 
+    /// Single Q4K GEMV: BF16 → BF16 into pre-allocated output tensor.
+    /// Returns `true` if the prealloc dispatch succeeded; caller reuses `out`.
+    /// Saves 1 Metal allocation per decode step vs `forward_q4k_bf16i_to_bf16`.
+    #[cfg(feature = "metal")]
+    pub fn forward_q4k_bf16i_to_bf16_prealloc(
+        &self,
+        xs_bf16: &Tensor,
+        out: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q4k_bf16i_to_bf16_prealloc(xs_bf16, out)
+            .unwrap_or(false)
+    }
+
     /// Paired Q8_0 bf16i GEMV into pre-allocated F32 output tensors.
     /// Returns `true` if succeeded; caller reuses `out_a` / `out_b`.
     #[cfg(feature = "metal")]
@@ -732,6 +766,27 @@ impl QLinear {
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
+    }
+
+    /// Paired Q4K GEMV: F32 input → F32 pair output, into pre-allocated tensors.
+    /// Returns `true` if dispatch succeeded; caller reuses `out_a` and `out_b`.
+    /// Saves 2 Metal allocations per decode step for E4B gate+up GEMV.
+    pub fn forward_paired_q4k_prealloc(
+        &self,
+        other: &QLinear,
+        xs_f32: &Tensor,
+        out_a: &Tensor,
+        out_b: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() || other.bias.is_some() {
+            return false;
+        }
+        let (qt_self, qt_other) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return false,
+        };
+        qt_self.fwd_mv2_q4k_prealloc(qt_other, xs_f32, out_a, out_b)
+            .unwrap_or(false)
     }
 
     /// Forward pass that takes an already-F32 input and returns F32 output.

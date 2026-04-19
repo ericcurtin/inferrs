@@ -795,6 +795,30 @@ impl QTensor {
         }
     }
 
+    /// Q4K GEMV: F32 input → BF16 output, into pre-allocated BF16 tensor.
+    /// Returns `true` on success; caller reuses `out`.
+    pub fn fwd_mv_q4k_bf16o_prealloc(&self, xs: &Tensor, out: &Tensor) -> Result<bool> {
+        if xs.dtype() != DType::F32 || out.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_q4k_bf16o_prealloc(&self.shape, &xs_s, &xs_l, out_metal.buffer(), 0)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Q8_0 GEMV: F32 input → BF16 output, into pre-allocated BF16 tensor.
     /// Returns `true` on success; caller reuses `out`.
     #[cfg(feature = "metal")]
@@ -1259,6 +1283,37 @@ impl QTensor {
         }
     }
 
+    /// Q4K GEMV: BF16 input → BF16 output, into a pre-allocated output tensor.
+    /// Returns `true` if the prealloc dispatch succeeded; caller reuses `out`.
+    pub fn fwd_mv_q4k_bf16i_to_bf16_prealloc(&self, xs: &Tensor, out: &Tensor) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || out.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                let ok = m.fwd_mv_q4k_bf16i_to_bf16_prealloc(
+                    &self.shape,
+                    &xs_s,
+                    &xs_l,
+                    out_metal.buffer(),
+                    0,
+                )?;
+                Ok(ok)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn fwd_mv3_q4k(
         &self,
         kw: &QTensor,
@@ -1670,6 +1725,52 @@ impl QTensor {
                 Ok(Some((out_a, out_b)))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Paired Q4K GEMV into pre-allocated F32 tensors.
+    /// Returns `true` if dispatch succeeded; caller reuses `out_a` and `out_b`.
+    pub fn fwd_mv2_q4k_prealloc(
+        &self,
+        other: &QTensor,
+        xs: &Tensor,
+        out_a: &Tensor,
+        out_b: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        if out_a.dtype() != DType::F32 || out_b.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let oa_g = out_a.storage();
+        let ob_g = out_b.storage();
+        let (oa_metal, ob_metal) = match (&*oa_g, &*ob_g) {
+            (Storage::Metal(a), Storage::Metal(b)) => (a, b),
+            _ => return Ok(false),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(self_m), QStorage::Metal(other_m)) => {
+                if self_m.dtype() != GgmlDType::Q4K || other_m.dtype() != GgmlDType::Q4K {
+                    return Ok(false);
+                }
+                let elem_count = out_a.elem_count();
+                self_m.fwd_mv2_q4k_prealloc(
+                    other_m,
+                    &self.shape,
+                    &xs_s,
+                    &xs_l,
+                    oa_metal.buffer(),
+                    ob_metal.buffer(),
+                    elem_count,
+                )
+            }
+            _ => Ok(false),
         }
     }
 }
