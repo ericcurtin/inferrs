@@ -603,11 +603,15 @@ impl Module for Mlp {
         // and the dense safetensors path are both handled by the regular
         // `Module::forward` and do not benefit from pre-conversion, so we only
         // take the pre-convert branch for quantized non-CUDA non-F32 inputs.
-        let need_pre_convert = self.gate_proj.is_quantized()
-            && !matches!(xs.device(), candle_core::Device::Cuda(_))
-            && xs.dtype() != DType::F32;
+        // `need_pre_convert`: true when we need to cast xs to F32 before the
+        // quantized GEMV (which requires F32 input on Metal/CPU).  When xs is
+        // already F32 (e.g. produced by rmsnorm_bf16i_f32o), no cast is needed
+        // but we still want the quantized GEMV path — captured by `use_quantized`.
+        let use_quantized =
+            self.gate_proj.is_quantized() && !matches!(xs.device(), candle_core::Device::Cuda(_));
+        let need_pre_convert = use_quantized && xs.dtype() != DType::F32;
 
-        if need_pre_convert {
+        if use_quantized {
             let orig_dtype = xs.dtype();
             #[allow(unused_variables)]
             let is_single_token = xs.rank() >= 2 && xs.dim(xs.rank() - 2).unwrap_or(0) == 1;
@@ -2827,7 +2831,46 @@ impl DecoderLayer {
         // Standard Gemma MLP sub-layer (shared expert for MoE, or sole FFN for dense).
         let residual = &xs;
 
-        // Standard Gemma MLP sub-layer (shared expert for MoE, or sole FFN for dense).
+        // For Q4K gate/up (E4B) single-token decode: use rmsnorm_bf16i_f32o to
+        // produce F32 directly from the pre-FFN norm, saving 1 BF16→F32 cast
+        // dispatch inside Mlp::forward (xs.to_dtype(F32) becomes a zero-copy clone).
+        // This saves 1 dispatch per layer × 42 layers = 42 fewer dispatches for E4B.
+        //
+        // After applying the MLP, cast back to BF16 if needed (e.g. when down_proj
+        // is Q6_K in the Q4_K_M GGUF and has no BF16-output variant).
+        //
+        // Only applied when:
+        //  - Metal BF16 single-token decode (xs is [1,1,hidden_size] BF16)
+        //  - MLP gate_proj AND up_proj are Q4K (E4B path; E2B uses Q8_0 bf16i)
+        //  - No MoE (MoE needs BF16 input for routing)
+        #[cfg(feature = "metal")]
+        let shared_mlp_out = if self.moe.is_none()
+            && self.mlp.gate_proj.is_q4k()
+            && self.mlp.up_proj.is_q4k()
+            && xs.dtype() == DType::BF16
+            && matches!(xs.device(), candle_core::Device::Metal(_))
+            && xs.rank() >= 2
+            && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+        {
+            if let Some(normed_f32) = self.pre_feedforward_layernorm.forward_f32_out(&xs) {
+                let mlp_out = normed_f32?.apply(&self.mlp)?;
+                // Ensure output is BF16 (down_proj may be Q6_K and return F32).
+                if mlp_out.dtype() != DType::BF16 {
+                    mlp_out.to_dtype(DType::BF16)?
+                } else {
+                    mlp_out
+                }
+            } else {
+                self.pre_feedforward_layernorm
+                    .forward(&xs)
+                    .and_then(|n| n.apply(&self.mlp))?
+            }
+        } else {
+            self.pre_feedforward_layernorm
+                .forward(&xs)
+                .and_then(|n| n.apply(&self.mlp))?
+        };
+        #[cfg(not(feature = "metal"))]
         let shared_mlp_out = self
             .pre_feedforward_layernorm
             .forward(&xs)
