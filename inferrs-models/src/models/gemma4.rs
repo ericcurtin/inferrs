@@ -2030,18 +2030,83 @@ impl Attention {
                 .forward(xs)?
                 .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
         };
-        // For decode (q_len=1): reshape instead of transpose to keep tensor contiguous,
-        // avoiding the implicit .contiguous() before the RoPE kernel.
-        let query_states = if q_len == 1 {
-            self.q_norm
-                .forward(&q_raw)?
-                .reshape((b_sz, self.num_heads, 1, self.head_dim))?
+        // For decode (q_len=1): fuse Q-norm + Q-rope in a single Metal dispatch using
+        // rms_norm_partial_rope_inplace_bf16. This saves 1 dispatch per shared layer vs
+        // the separate q_norm + partial_rope_inplace path (2 dispatches → 1).
+        //
+        // For prefill (q_len>1) or non-BF16/non-Metal, fall back to the separate path.
+        #[cfg(feature = "metal")]
+        let query_states = if q_len == 1
+            && q_raw.dtype() == DType::BF16
+            && matches!(q_raw.device(), candle_core::Device::Metal(_))
+        {
+            let rotary_dim = self.rotary_emb.rotary_dim;
+            let head_dim = self.head_dim;
+            // Lazily allocate (or reallocate) pre-allocated Q output buffer.
+            let needs_alloc = self
+                .partial_rope_q_out
+                .as_ref()
+                .is_none_or(|t| t.dim(0).unwrap_or(0) != b_sz || t.dtype() != q_raw.dtype());
+            if needs_alloc {
+                self.partial_rope_q_out = Some(Tensor::zeros(
+                    (b_sz, self.num_heads, 1, head_dim),
+                    q_raw.dtype(),
+                    q_raw.device(),
+                )?);
+            }
+            let q_out = self.partial_rope_q_out.as_mut().unwrap();
+            let cos = self.rotary_emb.cos.narrow(0, seqlen_offset, 1)?;
+            let sin = self.rotary_emb.sin.narrow(0, seqlen_offset, 1)?;
+            let (cos, sin) = if q_raw.dtype() != self.rotary_emb.cos.dtype() {
+                (cos.to_dtype(q_raw.dtype())?, sin.to_dtype(q_raw.dtype())?)
+            } else {
+                (cos, sin)
+            };
+            // q_raw: [b, 1, n_heads, head_dim] → flatten to [n_heads, head_dim]
+            let q_flat = q_raw.reshape((b_sz * self.num_heads, head_dim))?;
+            let q_out_flat = q_out.reshape((b_sz * self.num_heads, head_dim))?;
+            let q_norm_w = self.q_norm.weight();
+            // Fused rms_norm + partial_rope in 1 dispatch (saves q_norm dispatch).
+            let fused = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
+                &q_flat,
+                q_norm_w,
+                &cos,
+                &sin,
+                &q_out_flat,
+                rotary_dim,
+                1e-6_f32,
+            )?;
+            if fused {
+                q_out.clone()
+            } else {
+                // Fallback: separate norm + rope.
+                let normed =
+                    self.q_norm
+                        .forward(&q_raw)?
+                        .reshape((b_sz, self.num_heads, 1, head_dim))?;
+                self.apply_rope_q_buffered(&normed, seqlen_offset)?
+            }
         } else {
-            self.q_norm.forward(&q_raw)?.transpose(1, 2)?
+            let query_states = if q_len == 1 {
+                self.q_norm
+                    .forward(&q_raw)?
+                    .reshape((b_sz, self.num_heads, 1, self.head_dim))?
+            } else {
+                self.q_norm.forward(&q_raw)?.transpose(1, 2)?
+            };
+            self.apply_rope_q_buffered(&query_states, seqlen_offset)?
         };
-
-        // RoPE — use buffer-based path for partial-RoPE global layers during decode.
-        let query_states = self.apply_rope_q_buffered(&query_states, seqlen_offset)?;
+        #[cfg(not(feature = "metal"))]
+        let query_states = {
+            let query_states = if q_len == 1 {
+                self.q_norm
+                    .forward(&q_raw)?
+                    .reshape((b_sz, self.num_heads, 1, self.head_dim))?
+            } else {
+                self.q_norm.forward(&q_raw)?.transpose(1, 2)?
+            };
+            self.apply_rope_q_buffered(&query_states, seqlen_offset)?
+        };
 
         // Use shared K,V directly (no cache update for this layer).
         // Use fused SDPA for decode (q_len=1) when available.
