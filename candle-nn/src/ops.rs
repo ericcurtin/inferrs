@@ -727,9 +727,90 @@ pub fn compute_decay_gate(
         );
         return Some(Ok(out));
     }
-    #[allow(unused_variables, unreachable_code)]
-    let _ = (a_input, dt_bias, a_exp);
     None
+}
+
+#[cfg(feature = "metal")]
+/// Single-token SDPA (1-pass sdpa_vector kernel) with pre-allocated output buffer.
+///
+/// Writes the attention result directly into `out` without allocating a new Metal buffer.
+/// Returns `true` when the prealloc path succeeded; `false` on fallback.
+/// Only works for BF16, single-token decode (q_seq=1), supported head dims, no mask.
+pub fn sdpa_vector_prealloc(
+    q: &Tensor, // [1, n_q_heads, 1, head_dim]
+    k: &Tensor, // [1, n_kv_heads, N, head_dim]
+    v: &Tensor, // [1, n_kv_heads, N, head_dim]
+    scale: f32,
+    softcapping: f32,
+    out: &Tensor, // pre-allocated [1, n_q_heads, 1, head_dim] BF16
+) -> bool {
+    use candle::{DType, Storage};
+    use candle_metal_kernels::SdpaDType;
+
+    if q.dtype() != DType::BF16 || out.dtype() != DType::BF16 {
+        return false;
+    }
+    if q.elem_count() != out.elem_count() {
+        return false;
+    }
+    let device = match q.device() {
+        candle::Device::Metal(d) => d,
+        _ => return false,
+    };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    let (o_s, _) = out.storage_and_layout();
+
+    let (q_metal, k_metal, v_metal, out_metal) =
+        match (&*q_s, &*k_s, &*v_s, &*o_s) {
+            (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => {
+                (a, b, c, d)
+            }
+            _ => return false,
+        };
+
+    let q_dims = q_l.dims();
+    let k_dims = k_l.dims();
+
+    // Only support BF16 sdpa_vector with standard head dims.
+    let head_dim = *q_dims.last().unwrap_or(&0);
+    let supported = matches!(head_dim, 32 | 64 | 96 | 128 | 256 | 512);
+    if !supported {
+        return false;
+    }
+
+    // Only for single-token decode.
+    if q_l.dim(2).unwrap_or(0) != 1 {
+        return false;
+    }
+
+    let encoder = match device.command_encoder() {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    candle_metal_kernels::call_sdpa_vector(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        q_l.start_offset(),
+        q_dims,
+        q_metal.buffer(),
+        k_l.start_offset(),
+        k_dims,
+        k_l.stride(),
+        k_metal.buffer(),
+        v_l.start_offset(),
+        v_l.stride(),
+        v_metal.buffer(),
+        out_metal.buffer(),
+        scale,
+        softcapping,
+        SdpaDType::BF16,
+    )
+    .is_ok()
 }
 
 /// Fused RMSNorm + residual add: `dst = rms_norm(x) * alpha + residual`.

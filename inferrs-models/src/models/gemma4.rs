@@ -1095,6 +1095,12 @@ struct Attention {
     sdpa_2pass_maxs: Option<candle_core::Tensor>,
     #[allow(dead_code)]
     sdpa_2pass_out: Option<candle_core::Tensor>,
+    /// Pre-allocated BF16 output buffer for the 1-pass SDPA kernel.
+    /// Shape [1, n_heads, 1, head_dim]. Reused across decode steps when kv_len ≤ 1024.
+    sdpa_1pass_out: Option<candle_core::Tensor>,
+    /// Pre-allocated BF16 output buffer for o_proj GEMV.
+    /// Shape [1, 1, hidden_size]. Reused across decode steps.
+    o_proj_out: Option<candle_core::Tensor>,
 }
 
 impl Attention {
@@ -1252,6 +1258,8 @@ impl Attention {
             sdpa_2pass_sums: None,
             sdpa_2pass_maxs: None,
             sdpa_2pass_out: None,
+            sdpa_1pass_out: None,
+            o_proj_out: None,
         })
     }
 
@@ -1948,15 +1956,55 @@ impl Attention {
                 let attn_result = if let Some(a) = donor_attn {
                     a
                 } else {
-                    candle_nn::ops::sdpa(
-                        &query_states,
-                        &key_states,
-                        &value_states,
-                        None,
-                        false,
-                        1.0_f32,
-                        softcapping,
-                    )?
+                    // Try pre-allocated 1-pass SDPA output buffer (Metal BF16 decode only).
+                    #[cfg(feature = "metal")]
+                    let attn_res = 'sdpa1pass: {
+                        if query_states.dtype() == DType::BF16
+                            && matches!(query_states.device(), candle_core::Device::Metal(_))
+                        {
+                            let q_elem = query_states.elem_count();
+                            let needs_alloc = self.sdpa_1pass_out.as_ref()
+                                .is_none_or(|t| t.elem_count() != q_elem || t.dtype() != DType::BF16);
+                            if needs_alloc {
+                                self.sdpa_1pass_out = Some(match Tensor::zeros(
+                                    query_states.shape().dims(), DType::BF16, query_states.device()) {
+                                    Ok(t) => t,
+                                    Err(_) => break 'sdpa1pass None,
+                                });
+                            }
+                            let pa = self.sdpa_1pass_out.as_ref().unwrap();
+                            if candle_nn::ops::sdpa_vector_prealloc(
+                                &query_states,
+                                &key_states,
+                                &value_states,
+                                1.0_f32,
+                                softcapping,
+                                pa,
+                            ) {
+                                Some(pa.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    #[cfg(not(feature = "metal"))]
+                    let attn_res: Option<Tensor> = None;
+
+                    if let Some(a) = attn_res {
+                        a
+                    } else {
+                        candle_nn::ops::sdpa(
+                            &query_states,
+                            &key_states,
+                            &value_states,
+                            None,
+                            false,
+                            1.0_f32,
+                            softcapping,
+                        )?
+                    }
                 };
                 // For decode (q_len=1), attn_result is [b, n_heads, 1, head_dim] — contiguous.
                 // Directly reshape to [b, 1, n_heads*head_dim] without transpose:
