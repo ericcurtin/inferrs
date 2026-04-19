@@ -99,6 +99,19 @@ impl QLinear {
             _ => None,
         }
     }
+
+    /// Returns the output dimension (number of rows in the weight matrix) for
+    /// quantized layers, or 0 if unavailable.  Used to pre-allocate output buffers
+    /// without needing to run a GEMV first.
+    pub fn inner_output_dim(&self) -> usize {
+        match &self.inner {
+            QMatMul::QTensor(qt) => qt.shape().dims().first().copied().unwrap_or(0),
+            QMatMul::Tensor(w) | QMatMul::TensorF16(w) => {
+                w.dims().first().copied().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
 }
 
 impl Module for QLinear {

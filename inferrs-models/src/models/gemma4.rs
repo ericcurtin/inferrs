@@ -612,6 +612,55 @@ impl Mlp {
     /// xs must be BF16, single-token [1,1,hidden].
     #[cfg(feature = "metal")]
     fn decode_forward_q8_0_bf16i(&mut self, xs: &Tensor) -> Option<Result<Tensor>> {
+        // Fast path: fused gate+up GEMV + gelu_mul in one Metal dispatch.
+        // forward_q8_0_bf16i_gelu_mul_f32_prealloc combines:
+        //   1. gate GEMV (Q8_0 BF16i → F32)
+        //   2. up GEMV   (Q8_0 BF16i → F32)
+        //   3. gelu_tanh(gate) * up → F32 output
+        // into a single dispatch, saving 1 kernel vs the two-step paired+gelu path.
+        #[cfg(feature = "metal")]
+        if xs.dtype() == DType::BF16 && matches!(xs.device(), candle_core::Device::Metal(_)) {
+            // Ensure gelu_mul_buf is allocated.
+            let gelu_elem = self.gate_proj.inner_output_dim();
+            if gelu_elem > 0 {
+                let gelu_ok = self.gelu_mul_buf.as_ref()
+                    .is_some_and(|t| t.elem_count() == gelu_elem && t.dtype() == DType::F32);
+                if !gelu_ok {
+                    // gelu_mul_buf shape: [1, 1, intermediate_size] (flat elem_count = gelu_elem)
+                    self.gelu_mul_buf = Some(match Tensor::zeros(
+                        &[1usize, 1, gelu_elem], DType::F32, xs.device()) {
+                        Ok(t) => t, Err(e) => return Some(Err(e)),
+                    });
+                }
+                if let Some(gelu_buf) = self.gelu_mul_buf.as_ref() {
+                    if self.gate_proj.forward_q8_0_bf16i_gelu_mul_f32_prealloc(
+                        &self.up_proj, xs, gelu_buf)
+                    {
+                        let hidden_act = gelu_buf.clone();
+                        // down_proj prealloc path.
+                        if let Some(dp_pa) = self.down_proj_out.as_ref() {
+                            if dp_pa.dtype() == DType::BF16
+                                && self.down_proj.forward_q8_0_bf16o_prealloc(&hidden_act, dp_pa)
+                            {
+                                return Some(Ok(self.down_proj_out.as_ref().unwrap().clone()));
+                            }
+                        }
+                        if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act) {
+                            let out = match bf16_out { Ok(t) => t, Err(e) => return Some(Err(e)) };
+                            if self.down_proj_out.is_none() {
+                                self.down_proj_out = Some(match Tensor::zeros(
+                                    out.shape().dims(), DType::BF16, out.device()) {
+                                    Ok(t) => t, Err(e) => return Some(Err(e)),
+                                });
+                            }
+                            return Some(Ok(out));
+                        }
+                        return Some(self.down_proj.forward_f32(&hidden_act).and_then(|t| t.to_dtype(DType::BF16)));
+                    }
+                }
+            }
+        }
+        // Fallback: two-step paired GEMV + separate gelu_mul.
         // Prealloc hit path (steady state — no allocations).
         if let (Some(gate_pa), Some(up_pa)) = (self.gate_out.as_ref(), self.up_out.as_ref()) {
             if gate_pa.dtype() == DType::F32 && up_pa.dtype() == DType::F32 {
