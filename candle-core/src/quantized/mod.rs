@@ -1005,6 +1005,31 @@ impl QTensor {
             _ => Ok(None),
         }
     }
+    /// BF16 input → F32 output GEMV into pre-allocated F32 tensor. Supports Q4K and Q8_0.
+    /// Returns `true` on success; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_bf16i_prealloc(&self, xs: &Tensor, out: &Tensor) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_bf16i_prealloc(&self.shape, &xs_s, &xs_l, out_metal.buffer(), 0)
+            }
+            _ => Ok(false),
+        }
+    }
+
     #[cfg(feature = "metal")]
     /// Fused QKV triple Q4K GEMV on Metal: `(q, k, v) = (self@xs, kw@xs, vw@xs)`
     /// in a single dispatch.  Q and K/V may differ in output size (GQA).

@@ -3301,12 +3301,14 @@ impl DecoderLayer {
     ) -> Option<Result<Tensor>> {
         use candle_core::DType;
         if let (Some(pli), Some(pli_input)) = (&self.pli, per_layer_input) {
-            // PLI gate: BF16→F32 GEMV (Q8_0 bf16i path).
+            // PLI gate: BF16→F32 GEMV (Q8_0 or Q4K bf16i path).
             // Use pre-allocated F32 output buffer to save 1 Metal allocation per layer/step.
             let gate_f32 = {
                 let gate_prealloc_ok = if let Some(pa) = self.pli_gate_out.as_ref() {
                     if pa.dtype() == DType::F32 && xs.dtype() == DType::BF16 {
+                        // Try Q8_0 prealloc first, then generic bf16i prealloc (covers Q4K too).
                         pli.gate.forward_q8_0_bf16i_f32_prealloc(&xs, pa)
+                            || pli.gate.forward_bf16i_prealloc(&xs, pa)
                     } else { false }
                 } else { false };
                 if gate_prealloc_ok {
@@ -3360,7 +3362,9 @@ impl DecoderLayer {
             let pli_proj_out = {
                 let proj_prealloc_ok = if let Some(pa) = self.pli_proj_bf16_out.as_ref() {
                     if pa.dtype() == DType::BF16 {
+                        // Try Q8_0 prealloc first, then Q4K prealloc.
                         pli.projection.forward_q8_0_bf16o_prealloc(&pli_mid_f32, pa)
+                            || pli.projection.forward_q4k_bf16o_prealloc(&pli_mid_f32, pa)
                     } else { false }
                 } else { false };
                 if proj_prealloc_ok {

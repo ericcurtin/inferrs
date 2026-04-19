@@ -347,6 +347,20 @@ impl QLinear {
         }
     }
 
+    /// BF16 input → F32 output GEMV into a pre-allocated F32 tensor (Q4K or Q8_0).
+    /// Returns `true` if the prealloc dispatch succeeded; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn forward_bf16i_prealloc(&self, xs: &Tensor, out: &Tensor) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_bf16i_prealloc(xs, out).unwrap_or(false)
+    }
+
     /// Q6K GEMV with BF16 input → F32 output. Saves the BF16→F32 pre-cast.
     /// Returns None for non-Q6K, non-Metal, non-BF16, or bias layers.
     #[cfg(feature = "metal")]
