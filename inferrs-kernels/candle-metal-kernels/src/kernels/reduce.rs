@@ -623,6 +623,90 @@ pub fn call_partial_rope_bf16(
 /// `n_heads × head_dim` threads total; `head_dim` threads per threadgroup.
 /// Requires `head_dim ≤ 1024`.
 #[allow(clippy::too_many_arguments)]
+/// Fused Q+K+V rms_norm (+partial_rope for Q/K) in a single Metal dispatch.
+///
+/// Dispatches (n_q_heads + 2*n_kv_heads) threadgroups.
+/// V heads use identity (all-ones) norm weight and rotary_dim=0.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_partial_rope_qkv_bf16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_src: &Buffer,
+    q_src_offset: usize,
+    k_src: &Buffer,
+    k_src_offset: usize,
+    v_src: &Buffer,
+    v_src_offset: usize,
+    q_norm_weight: &Buffer,
+    q_norm_weight_offset: usize,
+    k_norm_weight: &Buffer,
+    k_norm_weight_offset: usize,
+    cos: &Buffer,
+    cos_offset: usize,
+    sin: &Buffer,
+    sin_offset: usize,
+    q_dst: &Buffer,
+    q_dst_offset: usize,
+    k_dst: &Buffer,
+    k_dst_offset: usize,
+    v_dst: &Buffer,
+    v_dst_offset: usize,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    eps: f32,
+) -> Result<(), MetalKernelError> {
+    let pipeline =
+        kernels.load_pipeline(device, Source::Reduce, "rms_norm_partial_rope_qkv_bf16")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (q_src, q_src_offset),
+            (k_src, k_src_offset),
+            (v_src, v_src_offset),
+            (q_norm_weight, q_norm_weight_offset),
+            (k_norm_weight, k_norm_weight_offset),
+            (cos, cos_offset),
+            (sin, sin_offset),
+            (q_dst, q_dst_offset),
+            (k_dst, k_dst_offset),
+            (v_dst, v_dst_offset),
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            rotary_dim,
+            eps
+        )
+    );
+    let tg_size = MTLSize {
+        width: head_dim as usize,
+        height: 1,
+        depth: 1,
+    };
+    let tg_count = MTLSize {
+        width: (n_q_heads + 2 * n_kv_heads) as usize,
+        height: 1,
+        depth: 1,
+    };
+    encoder.use_resource(q_src, MTLResourceUsage::Read);
+    encoder.use_resource(k_src, MTLResourceUsage::Read);
+    encoder.use_resource(v_src, MTLResourceUsage::Read);
+    encoder.use_resource(q_norm_weight, MTLResourceUsage::Read);
+    encoder.use_resource(k_norm_weight, MTLResourceUsage::Read);
+    encoder.use_resource(cos, MTLResourceUsage::Read);
+    encoder.use_resource(sin, MTLResourceUsage::Read);
+    encoder.use_resource(q_dst, MTLResourceUsage::Write);
+    encoder.use_resource(k_dst, MTLResourceUsage::Write);
+    encoder.use_resource(v_dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tg_count, tg_size);
+    Ok(())
+}
+
 /// Fused Q+K rms_norm + partial_rope in a single Metal dispatch.
 ///
 /// Dispatches (n_q_heads + n_kv_heads) threadgroups, each with head_dim threads.

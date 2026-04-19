@@ -981,6 +981,125 @@ pub fn rms_norm_partial_rope_inplace_bf16(
     Ok(true)
 }
 
+/// Fused Q+K+V rms_norm (+partial_rope for Q/K) in a single Metal dispatch.
+/// Reduces 3 kernel dispatches (Q norm+rope, K norm+rope, V norm) to 1.
+/// V uses identity weight (all-ones). rotary_dim applies to Q and K.
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_partial_rope_qkv_bf16(
+    q_src: &candle::Tensor,
+    k_src: &candle::Tensor,
+    v_src: &candle::Tensor,
+    q_norm_weight: &candle::Tensor,
+    k_norm_weight: &candle::Tensor,
+    cos: &candle::Tensor,
+    sin: &candle::Tensor,
+    q_dst: &candle::Tensor,
+    k_dst: &candle::Tensor,
+    v_dst: &candle::Tensor,
+    rotary_dim: usize,
+    eps: f32,
+) -> candle::Result<bool> {
+    use candle::{DType, Storage};
+    if q_src.dtype() != DType::BF16
+        || k_src.dtype() != DType::BF16
+        || v_src.dtype() != DType::BF16
+        || q_norm_weight.dtype() != DType::BF16
+        || k_norm_weight.dtype() != DType::BF16
+        || cos.dtype() != DType::BF16
+        || sin.dtype() != DType::BF16
+    {
+        return Ok(false);
+    }
+    if !q_src.is_contiguous()
+        || !k_src.is_contiguous()
+        || !v_src.is_contiguous()
+        || !cos.is_contiguous()
+        || !sin.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let q_dims = q_src.dims();
+    let k_dims = k_src.dims();
+    let v_dims = v_src.dims();
+    if q_dims.len() < 2 || k_dims.len() < 2 || v_dims.len() < 2 {
+        return Ok(false);
+    }
+    let head_dim = *q_dims.last().unwrap();
+    if head_dim != *k_dims.last().unwrap() || head_dim != *v_dims.last().unwrap() || head_dim > 1024
+    {
+        return Ok(false);
+    }
+    let n_q_heads: usize = q_dims.iter().rev().skip(1).product();
+    let n_kv_heads: usize = k_dims.iter().rev().skip(1).product();
+    let n_v_heads: usize = v_dims.iter().rev().skip(1).product();
+    if n_kv_heads != n_v_heads || rotary_dim > head_dim || rotary_dim % 2 != 0 {
+        return Ok(false);
+    }
+    let (qs, ql) = q_src.storage_and_layout();
+    let (ks, kl) = k_src.storage_and_layout();
+    let (vs, vl) = v_src.storage_and_layout();
+    let (qnws, qnwl) = q_norm_weight.storage_and_layout();
+    let (knws, knwl) = k_norm_weight.storage_and_layout();
+    let (css, csl) = cos.storage_and_layout();
+    let (sns, snl) = sin.storage_and_layout();
+    let (qds, _qdl) = q_dst.storage_and_layout();
+    let (kds, _kdl) = k_dst.storage_and_layout();
+    let (vds, _vdl) = v_dst.storage_and_layout();
+    let (qm, km, vm, qnwm, knwm, cosm, sinm, qdm, kdm, vdm) = match (
+        &*qs, &*ks, &*vs, &*qnws, &*knws, &*css, &*sns, &*qds, &*kds, &*vds,
+    ) {
+        (
+            Storage::Metal(a),
+            Storage::Metal(b),
+            Storage::Metal(c),
+            Storage::Metal(d),
+            Storage::Metal(e),
+            Storage::Metal(f),
+            Storage::Metal(g),
+            Storage::Metal(h),
+            Storage::Metal(i),
+            Storage::Metal(j),
+        ) => (a, b, c, d, e, f, g, h, i, j),
+        _ => return Ok(false),
+    };
+    use candle::backend::BackendStorage;
+    let device = qm.device().clone();
+    let encoder = device.command_encoder().map_err(candle::Error::wrap)?;
+    candle_metal_kernels::call_rms_norm_partial_rope_qkv_bf16(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        qm.buffer(),
+        ql.start_offset() * DType::BF16.size_in_bytes(),
+        km.buffer(),
+        kl.start_offset() * DType::BF16.size_in_bytes(),
+        vm.buffer(),
+        vl.start_offset() * DType::BF16.size_in_bytes(),
+        qnwm.buffer(),
+        qnwl.start_offset() * DType::BF16.size_in_bytes(),
+        knwm.buffer(),
+        knwl.start_offset() * DType::BF16.size_in_bytes(),
+        cosm.buffer(),
+        csl.start_offset() * DType::BF16.size_in_bytes(),
+        sinm.buffer(),
+        snl.start_offset() * DType::BF16.size_in_bytes(),
+        qdm.buffer(),
+        0,
+        kdm.buffer(),
+        0,
+        vdm.buffer(),
+        0,
+        n_q_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rotary_dim as u32,
+        eps,
+    )
+    .map_err(candle::Error::wrap)?;
+    Ok(true)
+}
+
 /// Fused Q+K rms_norm + partial_rope in a single Metal dispatch.
 /// Reduces 2 kernel dispatches to 1 per donor layer per decode step.
 /// Returns `Ok(true)` on success, `Ok(false)` when the fast path is unavailable.

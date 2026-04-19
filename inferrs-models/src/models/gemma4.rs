@@ -1032,6 +1032,8 @@ struct Attention {
     /// Lazily allocated on the first decode step.
     partial_rope_q_out: Option<Tensor>,
     partial_rope_k_out: Option<Tensor>,
+    /// Pre-allocated V norm output buffer for the fused QKV norm+rope kernel.
+    v_norm_out: Option<Tensor>,
 
     #[allow(dead_code)]
     flash_attn_tmp: Option<candle_core::Tensor>,
@@ -1195,6 +1197,7 @@ impl Attention {
             // Lazily allocated on first decode step; None until then.
             partial_rope_q_out: None,
             partial_rope_k_out: None,
+            v_norm_out: None,
 
             flash_attn_tmp: None,
             sdpa_2pass_intermediate: None,
@@ -1577,29 +1580,24 @@ impl Attention {
         // Track whether the fused norm+rope path was used (to skip apply_rope_qkv_buffered).
         let mut qk_fused_norm_rope = false;
         let (query_states, key_states, value_states) = if q_len == 1 {
-            // V norm: always a separate dispatch (no RoPE to fuse).
+            // V norm: always needed (separate or fused).
             let v_norm_w = if v_raw.dtype() == DType::F32 {
                 &self.v_norm_weight_f32
             } else {
                 &self.v_norm_weight
             };
-            let v_normed = apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?;
-            let v_states = v_normed.reshape((b_sz, self.num_kv_heads, 1, self.head_dim))?;
-            // Q and K: try fused norm+RoPE (Metal BF16, all attention layers).
-            // Works for both partial RoPE (global, rotary_dim < head_dim) and full RoPE
-            // (sliding, rotary_dim == head_dim). The kernel handles both by treating
-            // rotary_dim == head_dim as all-elements-rotated.
             let rotary_dim = self.rotary_emb.rotary_dim;
             let head_dim = self.head_dim;
-            // Try fused norm+rope on Metal BF16 for all decode layers.
+
+            // Try fused Q+K+V norm+rope in a single Metal dispatch (saves 2 dispatches/layer
+            // vs the old separate V norm + QK fused path).
             #[cfg(feature = "metal")]
-            {
+            let (q_states, k_states, v_states) = 'metal: {
                 if q_raw.dtype() == DType::BF16
                     && matches!(q_raw.device(), candle_core::Device::Metal(_))
                     && rotary_dim <= head_dim
                     && head_dim <= 1024
                 {
-                    // Ensure output buffers exist.
                     let needs_alloc = self.partial_rope_q_out.as_ref().is_none_or(|t| {
                         t.dim(0).unwrap_or(0) != b_sz || t.dtype() != q_raw.dtype()
                     });
@@ -1614,9 +1612,15 @@ impl Attention {
                             k_raw.dtype(),
                             k_raw.device(),
                         )?);
+                        self.v_norm_out = Some(Tensor::zeros(
+                            (b_sz, self.num_kv_heads, 1, head_dim),
+                            v_raw.dtype(),
+                            v_raw.device(),
+                        )?);
                     }
                     let q_out = self.partial_rope_q_out.as_mut().unwrap();
                     let k_out = self.partial_rope_k_out.as_mut().unwrap();
+                    let v_out = self.v_norm_out.as_mut().unwrap();
 
                     let cos = self.rotary_emb.cos.narrow(0, seqlen_offset, 1)?;
                     let sin = self.rotary_emb.sin.narrow(0, seqlen_offset, 1)?;
@@ -1627,13 +1631,36 @@ impl Attention {
                     };
                     let q_norm_w = self.q_norm.weight();
                     let k_norm_w = self.k_norm.weight();
-                    // q_raw: [b, q_len, n_heads, head_dim] → flatten to [b*n_heads, head_dim].
                     let q_flat = q_raw.reshape((b_sz * self.num_heads, head_dim))?;
                     let k_flat = k_raw.reshape((b_sz * self.num_kv_heads, head_dim))?;
+                    let v_flat = v_raw
+                        .contiguous()?
+                        .reshape((b_sz * self.num_kv_heads, head_dim))?;
                     let q_out_flat = q_out.reshape((b_sz * self.num_heads, head_dim))?;
                     let k_out_flat = k_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
-                    // Try fused Q+K dispatch first (saves 1 Metal kernel call per layer).
-                    let fused_ok = candle_nn::rotary_emb::rms_norm_partial_rope_qk_bf16(
+                    let v_out_flat = v_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
+
+                    // Try fused Q+K+V in a single dispatch.
+                    if candle_nn::rotary_emb::rms_norm_partial_rope_qkv_bf16(
+                        &q_flat,
+                        &k_flat,
+                        &v_flat,
+                        q_norm_w,
+                        k_norm_w,
+                        &cos,
+                        &sin,
+                        &q_out_flat,
+                        &k_out_flat,
+                        &v_out_flat,
+                        rotary_dim,
+                        1e-6_f32,
+                    )? {
+                        qk_fused_norm_rope = true;
+                        break 'metal (q_out.clone(), k_out.clone(), v_out.clone());
+                    }
+
+                    // Fallback: fused Q+K, separate V norm.
+                    if candle_nn::rotary_emb::rms_norm_partial_rope_qk_bf16(
                         &q_flat,
                         &k_flat,
                         q_norm_w,
@@ -1644,50 +1671,65 @@ impl Attention {
                         &k_out_flat,
                         rotary_dim,
                         1e-6_f32,
-                    )?;
-                    if fused_ok {
+                    )? {
                         qk_fused_norm_rope = true;
-                    } else {
-                        // Fallback: two separate dispatches.
-                        let q_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
-                            &q_flat,
-                            q_norm_w,
-                            &cos,
-                            &sin,
-                            &q_out_flat,
-                            rotary_dim,
-                            1e-6_f32,
-                        )?;
-                        let k_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
-                            &k_flat,
-                            k_norm_w,
-                            &cos,
-                            &sin,
-                            &k_out_flat,
-                            rotary_dim,
-                            1e-6_f32,
-                        )?;
-                        if q_ok && k_ok {
-                            qk_fused_norm_rope = true;
-                        }
+                        let v_normed = apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?;
+                        let v_states = v_normed.reshape((b_sz, self.num_kv_heads, 1, head_dim))?;
+                        break 'metal (q_out.clone(), k_out.clone(), v_states);
+                    }
+
+                    // Fallback: two separate dispatches for Q and K.
+                    let q_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
+                        &q_flat,
+                        q_norm_w,
+                        &cos,
+                        &sin,
+                        &q_out_flat,
+                        rotary_dim,
+                        1e-6_f32,
+                    )?;
+                    let k_ok = candle_nn::rotary_emb::rms_norm_partial_rope_inplace_bf16(
+                        &k_flat,
+                        k_norm_w,
+                        &cos,
+                        &sin,
+                        &k_out_flat,
+                        rotary_dim,
+                        1e-6_f32,
+                    )?;
+                    if q_ok && k_ok {
+                        qk_fused_norm_rope = true;
                     }
                 }
-            }
-
-            if qk_fused_norm_rope {
-                let q_out = self.partial_rope_q_out.as_ref().unwrap();
-                let k_out = self.partial_rope_k_out.as_ref().unwrap();
-                (q_out.clone(), k_out.clone(), v_states)
-            } else {
-                // Standard separate norm + RoPE path (fallback).
+                let v_normed = apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?;
+                let v_states = v_normed.reshape((b_sz, self.num_kv_heads, 1, head_dim))?;
+                if qk_fused_norm_rope {
+                    let q_out = self.partial_rope_q_out.as_ref().unwrap();
+                    let k_out = self.partial_rope_k_out.as_ref().unwrap();
+                    (q_out.clone(), k_out.clone(), v_states)
+                } else {
+                    let q_normed = self.q_norm.forward(&q_raw)?;
+                    let k_normed = self.k_norm.forward(&k_raw)?;
+                    (
+                        q_normed.reshape((b_sz, self.num_heads, 1, head_dim))?,
+                        k_normed.reshape((b_sz, self.num_kv_heads, 1, head_dim))?,
+                        v_states,
+                    )
+                }
+            };
+            #[cfg(not(feature = "metal"))]
+            let (q_states, k_states, v_states) = {
+                let v_normed = apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?;
+                let v_s = v_normed.reshape((b_sz, self.num_kv_heads, 1, head_dim))?;
                 let q_normed = self.q_norm.forward(&q_raw)?;
                 let k_normed = self.k_norm.forward(&k_raw)?;
                 (
-                    q_normed.reshape((b_sz, self.num_heads, 1, self.head_dim))?,
-                    k_normed.reshape((b_sz, self.num_kv_heads, 1, self.head_dim))?,
-                    v_states,
+                    q_normed.reshape((b_sz, self.num_heads, 1, head_dim))?,
+                    k_normed.reshape((b_sz, self.num_kv_heads, 1, head_dim))?,
+                    v_s,
                 )
-            }
+            };
+            (q_states, k_states, v_states)
         } else {
             let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
             let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;

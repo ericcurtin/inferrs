@@ -1985,6 +1985,100 @@ kernel void rms_norm_partial_rope_bf16(
     }
 }
 
+/// Fused Q+K+V rms_norm (+partial_rope for Q/K) in a single dispatch.
+///
+/// Extends rms_norm_partial_rope_qk_bf16 to also normalize V (no RoPE, identity weight).
+/// Dispatches n_q_heads + 2*n_kv_heads threadgroups:
+///   [0, n_q_heads): Q heads — norm + partial_rope with q_norm_weight
+///   [n_q_heads, n_q_heads+n_kv_heads): K heads — norm + partial_rope with k_norm_weight
+///   [n_q_heads+n_kv_heads, n_q_heads+2*n_kv_heads): V heads — norm only (rotary_dim=0)
+///
+/// q_src, k_src: [n_{q,kv}_heads, head_dim] BF16
+/// v_src:        [n_kv_heads, head_dim]      BF16
+/// q_norm_weight, k_norm_weight: [head_dim]  BF16
+/// cos: [rotary_dim/2] BF16, sin: [rotary_dim/2] BF16
+/// q_dst, k_dst, v_dst: output buffers
+[[host_name("rms_norm_partial_rope_qkv_bf16")]]
+kernel void rms_norm_partial_rope_qkv_bf16(
+    device const bfloat   * q_src,
+    device const bfloat   * k_src,
+    device const bfloat   * v_src,
+    device const bfloat   * q_norm_weight,
+    device const bfloat   * k_norm_weight,
+    device const bfloat   * cos,
+    device const bfloat   * sin,
+    device       bfloat   * q_dst,
+    device       bfloat   * k_dst,
+    device       bfloat   * v_dst,
+    constant uint32_t     & n_q_heads,
+    constant uint32_t     & n_kv_heads,
+    constant uint32_t     & head_dim,
+    constant uint32_t     & rotary_dim,
+    constant float        & eps,
+    uint  tgpig  [[threadgroup_position_in_grid]],
+    uint  tiisg  [[thread_index_in_threadgroup]],
+    uint  tgsize [[threads_per_threadgroup]]
+) {
+    // Classify this threadgroup: Q (0), K (1), or V (2)
+    const bool is_q = tgpig < n_q_heads;
+    const bool is_v = !is_q && tgpig >= n_q_heads + n_kv_heads;
+    // local head index within the type
+    const uint local_h = is_q ? tgpig
+        : (is_v ? tgpig - n_q_heads - n_kv_heads : tgpig - n_q_heads);
+
+    const device bfloat * src_head = is_q ? (q_src + local_h * head_dim)
+        : is_v ? (v_src + local_h * head_dim)
+        : (k_src + local_h * head_dim);
+    device bfloat * dst_head = is_q ? (q_dst + local_h * head_dim)
+        : is_v ? (v_dst + local_h * head_dim)
+        : (k_dst + local_h * head_dim);
+    // V uses all-ones weight (identity), so we hardcode weight=1 for V.
+    const device bfloat * norm_weight = is_q ? q_norm_weight
+        : is_v ? nullptr  // not used for V
+        : k_norm_weight;
+
+    const uint d = tiisg;
+
+    // --- Pass 1: compute sum of squares ---
+    threadgroup float shared_sos[1024];
+    float local_sos = 0.0f;
+    if (d < head_dim) {
+        float v = float(src_head[d]);
+        local_sos = v * v;
+    }
+    shared_sos[d < 1024 ? d : 0] = local_sos;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
+        if (d < stride) shared_sos[d] += shared_sos[d + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_rms = rsqrt(shared_sos[0] / float(head_dim) + eps);
+
+    // --- Pass 2: normalize + optional RoPE ---
+    if (d >= head_dim) return;
+
+    const float w = (is_v || norm_weight == nullptr) ? 1.0f : float(norm_weight[d]);
+    const float normed = float(src_head[d]) * inv_rms * w;
+
+    if (is_v || d >= rotary_dim) {
+        dst_head[d] = (bfloat)normed;
+    } else {
+        const uint rdim2 = rotary_dim / 2;
+        const uint rot_pair = d % rdim2;
+        const float c = float(cos[rot_pair]);
+        const float s = float(sin[rot_pair]);
+        if (d < rdim2) {
+            const float w2 = (norm_weight == nullptr) ? 1.0f : float(norm_weight[d + rdim2]);
+            const float y_normed = float(src_head[d + rdim2]) * inv_rms * w2;
+            dst_head[d] = (bfloat)(normed * c - y_normed * s);
+        } else {
+            const float w2 = (norm_weight == nullptr) ? 1.0f : float(norm_weight[d - rdim2]);
+            const float x_normed = float(src_head[d - rdim2]) * inv_rms * w2;
+            dst_head[d] = (bfloat)(x_normed * s + normed * c);
+        }
+    }
+}
+
 /// Fused Q+K rms_norm + partial_rope in a single dispatch.
 ///
 /// Combines two `rms_norm_partial_rope_bf16` dispatches (one for Q, one for K)
