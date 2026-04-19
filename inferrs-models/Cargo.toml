@@ -11,6 +11,11 @@ path = "src/lib.rs"
 
 [features]
 default = []
+accelerate = [
+    "candle-core/accelerate",
+    "candle-nn/accelerate",
+    "candle-transformers/accelerate",
+]
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",

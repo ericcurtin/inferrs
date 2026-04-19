@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "accelerate-src"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "415ed64958754dbe991900f3940677e6a7eefb4d7367afd70d642677b0c7d19d"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -306,6 +312,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 name = "candle-core"
 version = "0.9.2"
 dependencies = [
+ "accelerate-src",
  "byteorder",
  "candle-kernels",
  "candle-metal-kernels",
@@ -314,6 +321,7 @@ dependencies = [
  "float8 0.6.1",
  "gemm 0.19.0",
  "half",
+ "libc",
  "libm",
  "memmap2",
  "num-traits",
@@ -357,6 +365,7 @@ dependencies = [
 name = "candle-nn"
 version = "0.9.2"
 dependencies = [
+ "accelerate-src",
  "candle-core",
  "candle-metal-kernels",
  "half",
@@ -375,6 +384,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b538ec4aa807c416a2ddd3621044888f188827862e2a6fcacba4738e89795d01"
 dependencies = [
+ "accelerate-src",
  "byteorder",
  "candle-core",
  "candle-nn",

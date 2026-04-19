@@ -13,10 +13,10 @@ path = "src/main.rs"
 # the Vulkan/MoltenVK and OpenVINO plugins at runtime.
 [target.'cfg(target_os = "macos")'.dependencies]
 libloading = "0.8"
-candle-core = { workspace = true, features = ["metal"] }
-candle-nn = { workspace = true, features = ["metal"] }
-candle-transformers = { workspace = true, features = ["metal"] }
-inferrs-models = { path = "../inferrs-models", features = ["metal"] }
+candle-core = { workspace = true, features = ["metal", "accelerate"] }
+candle-nn = { workspace = true, features = ["metal", "accelerate"] }
+candle-transformers = { workspace = true, features = ["metal", "accelerate"] }
+inferrs-models = { path = "../inferrs-models", features = ["metal", "accelerate"] }
 
 
 [dependencies]
