@@ -246,14 +246,20 @@ impl FullAttention {
             .narrow(3, self.head_dim, self.head_dim)?
             .reshape((b, t, self.num_heads * self.head_dim))?;
 
-        // Reshape to [b, heads, t, head_dim]
-        let q = q_raw.transpose(1, 2)?;
-        let k = k_raw
+        // Apply k_norm BEFORE transpose while k_raw is still contiguous,
+        // avoiding the .contiguous() copy that apply_rms_norm_heads would need.
+        let k = self
+            .k_norm
+            .forward(&k_raw.reshape((b * t * self.num_kv_heads, self.head_dim))?)?
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?; // → [b, kv_h, t, head_dim]
         let v = v_raw
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
+
+        // q_raw is non-contiguous (narrow on interleaved layout), so we must
+        // transpose first and let apply_rms_norm_heads handle the contiguous copy.
+        let q = q_raw.transpose(1, 2)?;
 
         Ok((q, k, v, gate))
     }
@@ -269,9 +275,9 @@ impl FullAttention {
         let orig_dtype = x.dtype();
         let (q, k, v, gate) = self.project_qkv(x)?;
 
-        // QK norms (per-head, on head_dim)
+        // Q norm (q is already [b, h, t, d] non-contiguous due to interleaved narrow).
+        // K norm was already applied in project_qkv before the transpose.
         let q = apply_rms_norm_heads(&q, &self.q_norm)?;
-        let k = apply_rms_norm_heads(&k, &self.k_norm)?;
 
         // RoPE
         let cos_slice = cos.narrow(0, seqlen_offset, t)?;
@@ -351,8 +357,9 @@ impl FullAttention {
         let (q, k, v, gate) = self.project_qkv(x)?;
 
         // ── QK-norm ──────────────────────────────────────────────────────────
+        // K norm was already applied in project_qkv (before transpose, no copy needed).
+        // Q norm must be applied here (q is non-contiguous due to interleaved narrow).
         let q = apply_rms_norm_heads(&q, &self.q_norm)?;
-        let k = apply_rms_norm_heads(&k, &self.k_norm)?;
 
         // ── RoPE ─────────────────────────────────────────────────────────────
         let cos_slice = ctx.cos.narrow(0, seqlen_offset, t)?;
