@@ -2408,10 +2408,11 @@ kernel void rms_norm_partial_rope_qkv_kvcache_bf16(
     device bfloat * dst_head = is_q ? (q_dst + local_h * head_dim)
         : is_v ? (v_dst + local_h * head_dim)
         : (k_dst + local_h * head_dim);
-    // Cache write pointer: cache[head * kv_head_stride + kv_offset + d]
+    // Cache write pointer: cache[head * kv_head_stride + kv_offset * head_dim + d]
+    // kv_offset is the token index; multiply by head_dim to get element offset.
     device bfloat * cache_head = is_q ? nullptr
-        : is_v ? (v_cache + local_h * kv_head_stride + kv_offset)
-        : (k_cache + local_h * kv_head_stride + kv_offset);
+        : is_v ? (v_cache + local_h * kv_head_stride + kv_offset * head_dim)
+        : (k_cache + local_h * kv_head_stride + kv_offset * head_dim);
     const device bfloat * norm_weight = is_q ? q_norm_weight
         : is_v ? nullptr
         : k_norm_weight;

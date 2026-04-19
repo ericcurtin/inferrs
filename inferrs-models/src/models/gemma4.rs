@@ -1911,6 +1911,8 @@ impl Attention {
         // For prefill (q_len>1): transpose as before.
         // Track whether the fused norm+rope path was used (to skip apply_rope_qkv_buffered).
         let mut qk_fused_norm_rope = false;
+        // Track whether the fused kvcache kernel wrote directly into the rotating KV cache.
+        let mut kv_rotating_did_fused_write = false;
         let (query_states, key_states, value_states) = if q_len == 1 {
             // V norm: always needed (separate or fused).
             let v_norm_w = if v_raw.dtype() == DType::F32 {
@@ -1970,7 +1972,27 @@ impl Attention {
                     let k_out_flat = k_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
                     let v_out_flat = v_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
 
-                    // Try fused Q+K+V in a single dispatch.
+                    // Try fused Q+K+V norm+rope WITH direct KV cache write (sliding layers only).
+                    // Eliminates 2 slice_set dispatches per layer per decode step.
+                    if q_len == 1 && !kv_rotating_did_fused_write {
+                        if let KvCache::Rotating(c) = &mut self.kv_cache {
+                            if let Some((kb, vb, write_offset, _valid)) = c.kv_buf_for_fused_write() {
+                                if candle_nn::rotary_emb::rms_norm_partial_rope_qkv_kvcache_bf16(
+                                    &q_flat, &k_flat, &v_flat,
+                                    q_norm_w, k_norm_w, &cos, &sin,
+                                    &q_out_flat, &k_out_flat, &v_out_flat,
+                                    kb, vb,
+                                    rotary_dim, 1e-6_f32, write_offset,
+                                )? {
+                                    qk_fused_norm_rope = true;
+                                    kv_rotating_did_fused_write = true;
+                                    break 'metal (q_out.clone(), k_out.clone(), v_out.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    // Try fused Q+K+V in a single dispatch (without KV cache write).
                     if candle_nn::rotary_emb::rms_norm_partial_rope_qkv_bf16(
                         &q_flat,
                         &k_flat,
@@ -2138,7 +2160,13 @@ impl Attention {
                 }
             }
             // Sliding layers: always use rotating KV cache (TQ not applied).
-            (_, KvCache::Rotating(c)) => c.append(&key_states, &value_states)?,
+            (_, KvCache::Rotating(c)) => {
+                if kv_rotating_did_fused_write {
+                    c.advance_one_token_and_view()?
+                } else {
+                    c.append(&key_states, &value_states)?
+                }
+            }
             // No TQ: plain cache for both types.
             (None, KvCache::Normal(c)) => c.append(&key_states, &value_states)?,
         };
