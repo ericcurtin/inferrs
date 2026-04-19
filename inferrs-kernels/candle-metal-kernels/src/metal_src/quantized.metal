@@ -3265,6 +3265,81 @@ kernel void kernel_mul_mv_q8_0_bf16i_f32(
     kernel_mul_mv_q8_0_bf16i_impl_4sg(src0,src1_bf16,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,shmem,tgpig,tiisg,sgitg);
 }
 
+/// Q8_0 GEMV fused with GELU × BF16 elementwise multiply: BF16 input → F32 output.
+///
+/// Fuses three operations into one kernel dispatch:
+///   gate_out = GEMV(src1_bf16, src0_q8)       [Q8_0 BF16i GEMV]
+///   gelu_out = gelu_tanh(gate_out)             [GELU activation]
+///   dst      = gelu_out * bf16_to_f32(pli[i])  [elementwise BF16 multiply]
+///
+/// Used for the PLI gate projection in Gemma4 decoder layers.
+/// Eliminates 1 Metal dispatch per PLI layer per decode step vs. the two-step
+/// path (bf16i GEMV then gelu_mul_f32_bf16i kernel).
+///
+/// Parameters match kernel_mul_mv_q8_0_bf16i_f32, plus:
+///   pli_embed (ushort*): BF16 per-layer embedding vector, length ne01.
+[[host_name("kernel_mul_mv_q8_0_bf16i_gelu_mul_bf16i_f32")]]
+kernel void kernel_mul_mv_q8_0_bf16i_gelu_mul_bf16i_f32(
+        device const  void   * src0,
+        device const ushort  * src1_bf16,   // BF16 activation
+        device const ushort  * pli_embed,   // BF16 per-layer embedding
+        device       float   * dst,
+        constant   int64_t & ne00, constant   int64_t & ne01, constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne0,  constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    // Reuse the standard bf16i impl for the reduction, then post-process with gelu*pli.
+    constexpr int NR0 = 2, NSG = 4, NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = ne00/QK8_0;
+    const int r0 = tgpig.x * NR0, r1 = tgpig.y, im = tgpig.z;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = r0*nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q8_0 * x = (device const block_q8_0 *)src0 + off0;
+    device const ushort * y = src1_bf16 + r1*ne10 + im*ne00*ne1;
+    const int ix = tiisg/(NW/NQ), il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NQ], sumf[NR0] = {0.f};
+    device const ushort * yb = y + ib0*QK8_0 + il*NQ;
+    device const block_q8_0 * ax[NR0];
+    for (int row = 0; row < NR0; ++row) { ax[row] = x + row*nb; }
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (int i = 0; i < NQ; ++i) { yl[i] = as_type<float>(uint(yb[i]) << 16); }
+        for (int row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            float s = 0.f;
+            for (int i = 0; i < NQ; ++i) { s += qs[i] * yl[i]; }
+            sumf[row] += s * ax[row][ib].d;
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+    threadgroup float shmem[NW * NR0];
+    for (int row = 0; row < NR0; ++row) {
+        if (sgitg == 0) { shmem[NW*row + tiisg] = 0.f; }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int row = 0; row < NR0; ++row) { if (tiisg == 0) { shmem[NW*row + sgitg] = sumf[row]; } }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // GELU helper (pytorch tanh variant): 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+    constexpr float kAlpha = 0.7978845608028654f;
+    constexpr float kBeta  = 0.044715f;
+    for (int row = 0; row < NR0; ++row) {
+        float tot = simd_sum(shmem[NW*row + tiisg]);
+        if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {
+            // Apply gelu_tanh then multiply by pli_embed[r0+row] (BF16 → F32).
+            float t = kAlpha * (tot + kBeta * tot * tot * tot);
+            float gelu = 0.5f * tot * (1.0f + precise::tanh(t));
+            float pli  = as_type<float>(uint(pli_embed[r0 + row]) << 16);
+            dst[r1*ne0 + im*ne0*ne1 + r0 + row] = gelu * pli;
+        }
+    }
+}
+
 /// Q8_0 GEMV: BF16 input → BF16 output.
 /// Combines bf16i conversion (input) and f32→bf16 (output) to eliminate
 /// both the pre-cast and post-cast dispatches for the o_proj / down_proj paths.

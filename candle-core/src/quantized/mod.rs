@@ -923,6 +923,45 @@ impl QTensor {
         }
     }
 
+    /// Q8_0 GEMV fused with GELU × BF16i elementwise multiply → F32 output (prealloc).
+    ///
+    /// Computes `gelu_tanh(GEMV(xs, self)) * pli_embed[i]` in one kernel dispatch.
+    /// Saves 1 Metal dispatch per PLI gate layer vs the two-step path.
+    /// Returns `Ok(true)` when the kernel was dispatched successfully.
+    pub fn fwd_mv_q8_0_bf16i_gelu_mul_bf16i_f32_prealloc(
+        &self,
+        xs: &Tensor,
+        pli_embed: &Tensor,
+        out: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || pli_embed.dtype() != DType::BF16 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let pli_g = pli_embed.storage();
+        let (pli_s, pli_l) = match &*pli_g {
+            Storage::Metal(s) => (s.clone(), pli_embed.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_q8_0_bf16i_gelu_mul_bf16i_f32_prealloc(
+                    &self.shape, &xs_s, &xs_l, &pli_s, &pli_l, out_metal.buffer(), 0,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Q6K GEMV: BF16 input → F32 output. Saves the BF16→F32 pre-cast dispatch.
     pub fn fwd_mv_q6k_bf16i_f32(&self, xs: &Tensor) -> Result<Tensor> {
         if xs.dtype() != DType::BF16 {

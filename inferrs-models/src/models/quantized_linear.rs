@@ -311,6 +311,32 @@ impl QLinear {
         qt.fwd_mv_q8_0_bf16i_f32_prealloc(xs_bf16, out).unwrap_or(false)
     }
 
+    /// Q8_0 GEMV fused with GELU × BF16i elementwise multiply → F32 output (prealloc).
+    ///
+    /// Computes `gelu_tanh(GEMV(xs_bf16, self)) * pli_embed[i]` in one kernel dispatch
+    /// and writes the F32 result into the pre-allocated `out` tensor.
+    /// Returns `true` when the dispatch succeeded.
+    ///
+    /// Saves 1 Metal dispatch per PLI gate layer per decode step vs the two-step path
+    /// (bf16i GEMV + gelu_mul_f32_bf16i_prealloc).
+    #[cfg(feature = "metal")]
+    pub fn forward_q8_0_bf16i_gelu_mul_bf16i_f32_prealloc(
+        &self,
+        xs_bf16: &Tensor,
+        pli_embed: &Tensor,
+        out: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q8_0_bf16i_gelu_mul_bf16i_f32_prealloc(xs_bf16, pli_embed, out)
+            .unwrap_or(false)
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output.
     /// Eliminates both the BF16→F32 pre-cast and the F32→BF16 post-cast.
     /// Used for o_proj and PLI projection in the decode path.
