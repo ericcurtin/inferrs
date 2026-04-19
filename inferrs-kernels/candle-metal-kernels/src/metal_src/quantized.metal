@@ -7070,6 +7070,12 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
+// Number of output rows per simdgroup for Q6K (matches llama.cpp N_R0_Q6_K=2).
+// Each threadgroup has 2 simdgroups × 2 rows = 4 rows per TG.
+// This halves the number of threadgroups vs the 1-row-per-simdgroup approach,
+// reducing scheduler overhead on large outputs (e.g. 262K-row lm_head).
+#define N_DST_Q6K 2
+
 void kernel_mul_mv_q6_K_f32_impl(
         device const  void * src0,
         device const float * src1,
@@ -7099,17 +7105,20 @@ void kernel_mul_mv_q6_K_f32_impl(
     const int64_t r1 = tgpig.y;
     const int     im = tgpig.z;
 
-    const int row = 2 * r0 + sgitg;
+    // First output row for this simdgroup: (r0 * 2 + sgitg) * N_DST_Q6K
+    // With N_DST_Q6K=2 rows/simdgroup and 2 simdgroups/TG: 4 rows per TG total.
+    // Dispatch grid width = ceil(ne01 / 4), halving the number of TGs vs align=2.
+    const int first_row = (2 * r0 + sgitg) * N_DST_Q6K;
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
-    device const block_q6_K * x = (device const block_q6_K *) src0 + row * nb + offset0;
+    device const block_q6_K * x = (device const block_q6_K *) src0 + first_row * nb + offset0;
     device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
 
-    float sumf = 0;
+    float sumf[N_DST_Q6K] = { 0.f, 0.f };
 
     const int tid  = tiisg/2;
     const int ix   = tiisg%2;
@@ -7125,30 +7134,34 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     for (int i = ix; i < nb; i += 2) {
 
-        device const uint8_t * q1 = x[i].ql + q_offset_l;
-        device const uint8_t * q2 = q1 + 32;
-        device const uint8_t * qh = x[i].qh + q_offset_h;
-        device const int8_t  * sc = x[i].scales + is;
-
         device const float * y = yy + i * QK_K + y_offset;
 
-        const float dall = x[i].d;
+        for (int nr = 0; nr < N_DST_Q6K; ++nr) {
+            device const block_q6_K * xr = x + nr * nb;
+            device const uint8_t * q1 = xr[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xr[i].qh + q_offset_h;
+            device const int8_t  * sc = xr[i].scales + is;
 
-        float4 sums = {0.f, 0.f, 0.f, 0.f};
-        for (int l = 0; l < n; ++l) {
-            sums[0] += y[l+ 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-            sums[1] += y[l+32] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-            sums[2] += y[l+64] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-            sums[3] += y[l+96] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            const float dall = xr[i].d;
+
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < n; ++l) {
+                sums[0] += y[l+ 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += y[l+32] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += y[l+64] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += y[l+96] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[nr] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
         }
-
-        sumf += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
-
     }
 
-    const float tot = simd_sum(sumf);
-    if (tiisg == 0) {
-        dst[r1*ne0 + im*ne0*ne1 + row] = tot;
+    for (int nr = 0; nr < N_DST_Q6K; ++nr) {
+        const float tot = simd_sum(sumf[nr]);
+        if (tiisg == 0 && first_row + nr < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + nr] = tot;
+        }
     }
 }
 

@@ -100,9 +100,12 @@ pub fn call_quantized_matmul_mv_t(
             (nth0, nth1, align)
         }
         GgmlDType::Q6K => {
+            // 2 simdgroups × N_DST_Q6K=2 rows/simdgroup = 4 rows per TG.
+            // Matches llama.cpp's N_SG_Q6_K=2, N_R0_Q6_K=2 dispatch.
+            // Halves the TG count for large outputs (e.g. 262K-row lm_head).
             let nth0 = 2;
             let nth1 = 32;
-            let align = 2;
+            let align = 4;
             (nth0, nth1, align)
         }
         GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => {
