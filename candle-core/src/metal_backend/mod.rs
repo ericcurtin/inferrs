@@ -1837,6 +1837,27 @@ impl MetalStorage {
         &self.buffer
     }
 
+    /// Write a byte slice directly into the Metal buffer at the given byte offset.
+    ///
+    /// On Apple Silicon with `StorageModeShared`, the buffer is in unified memory
+    /// and is CPU-accessible via `buffer.contents()`.  This enables zero-copy writes
+    /// from CPU-dequantized data into a pre-allocated Metal KV cache buffer, avoiding:
+    ///   1. CPU Vec allocation for the delta tensor
+    ///   2. `new_buffer_with_data` pool lookup + memcpy into separate Metal buffer
+    ///   3. `slice_set` Metal compute dispatch (scatter write kernel)
+    ///
+    /// # Safety
+    /// The caller must ensure `byte_offset + data.len() <= self.count * dtype_size`.
+    /// No GPU operations must be in flight writing to this buffer region.
+    pub unsafe fn write_bytes_at_offset(&self, data: &[u8], byte_offset: usize) {
+        let contents = self.buffer.contents();
+        if contents.is_null() {
+            return;
+        }
+        let dst = contents.cast::<u8>().add(byte_offset);
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+    }
+
     pub fn binary(
         &self,
         op: &'static str,

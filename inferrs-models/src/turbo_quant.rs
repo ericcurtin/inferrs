@@ -1102,12 +1102,143 @@ impl TurboQuantKvCache {
         let bytes_per_token = ((self.head_dim - 1) * self.bits as usize).div_ceil(8);
 
         let n_new_elems = self.num_kv_heads * delta * self.head_dim;
-        let shape = (self.num_kv_heads, delta, self.head_dim);
 
-        // For BF16 and F16 models we dequantize directly into the target half-precision
-        // type on the CPU before the device upload.  This avoids a GPU `to_dtype` kernel
-        // call AND halves the CPU→GPU transfer (2 bytes vs 4 per element).
-        // For F32 (and any other dtype) we fall back to the f32 intermediate path.
+        // Ensure the pre-allocated buffer is large enough for the current sequence.
+        // The buffer is grown by doubling (amortised O(1)) to avoid frequent reallocations.
+        // On the first decode step this allocates a buffer sized to at least `seq_len` tokens.
+        let needed_cap = self.seq_len;
+        if self.kv_buffer_cap < needed_cap {
+            let new_cap = needed_cap
+                .max(self.kv_buffer_cap * 2)
+                .max(MIN_KV_BUFFER_CAP);
+            let k_buf = Tensor::zeros(
+                (1, self.num_kv_heads, new_cap, self.head_dim),
+                self.orig_dtype,
+                &self.device,
+            )?;
+            let v_buf = Tensor::zeros(
+                (1, self.num_kv_heads, new_cap, self.head_dim),
+                self.orig_dtype,
+                &self.device,
+            )?;
+            // Copy existing valid data into the new (larger) buffer.
+            if self.cached_seq_len > 0 {
+                if let Some((k_old, v_old)) = &self.kv_buffer {
+                    k_buf.slice_set(&k_old.contiguous()?, 2, 0)?;
+                    v_buf.slice_set(&v_old.contiguous()?, 2, 0)?;
+                }
+            }
+            self.kv_buffer = Some((k_buf, v_buf));
+            self.kv_buffer_cap = new_cap;
+        }
+
+        let (k_buf, v_buf) = self.kv_buffer.as_mut().expect("kv_buffer allocated above");
+
+        // Fast path for Metal BF16/F16: write dequantized data directly into the
+        // kv_buffer's shared Metal memory, bypassing:
+        //   1. CPU Vec → `new_buffer_with_data` (allocation + memcpy to new Metal buffer)
+        //   2. `slice_set` Metal compute dispatch (scatter write kernel)
+        // On Apple Silicon with StorageModeShared, Metal buffers are CPU-accessible.
+        // The kv_buffer layout is [1, num_kv_heads, kv_buffer_cap, head_dim].
+        // For head h, token t: byte_offset = (h * kv_buffer_cap + t) * head_dim * dtype_size.
+        #[cfg(feature = "metal")]
+        {
+            use candle_core::Storage;
+            let dtype_size = self.orig_dtype.size_in_bytes();
+            // Capture fields before calling dequantize_delta (which borrows self).
+            let num_kv_heads = self.num_kv_heads;
+            let head_dim = self.head_dim;
+            let kv_buffer_cap = self.kv_buffer_cap;
+            // stride from one head's start to the next in the kv_buffer
+            let head_cap_stride = kv_buffer_cap * head_dim * dtype_size;
+            // offset within a head for the new token(s)
+            let token_byte_offset = self.cached_seq_len * head_dim * dtype_size;
+
+            let metal_write = |buf: &Tensor, data_bytes: &[u8]| -> bool {
+                let (storage, layout) = buf.storage_and_layout();
+                if let Storage::Metal(ms) = &*storage {
+                    let base = layout.start_offset() * dtype_size;
+                    // data_bytes is [num_kv_heads * delta * head_dim] elements in layout:
+                    // [head_0_delta_tokens, head_1_delta_tokens, ...]
+                    let head_data_bytes = delta * head_dim * dtype_size;
+                    for h in 0..num_kv_heads {
+                        let src_offset = h * head_data_bytes;
+                        let dst_offset = base + h * head_cap_stride + token_byte_offset;
+                        unsafe {
+                            ms.write_bytes_at_offset(
+                                &data_bytes[src_offset..src_offset + head_data_bytes],
+                                dst_offset,
+                            );
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+
+            match self.orig_dtype {
+                DType::BF16 => {
+                    // Dequantize before borrowing kv_buffer mutably.
+                    let (k_data, v_data) =
+                        self.dequantize_delta::<bf16>(delta, bytes_per_token, n_new_elems);
+                    let (k_buf, v_buf) =
+                        self.kv_buffer.as_mut().expect("kv_buffer allocated above");
+                    // Cast bf16 Vec to byte slice (bf16 is repr(transparent) u16).
+                    let k_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            k_data.as_ptr() as *const u8,
+                            k_data.len() * std::mem::size_of::<bf16>(),
+                        )
+                    };
+                    let v_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            v_data.as_ptr() as *const u8,
+                            v_data.len() * std::mem::size_of::<bf16>(),
+                        )
+                    };
+                    if metal_write(k_buf, k_bytes) && metal_write(v_buf, v_bytes) {
+                        self.cached_seq_len = self.seq_len;
+                        let (k_buf, v_buf) =
+                            self.kv_buffer.as_ref().expect("kv_buffer allocated above");
+                        let k = k_buf.narrow(2, 0, self.seq_len)?;
+                        let v = v_buf.narrow(2, 0, self.seq_len)?;
+                        return Ok((k, v));
+                    }
+                }
+                DType::F16 => {
+                    let (k_data, v_data) =
+                        self.dequantize_delta::<f16>(delta, bytes_per_token, n_new_elems);
+                    let (k_buf, v_buf) =
+                        self.kv_buffer.as_mut().expect("kv_buffer allocated above");
+                    let k_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            k_data.as_ptr() as *const u8,
+                            k_data.len() * std::mem::size_of::<f16>(),
+                        )
+                    };
+                    let v_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            v_data.as_ptr() as *const u8,
+                            v_data.len() * std::mem::size_of::<f16>(),
+                        )
+                    };
+                    if metal_write(k_buf, k_bytes) && metal_write(v_buf, v_bytes) {
+                        self.cached_seq_len = self.seq_len;
+                        let (k_buf, v_buf) =
+                            self.kv_buffer.as_ref().expect("kv_buffer allocated above");
+                        let k = k_buf.narrow(2, 0, self.seq_len)?;
+                        let v = v_buf.narrow(2, 0, self.seq_len)?;
+                        return Ok((k, v));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Fallback path (non-Metal or unsupported dtype): create intermediate CPU tensors
+        // and use slice_set to write into the buffer.
+        let shape = (self.num_kv_heads, delta, self.head_dim);
         let (k_new, v_new) = match self.orig_dtype {
             DType::BF16 => {
                 let (k_data, v_data) =
@@ -1147,48 +1278,19 @@ impl TurboQuantKvCache {
             }
         };
 
-        // k_new and v_new are now fully constructed (either via the bf16 fast path or
-        // the f32 fallback path above).
-
-        // Ensure the pre-allocated buffer is large enough for the current sequence.
-        // The buffer is grown by doubling (amortised O(1)) to avoid frequent reallocations.
-        // On the first decode step this allocates a buffer sized to at least `seq_len` tokens.
-        let needed_cap = self.seq_len;
-        if self.kv_buffer_cap < needed_cap {
-            let new_cap = needed_cap
-                .max(self.kv_buffer_cap * 2)
-                .max(MIN_KV_BUFFER_CAP);
-            let k_buf = Tensor::zeros(
-                (1, self.num_kv_heads, new_cap, self.head_dim),
-                self.orig_dtype,
-                &self.device,
-            )?;
-            let v_buf = Tensor::zeros(
-                (1, self.num_kv_heads, new_cap, self.head_dim),
-                self.orig_dtype,
-                &self.device,
-            )?;
-            // Copy existing valid data into the new (larger) buffer.
-            if self.cached_seq_len > 0 {
-                if let Some((k_old, v_old)) = &self.kv_buffer {
-                    k_buf.slice_set(&k_old.contiguous()?, 2, 0)?;
-                    v_buf.slice_set(&v_old.contiguous()?, 2, 0)?;
-                }
-            }
-            self.kv_buffer = Some((k_buf, v_buf));
-            self.kv_buffer_cap = new_cap;
-        }
-
         // Write the new delta tokens into the buffer at position `cached_seq_len`.
         // `slice_set` is an in-place write — no allocation, no copy of previous data.
-        let (k_buf, v_buf) = self.kv_buffer.as_mut().expect("kv_buffer allocated above");
-        k_buf.slice_set(&k_new.contiguous()?, 2, self.cached_seq_len)?;
-        v_buf.slice_set(&v_new.contiguous()?, 2, self.cached_seq_len)?;
+        {
+            let (k_buf, v_buf) = self.kv_buffer.as_mut().expect("kv_buffer allocated above");
+            k_buf.slice_set(&k_new.contiguous()?, 2, self.cached_seq_len)?;
+            v_buf.slice_set(&v_new.contiguous()?, 2, self.cached_seq_len)?;
+        }
 
         // Update the cached sequence length.
         self.cached_seq_len = self.seq_len;
 
         // Return a zero-copy narrow view of the valid portion of the buffer.
+        let (k_buf, v_buf) = self.kv_buffer.as_ref().expect("kv_buffer allocated above");
         let k = k_buf.narrow(2, 0, self.seq_len)?;
         let v = v_buf.narrow(2, 0, self.seq_len)?;
         Ok((k, v))
