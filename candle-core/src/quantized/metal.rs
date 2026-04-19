@@ -433,6 +433,62 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q8_0 GEMV: F32 input → BF16 output, into a pre-allocated BF16 buffer.
+    /// Eliminates the Metal buffer allocation for down_proj per decode step.
+    pub fn fwd_mv_q8_0_bf16o_prealloc(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &Buffer,
+        dst_offset_bytes: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q8_0 {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            return Ok(false);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes();
+            let d_off = dst_offset_bytes + batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q8_0_bf16o(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                d_off,
+                dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Q8_0 GEMV: BF16 input → F32 output.
     /// Eliminates the BF16→F32 pre-cast for E2B PLI gate and other F32-output GEMVs.
     pub fn fwd_mv_q8_0_bf16i_f32(
@@ -660,6 +716,65 @@ impl QMetalStorage {
         let dst_storage =
             crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::BF16);
         Ok((dst_storage, dst_shape))
+    }
+
+    /// Q8_0 GEMV: BF16 input → BF16 output, writing into a caller-supplied buffer.
+    ///
+    /// Like `fwd_mv_q8_0_bf16i_to_bf16` but avoids allocating a new Metal buffer.
+    /// `dst` must already be allocated with at least `n` BF16 elements.
+    /// Returns `true` on success, `false` if preconditions are not met.
+    pub fn fwd_mv_q8_0_bf16i_to_bf16_prealloc(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &Buffer,
+        dst_offset_bytes: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q8_0 {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            return Ok(false);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_offset = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let d_off = dst_offset_bytes + batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q8_0_bf16i_to_bf16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_offset,
+                &self.buffer,
+                self.offset,
+                d_off,
+                dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
     }
 
     /// GEMV with BF16 input: calls kernel_mul_mv_q4_K_bf16i_f32, avoiding a separate
@@ -932,6 +1047,64 @@ impl QMetalStorage {
             crate::MetalStorage::new(dst_a, device.clone(), dst_shape.elem_count(), DType::F32);
         let db = crate::MetalStorage::new(dst_b, device, dst_shape.elem_count(), DType::F32);
         Ok(((da, dst_shape.clone()), (db, dst_shape)))
+    }
+
+    /// Paired Q8_0 bf16i GEMV into pre-allocated F32 buffers.
+    /// Eliminates 2 Metal buffer allocations per decode step for E2B gate+up.
+    pub fn fwd_mv2_q8_0_bf16i_prealloc(
+        &self,
+        other: &QMetalStorage,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst_a: &Buffer,
+        dst_b: &Buffer,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        if self.dtype != GgmlDType::Q8_0 || other.dtype != GgmlDType::Q8_0 {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let src1_offset = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let dst_offset = batch_id * n * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv2_q8_0_bf16i_paired(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                src1_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                dst_a,
+                &other.buffer,
+                other.offset,
+                dst_offset,
+                dst_b,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
     }
 
     /// Paired Q3K GEMV: computes (self @ xs, other @ xs) in one Metal dispatch.
@@ -1345,6 +1518,79 @@ impl QMetalStorage {
         Ok(((rq, sq), (rk, skv.clone()), (rv, skv)))
     }
 
+    /// Triple Q4K GEMV: BF16 → BF16, writing into caller-supplied buffers.
+    /// Eliminates 3 Metal buffer allocations per decode step for Q4K (E4B) models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fwd_mv3_q4k_bf16i_to_bf16_prealloc(
+        &self,
+        kw: &QMetalStorage,
+        vw: &QMetalStorage,
+        self_shape: &Shape,
+        kv_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst_q: &Buffer,
+        dst_q_offset: usize,
+        dst_k: &Buffer,
+        dst_k_offset: usize,
+        dst_v: &Buffer,
+        dst_v_offset: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        if self.dtype != GgmlDType::Q4K || kw.dtype != GgmlDType::Q4K || vw.dtype != GgmlDType::Q4K
+        {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        let (n_q, k) = self_shape.dims2()?;
+        let (n_kv, _) = kv_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let src1_off = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let dq_off = dst_q_offset + batch_id * n_q * DType::BF16.size_in_bytes();
+            let dkv_off_k = dst_k_offset + batch_id * n_kv * DType::BF16.size_in_bytes();
+            let dkv_off_v = dst_v_offset + batch_id * n_kv * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv3_q4k_bf16i_to_bf16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n_q, n_kv, k),
+                storage.buffer(),
+                src1_off,
+                &self.buffer,
+                self.offset,
+                dq_off,
+                dst_q,
+                &kw.buffer,
+                kw.offset,
+                dkv_off_k,
+                dst_k,
+                &vw.buffer,
+                vw.offset,
+                dkv_off_v,
+                dst_v,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Triple Q8_0 GEMV: computes Q, K, V projections in one Metal dispatch.
     pub fn fwd_mv3_q8_0(
         &self,
@@ -1677,6 +1923,84 @@ impl QMetalStorage {
         let dk = crate::MetalStorage::new(dst_k, device.clone(), skv.elem_count(), DType::BF16);
         let dv = crate::MetalStorage::new(dst_v, device, skv.elem_count(), DType::BF16);
         Ok(((dq, sq), (dk, skv.clone()), (dv, skv)))
+    }
+
+    /// Triple Q8_0 GEMV: BF16 input → BF16 outputs, writing into caller-supplied buffers.
+    ///
+    /// Eliminates 3 Metal buffer allocations per decode step (one per Q/K/V output).
+    /// `dst_q`, `dst_k`, `dst_v` must be pre-allocated BF16 buffers with correct sizes.
+    /// Returns `true` on success, `false` if preconditions not met.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fwd_mv3_q8_0_bf16i_to_bf16_prealloc(
+        &self,
+        kw: &QMetalStorage,
+        vw: &QMetalStorage,
+        self_shape: &Shape,
+        kv_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst_q: &Buffer,
+        dst_q_offset: usize,
+        dst_k: &Buffer,
+        dst_k_offset: usize,
+        dst_v: &Buffer,
+        dst_v_offset: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        if self.dtype != GgmlDType::Q8_0
+            || kw.dtype != GgmlDType::Q8_0
+            || vw.dtype != GgmlDType::Q8_0
+        {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        let (n_q, k) = self_shape.dims2()?;
+        let (n_kv, _) = kv_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let src1_off = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let dq_off = dst_q_offset + batch_id * n_q * DType::BF16.size_in_bytes();
+            let dkv_off_k = dst_k_offset + batch_id * n_kv * DType::BF16.size_in_bytes();
+            let dkv_off_v = dst_v_offset + batch_id * n_kv * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv3_q8_0_bf16i_to_bf16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n_q, n_kv, k),
+                storage.buffer(),
+                src1_off,
+                &self.buffer,
+                self.offset,
+                dq_off,
+                dst_q,
+                &kw.buffer,
+                kw.offset,
+                dkv_off_k,
+                dst_k,
+                &vw.buffer,
+                vw.offset,
+                dkv_off_v,
+                dst_v,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
     }
 
     pub fn fwd(

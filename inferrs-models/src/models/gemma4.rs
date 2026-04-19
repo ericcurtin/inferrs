@@ -558,6 +558,13 @@ struct Mlp {
     /// Shape [1, 1, intermediate_size], reused across decode steps.
     /// Uses RefCell for interior mutability (Module::forward takes &self).
     gelu_mul_buf: std::cell::RefCell<Option<Tensor>>,
+    /// Pre-allocated BF16 buffer for down_proj Q8_0 output.
+    /// Shape [1, 1, hidden_size], reused across decode steps.
+    down_proj_out: std::cell::RefCell<Option<Tensor>>,
+    /// Pre-allocated F32 buffers for paired gate+up Q8_0 GEMV output.
+    /// Shape [1, 1, intermediate_size] each.
+    gate_out: std::cell::RefCell<Option<Tensor>>,
+    up_out: std::cell::RefCell<Option<Tensor>>,
 }
 
 impl Mlp {
@@ -593,6 +600,9 @@ impl Mlp {
             )?,
             act_fn,
             gelu_mul_buf: std::cell::RefCell::new(None),
+            down_proj_out: std::cell::RefCell::new(None),
+            gate_out: std::cell::RefCell::new(None),
+            up_out: std::cell::RefCell::new(None),
         })
     }
 }
@@ -637,9 +647,77 @@ impl Module for Mlp {
             {
                 // BF16i paired GEMV: skips the xs→F32 pre-cast.
                 // Q8_0 only (E2B) — Q4K bf16i confirmed slower on benchmark for large matrices.
+                // Use pre-allocated gate/up/down output buffers to eliminate Metal allocations.
+                let gate_prealloc_ok = {
+                    let gate_ref = self.gate_out.borrow();
+                    let up_ref = self.up_out.borrow();
+                    if let (Some(gate_pa), Some(up_pa)) = (gate_ref.as_ref(), up_ref.as_ref()) {
+                        if gate_pa.dtype() == DType::F32 && up_pa.dtype() == DType::F32 {
+                            self.gate_proj.forward_paired_q8_0_bf16i_prealloc(&self.up_proj, xs, gate_pa, up_pa)
+                        } else { false }
+                    } else { false }
+                };
+                if gate_prealloc_ok {
+                    let gate_f32 = self.gate_out.borrow().as_ref().unwrap().clone();
+                    let up_f32 = self.up_out.borrow().as_ref().unwrap().clone();
+                    let gelu_elem = gate_f32.elem_count();
+                    let hidden_act_f32 = {
+                        let mut buf_ref = self.gelu_mul_buf.borrow_mut();
+                        let buf_ok = buf_ref.as_ref().is_some_and(
+                            |t| t.elem_count() == gelu_elem && t.dtype() == DType::F32);
+                        if !buf_ok {
+                            *buf_ref = Some(Tensor::zeros(
+                                gate_f32.shape().dims(), DType::F32, gate_f32.device())?);
+                        }
+                        let pa = buf_ref.as_ref().unwrap();
+                        if candle_nn::ops::gelu_mul_prealloc(&gate_f32, &up_f32, pa) {
+                            pa.clone()
+                        } else {
+                            candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?
+                        }
+                    };
+                    // Use pre-allocated down_proj output buffer.
+                    let down_prealloc_ok = {
+                        let dp_ref = self.down_proj_out.borrow();
+                        if let Some(dp_pa) = dp_ref.as_ref() {
+                            if dp_pa.dtype() == DType::BF16 {
+                                self.down_proj.forward_q8_0_bf16o_prealloc(&hidden_act_f32, dp_pa)
+                            } else { false }
+                        } else { false }
+                    };
+                    if down_prealloc_ok {
+                        return Ok(self.down_proj_out.borrow().as_ref().unwrap().clone());
+                    }
+                    if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
+                        let out = bf16_out?;
+                        // Lazily allocate down_proj prealloc buffer.
+                        if self.down_proj_out.borrow().is_none() {
+                            *self.down_proj_out.borrow_mut() = Some(
+                                Tensor::zeros(out.shape().dims(), DType::BF16, out.device())?);
+                        }
+                        return Ok(out);
+                    }
+                    return self.down_proj.forward_f32(&hidden_act_f32)?.to_dtype(orig_dtype);
+                }
+                // Fall through to allocating path on first call (to set up gate_out/up_out).
                 let paired_bf16i = self.gate_proj.forward_paired_q8_0_bf16i(&self.up_proj, xs);
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
+                    // Lazily allocate gate/up prealloc buffers.
+                    {
+                        let mut gate_ref = self.gate_out.borrow_mut();
+                        if gate_ref.is_none() {
+                            *gate_ref = Some(Tensor::zeros(
+                                gate_f32.shape().dims(), DType::F32, gate_f32.device())?);
+                        }
+                    }
+                    {
+                        let mut up_ref = self.up_out.borrow_mut();
+                        if up_ref.is_none() {
+                            *up_ref = Some(Tensor::zeros(
+                                up_f32.shape().dims(), DType::F32, up_f32.device())?);
+                        }
+                    }
                     // Use pre-allocated gelu_mul buffer to avoid pool allocation.
                     let gelu_elem = gate_f32.elem_count();
                     let hidden_act_f32 = {
@@ -659,7 +737,12 @@ impl Module for Mlp {
                     };
                     // Use bf16o for down_proj (F32→BF16, saves 1 dispatch)
                     if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
-                        return bf16_out;
+                        let out = bf16_out?;
+                        if self.down_proj_out.borrow().is_none() {
+                            *self.down_proj_out.borrow_mut() = Some(
+                                Tensor::zeros(out.shape().dims(), DType::BF16, out.device())?);
+                        }
+                        return Ok(out);
                     }
                     return self
                         .down_proj
@@ -1101,12 +1184,19 @@ struct Attention {
     /// Pre-allocated BF16 output buffer for o_proj GEMV.
     /// Shape [1, 1, hidden_size]. Reused across decode steps.
     o_proj_out: Option<candle_core::Tensor>,
+    /// Pre-allocated BF16 output buffers for triple QKV GEMV.
+    /// Shapes: q=[1,1,num_heads*head_dim], k/v=[1,1,num_kv_heads*head_dim].
+    /// Lazily allocated on first decode step; reused across all subsequent steps.
+    qkv_q_out: Option<candle_core::Tensor>,
+    qkv_k_out: Option<candle_core::Tensor>,
+    qkv_v_out: Option<candle_core::Tensor>,
 }
 
 impl Attention {
     /// Apply o_proj using BF16-input inline GEMV when available (eliminates
     /// a BF16->F32 to_dtype dispatch for single-token decode on Metal).
-    fn apply_o_proj(&self, xs: &Tensor) -> Result<Tensor> {
+    /// Uses a pre-allocated output buffer for Q8_0 (E2B) to save 1 Metal allocation/step.
+    fn apply_o_proj(&mut self, xs: &Tensor) -> Result<Tensor> {
         // For Metal single-token decode with BF16 input, use the BF16→BF16 kernel:
         // no pre-cast (BF16→F32) and no post-cast (F32→BF16) needed.
         // Saves 1 dispatch vs forward_bf16i (which outputs F32, then back-cast).
@@ -1115,11 +1205,35 @@ impl Attention {
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
+            // Q8_0 prealloc path (E2B): write into pre-allocated output buffer.
+            // Saves 1 Metal buffer allocation per decode step × 35 attention layers.
+            // o_proj: [1,1,n_heads*head_dim] → [1,1,hidden_size].
+            // Output shape is [b, q_len, hidden_size] — num_heads*head_dim = hidden_size for Gemma4.
+            #[cfg(feature = "metal")]
+            {
+                let prealloc_ok = if let Some(pa) = self.o_proj_out.as_ref() {
+                    if pa.dtype() == DType::BF16 {
+                        self.o_proj.forward_q8_0_bf16i_to_bf16_prealloc(xs, pa)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if prealloc_ok {
+                    return Ok(self.o_proj_out.as_ref().unwrap().clone());
+                }
+            }
             // BF16→BF16 GEMV: eliminates both pre-cast and post-cast (saves 1 dispatch vs bf16i path).
             // Q8_0 (E2B): bf16i_to_bf16 saves pre+post casts (2 dispatches → 1).
             // Q4K (E4B): bf16i_to_bf16 — saves 1 dispatch (2 dispatches → 1) vs bf16i+to_dtype.
             if let Some(out) = self.o_proj.forward_q8_0_bf16i_to_bf16(xs) {
-                return out;
+                let out = out?;
+                // Lazily allocate the prealloc buffer on first successful Q8_0 call.
+                if self.o_proj_out.is_none() {
+                    self.o_proj_out = Some(Tensor::zeros(out.shape().dims(), DType::BF16, out.device())?);
+                }
+                return Ok(out);
             }
             #[cfg(feature = "metal")]
             if let Some(out) = self.o_proj.forward_q4k_bf16i_to_bf16(xs) {
@@ -1260,6 +1374,9 @@ impl Attention {
             sdpa_2pass_out: None,
             sdpa_1pass_out: None,
             o_proj_out: None,
+            qkv_q_out: None,
+            qkv_k_out: None,
+            qkv_v_out: None,
         })
     }
 
@@ -1475,31 +1592,52 @@ impl Attention {
 
         let (q_raw, k_raw, v_raw) = if need_pre_convert && is_single_token_decode {
             // BF16→BF16 triple QKV GEMV: Q8_0 (E2B) and Q4K (E4B).
+            // Use pre-allocated output buffers to eliminate 3 Metal allocations per decode step.
             #[cfg(feature = "metal")]
-            let qkv_b2b = if orig_dtype == DType::BF16
+            let qkv_b2b: Option<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)> =
+            if orig_dtype == DType::BF16
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
-                // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast (1 dispatch saved).
-                // Q4K (E4B): bf16i_to_bf16 saves the xs.to_dtype(F32) dispatch per donor layer.
-                self.q_proj
-                    .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
-                    .or_else(|| {
-                        self.q_proj
-                            .forward_triple_q4k_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
-                    })
+                // Lazily allocate prealloc buffers (flat shape: GEMV outputs [1,1,n*d]).
+                let q_elems = b_sz * q_len * self.num_heads * self.head_dim;
+                let kv_elems = b_sz * q_len * self.num_kv_heads * self.head_dim;
+                let needs_alloc = self.qkv_q_out.as_ref()
+                    .is_none_or(|t| t.elem_count() != q_elems || t.dtype() != DType::BF16)
+                    || self.qkv_k_out.as_ref()
+                    .is_none_or(|t| t.elem_count() != kv_elems || t.dtype() != DType::BF16);
+                if needs_alloc {
+                    self.qkv_q_out = Some(Tensor::zeros(
+                        (b_sz, q_len, self.num_heads * self.head_dim), DType::BF16, xs.device())?);
+                    self.qkv_k_out = Some(Tensor::zeros(
+                        (b_sz, q_len, self.num_kv_heads * self.head_dim), DType::BF16, xs.device())?);
+                    self.qkv_v_out = Some(Tensor::zeros(
+                        (b_sz, q_len, self.num_kv_heads * self.head_dim), DType::BF16, xs.device())?);
+                }
+                if let (Some(oq), Some(ok), Some(ov)) = (
+                    self.qkv_q_out.as_ref(),
+                    self.qkv_k_out.as_ref(),
+                    self.qkv_v_out.as_ref(),
+                ) {
+                    // Try Q8_0 prealloc (E2B), then Q4K prealloc (E4B).
+                    let ok_write = self.q_proj.forward_triple_q8_0_bf16i_to_bf16_prealloc(
+                        &self.k_proj, &self.v_proj, xs, oq, ok, ov)
+                        || self.q_proj.forward_triple_q4k_bf16i_to_bf16_prealloc(
+                        &self.k_proj, &self.v_proj, xs, oq, ok, ov);
+                    if ok_write {
+                        Some((oq.clone(), ok.clone(), ov.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             };
             #[cfg(not(feature = "metal"))]
-            let qkv_b2b: Option<
-                candle_core::Result<(
-                    candle_core::Tensor,
-                    candle_core::Tensor,
-                    candle_core::Tensor,
-                )>,
-            > = None;
-            if let Some(result) = qkv_b2b {
-                let (q_bf16, k_bf16, v_bf16) = result?;
+            let qkv_b2b: Option<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)> =
+                None;
+            if let Some((q_bf16, k_bf16, v_bf16)) = qkv_b2b {
                 (
                     q_bf16.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
                     k_bf16.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,

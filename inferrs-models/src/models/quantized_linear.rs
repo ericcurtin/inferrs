@@ -236,6 +236,20 @@ impl QLinear {
         }
     }
 
+    /// Q8_0 GEMV: F32 → BF16 into a pre-allocated BF16 tensor.
+    /// Returns `true` on success; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn forward_q8_0_bf16o_prealloc(&self, xs_f32: &Tensor, out: &Tensor) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q8_0_bf16o_prealloc(xs_f32, out).unwrap_or(false)
+    }
+
     /// Q4K GEMV: BF16 input → BF16 output. For E4B decode.
     pub fn forward_q4k_bf16i_to_bf16(&self, xs_bf16: &Tensor) -> Option<Result<Tensor>> {
         if self.bias.is_some() {
@@ -406,6 +420,98 @@ impl QLinear {
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
+    }
+
+    /// Triple Q8_0 GEMV: BF16 → BF16 into pre-allocated output tensors.
+    /// Returns `true` if the prealloc dispatch succeeded; caller reuses `out_q/k/v`.
+    #[cfg(feature = "metal")]
+    pub fn forward_triple_q8_0_bf16i_to_bf16_prealloc(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_bf16: &Tensor,
+        out_q: &Tensor,
+        out_k: &Tensor,
+        out_v: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return false;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return false;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return false,
+        };
+        qt_q.fwd_mv3_q8_0_bf16i_to_bf16_prealloc(qt_k, qt_v, xs_bf16, out_q, out_k, out_v)
+            .unwrap_or(false)
+    }
+
+    /// Triple Q4K GEMV: BF16 → BF16 into pre-allocated output tensors.
+    /// Returns `true` if the prealloc dispatch succeeded; caller reuses `out_q/k/v`.
+    #[cfg(feature = "metal")]
+    pub fn forward_triple_q4k_bf16i_to_bf16_prealloc(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_bf16: &Tensor,
+        out_q: &Tensor,
+        out_k: &Tensor,
+        out_v: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return false;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return false;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return false,
+        };
+        qt_q.fwd_mv3_q4k_bf16i_to_bf16_prealloc(qt_k, qt_v, xs_bf16, out_q, out_k, out_v)
+            .unwrap_or(false)
+    }
+
+    /// Single Q8_0 GEMV: BF16 → BF16 into pre-allocated output tensor.
+    /// Returns `true` if the prealloc dispatch succeeded; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn forward_q8_0_bf16i_to_bf16_prealloc(
+        &self,
+        xs_bf16: &Tensor,
+        out: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q8_0_bf16i_to_bf16_prealloc(xs_bf16, out)
+            .unwrap_or(false)
+    }
+
+    /// Paired Q8_0 bf16i GEMV into pre-allocated F32 output tensors.
+    /// Returns `true` if succeeded; caller reuses `out_a` / `out_b`.
+    #[cfg(feature = "metal")]
+    pub fn forward_paired_q8_0_bf16i_prealloc(
+        &self,
+        other: &QLinear,
+        xs_bf16: &Tensor,
+        out_a: &Tensor,
+        out_b: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() || other.bias.is_some() {
+            return false;
+        }
+        let (qt_s, qt_o) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return false,
+        };
+        qt_s.fwd_mv2_q8_0_bf16i_prealloc(qt_o, xs_bf16, out_a, out_b)
+            .unwrap_or(false)
     }
 
     #[cfg(feature = "metal")]

@@ -795,6 +795,31 @@ impl QTensor {
         }
     }
 
+    /// Q8_0 GEMV: F32 input → BF16 output, into pre-allocated BF16 tensor.
+    /// Returns `true` on success; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q8_0_bf16o_prealloc(&self, xs: &Tensor, out: &Tensor) -> Result<bool> {
+        if xs.dtype() != DType::F32 || out.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_q8_0_bf16o_prealloc(&self.shape, &xs_s, &xs_l, out_metal.buffer(), 0)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Q4K GEMV: BF16 input → BF16 output. For E4B decode.
     pub fn fwd_mv_q4k_bf16i_to_bf16(&self, xs: &Tensor) -> Result<Option<Tensor>> {
         let xs_g = xs.storage();
@@ -1067,6 +1092,148 @@ impl QTensor {
         }
     }
 
+    /// Triple Q4K GEMV: BF16 → BF16 into pre-allocated output tensors.
+    /// Returns `true` if the prealloc path succeeded; caller reuses `out_q/k/v`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv3_q4k_bf16i_to_bf16_prealloc(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+        out_q: &Tensor,
+        out_k: &Tensor,
+        out_v: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16
+            || out_q.dtype() != DType::BF16
+            || out_k.dtype() != DType::BF16
+            || out_v.dtype() != DType::BF16
+        {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let q_g = out_q.storage();
+        let k_g = out_k.storage();
+        let v_g = out_v.storage();
+        let (q_metal, k_metal, v_metal) = match (&*q_g, &*k_g, &*v_g) {
+            (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c)) => (a, b, c),
+            _ => return Ok(false),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                let ok = qm.fwd_mv3_q4k_bf16i_to_bf16_prealloc(
+                    km,
+                    vm,
+                    &self.shape,
+                    &kw.shape,
+                    &xs_s,
+                    &xs_l,
+                    q_metal.buffer(),
+                    0,
+                    k_metal.buffer(),
+                    0,
+                    v_metal.buffer(),
+                    0,
+                )?;
+                Ok(ok)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Triple Q8_0 GEMV: BF16 → BF16 into pre-allocated output tensors.
+    /// Returns `true` if the prealloc path succeeded; caller reuses `out_q/k/v`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv3_q8_0_bf16i_to_bf16_prealloc(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+        out_q: &Tensor,
+        out_k: &Tensor,
+        out_v: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16
+            || out_q.dtype() != DType::BF16
+            || out_k.dtype() != DType::BF16
+            || out_v.dtype() != DType::BF16
+        {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let q_g = out_q.storage();
+        let k_g = out_k.storage();
+        let v_g = out_v.storage();
+        let (q_metal, k_metal, v_metal) = match (&*q_g, &*k_g, &*v_g) {
+            (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c)) => (a, b, c),
+            _ => return Ok(false),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                let ok = qm.fwd_mv3_q8_0_bf16i_to_bf16_prealloc(
+                    km,
+                    vm,
+                    &self.shape,
+                    &kw.shape,
+                    &xs_s,
+                    &xs_l,
+                    q_metal.buffer(),
+                    0,
+                    k_metal.buffer(),
+                    0,
+                    v_metal.buffer(),
+                    0,
+                )?;
+                Ok(ok)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Single Q8_0 GEMV: BF16 → BF16 into a pre-allocated output tensor.
+    /// Returns `true` on success; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q8_0_bf16i_to_bf16_prealloc(
+        &self,
+        xs: &Tensor,
+        out: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || out.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                let ok = m.fwd_mv_q8_0_bf16i_to_bf16_prealloc(
+                    &self.shape,
+                    &xs_s,
+                    &xs_l,
+                    out_metal.buffer(),
+                    0,
+                )?;
+                Ok(ok)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn fwd_mv3_q4k(
         &self,
         kw: &QTensor,
@@ -1223,6 +1390,48 @@ impl QTensor {
                 )))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Paired Q8_0 bf16i GEMV into pre-allocated F32 output tensors.
+    /// Returns `true` on success; caller reuses `out_a` / `out_b`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv2_q8_0_bf16i_prealloc(
+        &self,
+        other: &QTensor,
+        xs: &Tensor,
+        out_a: &Tensor,
+        out_b: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16
+            || out_a.dtype() != DType::F32
+            || out_b.dtype() != DType::F32
+        {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let a_g = out_a.storage();
+        let b_g = out_b.storage();
+        let (a_metal, b_metal) = match (&*a_g, &*b_g) {
+            (Storage::Metal(a), Storage::Metal(b)) => (a, b),
+            _ => return Ok(false),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(sm), QStorage::Metal(om)) => {
+                sm.fwd_mv2_q8_0_bf16i_prealloc(
+                    om,
+                    &self.shape,
+                    &xs_s,
+                    &xs_l,
+                    a_metal.buffer(),
+                    b_metal.buffer(),
+                )
+            }
+            _ => Ok(false),
         }
     }
 
