@@ -3890,7 +3890,7 @@ struct ModelPli {
     ///   - 1 reshape + 1 add + 1 contiguous
     ///
     /// Total: ~6–8 fewer GPU kernel dispatches per decode step.
-    pli_all_cache: std::collections::HashMap<u32, Arc<Vec<Tensor>>>,
+    pli_all_cache: std::collections::HashMap<u32, Arc<Vec<Option<Tensor>>>>,
     /// LRU order for `pli_all_cache`.
     pli_all_cache_lru: std::collections::VecDeque<u32>,
 }
@@ -4550,7 +4550,7 @@ impl Gemma4Model {
         ids_for_pli: &Tensor,
         xs_for_pli: Option<&Tensor>,
         xs: &Tensor,
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<Arc<Vec<Option<Tensor>>>> {
         if let Some(model_pli) = &mut self.pli {
             // For the single-token decode path (seq_len == 1, no audio):
             // `pli_all = norm(per_layer_model_projection(embed(token))) + scaled_pli_embed(token)`
@@ -4571,12 +4571,9 @@ impl Gemma4Model {
                 };
 
                 if let Some(cached_layers) = model_pli.pli_all_cache.get(&token_id) {
-                    // Cache hit: clone the Arc (one atomic increment) instead of 35 Tensor clones.
-                    let arc = Arc::clone(cached_layers);
-                    Ok(arc
-                        .iter()
-                        .map(|t| Some(t.clone()))
-                        .collect::<Vec<_>>())
+                    // Cache hit: clone the Arc (one atomic increment).
+                    // Vec<Option<Tensor>> is stored directly — no per-step wrapping or Vec alloc.
+                    return Ok(Arc::clone(cached_layers));
                 } else {
                     // Cache miss: compute pli_all and slice into per-layer tensors.
                     // 1. Get pli_embed (from pli_embed_cache or compute)
@@ -4623,9 +4620,10 @@ impl Gemma4Model {
                     ))?;
                     let pli_all = (pli_proj + pli_embed2)?.contiguous()?;
 
-                    // 3. Slice into per-layer tensors and cache.
-                    let per_layer: Vec<Tensor> = (0..self.num_hidden_layers)
-                        .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)))
+                    // 3. Slice into per-layer tensors (wrapped in Some) and cache.
+                    // Store Vec<Option<Tensor>> directly so cache hits avoid per-step wrapping.
+                    let per_layer: Vec<Option<Tensor>> = (0..self.num_hidden_layers)
+                        .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
                         .collect::<candle_core::Result<Vec<_>>>()?;
 
                     // Store in pli_all_cache (LRU eviction)
@@ -4640,7 +4638,7 @@ impl Gemma4Model {
                     model_pli.pli_all_cache.insert(token_id, Arc::clone(&per_layer_arc));
                     model_pli.pli_all_cache_lru.push_back(token_id);
 
-                    Ok(per_layer_arc.iter().map(|t| Some(t.clone())).collect::<Vec<_>>())
+                    Ok(per_layer_arc)
                 }
             } else {
                 // Prefill/audio path: compute from scratch for all tokens.
@@ -4671,12 +4669,12 @@ impl Gemma4Model {
                     model_pli.pli_dim,
                 ))?;
                 let pli_all = (pli_proj + pli_embed)?.contiguous()?;
-                Ok((0..self.num_hidden_layers)
+                Ok(Arc::new((0..self.num_hidden_layers)
                     .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
-                    .collect::<candle_core::Result<_>>()?)
+                    .collect::<candle_core::Result<Vec<_>>>()?))
             }
         } else {
-            Ok(vec![None; self.num_hidden_layers])
+            Ok(Arc::new(vec![None; self.num_hidden_layers]))
         }
     }
 
