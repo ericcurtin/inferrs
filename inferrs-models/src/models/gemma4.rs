@@ -3960,6 +3960,10 @@ pub struct Gemma4Model {
     ///
     /// Lazily initialised on the first single-token `forward` call; `None` until then.
     decode_input_buf: Option<Tensor>,
+    /// When `true`, `hint_decode_token` has already written the token ID directly
+    /// into `decode_input_buf`'s shared Metal memory (via `write_bytes_at_offset`),
+    /// so `forward()` can skip the `slice_set` dispatch entirely.
+    decode_input_buf_prewritten: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -4303,6 +4307,7 @@ impl Gemma4Model {
             pending_decode_token_id: None,
             skip_final_softcap: false,
             decode_input_buf: None,
+            decode_input_buf_prewritten: false,
         })
     }
 
@@ -4504,8 +4509,11 @@ impl Gemma4Model {
 
         // For single-token decode steps (the hot path), reuse a pre-allocated
         // [1, 1] u32 GPU buffer to avoid one Metal allocation per decode step.
-        // On the first decode call we lazily allocate the buffer; thereafter we
-        // overwrite it in-place with slice_set and forward that buffer instead.
+        // On the first decode call we lazily allocate the buffer; thereafter
+        // `hint_decode_token` pre-writes the token ID directly into the buffer's
+        // shared Metal memory (via `write_bytes_at_offset`), so we skip the
+        // `slice_set` kernel dispatch entirely when `decode_input_buf_prewritten`
+        // is set.  Fallback: use `slice_set` when the prewrite was not done.
         if seq_len == 1 && b_size == 1 {
             if self.decode_input_buf.is_none() {
                 self.decode_input_buf = Some(Tensor::zeros(
@@ -4513,10 +4521,20 @@ impl Gemma4Model {
                     candle_core::DType::U32,
                     &self.device,
                 )?);
+                // hint_decode_token pre-writes via write_bytes_at_offset only
+                // when the buffer already exists; on first call the hint was
+                // not pre-written, so fall through to slice_set.
+                self.decode_input_buf_prewritten = false;
             }
             // SAFETY: we just ensured decode_input_buf is Some above.
             let buf = self.decode_input_buf.as_ref().unwrap();
-            buf.slice_set(input_ids, 0, 0)?;
+            if !self.decode_input_buf_prewritten {
+                // Hint was not pre-written (first decode step or non-Metal):
+                // update the buffer via slice_set.
+                buf.slice_set(input_ids, 0, 0)?;
+            }
+            // Reset flag for next call.
+            self.decode_input_buf_prewritten = false;
             // Clone is cheap: just bumps an Arc refcount; no GPU data is copied.
             let buf = buf.clone();
             let xs = self.embed_tokens.forward(&buf)?;
@@ -5188,8 +5206,27 @@ impl Gemma4Model {
     /// This allows `forward_transformer` to look up the PLI embedding cache using
     /// the raw `u32` token ID directly, avoiding a GPU→CPU device transfer of
     /// the `input_ids` tensor.  The hint is consumed and cleared after one call.
+    ///
+    /// On Metal, also pre-writes the token ID directly into `decode_input_buf`'s
+    /// shared memory via `write_bytes_at_offset`, eliminating the `slice_set`
+    /// kernel dispatch that `forward()` would otherwise need to update the buffer.
+    /// This saves 1 Metal kernel dispatch per decode step.
     pub fn hint_decode_token(&mut self, token_id: u32) {
         self.pending_decode_token_id = Some(token_id);
+        // Pre-write into decode_input_buf to skip slice_set in forward().
+        #[cfg(feature = "metal")]
+        if let Some(buf) = &self.decode_input_buf {
+            use candle_core::Storage;
+            let (storage, layout) = buf.storage_and_layout();
+            if let Storage::Metal(ms) = &*storage {
+                let byte_offset = layout.start_offset() * std::mem::size_of::<u32>();
+                let bytes = token_id.to_ne_bytes();
+                unsafe { ms.write_bytes_at_offset(&bytes, byte_offset); }
+                self.decode_input_buf_prewritten = true;
+                return;
+            }
+        }
+        self.decode_input_buf_prewritten = false;
     }
 
     /// Hint that the next `forward()` result will be sampled with `temperature`.
