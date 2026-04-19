@@ -6250,6 +6250,130 @@ kernel void kernel_mul_mv_q4_K_f32_bf16o(
         nullptr, tgpig, tiisg, sgitg);
 }
 
+/// Fused Q4K GEMV with gelu_mul input: computes down_proj(gelu(gate)*up) in one dispatch.
+/// Saves the separate gelu_mul dispatch between gate+up GEMV and down_proj GEMV.
+/// Takes two F32 inputs (gate, up) and outputs BF16.
+/// Grid/threadgroup layout identical to kernel_mul_mv_q4_K_f32_bf16o.
+[[host_name("kernel_mul_mv_q4_K_gelumul_f32_bf16o")]]
+kernel void kernel_mul_mv_q4_K_gelumul_f32_bf16o(
+        device const  void  * src0,        // Q4K weight (down_proj)
+        device const float  * gate_f32,    // gate projection output (F32)
+        device const float  * up_f32,      // up projection output (F32)
+        device      ushort  * dst,         // BF16 output
+        constant   int64_t  & ne00,        // K (intermediate_size)
+        constant   int64_t  & ne01,        // N (hidden_size output rows)
+        constant   int64_t  & ne02,
+        constant  uint64_t  & nb00, constant uint64_t & nb01, constant uint64_t & nb02,
+        constant   int64_t  & ne10,
+        constant   int64_t  & ne11, constant int64_t & ne12,
+        constant  uint64_t  & nb10, constant uint64_t & nb11, constant uint64_t & nb12,
+        constant   int64_t  & ne0,  constant int64_t  & ne1,
+        constant   uint     & r2,   constant uint     & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    const int ix = tiisg/8, it = tiisg%8, iq = it/4, ir = it%4;
+    const int nb = ne00/QK_K, r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;
+    const int first_row = (r0 * N_SG_Q4K + sgitg) * N_DST_Q4K;
+    const int ib_row = first_row * nb;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q4_K * x = (device const block_q4_K *)src0 + ib_row + offset0;
+    // gate and up share the same layout as src1 in the standard kernel.
+    device const float * g4 = gate_f32 + r1*ne10 + im*ne00*ne1 + ix*QK_K + 64*iq + 8*ir;
+    device const float * u4 = up_f32   + r1*ne10 + im*ne00*ne1 + ix*QK_K + 64*iq + 8*ir;
+
+    float yl[16], yh[16], sumf[N_DST_Q4K]={0.f};
+    const int step = sizeof(block_q4_K) * nb / 2;
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    // Gelu-tanh helper: gelu_pytorch_tanh(x) = 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+    auto gelu_f = [](float x) -> float {
+        constexpr float kAlpha = 0.7978845608028654f;
+        constexpr float kBeta  = 0.044715f;
+        float t = kAlpha * (x + kBeta * x * x * x);
+        return 0.5f * x * (1.0f + precise::tanh(t));
+    };
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy;
+        {
+            // Load gate and up, apply gelu_mul inline.
+            float4 ga0=float4(g4[0],g4[1],g4[2],g4[3]);
+            float4 ga1=float4(g4[4],g4[5],g4[6],g4[7]);
+            float4 gb0=float4(g4[32],g4[33],g4[34],g4[35]);
+            float4 gb1=float4(g4[36],g4[37],g4[38],g4[39]);
+            float4 gc0=float4(g4[128],g4[129],g4[130],g4[131]);
+            float4 gc1=float4(g4[132],g4[133],g4[134],g4[135]);
+            float4 gd0=float4(g4[160],g4[161],g4[162],g4[163]);
+            float4 gd1=float4(g4[164],g4[165],g4[166],g4[167]);
+            float4 ua0=float4(u4[0],u4[1],u4[2],u4[3]);
+            float4 ua1=float4(u4[4],u4[5],u4[6],u4[7]);
+            float4 ub0=float4(u4[32],u4[33],u4[34],u4[35]);
+            float4 ub1=float4(u4[36],u4[37],u4[38],u4[39]);
+            float4 uc0=float4(u4[128],u4[129],u4[130],u4[131]);
+            float4 uc1=float4(u4[132],u4[133],u4[134],u4[135]);
+            float4 ud0=float4(u4[160],u4[161],u4[162],u4[163]);
+            float4 ud1=float4(u4[164],u4[165],u4[166],u4[167]);
+            // Fused gelu*up:
+            float4 a0 = float4(gelu_f(ga0[0])*ua0[0], gelu_f(ga0[1])*ua0[1], gelu_f(ga0[2])*ua0[2], gelu_f(ga0[3])*ua0[3]);
+            float4 a1 = float4(gelu_f(ga1[0])*ua1[0], gelu_f(ga1[1])*ua1[1], gelu_f(ga1[2])*ua1[2], gelu_f(ga1[3])*ua1[3]);
+            float4 b0 = float4(gelu_f(gb0[0])*ub0[0], gelu_f(gb0[1])*ub0[1], gelu_f(gb0[2])*ub0[2], gelu_f(gb0[3])*ub0[3]);
+            float4 b1 = float4(gelu_f(gb1[0])*ub1[0], gelu_f(gb1[1])*ub1[1], gelu_f(gb1[2])*ub1[2], gelu_f(gb1[3])*ub1[3]);
+            float4 c0 = float4(gelu_f(gc0[0])*uc0[0], gelu_f(gc0[1])*uc0[1], gelu_f(gc0[2])*uc0[2], gelu_f(gc0[3])*uc0[3]);
+            float4 c1 = float4(gelu_f(gc1[0])*uc1[0], gelu_f(gc1[1])*uc1[1], gelu_f(gc1[2])*uc1[2], gelu_f(gc1[3])*uc1[3]);
+            float4 d0 = float4(gelu_f(gd0[0])*ud0[0], gelu_f(gd0[1])*ud0[1], gelu_f(gd0[2])*ud0[2], gelu_f(gd0[3])*ud0[3]);
+            float4 d1 = float4(gelu_f(gd1[0])*ud1[0], gelu_f(gd1[1])*ud1[1], gelu_f(gd1[2])*ud1[2], gelu_f(gd1[3])*ud1[3]);
+            yl[ 0]=a0[0]; yl[ 1]=a0[1]; yl[ 2]=a0[2]; yl[ 3]=a0[3];
+            yl[ 4]=a1[0]; yl[ 5]=a1[1]; yl[ 6]=a1[2]; yl[ 7]=a1[3];
+            yl[ 8]=b0[0]; yl[ 9]=b0[1]; yl[10]=b0[2]; yl[11]=b0[3];
+            yl[12]=b1[0]; yl[13]=b1[1]; yl[14]=b1[2]; yl[15]=b1[3];
+            yh[ 0]=c0[0]; yh[ 1]=c0[1]; yh[ 2]=c0[2]; yh[ 3]=c0[3];
+            yh[ 4]=c1[0]; yh[ 5]=c1[1]; yh[ 6]=c1[2]; yh[ 7]=c1[3];
+            yh[ 8]=d0[0]; yh[ 9]=d0[1]; yh[10]=d0[2]; yh[11]=d0[3];
+            yh[12]=d1[0]; yh[13]=d1[1]; yh[14]=d1[2]; yh[15]=d1[3];
+            sumy[0]=dot(a0,float4(1))+dot(a1,float4(1));
+            sumy[1]=dot(b0,float4(1))+dot(b1,float4(1));
+            sumy[2]=dot(c0,float4(1))+dot(c1,float4(1));
+            sumy[3]=dot(d0,float4(1))+dot(d1,float4(1));
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16*iq + 4*ir;
+        device const half     * dh = &x[ib].d;
+        for (int row = 0; row < N_DST_Q4K; row++) {
+            sc16[0]=sc[0]&kmask1; sc16[1]=sc[2]&kmask1;
+            sc16[2]=((sc[4]>>0)&kmask2)|((sc[0]&kmask3)>>2);
+            sc16[3]=((sc[4]>>4)&kmask2)|((sc[2]&kmask3)>>2);
+            device const uint16_t * q2 = q1 + 32;
+            float4 acc1={0.f,0.f,0.f,0.f}, acc2={0.f,0.f,0.f,0.f};
+            _Pragma("clang loop unroll(full)")
+            for (short i=0; i<4; ++i) {
+                acc1[0]+=yl[2*i+0]*(q1[i]&0x000F); acc1[1]+=yl[2*i+1]*(q1[i]&0x0F00);
+                acc1[2]+=yl[2*i+8]*(q1[i]&0x00F0); acc1[3]+=yl[2*i+9]*(q1[i]&0xF000);
+                acc2[0]+=yh[2*i+0]*(q2[i]&0x000F); acc2[1]+=yh[2*i+1]*(q2[i]&0x0F00);
+                acc2[2]+=yh[2*i+8]*(q2[i]&0x00F0); acc2[3]+=yh[2*i+9]*(q2[i]&0xF000);
+            }
+            sumf[row]+=dh[0]*((acc1[0]+1.f/256.f*acc1[1])*sc8[0]+(acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f+
+                              (acc2[0]+1.f/256.f*acc2[1])*sc8[4]+(acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f)
+                      -dh[1]*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
+            q1+=step; sc+=step; dh+=step;
+        }
+        g4 += 4 * QK_K;
+        u4 += 4 * QK_K;
+    }
+    for (int row = 0; row < N_DST_Q4K; ++row) {
+        float all_sum = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (ushort)(as_type<uint>(all_sum) >> 16);
+        }
+    }
+}
+
 // Fused double-GEMV for Q4K: computes gate_proj(x) and up_proj(x) in a single
 // dispatch.  Both weight matrices share the same shape [ne01, ne00] (Q4K) and
 // the same input vector src1 [ne10=ne00].  Outputs are written to dst_a and
