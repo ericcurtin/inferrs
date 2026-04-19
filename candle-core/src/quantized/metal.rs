@@ -545,6 +545,58 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Q8_0 GEMV: BF16 input → F32 output, into a pre-allocated F32 buffer.
+    pub fn fwd_mv_q8_0_bf16i_f32_prealloc(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        dst: &Buffer,
+        dst_offset_bytes: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q8_0 {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let lhs_off = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let d_off = dst_offset_bytes + batch_id * n * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q8_0_bf16i(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                lhs_off,
+                &self.buffer,
+                self.offset,
+                d_off,
+                dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Q6K GEMV: BF16 input → F32 output.
     /// Saves the BF16→F32 pre-cast dispatch for Q6K layers (e.g. lm_head in E4B).
     pub fn fwd_mv_q6k_bf16i_f32(

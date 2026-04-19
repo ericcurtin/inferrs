@@ -2850,6 +2850,12 @@ struct DecoderLayer {
     /// Pre-allocated BF16 output for PLI norm_add_scale (apply_pli_scalar output).
     /// Shape [1,1,hidden_size], reused across decode steps.
     pli_output_buf: Option<Tensor>,
+    /// Pre-allocated F32 output for PLI gate GEMV (Q8_0 BF16i→F32 or BF16i path).
+    /// Shape [1,1,hidden_size_per_layer_input], reused across decode steps.
+    pli_gate_out: Option<Tensor>,
+    /// Pre-allocated BF16 output for PLI projection GEMV (Q8_0 BF16o or Q4K BF16o).
+    /// Shape [1,1,hidden_size], reused across decode steps.
+    pli_proj_bf16_out: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -2979,6 +2985,8 @@ impl DecoderLayer {
             post_ffn_add_out: None,
             input_norm_out: None,
             pli_output_buf: None,
+            pli_gate_out: None,
+            pli_proj_bf16_out: None,
         })
     }
 
@@ -3182,19 +3190,26 @@ impl DecoderLayer {
     ) -> Option<Result<Tensor>> {
         use candle_core::DType;
         if let (Some(pli), Some(pli_input)) = (&self.pli, per_layer_input) {
-            let gate_f32 = if let Some(out) = pli
-                .gate
-                .forward_q8_0_bf16i_f32(&xs)
-                .or_else(|| pli.gate.forward_bf16i(&xs))
-            {
-                match out {
-                    Ok(o) => o,
-                    Err(e) => return Some(Err(e)),
-                }
-            } else {
-                match xs.apply(&pli.gate) {
-                    Ok(o) => o,
-                    Err(e) => return Some(Err(e)),
+            // PLI gate: BF16→F32 GEMV (Q8_0 bf16i path).
+            // Use pre-allocated F32 output buffer to save 1 Metal allocation per layer/step.
+            let gate_f32 = {
+                let gate_prealloc_ok = if let Some(pa) = self.pli_gate_out.as_ref() {
+                    if pa.dtype() == DType::F32 && xs.dtype() == DType::BF16 {
+                        pli.gate.forward_q8_0_bf16i_f32_prealloc(&xs, pa)
+                    } else { false }
+                } else { false };
+                if gate_prealloc_ok {
+                    self.pli_gate_out.as_ref().unwrap().clone()
+                } else if let Some(out) = pli.gate.forward_q8_0_bf16i_f32(&xs).or_else(|| pli.gate.forward_bf16i(&xs)) {
+                    let o = match out { Ok(o) => o, Err(e) => return Some(Err(e)) };
+                    if self.pli_gate_out.is_none() {
+                        self.pli_gate_out = Some(match Tensor::zeros(o.shape().dims(), DType::F32, o.device()) {
+                            Ok(t) => t, Err(e) => return Some(Err(e)),
+                        });
+                    }
+                    o
+                } else {
+                    match xs.apply(&pli.gate) { Ok(o) => o, Err(e) => return Some(Err(e)) }
                 }
             };
 
@@ -3203,23 +3218,33 @@ impl DecoderLayer {
                 Err(e) => return Some(Err(e)),
             };
 
-            let pli_proj_out = if let Some(out) = pli
-                .projection
-                .forward_q8_0_bf16o(&pli_mid_f32)
-                .or_else(|| pli.projection.forward_q4k_bf16o(&pli_mid_f32))
-            {
-                match out {
-                    Ok(o) => o,
-                    Err(e) => return Some(Err(e)),
-                }
-            } else {
-                let f32_out = match pli.projection.forward_f32(&pli_mid_f32) {
-                    Ok(o) => o,
-                    Err(e) => return Some(Err(e)),
-                };
-                match f32_out.to_dtype(DType::BF16) {
-                    Ok(o) => o,
-                    Err(e) => return Some(Err(e)),
+            // PLI projection: F32→BF16 GEMV.
+            // Use pre-allocated BF16 output buffer to save 1 Metal allocation per layer/step.
+            let pli_proj_out = {
+                let proj_prealloc_ok = if let Some(pa) = self.pli_proj_bf16_out.as_ref() {
+                    if pa.dtype() == DType::BF16 {
+                        pli.projection.forward_q8_0_bf16o_prealloc(&pli_mid_f32, pa)
+                    } else { false }
+                } else { false };
+                if proj_prealloc_ok {
+                    self.pli_proj_bf16_out.as_ref().unwrap().clone()
+                } else if let Some(out) = pli.projection.forward_q8_0_bf16o(&pli_mid_f32)
+                    .or_else(|| pli.projection.forward_q4k_bf16o(&pli_mid_f32))
+                {
+                    let o = match out { Ok(o) => o, Err(e) => return Some(Err(e)) };
+                    if self.pli_proj_bf16_out.is_none() {
+                        self.pli_proj_bf16_out = Some(match Tensor::zeros(o.shape().dims(), DType::BF16, o.device()) {
+                            Ok(t) => t, Err(e) => return Some(Err(e)),
+                        });
+                    }
+                    o
+                } else {
+                    let f32_out = match pli.projection.forward_f32(&pli_mid_f32) {
+                        Ok(o) => o, Err(e) => return Some(Err(e)),
+                    };
+                    match f32_out.to_dtype(DType::BF16) {
+                        Ok(o) => o, Err(e) => return Some(Err(e)),
+                    }
                 }
             };
 

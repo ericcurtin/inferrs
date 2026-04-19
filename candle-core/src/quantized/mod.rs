@@ -874,6 +874,31 @@ impl QTensor {
         }
     }
 
+    /// Q8_0 GEMV: BF16 input → F32 output, into a pre-allocated F32 tensor.
+    /// Returns `true` on success; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q8_0_bf16i_f32_prealloc(&self, xs: &Tensor, out: &Tensor) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_q8_0_bf16i_f32_prealloc(&self.shape, &xs_s, &xs_l, out_metal.buffer(), 0)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Q6K GEMV: BF16 input → F32 output. Saves the BF16→F32 pre-cast dispatch.
     pub fn fwd_mv_q6k_bf16i_f32(&self, xs: &Tensor) -> Result<Tensor> {
         if xs.dtype() != DType::BF16 {
