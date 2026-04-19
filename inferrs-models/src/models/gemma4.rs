@@ -3946,23 +3946,43 @@ impl Gemma4Model {
         let greedy = self.skip_final_softcap;
         self.skip_final_softcap = false; // always reset
 
-        // For greedy sampling on CUDA with a quantized (GGUF) lm_head, keep the
-        // output as F32 (no F32→BF16 conversion needed since argmax works on any
-        // numeric dtype).  This saves one GPU kernel per decode step.
-        //
-        // The F32 fast path is only valid when lm_head is a QTensor: the GGUF GEMV
-        // kernel accepts F32 input and outputs F32.  For the dense safetensors path
-        // (QMatMul::Tensor with BF16 weights), xs.matmul(&w) requires matching dtypes
-        // so we must NOT pass F32 — doing so triggers "dtype mismatch in matmul".
+        // Fast lm_head path for Metal + BF16 decode (single token):
+        // Try Q6K BF16i kernel first (BF16 input → F32 output, saves BF16→F32 pre-cast).
+        // For greedy sampling, the F32 output is kept (no F32→BF16 back-cast needed).
+        // For non-greedy, keep the standard BF16 path so softcapping runs on BF16.
+        #[cfg(feature = "metal")]
+        let logits = if greedy
+            && last_hidden.dtype() == DType::BF16
+            && matches!(last_hidden.device(), candle_core::Device::Metal(_))
+        {
+            if let Some(out) = self.lm_head.forward_q6k_bf16i_f32(&last_hidden) {
+                // Q6K BF16i path: BF16 in, F32 out — no casts needed. 2 dispatches saved.
+                out?
+            } else if self.lm_head.is_quantized() {
+                // Other quantized (Q8_0, Q4K): pass F32 to avoid back-cast.
+                let h_f32 = last_hidden.to_dtype(DType::F32)?;
+                h_f32.apply(&self.lm_head)? // stays F32
+            } else {
+                last_hidden.apply(&self.lm_head)?
+            }
+        } else if greedy
+            && self.lm_head.is_quantized()
+            && matches!(last_hidden.device(), candle_core::Device::Cuda(_))
+            && last_hidden.dtype() != DType::F32
+        {
+            let h_f32 = last_hidden.to_dtype(DType::F32)?;
+            h_f32.apply(&self.lm_head)?
+        } else {
+            last_hidden.apply(&self.lm_head)?
+        };
+        #[cfg(not(feature = "metal"))]
         let logits = if greedy
             && self.lm_head.is_quantized()
             && matches!(last_hidden.device(), candle_core::Device::Cuda(_))
+            && last_hidden.dtype() != DType::F32
         {
-            // Pass F32 input to lm_head to bypass the F32→BF16 output conversion.
-            // The lm_head GEMV (quantize_q8_1_bf16 + mul_mat_vec) outputs F32;
-            // with F32 input the existing QLinear code keeps it as F32 (no conversion).
             let h_f32 = last_hidden.to_dtype(DType::F32)?;
-            h_f32.apply(&self.lm_head)? // Output stays F32
+            h_f32.apply(&self.lm_head)?
         } else {
             last_hidden.apply(&self.lm_head)?
         };

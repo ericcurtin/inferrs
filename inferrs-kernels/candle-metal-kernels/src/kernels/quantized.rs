@@ -353,6 +353,70 @@ pub fn call_quantized_matmul_mv_q8_0_bf16o(
     Ok(())
 }
 
+/// Q6K GEMV with BF16 input → F32 output.
+/// Eliminates the BF16→F32 pre-cast dispatch for Q6K layers (e.g. lm_head).
+/// Grid: {ceil(n/4), m, b}, TG: {2, 32, 1} — same as Q6K F32 kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q6k_bf16i(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_bf16: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    rhs_offset: usize,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+    // Q6K: 2 simdgroups × N_DST_Q6K=2 rows/simdgroup = 4 rows/TG, align=4
+    let tgc = MTLSize {
+        width: divide(ne01 as usize, 4),
+        height: ne11 as usize,
+        depth: (ne12 * ne13) as usize,
+    };
+    let tgs = MTLSize {
+        width: 2,
+        height: 32,
+        depth: 1,
+    };
+    let pipeline =
+        kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q6_K_bf16i_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    // nb* fields are unused in the kernel (computed from ne* internally); pass zeros.
+    let (nb00, nb01, nb02, nb10, nb11, nb12) = (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+    set_params!(
+        encoder,
+        (
+            (rhs, rhs_offset),
+            (lhs_bf16, lhs_offset),
+            (dst, dst_offset),
+            ne00, ne01, ne02, nb00, nb01, nb02,
+            ne10, ne11, ne12, nb10, nb11, nb12,
+            ne0, ne1, r2, r3
+        )
+    );
+    encoder.use_resource(rhs, MTLResourceUsage::Read);
+    encoder.use_resource(lhs_bf16, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tgc, tgs);
+    Ok(())
+}
+
 /// Q8_0 GEMV: BF16 input → BF16 output.
 /// Eliminates both the pre-cast (BF16→F32) and post-cast (F32→BF16) dispatches.
 /// Used for o_proj (hidden→hidden) and PLI projection (256→hidden).

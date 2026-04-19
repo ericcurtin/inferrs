@@ -295,6 +295,34 @@ impl QLinear {
             Err(e) => Some(Err(e)),
         }
     }
+
+    /// Q6K GEMV with BF16 input → F32 output. Saves the BF16→F32 pre-cast.
+    /// Returns None for non-Q6K, non-Metal, non-BF16, or bias layers.
+    #[cfg(feature = "metal")]
+    pub fn forward_q6k_bf16i_f32(&self, xs: &Tensor) -> Option<candle_core::Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        if xs.dtype() != candle_core::DType::BF16 {
+            return None;
+        }
+        if !matches!(xs.device(), candle_core::Device::Metal(_)) {
+            return None;
+        }
+        let qt = match &self.inner {
+            candle_core::quantized::QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        if qt.dtype() != candle_core::quantized::GgmlDType::Q6K {
+            return None;
+        }
+        // Single-token decode only (seq_dim == 1)
+        if xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) != 1 {
+            return None;
+        }
+        Some(qt.fwd_mv_q6k_bf16i_f32(xs))
+    }
+
     #[cfg(feature = "metal")]
     /// Triple Q8_0 BF16i GEMV: Q+K+V in one dispatch, BF16 input → F32 output.
     /// Eliminates both the xs.to_dtype(F32) pre-cast and the 3×F32→BF16 back-casts.

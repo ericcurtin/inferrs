@@ -7193,6 +7193,91 @@ kernel void kernel_mul_mv_q6_K_f32(
     kernel_mul_mv_q6_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
+/// Q6K GEMV with BF16 input — eliminates the BF16→F32 pre-cast dispatch.
+/// Used for the lm_head (Q6K weights) during greedy decode on Metal.
+[[host_name("kernel_mul_mv_q6_K_bf16i_f32")]]
+kernel void kernel_mul_mv_q6_K_bf16i_f32(
+        device const  void   * src0,
+        device const bfloat  * src1,
+        device       float   * dst,
+        constant   int64_t   & ne00,
+        constant   int64_t   & ne01,
+        constant   int64_t   & ne02,
+        constant  uint64_t   & nb00,
+        constant  uint64_t   & nb01,
+        constant  uint64_t   & nb02,
+        constant   int64_t   & ne10,
+        constant   int64_t   & ne11,
+        constant   int64_t   & ne12,
+        constant  uint64_t   & nb10,
+        constant  uint64_t   & nb11,
+        constant  uint64_t   & nb12,
+        constant   int64_t   & ne0,
+        constant   int64_t   & ne1,
+        constant   uint      & r2,
+        constant   uint      & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    const uint8_t kmask1 = 0x03;
+    const uint8_t kmask2 = 0x0C;
+    const uint8_t kmask3 = 0x30;
+    const uint8_t kmask4 = 0xC0;
+
+    const int nb = ne00/QK_K;
+    const int64_t r0 = tgpig.x;
+    const int64_t r1 = tgpig.y;
+    const int     im = tgpig.z;
+    const int first_row = (2 * r0 + sgitg) * N_DST_Q6K;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+    const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q6_K * x  = (device const block_q6_K *) src0 + first_row * nb + offset0;
+    device const bfloat      * yy = src1 + r1*ne10 + im*ne00*ne1;
+
+    float sumf[N_DST_Q6K] = { 0.f, 0.f };
+
+    const int tid  = tiisg/2;
+    const int ix   = tiisg%2;
+    const int ip   = tid/8;
+    const int il   = tid%8;
+    const int n    = 4;
+    const int l0   = n*il;
+    const int is   = 8*ip + l0/16;
+    const int y_offset = 128*ip + l0;
+    const int q_offset_l = 64*ip + l0;
+    const int q_offset_h = 32*ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const bfloat * y = yy + i * QK_K + y_offset;
+        for (int nr = 0; nr < N_DST_Q6K; ++nr) {
+            device const block_q6_K * xr = x + nr * nb;
+            device const uint8_t * q1 = xr[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xr[i].qh + q_offset_h;
+            device const int8_t  * sc = xr[i].scales + is;
+            const float dall = xr[i].d;
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < n; ++l) {
+                sums[0] += float(y[l+ 0]) * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += float(y[l+32]) * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += float(y[l+64]) * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += float(y[l+96]) * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+            sumf[nr] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+    for (int nr = 0; nr < N_DST_Q6K; ++nr) {
+        const float tot = simd_sum(sumf[nr]);
+        if (tiisg == 0 && first_row + nr < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + nr] = tot;
+        }
+    }
+}
+
 // ======================= "True" 2-bit
 
 void kernel_mul_mv_iq2_xxs_f32_impl(
