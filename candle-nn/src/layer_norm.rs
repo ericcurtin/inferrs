@@ -216,16 +216,20 @@ impl RmsNorm {
     ///
     /// Saves 1 Metal dispatch per decoder layer during single-token decode
     /// (42 dispatches for E4B, 35 for E2B per step).
-    pub fn forward_add_then_f32_out(
+    ///
+    /// When `preallocated` is `Some((bf16_out, f32_out))`, writes results into
+    /// those pre-allocated tensors instead of allocating new Metal buffers,
+    /// eliminating per-step Metal buffer allocations.
+    pub fn forward_add_then_f32_out_prealloc(
         &self,
         src: &Tensor,
         residual: &Tensor,
         next_norm: &RmsNorm,
+        preallocated: Option<(&Tensor, &Tensor)>,
     ) -> Option<Result<(Tensor, Tensor)>> {
         #[cfg(feature = "metal")]
         {
             use candle::{DType, Storage};
-            // Only valid for BF16 contiguous inputs with BF16 weights on Metal.
             if src.dtype() != DType::BF16
                 || residual.dtype() != DType::BF16
                 || self.0.weight.dtype() != DType::BF16
@@ -259,6 +263,55 @@ impl RmsNorm {
             let elem_count = src_l.shape().elem_count();
             let last_dim = src_l.dims()[src_l.shape().rank() - 1];
 
+            let encoder = match device.command_encoder() {
+                Ok(e) => e,
+                Err(e) => return Some(Err(candle::Error::wrap(e))),
+            };
+
+            use candle::backend::BackendStorage;
+
+            // Use pre-allocated buffers if provided and correctly sized; else allocate.
+            if let Some((pa_bf16, pa_f32)) = preallocated {
+                if pa_bf16.elem_count() == elem_count
+                    && pa_f32.elem_count() == elem_count
+                    && pa_bf16.dtype() == DType::BF16
+                    && pa_f32.dtype() == DType::F32
+                {
+                    let (pb_s, _) = pa_bf16.storage_and_layout();
+                    let (pf_s, _) = pa_f32.storage_and_layout();
+                    match (&*pb_s, &*pf_s) {
+                        (Storage::Metal(pb_metal), Storage::Metal(pf_metal)) => {
+                            let result = candle_metal_kernels::call_rmsnorm_add_bf16i_f32o(
+                                device.metal_device(),
+                                &encoder,
+                                device.kernels(),
+                                elem_count,
+                                last_dim,
+                                self.0.eps as f32,
+                                src_metal.buffer(),
+                                src_l.start_offset() * DType::BF16.size_in_bytes(),
+                                w1_metal.buffer(),
+                                w1_l.start_offset() * DType::BF16.size_in_bytes(),
+                                res_metal.buffer(),
+                                res_l.start_offset() * DType::BF16.size_in_bytes(),
+                                pb_metal.buffer(),
+                                0,
+                                w2_metal.buffer(),
+                                w2_l.start_offset() * DType::BF16.size_in_bytes(),
+                                pf_metal.buffer(),
+                                0,
+                            );
+                            return match result {
+                                Ok(()) => Some(Ok((pa_bf16.clone(), pa_f32.clone()))),
+                                Err(e) => Some(Err(candle::Error::wrap(e))),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Fallback: allocate new buffers.
             let bf16_buf =
                 match device.new_buffer(elem_count, DType::BF16, "rmsnorm_add_bf16i_f32o_bf16") {
                     Ok(b) => b,
@@ -270,12 +323,6 @@ impl RmsNorm {
                     Err(e) => return Some(Err(e)),
                 };
 
-            let encoder = match device.command_encoder() {
-                Ok(e) => e,
-                Err(e) => return Some(Err(candle::Error::wrap(e))),
-            };
-
-            use candle::backend::BackendStorage;
             let result = candle_metal_kernels::call_rmsnorm_add_bf16i_f32o(
                 device.metal_device(),
                 &encoder,
@@ -299,18 +346,10 @@ impl RmsNorm {
 
             match result {
                 Ok(()) => {
-                    let bf16_storage = candle::MetalStorage::new(
-                        bf16_buf,
-                        device.clone(),
-                        elem_count,
-                        DType::BF16,
-                    );
-                    let f32_storage = candle::MetalStorage::new(
-                        f32_buf,
-                        device.clone(),
-                        elem_count,
-                        DType::F32,
-                    );
+                    let bf16_storage =
+                        candle::MetalStorage::new(bf16_buf, device.clone(), elem_count, DType::BF16);
+                    let f32_storage =
+                        candle::MetalStorage::new(f32_buf, device.clone(), elem_count, DType::F32);
                     let bf16_out = candle::Tensor::from_storage(
                         Storage::Metal(bf16_storage),
                         src_l.shape().clone(),
@@ -332,17 +371,30 @@ impl RmsNorm {
         None
     }
 
+    pub fn forward_add_then_f32_out(
+        &self,
+        src: &Tensor,
+        residual: &Tensor,
+        next_norm: &RmsNorm,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        self.forward_add_then_f32_out_prealloc(src, residual, next_norm, None)
+    }
+
     /// Fused double-RMSNorm (all BF16): `(post_attn_norm_add, pre_ffn_norm_bf16)`.
     ///
     /// Like `forward_add_then_f32_out` but outputs BF16 for the second norm.
     /// Used for Q8_0 (E2B) decode where the MLP bf16i path takes BF16 input.
     ///
     /// Returns `Some((bf16_out, bf16_norm))` on Metal; `None` on fallback.
-    pub fn forward_add_then_bf16_out(
+    ///
+    /// When `preallocated` is `Some((bf16_out, bf16_norm))`, writes results into
+    /// those pre-allocated tensors instead of allocating new Metal buffers.
+    pub fn forward_add_then_bf16_out_prealloc(
         &self,
         src: &Tensor,
         residual: &Tensor,
         next_norm: &RmsNorm,
+        preallocated: Option<(&Tensor, &Tensor)>,
     ) -> Option<Result<(Tensor, Tensor)>> {
         #[cfg(feature = "metal")]
         {
@@ -379,6 +431,55 @@ impl RmsNorm {
             let elem_count = src_l.shape().elem_count();
             let last_dim = src_l.dims()[src_l.shape().rank() - 1];
 
+            let encoder = match device.command_encoder() {
+                Ok(e) => e,
+                Err(e) => return Some(Err(candle::Error::wrap(e))),
+            };
+
+            use candle::backend::BackendStorage;
+
+            // Use pre-allocated buffers if provided and correctly sized.
+            if let Some((pa_bf16, pa_bf16_norm)) = preallocated {
+                if pa_bf16.elem_count() == elem_count
+                    && pa_bf16_norm.elem_count() == elem_count
+                    && pa_bf16.dtype() == DType::BF16
+                    && pa_bf16_norm.dtype() == DType::BF16
+                {
+                    let (pb_s, _) = pa_bf16.storage_and_layout();
+                    let (pn_s, _) = pa_bf16_norm.storage_and_layout();
+                    match (&*pb_s, &*pn_s) {
+                        (Storage::Metal(pb_metal), Storage::Metal(pn_metal)) => {
+                            let result = candle_metal_kernels::call_rmsnorm_add_bf16_then_rmsnorm_bf16(
+                                device.metal_device(),
+                                &encoder,
+                                device.kernels(),
+                                elem_count,
+                                last_dim,
+                                self.0.eps as f32,
+                                src_metal.buffer(),
+                                src_l.start_offset() * DType::BF16.size_in_bytes(),
+                                w1_metal.buffer(),
+                                w1_l.start_offset() * DType::BF16.size_in_bytes(),
+                                res_metal.buffer(),
+                                res_l.start_offset() * DType::BF16.size_in_bytes(),
+                                pb_metal.buffer(),
+                                0,
+                                w2_metal.buffer(),
+                                w2_l.start_offset() * DType::BF16.size_in_bytes(),
+                                pn_metal.buffer(),
+                                0,
+                            );
+                            return match result {
+                                Ok(()) => Some(Ok((pa_bf16.clone(), pa_bf16_norm.clone()))),
+                                Err(e) => Some(Err(candle::Error::wrap(e))),
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Fallback: allocate new buffers.
             let bf16_buf =
                 match device.new_buffer(elem_count, DType::BF16, "rmsnorm_add_bf16_then_rmsnorm_bf16_out") {
                     Ok(b) => b,
@@ -390,12 +491,6 @@ impl RmsNorm {
                     Err(e) => return Some(Err(e)),
                 };
 
-            let encoder = match device.command_encoder() {
-                Ok(e) => e,
-                Err(e) => return Some(Err(candle::Error::wrap(e))),
-            };
-
-            use candle::backend::BackendStorage;
             let result = candle_metal_kernels::call_rmsnorm_add_bf16_then_rmsnorm_bf16(
                 device.metal_device(),
                 &encoder,
@@ -450,6 +545,15 @@ impl RmsNorm {
         }
         #[cfg(not(feature = "metal"))]
         None
+    }
+
+    pub fn forward_add_then_bf16_out(
+        &self,
+        src: &Tensor,
+        residual: &Tensor,
+        next_norm: &RmsNorm,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        self.forward_add_then_bf16_out_prealloc(src, residual, next_norm, None)
     }
 
     /// RMSNorm with BF16 input and F32 output.

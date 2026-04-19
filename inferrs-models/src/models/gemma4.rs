@@ -2588,6 +2588,12 @@ struct DecoderLayer {
     pli: Option<LayerPli>,
     /// MoE block; `None` for dense models (e.g. 31B).
     moe: Option<Gemma4MoeBlock>,
+    /// Pre-allocated BF16 output buffer for fused post_attn_norm_add (shape [hidden_size]).
+    /// Reused across decode steps to eliminate per-step Metal buffer allocations.
+    fused_norm_bf16_out: Option<Tensor>,
+    /// Pre-allocated second output buffer for fused pre_ffn_norm.
+    /// BF16 for E2B (Q8_0 bf16i path), F32 for E4B (Q4K path).
+    fused_norm_second_out: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -2712,6 +2718,8 @@ impl DecoderLayer {
             layer_scalar_val,
             pli,
             moe,
+            fused_norm_bf16_out: None,
+            fused_norm_second_out: None,
         })
     }
 
@@ -2966,11 +2974,32 @@ impl DecoderLayer {
 
         // For Q8_0 (E2B): MLP takes BF16 directly — use BF16-output fused norm.
         // For Q4K (E4B): MLP accepts F32 via bf16i internally — use F32-output fused norm.
+        let elem_count = attn_out.elem_count();
+        let attn_shape = attn_out.shape().clone();
         if is_q8_0 {
-            let fused = self.post_attention_layernorm.forward_add_then_bf16_out(
+            // Lazily allocate pre-allocated BF16 output buffers for fused norm.
+            // Both outputs are BF16 for Q8_0 path (residual add + pre-FFN norm).
+            // Shape must match attn_out so downstream ops (dims3, apply) work correctly.
+            let needs_alloc = self.fused_norm_bf16_out.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::BF16);
+            if needs_alloc {
+                self.fused_norm_bf16_out = Some(match Tensor::zeros(
+                    attn_shape.dims(), DType::BF16, attn_out.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+                self.fused_norm_second_out = Some(match Tensor::zeros(
+                    attn_shape.dims(), DType::BF16, attn_out.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+            }
+            let pa = self.fused_norm_bf16_out.as_ref().zip(self.fused_norm_second_out.as_ref());
+            let fused = self.post_attention_layernorm.forward_add_then_bf16_out_prealloc(
                 attn_out,
                 residual,
                 &self.pre_feedforward_layernorm,
+                pa.map(|(a, b)| (a, b)),
             );
             let (xs_residual, normed_bf16) = match fused? {
                 Ok(pair) => pair,
@@ -2996,10 +3025,31 @@ impl DecoderLayer {
             self.apply_pli_scalar(xs, per_layer_input)
         } else {
             // Q4K path: fuse norm with F32 output so MLP skips BF16→F32 pre-cast.
-            let fused = self.post_attention_layernorm.forward_add_then_f32_out(
+            // Pre-allocate: first output is BF16 (residual), second is F32 (pre-FFN norm).
+            let needs_alloc_bf16 = self.fused_norm_bf16_out.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::BF16);
+            let needs_alloc_f32 = self.fused_norm_second_out.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::F32);
+            if needs_alloc_bf16 {
+                self.fused_norm_bf16_out = Some(match Tensor::zeros(
+                    attn_shape.dims(), DType::BF16, attn_out.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+            }
+            if needs_alloc_f32 {
+                self.fused_norm_second_out = Some(match Tensor::zeros(
+                    attn_shape.dims(), DType::F32, attn_out.device()) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                });
+            }
+            let pa = self.fused_norm_bf16_out.as_ref().zip(self.fused_norm_second_out.as_ref());
+            let fused = self.post_attention_layernorm.forward_add_then_f32_out_prealloc(
                 attn_out,
                 residual,
                 &self.pre_feedforward_layernorm,
+                pa.map(|(a, b)| (a, b)),
             );
             let (xs_residual, normed_f32) = match fused? {
                 Ok(pair) => pair,
