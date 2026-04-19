@@ -3103,6 +3103,86 @@ kernel void kernel_mul_mv2_q8_0_bf16i_f32(
     kernel_mul_mv_q8_0_bf16i_impl_4sg(src0_b,src1_bf16,dst_b,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,shmem,tgpig,tiisg,sgitg);
 }
 
+/// Fused paired Q8_0 BF16-input GEMV with in-place gelu_mul.
+///
+/// Computes:
+///   gate_out = GEMV(src0_gate, src1_bf16)   [Q8_0 weights, BF16 activation]
+///   up_out   = GEMV(src0_up,   src1_bf16)
+///   dst[i]   = gelu_tanh(gate_out[i]) * up_out[i]  [F32 output]
+///
+/// Replaces 2 separate dispatches (kernel_mul_mv2_q8_0_bf16i_f32 +
+/// gelu_mul kernel) with a single dispatch, saving 1 Metal dispatch per
+/// MLP layer per decode step (~35 dispatches / step for Gemma4-E2B).
+///
+/// Grid and threadgroup dimensions are identical to kernel_mul_mv2_q8_0_bf16i_f32:
+///   Grid: (ceil(ne01/2), ne11, ne12), TG: (32, 4, 1) = 128 threads.
+[[host_name("kernel_mul_mv2_q8_0_bf16i_gelu_mul_f32")]]
+kernel void kernel_mul_mv2_q8_0_bf16i_gelu_mul_f32(
+        device const  void   * src0_gate,
+        device const  void   * src0_up,
+        device const ushort  * src1_bf16,
+        device       float   * dst,          // output: gelu(gate) * up, F32
+        constant   int64_t & ne00, constant   int64_t & ne01, constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne0,  constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 2, NSG = 4, NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = ne00/QK8_0;
+    const int r0 = tgpig.x * NR0, r1 = tgpig.y, im = tgpig.z;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = r0*nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q8_0 * xg = (device const block_q8_0 *)src0_gate + off0;
+    device const block_q8_0 * xu = (device const block_q8_0 *)src0_up   + off0;
+    device const ushort * y = src1_bf16 + r1*ne10 + im*ne00*ne1;
+    const int ix = tiisg/(NW/NQ), il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NQ];
+    float sg[NR0] = {0.f};  // gate accumulator
+    float su[NR0] = {0.f};  // up accumulator
+    device const ushort * yb = y + ib0*QK8_0 + il*NQ;
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (int i = 0; i < NQ; ++i) { yl[i] = as_type<float>(uint(yb[i]) << 16); }
+        for (int row = 0; row < NR0; ++row) {
+            device const int8_t * qg = xg[ib + row*nb].qs + il*NQ;
+            device const int8_t * qu = xu[ib + row*nb].qs + il*NQ;
+            float sg0 = 0.f, su0 = 0.f;
+            for (int i = 0; i < NQ; ++i) { sg0 += qg[i] * yl[i]; su0 += qu[i] * yl[i]; }
+            sg[row] += sg0 * xg[ib + row*nb].d;
+            su[row] += su0 * xu[ib + row*nb].d;
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+    threadgroup float shmem_g[N_SIMDWIDTH * NR0];
+    threadgroup float shmem_u[N_SIMDWIDTH * NR0];
+    for (int row = 0; row < NR0; ++row) {
+        if (sgitg == 0) { shmem_g[NW*row + tiisg] = 0.f; shmem_u[NW*row + tiisg] = 0.f; }
+        sg[row] = simd_sum(sg[row]);
+        su[row] = simd_sum(su[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int row = 0; row < NR0; ++row) {
+        if (tiisg == 0) { shmem_g[NW*row + sgitg] = sg[row]; shmem_u[NW*row + sgitg] = su[row]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // gelu_tanh(gate) * up
+    constexpr float kAlpha = 0.7978845608028654f;
+    constexpr float kBeta  = 0.044715f;
+    for (int row = 0; row < NR0; ++row) {
+        float gate_tot = simd_sum(shmem_g[NW*row + tiisg]);
+        float up_tot   = simd_sum(shmem_u[NW*row + tiisg]);
+        if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {
+            float t = kAlpha * (gate_tot + kBeta * gate_tot * gate_tot * gate_tot);
+            float gelu = 0.5f * gate_tot * (1.0f + precise::tanh(t));
+            dst[r1*ne0 + im*ne0*ne1 + r0 + row] = gelu * up_tot;
+        }
+    }
+}
+
 /// Optimised Q8_0 GEMV: float4 dequant + dot products, matching llama's approach.
 /// Full simdgroup (32 threads) per output row, each thread handles stride-32 float4 chunks.
 /// Grid: (ceil(ne01/2), ne11, ne12*ne13), TG: (32, 2, 1) = 64 threads.

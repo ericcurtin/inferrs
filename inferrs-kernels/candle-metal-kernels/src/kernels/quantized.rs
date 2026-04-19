@@ -362,6 +362,95 @@ pub fn call_quantized_matmul_mv_q8_0_bf16i_gelu_mul_bf16i(
     Ok(())
 }
 
+/// Fused paired Q8_0 BF16-input GEMV + gelu_mul → F32 output.
+///
+/// Computes `gelu_tanh(GEMV(gate_proj, xs)) * GEMV(up_proj, xs)` in one dispatch.
+/// Replaces 2 dispatches (kernel_mul_mv2_q8_0_bf16i_f32 + gelu_mul) with 1.
+/// Saves ~35 Metal dispatches per decode step for Gemma4-E2B (one per MLP layer).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv2_q8_0_bf16i_gelu_mul_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    gate_rhs: &Buffer,
+    gate_rhs_offset: usize,
+    up_rhs: &Buffer,
+    up_rhs_offset: usize,
+    lhs_bf16: &Buffer,
+    lhs_offset: usize,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+    let tgc = MTLSize {
+        width: divide(ne01 as usize, 2),
+        height: ne11 as usize,
+        depth: (ne12 * ne13) as usize,
+    };
+    let tgs = MTLSize {
+        width: 32,
+        height: 4,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Quantized,
+        "kernel_mul_mv2_q8_0_bf16i_gelu_mul_f32",
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (gate_rhs, gate_rhs_offset),
+            (up_rhs, up_rhs_offset),
+            (lhs_bf16, lhs_offset),
+            (dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(gate_rhs, MTLResourceUsage::Read);
+    encoder.use_resource(up_rhs, MTLResourceUsage::Read);
+    encoder.use_resource(lhs_bf16, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tgc, tgs);
+    Ok(())
+}
+
 /// Q8_0 GEMV with F32 input and BF16 output.
 /// Eliminates the F32→BF16 to_dtype dispatch after down_proj / pli_projection.
 /// Uses kernel_mul_mv_q8_0_f32_to_bf16 which converts inline.

@@ -627,6 +627,33 @@ impl QLinear {
         }
     }
 
+    /// Paired Q8_0 BF16i GEMV with fused gelu_mul → F32 output (prealloc).
+    ///
+    /// Computes `gelu_tanh(gate_GEMV(xs)) * up_GEMV(xs)` in one Metal dispatch.
+    /// Replaces 2 dispatches (paired GEMV + gelu_mul) with 1.
+    /// `self` = gate_proj, `other` = up_proj, `out` = pre-allocated F32 buffer.
+    /// Returns `true` on success; caller reuses `out`.
+    #[cfg(feature = "metal")]
+    pub fn forward_q8_0_bf16i_gelu_mul_f32_prealloc(
+        &self,
+        other: &QLinear,
+        xs_bf16: &Tensor,
+        out: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() || other.bias.is_some() {
+            return false;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 || out.dtype() != candle_core::DType::F32 {
+            return false;
+        }
+        let (qt_s, qt_o) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return false,
+        };
+        qt_s.fwd_mv2_q8_0_bf16i_gelu_mul_f32_prealloc(qt_o, xs_bf16, out)
+            .unwrap_or(false)
+    }
+
     #[cfg(feature = "metal")]
     /// Triple Q8_0 GEMV: computes Q, K, V projections in one dispatch.
     /// For E2B Q8_0_full models, replaces 3 separate GEMVs with one.

@@ -962,6 +962,42 @@ impl QTensor {
         }
     }
 
+    /// Paired Q8_0 BF16i GEMV with fused gelu_mul → F32 output (prealloc).
+    ///
+    /// Computes `gelu_tanh(GEMV(self=gate, xs)) * GEMV(up, xs)` in one dispatch.
+    /// `out` must be F32 with shape `[..., n]` where `n` is the gate/up output dim.
+    /// Returns `Ok(true)` on success; `Ok(false)` when conditions aren't met.
+    pub fn fwd_mv2_q8_0_bf16i_gelu_mul_f32_prealloc(
+        &self,
+        up: &QTensor,
+        xs: &Tensor,
+        out: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match (&self.storage, &up.storage) {
+            (QStorage::Metal(gate_m), QStorage::Metal(up_m)) => {
+                gate_m.fwd_mv2_q8_0_bf16i_gelu_mul_f32_prealloc(
+                    &self.shape, up_m, &up.shape,
+                    &xs_s, &xs_l,
+                    out_metal.buffer(), 0,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Q6K GEMV: BF16 input → F32 output. Saves the BF16→F32 pre-cast dispatch.
     pub fn fwd_mv_q6k_bf16i_f32(&self, xs: &Tensor) -> Result<Tensor> {
         if xs.dtype() != DType::BF16 {
