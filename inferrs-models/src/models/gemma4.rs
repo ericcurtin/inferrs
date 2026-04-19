@@ -818,18 +818,26 @@ impl RetainingRotatingKvCache {
 
         // Return a view of the valid portion of the circular buffer.
         // When the buffer is fully filled return it directly (contiguous).
-        // When only a prefix is valid, narrow() produces a non-contiguous view;
-        // force contiguity here so SDPA / matmul kernels don't each copy it.
+        // When only a prefix is valid, narrow() produces a non-contiguous view with
+        // stride[1] = max_seq_len * head_dim (the physical allocation stride).
+        //
+        // We intentionally do NOT call `.contiguous()` here.  All downstream consumers
+        // (sdpa_vector, sdpa_vector_2pass, sdpa_2pass_prealloc_full) accept the strided
+        // layout via the k_stride/v_stride parameters — they receive k_stride[1] and
+        // iterate over the N=valid tokens, using the physical stride to jump between
+        // KV heads.  Materialising a fresh contiguous buffer here costs one Metal
+        // allocation + memcpy per sliding-window layer per decode step (≥26 copies per
+        // step for E2B, ≥42 for E4B), which is a dominant decode-step overhead.
         let valid = self.current_seq_len.min(self.max_seq_len);
         let k_out = if valid == self.max_seq_len {
             kb.clone()
         } else {
-            kb.narrow(2, 0, valid)?.contiguous()?
+            kb.narrow(2, 0, valid)?
         };
         let v_out = if valid == self.max_seq_len {
             vb.clone()
         } else {
-            vb.narrow(2, 0, valid)?.contiguous()?
+            vb.narrow(2, 0, valid)?
         };
         Ok((k_out, v_out))
     }
