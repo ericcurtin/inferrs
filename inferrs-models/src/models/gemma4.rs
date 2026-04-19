@@ -3338,33 +3338,62 @@ impl DecoderLayer {
     ) -> Option<Result<Tensor>> {
         use candle_core::DType;
         if let (Some(pli), Some(pli_input)) = (&self.pli, per_layer_input) {
-            // PLI gate: BF16→F32 GEMV (Q8_0 or Q4K bf16i path).
-            // Use pre-allocated F32 output buffer to save 1 Metal allocation per layer/step.
-            let gate_f32 = {
-                let gate_prealloc_ok = if let Some(pa) = self.pli_gate_out.as_ref() {
-                    if pa.dtype() == DType::F32 && xs.dtype() == DType::BF16 {
-                        // Try Q8_0 prealloc first, then generic bf16i prealloc (covers Q4K too).
-                        pli.gate.forward_q8_0_bf16i_f32_prealloc(&xs, pa)
-                            || pli.gate.forward_bf16i_prealloc(&xs, pa)
-                    } else { false }
-                } else { false };
-                if gate_prealloc_ok {
-                    self.pli_gate_out.as_ref().unwrap().clone()
-                } else if let Some(out) = pli.gate.forward_q8_0_bf16i_f32(&xs).or_else(|| pli.gate.forward_bf16i(&xs)) {
-                    let o = match out { Ok(o) => o, Err(e) => return Some(Err(e)) };
-                    if self.pli_gate_out.is_none() {
-                        self.pli_gate_out = Some(match Tensor::zeros(o.shape().dims(), DType::F32, o.device()) {
-                            Ok(t) => t, Err(e) => return Some(Err(e)),
-                        });
+            // PLI gate + gelu_mul: fuse into one Metal dispatch when possible.
+            //
+            // Fast path (Metal, BF16 xs, BF16 pli_input, Q8_0 gate):
+            //   kernel_mul_mv_q8_0_bf16i_gelu_mul_bf16i_f32 combines GEMV + gelu_tanh + mul
+            //   into a single dispatch, saving 1 kernel launch per layer per decode step
+            //   (35 fewer dispatches for E2B, 35 for E4B).
+            //
+            // Fallback: two-step GEMV + gelu_mul (Q4K gate or non-BF16 inputs).
+            let pli_mid_f32 = 'fused: {
+                if xs.dtype() == DType::BF16 && pli_input.dtype() == DType::BF16
+                    && matches!(xs.device(), candle_core::Device::Metal(_))
+                {
+                    // Ensure pli_gelu_out buffer is allocated.
+                    // pli_input has shape [1, 1, pli_dim]; its elem_count() == pli_dim.
+                    let pli_dim = pli_input.elem_count();
+                    if pli_dim > 0 {
+                        let needs_alloc = self.pli_gelu_out.as_ref()
+                            .is_none_or(|t| t.elem_count() != pli_dim || t.dtype() != DType::F32);
+                        if needs_alloc {
+                            self.pli_gelu_out = Some(match Tensor::zeros(
+                                &[1usize, 1, pli_dim], DType::F32, xs.device()) {
+                                Ok(t) => t, Err(e) => return Some(Err(e)),
+                            });
+                        }
+                        if let Some(pa) = self.pli_gelu_out.as_ref() {
+                            #[cfg(feature = "metal")]
+                            if pli.gate.forward_q8_0_bf16i_gelu_mul_bf16i_f32_prealloc(
+                                &xs, pli_input, pa)
+                            {
+                                break 'fused pa.clone();
+                            }
+                        }
                     }
-                    o
-                } else {
-                    match xs.apply(&pli.gate) { Ok(o) => o, Err(e) => return Some(Err(e)) }
                 }
-            };
-
-            let pli_mid_f32 = {
-                // pli_input is BF16, gate_f32 is F32 → use F32×BF16→F32 prealloc path.
+                // Fallback: two-step path (separate GEMV + gelu_mul).
+                let gate_f32 = {
+                    let gate_prealloc_ok = if let Some(pa) = self.pli_gate_out.as_ref() {
+                        if pa.dtype() == DType::F32 && xs.dtype() == DType::BF16 {
+                            pli.gate.forward_q8_0_bf16i_f32_prealloc(&xs, pa)
+                                || pli.gate.forward_bf16i_prealloc(&xs, pa)
+                        } else { false }
+                    } else { false };
+                    if gate_prealloc_ok {
+                        self.pli_gate_out.as_ref().unwrap().clone()
+                    } else if let Some(out) = pli.gate.forward_q8_0_bf16i_f32(&xs).or_else(|| pli.gate.forward_bf16i(&xs)) {
+                        let o = match out { Ok(o) => o, Err(e) => return Some(Err(e)) };
+                        if self.pli_gate_out.is_none() {
+                            self.pli_gate_out = Some(match Tensor::zeros(o.shape().dims(), DType::F32, o.device()) {
+                                Ok(t) => t, Err(e) => return Some(Err(e)),
+                            });
+                        }
+                        o
+                    } else {
+                        match xs.apply(&pli.gate) { Ok(o) => o, Err(e) => return Some(Err(e)) }
+                    }
+                };
                 let gelu_elem = gate_f32.elem_count();
                 let needs_alloc = self.pli_gelu_out.as_ref()
                     .is_none_or(|t| t.elem_count() != gelu_elem || t.dtype() != DType::F32);
@@ -3380,9 +3409,7 @@ impl DecoderLayer {
                     } else {
                         candle_nn::ops::gelu_mul_prealloc(&gate_f32, pli_input, pa)
                     };
-                    if used {
-                        pa.clone()
-                    } else {
+                    if used { pa.clone() } else {
                         match candle_nn::ops::gelu_mul(&gate_f32, pli_input) {
                             Ok(o) => o, Err(e) => return Some(Err(e)),
                         }
