@@ -15,8 +15,8 @@ use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm,
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    apply_rope, causal_mask, compute_logits, concat_kv_cache, paged_write_gather_sdpa,
-    precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
+    apply_rms_norm_heads, apply_rope, causal_mask, compute_logits, concat_kv_cache,
+    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
 };
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
@@ -135,22 +135,20 @@ impl Attention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // Apply per-head QK norms BEFORE transpose so the input is still
-        // contiguous from the projection, avoiding a .contiguous() copy per layer.
-        // Reshape directly to [b*t*h, head_dim], norm, then reshape+transpose.
-        let q = self
-            .q_norm
-            .forward(&q.reshape((b * t * self.num_heads, self.head_dim))?)?
+        // Reshape to [b, heads, t, head_dim]
+        let q = q
             .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?; // → [b, h, t, head_dim]
-        let k = self
-            .k_norm
-            .forward(&k.reshape((b * t * self.num_kv_heads, self.head_dim))?)?
+            .transpose(1, 2)?;
+        let k = k
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?; // → [b, kv_h, t, head_dim]
+            .transpose(1, 2)?;
         let v = v
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
+
+        // Per-head QK norms
+        let q = apply_rms_norm_heads(&q, &self.q_norm)?;
+        let k = apply_rms_norm_heads(&k, &self.k_norm)?;
 
         // RoPE
         let cos_slice = cos.narrow(0, seqlen_offset, t)?;
@@ -295,21 +293,20 @@ impl Attention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // Apply per-head QK norms BEFORE transpose (same as forward()) to avoid
-        // the .contiguous() copy that apply_rms_norm_heads would otherwise need.
-        let q = self
-            .q_norm
-            .forward(&q.reshape((b * t * self.num_heads, self.head_dim))?)?
+        // Reshape to [b, heads, t, head_dim]
+        let q = q
             .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?; // → [b, h, t, head_dim]
-        let k = self
-            .k_norm
-            .forward(&k.reshape((b * t * self.num_kv_heads, self.head_dim))?)?
+            .transpose(1, 2)?;
+        let k = k
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?; // → [b, kv_h, t, head_dim]
+            .transpose(1, 2)?;
         let v = v
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
+
+        // Per-head QK norms
+        let q = apply_rms_norm_heads(&q, &self.q_norm)?;
+        let k = apply_rms_norm_heads(&k, &self.k_norm)?;
 
         // RoPE
         let cos_slice = ctx.cos.narrow(0, seqlen_offset, t)?;
