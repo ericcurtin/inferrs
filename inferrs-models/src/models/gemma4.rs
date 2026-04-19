@@ -2633,6 +2633,9 @@ struct DecoderLayer {
     /// Pre-allocated BF16 output for post_feedforward_layernorm.forward_add.
     /// Shape [1,1,hidden_size], reused across decode steps.
     post_ffn_add_out: Option<Tensor>,
+    /// Pre-allocated BF16 output for input_layernorm.forward(xs).
+    /// Shape [1,1,hidden_size], reused across decode steps.
+    input_norm_out: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -2760,6 +2763,7 @@ impl DecoderLayer {
             fused_norm_bf16_out: None,
             fused_norm_second_out: None,
             post_ffn_add_out: None,
+            input_norm_out: None,
         })
     }
 
@@ -2770,6 +2774,30 @@ impl DecoderLayer {
     /// that derive from this donor can reuse them.
     ///
     /// `per_layer_input`: [b, s, hidden_size_per_layer_input], or `None` for non-PLI models.
+    /// Compute input_layernorm(xs) using a pre-allocated output buffer when possible.
+    #[cfg(feature = "metal")]
+    fn input_layernorm_prealloc(&mut self, xs: &Tensor) -> Result<Tensor> {
+        use candle_core::DType;
+        let elem_count = xs.elem_count();
+        if xs.dtype() == DType::BF16
+            && matches!(xs.device(), candle_core::Device::Metal(_))
+            && xs.rank() >= 2
+            && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+        {
+            let needs_alloc = self.input_norm_out.as_ref()
+                .is_none_or(|t| t.elem_count() != elem_count || t.dtype() != DType::BF16);
+            if needs_alloc {
+                self.input_norm_out = Some(Tensor::zeros(
+                    xs.shape().dims(), DType::BF16, xs.device())?);
+            }
+            let out = self.input_norm_out.as_ref().unwrap();
+            if self.input_layernorm.forward_prealloc(xs, out) {
+                return Ok(out.clone());
+            }
+        }
+        self.input_layernorm.forward(xs)
+    }
+
     fn forward_donor(
         &mut self,
         xs: &Tensor,
@@ -2778,6 +2806,9 @@ impl DecoderLayer {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let residual = xs;
+        #[cfg(feature = "metal")]
+        let normed = self.input_layernorm_prealloc(xs)?;
+        #[cfg(not(feature = "metal"))]
         let normed = self.input_layernorm.forward(xs)?;
         let (attn_out, k, v) =
             self.self_attn
@@ -2821,6 +2852,9 @@ impl DecoderLayer {
         shared_value: &Tensor,
     ) -> Result<Tensor> {
         let residual = xs;
+        #[cfg(feature = "metal")]
+        let normed = self.input_layernorm_prealloc(xs)?;
+        #[cfg(not(feature = "metal"))]
         let normed = self.input_layernorm.forward(xs)?;
         let attn_out = self.self_attn.forward_with_shared_kv(
             &normed,

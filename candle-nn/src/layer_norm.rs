@@ -709,6 +709,56 @@ impl RmsNorm {
             _ => false,
         }
     }
+
+    /// RMSNorm writing into a pre-allocated output tensor (Metal only).
+    ///
+    /// Returns `true` when the prealloc path succeeded (output written into `out`).
+    /// Returns `false` when unavailable; the caller must call `forward` instead.
+    #[cfg(feature = "metal")]
+    pub fn forward_prealloc(&self, xs: &Tensor, out: &Tensor) -> bool {
+        use candle::{DType, Storage};
+        if xs.dtype() != DType::BF16
+            || out.dtype() != DType::BF16
+            || self.0.weight.dtype() != DType::BF16
+            || xs.elem_count() != out.elem_count()
+            || !xs.is_contiguous()
+        {
+            return false;
+        }
+        let device = match xs.device() {
+            candle::Device::Metal(d) => d,
+            _ => return false,
+        };
+        let (xs_s, xs_l) = xs.storage_and_layout();
+        let (w_s, w_l) = self.0.weight.storage_and_layout();
+        let (out_s, _) = out.storage_and_layout();
+        match (&*xs_s, &*w_s, &*out_s) {
+            (Storage::Metal(xs_m), Storage::Metal(w_m), Storage::Metal(out_m)) => {
+                let elem_count = xs_l.shape().elem_count();
+                let last_dim = xs_l.dims()[xs_l.shape().rank() - 1];
+                let encoder = match device.command_encoder() {
+                    Ok(e) => e,
+                    Err(_) => return false,
+                };
+                candle_metal_kernels::call_rms_norm(
+                    device.metal_device(),
+                    &encoder,
+                    device.kernels(),
+                    "rmsnorm_bf16",
+                    elem_count,
+                    last_dim,
+                    self.0.eps as f32,
+                    xs_m.buffer(),
+                    xs_l.start_offset() * DType::BF16.size_in_bytes(),
+                    w_m.buffer(),
+                    w_l.start_offset() * DType::BF16.size_in_bytes(),
+                    out_m.buffer(),
+                )
+                .is_ok()
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Module for RmsNorm {
