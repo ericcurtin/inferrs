@@ -1117,6 +1117,63 @@ pub fn gelu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         .and_then(|g| g.mul(up))
 }
 
+/// Fused GELU(gate) * up with pre-allocated output: `out[i] = gelu(gate[i]) * up[i]`.
+///
+/// Writes into a pre-allocated F32 Metal tensor without going through the buffer pool.
+/// Returns `true` when the prealloc path succeeded; `false` on fallback (caller must
+/// call `gelu_mul` instead).
+#[cfg(feature = "metal")]
+pub fn gelu_mul_prealloc(gate: &Tensor, up: &Tensor, out: &Tensor) -> bool {
+    use candle::Storage;
+    use candle::DType;
+    if gate.dtype() != DType::F32
+        || up.dtype() != DType::F32
+        || out.dtype() != DType::F32
+        || gate.elem_count() != out.elem_count()
+        || !gate.is_contiguous()
+        || !up.is_contiguous()
+    {
+        return false;
+    }
+    let device = match gate.device() {
+        candle::Device::Metal(d) => d,
+        _ => return false,
+    };
+    let (g_s, g_l) = gate.storage_and_layout();
+    let (u_s, u_l) = up.storage_and_layout();
+    let (o_s, _) = out.storage_and_layout();
+    match (&*g_s, &*u_s, &*o_s) {
+        (Storage::Metal(g_m), Storage::Metal(u_m), Storage::Metal(o_m)) => {
+            use candle::backend::BackendStorage;
+            let elem_count = g_l.shape().elem_count();
+            let encoder = match device.command_encoder() {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            candle_metal_kernels::call_binary_contiguous(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                "bgelu_mul_f32",
+                g_m.dtype().size_in_bytes(),
+                elem_count,
+                candle_metal_kernels::BufferOffset {
+                    buffer: g_m.buffer(),
+                    offset_in_bytes: g_l.start_offset() * DType::F32.size_in_bytes(),
+                },
+                candle_metal_kernels::BufferOffset {
+                    buffer: u_m.buffer(),
+                    offset_in_bytes: u_l.start_offset() * DType::F32.size_in_bytes(),
+                },
+                o_m.buffer(),
+            )
+            .is_ok()
+        }
+        _ => false,
+    }
+}
+
+
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {

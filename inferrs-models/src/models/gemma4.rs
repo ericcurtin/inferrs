@@ -554,6 +554,10 @@ struct Mlp {
     up_proj: QLinear,
     down_proj: QLinear,
     act_fn: Activation,
+    /// Pre-allocated F32 buffer for gelu_mul intermediate output.
+    /// Shape [1, 1, intermediate_size], reused across decode steps.
+    /// Uses RefCell for interior mutability (Module::forward takes &self).
+    gelu_mul_buf: std::cell::RefCell<Option<Tensor>>,
 }
 
 impl Mlp {
@@ -588,6 +592,7 @@ impl Mlp {
                 qvb.map(|q| q.pp("down_proj")).as_ref(),
             )?,
             act_fn,
+            gelu_mul_buf: std::cell::RefCell::new(None),
         })
     }
 }
@@ -635,7 +640,23 @@ impl Module for Mlp {
                 let paired_bf16i = self.gate_proj.forward_paired_q8_0_bf16i(&self.up_proj, xs);
                 if let Some(result) = paired_bf16i {
                     let (gate_f32, up_f32) = result?;
-                    let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    // Use pre-allocated gelu_mul buffer to avoid pool allocation.
+                    let gelu_elem = gate_f32.elem_count();
+                    let hidden_act_f32 = {
+                        let mut buf_ref = self.gelu_mul_buf.borrow_mut();
+                        let buf_ok = buf_ref.as_ref().is_some_and(
+                            |t| t.elem_count() == gelu_elem && t.dtype() == DType::F32);
+                        if !buf_ok {
+                            *buf_ref = Some(Tensor::zeros(
+                                gate_f32.shape().dims(), DType::F32, gate_f32.device())?);
+                        }
+                        let pa = buf_ref.as_ref().unwrap();
+                        if candle_nn::ops::gelu_mul_prealloc(&gate_f32, &up_f32, pa) {
+                            pa.clone()
+                        } else {
+                            candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?
+                        }
+                    };
                     // Use bf16o for down_proj (F32→BF16, saves 1 dispatch)
                     if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act_f32) {
                         return bf16_out;
@@ -660,7 +681,22 @@ impl Module for Mlp {
                     .or_else(|| self.gate_proj.forward_paired_q4k(&self.up_proj, &xs_f32));
                 if let Some(result) = paired_result {
                     let (gate_f32, up_f32) = result?;
-                    let hidden_act_f32 = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                    let gelu_elem = gate_f32.elem_count();
+                    let hidden_act_f32 = {
+                        let mut buf_ref = self.gelu_mul_buf.borrow_mut();
+                        let buf_ok = buf_ref.as_ref().is_some_and(
+                            |t| t.elem_count() == gelu_elem && t.dtype() == DType::F32);
+                        if !buf_ok {
+                            *buf_ref = Some(Tensor::zeros(
+                                gate_f32.shape().dims(), DType::F32, gate_f32.device())?);
+                        }
+                        let pa = buf_ref.as_ref().unwrap();
+                        if candle_nn::ops::gelu_mul_prealloc(&gate_f32, &up_f32, pa) {
+                            pa.clone()
+                        } else {
+                            candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?
+                        }
+                    };
                     if let Some(bf16_out) = self
                         .down_proj
                         .forward_q8_0_bf16o(&hidden_act_f32)
