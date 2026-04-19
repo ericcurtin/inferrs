@@ -615,6 +615,82 @@ pub fn call_partial_rope_bf16(
     Ok(())
 }
 
+/// Fused double-RMSNorm: post_attn_norm_add + pre_ffn_norm_f32_out.
+///
+/// Eliminates one Metal dispatch per decoder layer during single-token decode.
+///
+/// Computation (per row):
+///   bf16_out[i] = rms_norm(src[i], eps) * alpha1[i] + residual[i]   [BF16]
+///   f32_out[i]  = rms_norm(bf16_out[i], eps) * alpha2[i]             [F32]
+///
+/// Grid: one threadgroup per row. block_dim = min(max_threads, next_pow2(el/2)).
+#[allow(clippy::too_many_arguments)]
+pub fn call_rmsnorm_add_bf16i_f32o(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    length: usize,
+    elements_to_sum: usize,
+    eps: f32,
+    src: &Buffer,
+    src_offset: usize,
+    alpha1: &Buffer,
+    alpha1_offset: usize,
+    residual: &Buffer,
+    residual_offset: usize,
+    bf16_out: &Buffer,
+    bf16_out_offset: usize,
+    alpha2: &Buffer,
+    alpha2_offset: usize,
+    f32_out: &Buffer,
+    f32_out_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let pipeline =
+        kernels.load_pipeline(device, Source::Reduce, "rmsnorm_add_bf16i_f32o")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            length,
+            elements_to_sum,
+            (src, src_offset),
+            (alpha1, alpha1_offset),
+            (residual, residual_offset),
+            (bf16_out, bf16_out_offset),
+            (alpha2, alpha2_offset),
+            (f32_out, f32_out_offset),
+            eps
+        )
+    );
+
+    let out_length = length / elements_to_sum;
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (elements_to_sum / 2).next_power_of_two(),
+    );
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.use_resource(src, MTLResourceUsage::Read);
+    encoder.use_resource(alpha1, MTLResourceUsage::Read);
+    encoder.use_resource(residual, MTLResourceUsage::Read);
+    encoder.use_resource(bf16_out, MTLResourceUsage::Write);
+    encoder.use_resource(alpha2, MTLResourceUsage::Read);
+    encoder.use_resource(f32_out, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 /// Fused RMSNorm + partial-RoPE for BF16 single-token decode.
 ///
 /// Saves 1 dispatch per head per global attention layer by combining the

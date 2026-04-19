@@ -205,6 +205,133 @@ impl RmsNorm {
         }
     }
 
+    /// Fused double-RMSNorm: `(post_attn_norm_add, pre_ffn_norm_f32_out)`.
+    ///
+    /// Combines two sequential Metal dispatches into one:
+    ///   bf16_out = rms_norm(src) * self.weight + residual        [BF16]
+    ///   f32_out  = rms_norm(bf16_out) * next_norm.weight         [F32]
+    ///
+    /// Returns `Some((bf16_out, f32_out))` on Metal when both norms and inputs
+    /// are contiguous BF16.  Returns `None` on other backends / dtypes.
+    ///
+    /// Saves 1 Metal dispatch per decoder layer during single-token decode
+    /// (42 dispatches for E4B, 35 for E2B per step).
+    pub fn forward_add_then_f32_out(
+        &self,
+        src: &Tensor,
+        residual: &Tensor,
+        next_norm: &RmsNorm,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        #[cfg(feature = "metal")]
+        {
+            use candle::{DType, Storage};
+            // Only valid for BF16 contiguous inputs with BF16 weights on Metal.
+            if src.dtype() != DType::BF16
+                || residual.dtype() != DType::BF16
+                || self.0.weight.dtype() != DType::BF16
+                || next_norm.0.weight.dtype() != DType::BF16
+            {
+                return None;
+            }
+            if !src.is_contiguous() || !residual.is_contiguous() {
+                return None;
+            }
+            let device = match src.device() {
+                candle::Device::Metal(d) => d,
+                _ => return None,
+            };
+            let (src_s, src_l) = src.storage_and_layout();
+            let (res_s, res_l) = residual.storage_and_layout();
+            let (w1_s, w1_l) = self.0.weight.storage_and_layout();
+            let (w2_s, w2_l) = next_norm.0.weight.storage_and_layout();
+
+            let (src_metal, res_metal, w1_metal, w2_metal) =
+                match (&*src_s, &*res_s, &*w1_s, &*w2_s) {
+                    (
+                        Storage::Metal(a),
+                        Storage::Metal(b),
+                        Storage::Metal(c),
+                        Storage::Metal(d),
+                    ) => (a, b, c, d),
+                    _ => return None,
+                };
+
+            let elem_count = src_l.shape().elem_count();
+            let last_dim = src_l.dims()[src_l.shape().rank() - 1];
+
+            let bf16_buf =
+                match device.new_buffer(elem_count, DType::BF16, "rmsnorm_add_bf16i_f32o_bf16") {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+            let f32_buf =
+                match device.new_buffer(elem_count, DType::F32, "rmsnorm_add_bf16i_f32o_f32") {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+
+            let encoder = match device.command_encoder() {
+                Ok(e) => e,
+                Err(e) => return Some(Err(candle::Error::wrap(e))),
+            };
+
+            use candle::backend::BackendStorage;
+            let result = candle_metal_kernels::call_rmsnorm_add_bf16i_f32o(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                elem_count,
+                last_dim,
+                self.0.eps as f32,
+                src_metal.buffer(),
+                src_l.start_offset() * DType::BF16.size_in_bytes(),
+                w1_metal.buffer(),
+                w1_l.start_offset() * DType::BF16.size_in_bytes(),
+                res_metal.buffer(),
+                res_l.start_offset() * DType::BF16.size_in_bytes(),
+                &bf16_buf,
+                0,
+                w2_metal.buffer(),
+                w2_l.start_offset() * DType::BF16.size_in_bytes(),
+                &f32_buf,
+                0,
+            );
+
+            match result {
+                Ok(()) => {
+                    let bf16_storage = candle::MetalStorage::new(
+                        bf16_buf,
+                        device.clone(),
+                        elem_count,
+                        DType::BF16,
+                    );
+                    let f32_storage = candle::MetalStorage::new(
+                        f32_buf,
+                        device.clone(),
+                        elem_count,
+                        DType::F32,
+                    );
+                    let bf16_out = candle::Tensor::from_storage(
+                        Storage::Metal(bf16_storage),
+                        src_l.shape().clone(),
+                        candle::op::BackpropOp::none(),
+                        false,
+                    );
+                    let f32_out = candle::Tensor::from_storage(
+                        Storage::Metal(f32_storage),
+                        src_l.shape().clone(),
+                        candle::op::BackpropOp::none(),
+                        false,
+                    );
+                    Some(Ok((bf16_out, f32_out)))
+                }
+                Err(e) => Some(Err(candle::Error::wrap(e))),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        None
+    }
+
     /// RMSNorm with BF16 input and F32 output.
     ///
     /// Fuses the normalization with the BF16→F32 type conversion, saving one
