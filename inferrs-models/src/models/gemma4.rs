@@ -1435,10 +1435,14 @@ impl Attention {
             let qkv_b2b = if orig_dtype == DType::BF16
                 && matches!(xs.device(), candle_core::Device::Metal(_))
             {
-                // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast.
-                // Q4K (E4B): bf16i overhead > dispatch savings for large matrices — use bf16o path.
+                // Q8_0 (E2B): bf16i_to_bf16 eliminates xs.to_dtype(F32) pre-cast (1 dispatch saved).
+                // Q4K (E4B): bf16i_to_bf16 saves the xs.to_dtype(F32) dispatch per donor layer.
                 self.q_proj
                     .forward_triple_q8_0_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
+                    .or_else(|| {
+                        self.q_proj
+                            .forward_triple_q4k_bf16i_to_bf16(&self.k_proj, &self.v_proj, xs)
+                    })
             } else {
                 None
             };
