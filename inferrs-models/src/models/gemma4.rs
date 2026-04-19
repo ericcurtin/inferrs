@@ -1035,6 +1035,46 @@ impl RetainingRotatingKvCache {
         Ok((k_out, v_out))
     }
 
+    /// Ensure the circular buffer is allocated for at least 1 new token and return
+    /// (k_buf, v_buf, write_offset, valid_len) for the fused norm+rope+kvcache kernel.
+    ///
+    /// The caller MUST update `self.offset` and `self.current_seq_len` after a
+    /// successful fused write (call `advance_one_token()` below).
+    ///
+    /// Returns `None` if the buffer is not yet allocated (first call — caller
+    /// should fall back to the standard `append` path which will allocate it).
+    fn kv_buf_for_fused_write(
+        &self,
+    ) -> Option<(&candle_core::Tensor, &candle_core::Tensor, usize, usize)> {
+        let kb = self.k_buf.as_ref()?;
+        let vb = self.v_buf.as_ref()?;
+        let valid = self.current_seq_len.min(self.max_seq_len);
+        Some((kb, vb, self.offset, valid))
+    }
+
+    /// Advance the write pointer by 1 token after a successful fused write.
+    /// Returns the KV cache view (same as what `append` would return after the write).
+    fn advance_one_token_and_view(
+        &mut self,
+    ) -> candle_core::Result<(candle_core::Tensor, candle_core::Tensor)> {
+        self.current_seq_len += 1;
+        self.offset = (self.offset + 1) % self.max_seq_len;
+        let kb = self.k_buf.as_ref().expect("k_buf must be allocated for fused path");
+        let vb = self.v_buf.as_ref().expect("v_buf must be allocated for fused path");
+        let valid = self.current_seq_len.min(self.max_seq_len);
+        let k_out = if valid == self.max_seq_len {
+            kb.clone()
+        } else {
+            kb.narrow(2, 0, valid)?
+        };
+        let v_out = if valid == self.max_seq_len {
+            vb.clone()
+        } else {
+            vb.narrow(2, 0, valid)?
+        };
+        Ok((k_out, v_out))
+    }
+
     /// Reset the write-position and sequence-length counters **without dropping
     /// the Metal buffer**.
     ///

@@ -1100,6 +1100,152 @@ pub fn rms_norm_partial_rope_qkv_bf16(
     Ok(true)
 }
 
+/// Fused QKV norm+rope + direct KV cache write in a single Metal dispatch.
+///
+/// Like `rms_norm_partial_rope_qkv_bf16` but also writes K and V directly into
+/// the KV cache buffers at `kv_offset` (token position), eliminating 2 separate
+/// `slice_set` dispatches per sliding-window layer per decode step.
+///
+/// Parameters:
+/// - `k_cache`, `v_cache`: the pre-allocated KV cache tensors (shape [b, n_kv, max_seq, d])
+/// - `kv_offset`: token position within each head's slice (0-based)
+///
+/// Returns `Ok(true)` on success.
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_partial_rope_qkv_kvcache_bf16(
+    q_src: &candle::Tensor,
+    k_src: &candle::Tensor,
+    v_src: &candle::Tensor,
+    q_norm_weight: &candle::Tensor,
+    k_norm_weight: &candle::Tensor,
+    cos: &candle::Tensor,
+    sin: &candle::Tensor,
+    q_dst: &candle::Tensor,
+    k_dst: &candle::Tensor,
+    v_dst: &candle::Tensor,
+    k_cache: &candle::Tensor,
+    v_cache: &candle::Tensor,
+    rotary_dim: usize,
+    eps: f32,
+    kv_offset: usize,
+) -> candle::Result<bool> {
+    use candle::{DType, Storage};
+    if q_src.dtype() != DType::BF16
+        || k_src.dtype() != DType::BF16
+        || v_src.dtype() != DType::BF16
+        || q_norm_weight.dtype() != DType::BF16
+        || k_norm_weight.dtype() != DType::BF16
+        || cos.dtype() != DType::BF16
+        || sin.dtype() != DType::BF16
+        || k_cache.dtype() != DType::BF16
+        || v_cache.dtype() != DType::BF16
+    {
+        return Ok(false);
+    }
+    if !q_src.is_contiguous()
+        || !k_src.is_contiguous()
+        || !v_src.is_contiguous()
+        || !cos.is_contiguous()
+        || !sin.is_contiguous()
+        || !k_cache.is_contiguous()
+        || !v_cache.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let q_dims = q_src.dims();
+    let k_dims = k_src.dims();
+    let v_dims = v_src.dims();
+    if q_dims.len() < 2 || k_dims.len() < 2 || v_dims.len() < 2 {
+        return Ok(false);
+    }
+    let head_dim = *q_dims.last().unwrap();
+    if head_dim != *k_dims.last().unwrap() || head_dim != *v_dims.last().unwrap() || head_dim > 1024 {
+        return Ok(false);
+    }
+    let n_q_heads: usize = q_dims.iter().rev().skip(1).product();
+    let n_kv_heads: usize = k_dims.iter().rev().skip(1).product();
+    let n_v_heads: usize = v_dims.iter().rev().skip(1).product();
+    if n_kv_heads != n_v_heads || rotary_dim > head_dim || rotary_dim % 2 != 0 {
+        return Ok(false);
+    }
+    // Validate KV cache shape: [b, n_kv, max_seq_len, head_dim]
+    let kc_dims = k_cache.dims();
+    if kc_dims.len() != 4 || kc_dims[3] != head_dim || kc_dims[1] != n_kv_heads {
+        return Ok(false);
+    }
+    let max_seq_len = kc_dims[2];
+    if kv_offset >= max_seq_len {
+        return Ok(false);
+    }
+    let kv_head_stride = max_seq_len * head_dim; // elements between heads
+
+    let (qs, ql) = q_src.storage_and_layout();
+    let (ks, kl) = k_src.storage_and_layout();
+    let (vs, vl) = v_src.storage_and_layout();
+    let (qnws, qnwl) = q_norm_weight.storage_and_layout();
+    let (knws, knwl) = k_norm_weight.storage_and_layout();
+    let (css, csl) = cos.storage_and_layout();
+    let (sns, snl) = sin.storage_and_layout();
+    let (qds, _) = q_dst.storage_and_layout();
+    let (kds, _) = k_dst.storage_and_layout();
+    let (vds, _) = v_dst.storage_and_layout();
+    let (kcs, kcl) = k_cache.storage_and_layout();
+    let (vcs, vcl) = v_cache.storage_and_layout();
+    let (qm, km, vm, qnwm, knwm, cosm, sinm, qdm, kdm, vdm, kcm, vcm) = match (
+        &*qs, &*ks, &*vs, &*qnws, &*knws, &*css, &*sns, &*qds, &*kds, &*vds, &*kcs, &*vcs,
+    ) {
+        (
+            Storage::Metal(a), Storage::Metal(b), Storage::Metal(c),
+            Storage::Metal(d), Storage::Metal(e), Storage::Metal(f),
+            Storage::Metal(g), Storage::Metal(h), Storage::Metal(i),
+            Storage::Metal(j), Storage::Metal(k), Storage::Metal(l),
+        ) => (a, b, c, d, e, f, g, h, i, j, k, l),
+        _ => return Ok(false),
+    };
+    use candle::backend::BackendStorage;
+    let device = qm.device().clone();
+    let encoder = device.command_encoder().map_err(candle::Error::wrap)?;
+    candle_metal_kernels::call_rms_norm_partial_rope_qkv_kvcache_bf16(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        qm.buffer(),
+        ql.start_offset() * DType::BF16.size_in_bytes(),
+        km.buffer(),
+        kl.start_offset() * DType::BF16.size_in_bytes(),
+        vm.buffer(),
+        vl.start_offset() * DType::BF16.size_in_bytes(),
+        qnwm.buffer(),
+        qnwl.start_offset() * DType::BF16.size_in_bytes(),
+        knwm.buffer(),
+        knwl.start_offset() * DType::BF16.size_in_bytes(),
+        cosm.buffer(),
+        csl.start_offset() * DType::BF16.size_in_bytes(),
+        sinm.buffer(),
+        snl.start_offset() * DType::BF16.size_in_bytes(),
+        qdm.buffer(),
+        0,
+        kdm.buffer(),
+        0,
+        vdm.buffer(),
+        0,
+        kcm.buffer(),
+        kcl.start_offset() * DType::BF16.size_in_bytes(),
+        vcm.buffer(),
+        vcl.start_offset() * DType::BF16.size_in_bytes(),
+        n_q_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        rotary_dim as u32,
+        eps,
+        kv_offset as u32,
+        kv_head_stride as u32,
+    )
+    .map_err(candle::Error::wrap)?;
+    Ok(true)
+}
+
 /// Fused Q+K rms_norm + partial_rope in a single Metal dispatch.
 /// Reduces 2 kernel dispatches to 1 per donor layer per decode step.
 /// Returns `Ok(true)` on success, `Ok(false)` when the fast path is unavailable.
