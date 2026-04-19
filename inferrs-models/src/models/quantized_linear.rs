@@ -82,6 +82,15 @@ impl QLinear {
         }
     }
 
+    /// Returns true when the underlying weight is Q8_0-quantized.
+    pub fn is_q8_0(&self) -> bool {
+        if let QMatMul::QTensor(qt) = &self.inner {
+            qt.dtype() == candle_core::quantized::GgmlDType::Q8_0
+        } else {
+            false
+        }
+    }
+
     /// Returns the underlying weight tensor if this is a dense (non-quantized) layer.
     /// Returns `None` for quantized (GGUF) weights.
     pub fn dense_weight(&self) -> Option<&Tensor> {

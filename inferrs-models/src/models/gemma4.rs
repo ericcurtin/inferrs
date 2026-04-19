@@ -1649,9 +1649,7 @@ impl Attention {
                     let k_norm_w = self.k_norm.weight();
                     let q_flat = q_raw.reshape((b_sz * self.num_heads, head_dim))?;
                     let k_flat = k_raw.reshape((b_sz * self.num_kv_heads, head_dim))?;
-                    let v_flat = v_raw
-                        .contiguous()?
-                        .reshape((b_sz * self.num_kv_heads, head_dim))?;
+                    let v_flat = v_raw.reshape((b_sz * self.num_kv_heads, head_dim))?;
                     let q_out_flat = q_out.reshape((b_sz * self.num_heads, head_dim))?;
                     let k_out_flat = k_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
                     let v_out_flat = v_out.reshape((b_sz * self.num_kv_heads, head_dim))?;
@@ -2870,71 +2868,16 @@ impl DecoderLayer {
         self.apply_mlp_and_pli(xs, per_layer_input)
     }
 
-    /// Fused post_attn_norm_add + apply_mlp_and_pli for single-token decode (E4B Q4K Metal).
-    ///
-    /// Uses `rmsnorm_add_bf16i_f32o` to combine the `post_attention_layernorm.forward_add`
-    /// and `pre_feedforward_layernorm.forward_f32_out` into a single Metal dispatch,
-    /// saving 1 kernel per layer (42 for E4B, 35 for E2B per decode step).
-    ///
-    /// Returns `None` when the fast path is unavailable (wrong dtype, device, or shape);
-    /// the caller must fall back to the two-dispatch path in that case.
+    /// Applies the PLI residual (if present) and layer_scalar to `xs`, returning
+    /// `Some(Result<Tensor>)`.  Shared by both Q4K and Q8_0 branches of
+    /// `try_fused_post_attn_mlp`.
     #[cfg(feature = "metal")]
-    fn try_fused_post_attn_mlp(
-        &mut self,
-        attn_out: &Tensor,
-        residual: &Tensor,
+    fn apply_pli_scalar(
+        &self,
+        xs: Tensor,
         per_layer_input: Option<&Tensor>,
     ) -> Option<Result<Tensor>> {
         use candle_core::DType;
-        // Only for Metal, BF16, single-token decode, Q4K MLP, no MoE.
-        if attn_out.dtype() != DType::BF16 || self.moe.is_some() {
-            return None;
-        }
-        if !self.mlp.gate_proj.is_q4k() || !self.mlp.up_proj.is_q4k() {
-            return None;
-        }
-        if !matches!(attn_out.device(), candle_core::Device::Metal(_)) {
-            return None;
-        }
-        // Single-token decode: last spatial dim == 1.
-        if attn_out.rank() < 2 || attn_out.dim(attn_out.rank().saturating_sub(2)).unwrap_or(0) != 1 {
-            return None;
-        }
-
-        let fused = self.post_attention_layernorm.forward_add_then_f32_out(
-            attn_out,
-            residual,
-            &self.pre_feedforward_layernorm,
-        );
-        let (xs_bf16, normed_f32) = match fused? {
-            Ok(pair) => pair,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Run MLP with the pre-computed F32 normed input, skipping the norm dispatch.
-        let mlp_out = match normed_f32.apply(&self.mlp) {
-            Ok(o) => o,
-            Err(e) => return Some(Err(e)),
-        };
-        let mlp_out = if mlp_out.dtype() != DType::BF16 {
-            match mlp_out.to_dtype(DType::BF16) {
-                Ok(o) => o,
-                Err(e) => return Some(Err(e)),
-            }
-        } else {
-            mlp_out
-        };
-
-        // Fused post_feedforward_layernorm + residual_add.
-        let xs = match self
-            .post_feedforward_layernorm
-            .forward_add(&mlp_out, &xs_bf16)
-        {
-            Ok(o) => o,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // PLI path (same as apply_mlp_and_pli).
         if let (Some(pli), Some(pli_input)) = (&self.pli, per_layer_input) {
             let gate_f32 = if let Some(out) = pli
                 .gate
@@ -2985,6 +2928,100 @@ impl DecoderLayer {
             // No PLI: apply layer_scalar.
             let scalar = &self.layer_scalar;
             Some(xs.broadcast_mul(scalar))
+        }
+    }
+
+    /// Fused post_attn_norm_add + apply_mlp_and_pli for single-token decode (Q4K/Q8_0 Metal).
+    ///
+    /// Uses a single Metal dispatch to combine `post_attention_layernorm.forward_add`
+    /// and `pre_feedforward_layernorm`, saving 1 kernel per layer per decode step
+    /// (42 for E4B, 35 for E2B).
+    ///
+    /// Returns `None` when the fast path is unavailable (wrong dtype, device, or shape);
+    /// the caller must fall back to the two-dispatch path in that case.
+    #[cfg(feature = "metal")]
+    fn try_fused_post_attn_mlp(
+        &mut self,
+        attn_out: &Tensor,
+        residual: &Tensor,
+        per_layer_input: Option<&Tensor>,
+    ) -> Option<Result<Tensor>> {
+        use candle_core::DType;
+        // Only for Metal, BF16, single-token decode, Q4K or Q8_0 MLP, no MoE.
+        if attn_out.dtype() != DType::BF16 || self.moe.is_some() {
+            return None;
+        }
+        let is_q4k = self.mlp.gate_proj.is_q4k() && self.mlp.up_proj.is_q4k();
+        let is_q8_0 = self.mlp.gate_proj.is_q8_0() && self.mlp.up_proj.is_q8_0();
+        if !is_q4k && !is_q8_0 {
+            return None;
+        }
+        if !matches!(attn_out.device(), candle_core::Device::Metal(_)) {
+            return None;
+        }
+        // Single-token decode: last spatial dim == 1.
+        if attn_out.rank() < 2 || attn_out.dim(attn_out.rank().saturating_sub(2)).unwrap_or(0) != 1 {
+            return None;
+        }
+
+        // For Q8_0 (E2B): MLP takes BF16 directly — use BF16-output fused norm.
+        // For Q4K (E4B): MLP accepts F32 via bf16i internally — use F32-output fused norm.
+        if is_q8_0 {
+            let fused = self.post_attention_layernorm.forward_add_then_bf16_out(
+                attn_out,
+                residual,
+                &self.pre_feedforward_layernorm,
+            );
+            let (xs_residual, normed_bf16) = match fused? {
+                Ok(pair) => pair,
+                Err(e) => return Some(Err(e)),
+            };
+            // Q8_0 bf16i GEMV path: BF16 in → F32 out → BF16 out via bf16o.
+            let mlp_out = match normed_bf16.apply(&self.mlp) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
+            let mlp_out = if mlp_out.dtype() != DType::BF16 {
+                match mlp_out.to_dtype(DType::BF16) {
+                    Ok(o) => o,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                mlp_out
+            };
+            let xs = match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
+            self.apply_pli_scalar(xs, per_layer_input)
+        } else {
+            // Q4K path: fuse norm with F32 output so MLP skips BF16→F32 pre-cast.
+            let fused = self.post_attention_layernorm.forward_add_then_f32_out(
+                attn_out,
+                residual,
+                &self.pre_feedforward_layernorm,
+            );
+            let (xs_residual, normed_f32) = match fused? {
+                Ok(pair) => pair,
+                Err(e) => return Some(Err(e)),
+            };
+            let mlp_out = match normed_f32.apply(&self.mlp) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
+            let mlp_out = if mlp_out.dtype() != DType::BF16 {
+                match mlp_out.to_dtype(DType::BF16) {
+                    Ok(o) => o,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                mlp_out
+            };
+            let xs = match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
+            self.apply_pli_scalar(xs, per_layer_input)
         }
     }
 
