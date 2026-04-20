@@ -173,17 +173,14 @@ fn split_expert_qtensor(
 #[derive(Debug, Clone)]
 pub(super) struct Gemma4MoeRouter {
     proj: QLinear,
-    /// Precomputed scale * scalar_root_size: [hidden_size].
-    /// Avoids a separate scalar-multiply dispatch per forward call.
-    scale_normalized: Tensor,
     /// Per-expert learned scale factors, cached on CPU as F32.
     /// Used in forward_into to multiply routing weights without GPU dispatches.
     per_expert_scale_cpu: Vec<f32>,
     top_k: usize,
-    /// Pre-allocated all-ones RMSNorm weight for rms_norm_no_scale via RmsNorm.
-    /// Using the standard fused RMSNorm kernel (1 dispatch) vs the 6-dispatch
-    /// ad-hoc path (BF16→F32, sqr, mean, sqrt, div, F32→BF16).
-    ones_norm: candle_nn::RmsNorm,
+    /// RMSNorm with weight = scale * hidden_size^{-0.5}.
+    /// Fuses rms_norm_no_scale + broadcast_mul(scale_normalized) into 1 dispatch
+    /// (saves 1 GPU dispatch per MoE layer per step, 35 total per decode token).
+    scale_norm: candle_nn::RmsNorm,
 }
 
 impl Gemma4MoeRouter {
@@ -200,8 +197,9 @@ impl Gemma4MoeRouter {
             qvb.map(|q| q.pp("proj")).as_ref(),
         )?;
         let scale = vb.get(cfg.hidden_size, "scale")?.to_dtype(cfg.dtype)?;
-        // Precompute scale * scalar_root_size at init time to avoid a scalar-mul
-        // dispatch on every router forward call. hidden_size^{-0.5} is a constant.
+        // Precompute scale * scalar_root_size at init time.
+        // Using scale_normalized as the RMSNorm weight fuses rms_norm_no_scale +
+        // broadcast_mul into a single kernel dispatch, saving 35 dispatches per token.
         let scalar_root_size = (cfg.hidden_size as f64).powf(-0.5);
         let scale_normalized = (scale * scalar_root_size)?;
         // Cache per_expert_scale on CPU as F32 to avoid GPU index_select + mul
@@ -211,17 +209,14 @@ impl Gemma4MoeRouter {
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
             .to_vec1::<f32>()?;
-        // Pre-allocate all-ones weight for rms_norm_no_scale.
-        // Using RmsNorm with weight=1 is equivalent to rms_norm_no_scale and
-        // uses the fused 1-dispatch kernel vs the 6-dispatch ad-hoc path.
-        let ones_weight = Tensor::ones(cfg.hidden_size, cfg.dtype, vb.device())?;
-        let ones_norm = candle_nn::RmsNorm::new(ones_weight, cfg.rms_norm_eps);
+        // RMSNorm with weight = scale_normalized: fuses rms_norm_no_scale + broadcast_mul
+        // into 1 dispatch (the standard RMSNorm kernel applies the weight inline).
+        let scale_norm = candle_nn::RmsNorm::new(scale_normalized, cfg.rms_norm_eps);
         Ok(Self {
             proj,
-            scale_normalized,
             per_expert_scale_cpu,
             top_k: cfg.top_k_experts,
-            ones_norm,
+            scale_norm,
         })
     }
 
@@ -236,43 +231,47 @@ impl Gemma4MoeRouter {
     /// entirely on CPU using the direct Metal buffer read, saving 6 GPU dispatches
     /// (arg_sort + narrow + contiguous + gather + sum + broadcast_div per step).
     pub(super) fn forward(&self, hidden: &Tensor) -> Result<(Tensor, Tensor, &[f32])> {
-        // Use RmsNorm with all-ones weight (≡ rms_norm_no_scale) to get a single
-        // fused kernel dispatch instead of the 6-dispatch ad-hoc path.
-        let normed = self.ones_norm.forward(hidden)?;
-        // scale_normalized = scale * scalar_root_size was precomputed at init.
-        // One broadcast_mul dispatch instead of two (broadcast_mul + scalar mul).
-        let scaled = normed.broadcast_mul(&self.scale_normalized)?;
+        // scale_norm = RmsNorm(weight=scale_normalized) fuses rms_norm_no_scale +
+        // broadcast_mul(scale_normalized) into 1 kernel dispatch instead of 2.
+        let scaled = self.scale_norm.forward(hidden)?;
         let logits = scaled.apply(&self.proj)?;
-        let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
 
-        // Decode fast path: do top-k + renorm on CPU using direct Metal buffer read.
-        // Saves 6 GPU dispatches vs arg_sort + narrow + contiguous + gather + sum + div.
-        // seq_len=1 means probs is [1, num_experts] — trivially small for CPU processing.
+        // Decode fast path (Metal, seq_len=1): read logits directly from Metal buffer
+        // and compute softmax + top-k + renorm entirely on CPU.
+        // Eliminates 1 GPU softmax dispatch per MoE layer (35 saved per decode step).
+        // num_experts=128 is trivially fast on CPU; no accuracy loss (exact softmax).
         #[cfg(feature = "metal")]
-        if probs.dim(0).unwrap_or(0) == 1 {
-            if let Some(probs_f32) = metal_bf16_tensor_to_f32_vec(&probs) {
-                let num_experts = probs_f32.len();
-                // Find top-k indices by sorting (k=8 << 128, partial sort is fine).
-                let mut indexed: Vec<(usize, f32)> = probs_f32.iter().copied().enumerate().collect();
+        if logits.dim(0).unwrap_or(0) == 1 {
+            if let Some(logits_f32) = metal_bf16_tensor_to_f32_vec(&logits) {
+                let num_experts = logits_f32.len();
+                // CPU softmax: numerically stable (subtract max).
+                let max_l = logits_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut exps: Vec<f32> = logits_f32.iter().map(|&l| (l - max_l).exp()).collect();
+                let sum_exp: f32 = exps.iter().sum();
+                let inv_sum_exp = if sum_exp > 0.0 { 1.0 / sum_exp } else { 1.0 };
+                exps.iter_mut().for_each(|e| *e *= inv_sum_exp);
+                // Find top-k indices by partial sort (k=8 << 128).
+                let mut indexed: Vec<(usize, f32)> = exps.into_iter().enumerate().collect();
                 indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                 let top_k = self.top_k.min(num_experts);
-                // Renormalise top-k weights.
+                // Renormalise top-k weights to sum=1.
                 let raw_sum: f32 = indexed[..top_k].iter().map(|&(_, w)| w).sum();
-                let inv_sum = if raw_sum > 0.0 { 1.0 / raw_sum } else { 1.0 };
+                let inv_renorm = if raw_sum > 0.0 { 1.0 / raw_sum } else { 1.0 };
                 let mut idx_vec = Vec::with_capacity(top_k);
                 let mut w_vec = Vec::with_capacity(top_k);
                 for &(eidx, raw_w) in &indexed[..top_k] {
                     idx_vec.push(eidx as u32);
-                    w_vec.push(raw_w * inv_sum);
+                    w_vec.push(raw_w * inv_renorm);
                 }
-                // Both tensors stay on CPU: forward_into syncs indices to CPU anyway,
-                // and weights_vec is read back immediately via to_vec1 / metal_bf16_read.
-                // This avoids 2 Metal buffer allocations + 1 BF16 cast dispatch.
+                // Both tensors stay on CPU: forward_into syncs indices to CPU anyway.
+                // Avoids 2 Metal buffer allocations + 1 BF16 cast dispatch.
                 let top_k_indices = Tensor::from_vec(idx_vec, (1, top_k), &Device::Cpu)?;
                 let top_k_weights = Tensor::from_vec(w_vec, (1, top_k), &Device::Cpu)?;
                 return Ok((top_k_weights, top_k_indices, &self.per_expert_scale_cpu));
             }
         }
+
+        let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
 
         // General path (prefill, non-Metal, or fallback).
         // Top-k: sort descending, take first k, then gather probabilities.
@@ -313,6 +312,9 @@ pub(super) struct Gemma4MoeExperts {
     /// Reused across all 8 expert dispatches per decode step (same shape/dtype).
     /// Avoids 8 Metal buffer allocations per MoE layer per decode step.
     gelu_out: Option<candle_core::Tensor>,
+    /// Pre-allocated expert accumulation result buffer: [1, hidden_size].
+    /// Reused every decode step; avoids 35 Tensor::zeros + Metal buffer allocs per token.
+    result_buf: Option<candle_core::Tensor>,
 }
 
 impl Gemma4MoeExperts {
@@ -409,6 +411,7 @@ impl Gemma4MoeExperts {
             num_experts: cfg.num_experts,
             moe_intermediate_size: cfg.moe_intermediate_size,
             gelu_out: None,
+            result_buf: None,
         })
     }
 
@@ -477,7 +480,10 @@ impl Gemma4MoeExperts {
         // and 8 × 42 × 3 = ~1008 small CPU allocations per decode step.
         let is_decode = seq_len == 1;
 
-        let mut result = Tensor::zeros((seq_len, hidden_size), dtype, device)?;
+        // For decode, accumulate expert outputs without a zero-initialized result buffer.
+        // First active expert writes `result`; subsequent experts SAXPY-accumulate.
+        // This eliminates the Tensor::zeros allocation (35 Metal buffer allocs per token).
+        let mut result: Option<Tensor> = None;
 
         for (expert_idx, tokens) in expert_tokens.iter().enumerate() {
             if tokens.is_empty() {
@@ -501,6 +507,7 @@ impl Gemma4MoeExperts {
                 let up = split.narrow(0, 1, 1)?;     // [1, intermediate], contiguous
                 // Use prealloc gelu_mul buffer to avoid Metal buffer allocation per expert.
                 // The same [1, moe_intermediate_size] buffer is reused across all 8 experts.
+                // Now supports BF16→BF16 via bgelu_mul_bf16 kernel (1 dispatch vs 2).
                 let gelu_elem = self.moe_intermediate_size;
                 let gelu_ok = self.gelu_out.as_ref()
                     .is_some_and(|t| t.elem_count() == gelu_elem && t.dtype() == gate.dtype());
@@ -517,20 +524,48 @@ impl Gemma4MoeExperts {
                 } else {
                     candle_nn::ops::gelu_mul(&gate, &up)?
                 };
-                // Fast path (Metal, BF16, Q4K): fused down_proj GEMV + w-scale + accumulate.
-                // hidden_act (BF16) → F32 (1 dispatch) → SAXPY into result (1 dispatch).
-                // Saves 2 dispatches vs standard: down GEMV(1) + scale(1) + add(1) = 3.
+                // Fast path (Metal, BF16, Q4K): fused down_proj GEMV (BF16 input) + accumulate.
+                // forward_q4k_bf16i_saxpy_bf16 takes BF16 directly — no BF16→F32 cast dispatch.
+                // When result is None (first expert), SAXPY still works: result_buf starts as
+                // the pre-allocated zero buffer, giving result[i] = 0 + w * GEMV[i].
                 #[cfg(feature = "metal")]
                 if hidden_act.dtype() == DType::BF16
                     && matches!(hidden_act.device(), candle_core::Device::Metal(_))
                     && dtype == DType::BF16
                     && !self.down_linears.is_empty()
                 {
-                    let hidden_act_f32 = hidden_act.to_dtype(DType::F32)?;
-                    if self.down_linears[expert_idx].forward_q4k_f32_saxpy_bf16(
-                        &hidden_act_f32, &result, w)
+                    // Ensure result_buf exists and is zeroed for the first expert.
+                    if result.is_none() {
+                        let buf_ok = self.result_buf.as_ref()
+                            .is_some_and(|t| t.elem_count() == hidden_size && t.dtype() == dtype
+                                && t.device().location() == device.location());
+                        if !buf_ok {
+                            // Allocate once; reused every decode step.
+                            self.result_buf = Some(Tensor::zeros((1, hidden_size), dtype, device)?);
+                        } else {
+                            // Zero the pre-allocated buffer in-place via Metal blit fill.
+                            // Single blit command (no allocation) vs zeros_like (new buffer alloc).
+                            let buf = self.result_buf.as_ref().unwrap();
+                            if !candle_nn::ops::zero_tensor_inplace(buf) {
+                                // Blit failed: fall back to zeros_like (allocates).
+                                let z = buf.zeros_like()?;
+                                self.result_buf = Some(z);
+                            }
+                        }
+                        result = Some(self.result_buf.as_ref().unwrap().clone());
+                    }
+                    let acc = result.as_ref().unwrap();
+                    if self.down_linears[expert_idx].forward_q4k_bf16i_saxpy_bf16(
+                        &hidden_act, acc, w)
                     {
                         continue; // SAXPY accumulated into result; move to next expert.
+                    }
+                    // Fallback to F32 cast path if BF16i SAXPY not available.
+                    let hidden_act_f32 = hidden_act.to_dtype(DType::F32)?;
+                    if self.down_linears[expert_idx].forward_q4k_f32_saxpy_bf16(
+                        &hidden_act_f32, acc, w)
+                    {
+                        continue;
                     }
                 }
                 // Fallback: standard path (down GEMV + scale + accumulate).
@@ -542,7 +577,10 @@ impl Gemma4MoeExperts {
                 }; // [1, hidden]
                 // Scale by routing weight. Cast to result dtype if needed.
                 let out_dtype = if out.dtype() == dtype { out } else { out.to_dtype(dtype)? };
-                result = (result + (out_dtype * w as f64)?)?;
+                result = Some(match result {
+                    Some(r) => (r + (out_dtype * w as f64)?)?,
+                    None => (out_dtype * w as f64)?,
+                });
                 continue;
             }
             // Prefill / multi-token path: general scatter dispatch.
@@ -562,11 +600,22 @@ impl Gemma4MoeExperts {
                     .to_dtype(dtype)?
                     .unsqueeze(1)?;
                 let out_scaled = out.broadcast_mul(&w_tensor)?;
-                result = result.index_add(&idx_tensor, &out_scaled, 0)?;
+                result = Some(match result {
+                    Some(r) => r.index_add(&idx_tensor, &out_scaled, 0)?,
+                    None => {
+                        // First expert in prefill: scatter into a fresh zero buffer.
+                        let z = Tensor::zeros((seq_len, hidden_size), dtype, device)?;
+                        z.index_add(&idx_tensor, &out_scaled, 0)?
+                    }
+                });
             }
         }
 
-        Ok(result)
+        // Return accumulated result, or zeros if no experts were active (shouldn't happen).
+        match result {
+            Some(r) => Ok(r),
+            None => Ok(Tensor::zeros((seq_len, hidden_size), dtype, device)?),
+        }
     }
 }
 
