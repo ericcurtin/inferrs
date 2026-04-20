@@ -329,6 +329,15 @@ impl Gemma4MoeExperts {
             }
         }
 
+        // For decode (seq_len=1): all top-k experts receive the same single token
+        // at index 0. Use a simplified accumulation path that avoids:
+        //  - Tensor::from_vec + index_select (CPU allocation + GPU slice per expert)
+        //  - Tensor::from_vec + to_dtype + unsqueeze (CPU alloc + GPU cast per expert)
+        //  - index_add (general scatter; for 1 token, simple add suffices)
+        // Replacing with scalar broadcast_mul + add saves ~8 × 42 = 336 GPU dispatches
+        // and 8 × 42 × 3 = ~1008 small CPU allocations per decode step.
+        let is_decode = seq_len == 1;
+
         let mut result = Tensor::zeros((seq_len, hidden_size), dtype, device)?;
 
         for (expert_idx, tokens) in expert_tokens.iter().enumerate() {
@@ -336,45 +345,46 @@ impl Gemma4MoeExperts {
                 continue;
             }
             let n = tokens.len();
-            let (tok_pos, tok_weights): (Vec<u32>, Vec<f32>) =
-                tokens.iter().map(|&(t, w)| (t, w)).unzip();
 
-            let idx_tensor = Tensor::from_vec(tok_pos, n, device)?;
-            let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
-
-            // gate_up[expert_idx]: [2*intermediate, hidden]
-            // QLinear dispatches to the Metal/CUDA quantized GEMV kernel
-            // (Q8_0, Q4K, …) — no BF16 intermediate since the QTensor is on device.
-            let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
-            let gate_up_out = current.apply(&gate_up_linear)?; // [n, 2*intermediate]
-
-            // For decode (n=1): reshape [1, 2*intermediate] → [2, intermediate]
-            // so gate and up are contiguous rows, enabling gelu_mul fused kernel
-            // (1 dispatch vs gelu + mul = 2). Saves ~8 experts × 42 layers = 336
-            // fewer dispatches per decode step.
-            // For prefill (n>1): use narrow + standard act+mul (non-contiguous views
-            // but only used during prefill, not the decode hot path).
-            let hidden_act = if n == 1 {
+            let expert_out = if is_decode && n == 1 {
+                // Decode fast path: single token at index 0, weight is a scalar.
+                let w = tokens[0].1;
+                // current = hidden (the full [1, hidden] single-token tensor).
+                let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
+                let gate_up_out = hidden.apply(&gate_up_linear)?; // [1, 2*intermediate]
+                // Reshape to [2, intermediate] for contiguous gate/up views.
                 let split = gate_up_out.reshape((2, self.moe_intermediate_size))?;
-                let gate = split.narrow(0, 0, 1)?;   // [1, intermediate], contiguous
-                let up = split.narrow(0, 1, 1)?;      // [1, intermediate], contiguous
-                candle_nn::ops::gelu_mul(&gate, &up)?
+                let gate = split.narrow(0, 0, 1)?;  // [1, intermediate], contiguous
+                let up = split.narrow(0, 1, 1)?;     // [1, intermediate], contiguous
+                let hidden_act = candle_nn::ops::gelu_mul(&gate, &up)?;
+                let down_linear = self.down_proj.expert_linear(expert_idx)?;
+                let out = hidden_act.apply(&down_linear)?; // [1, hidden]
+                // Scale by routing weight. Cast to result dtype if needed.
+                let out_dtype = if out.dtype() == dtype { out } else { out.to_dtype(dtype)? };
+                (out_dtype * w as f64)?
             } else {
+                // Prefill / multi-token path: general scatter dispatch.
+                let tok_pos: Vec<u32> = tokens.iter().map(|&(t, _)| t).collect();
+                let tok_weights: Vec<f32> = tokens.iter().map(|&(_, w)| w).collect();
+                let idx_tensor = Tensor::from_vec(tok_pos, n, device)?;
+                let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
+                let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
+                let gate_up_out = current.apply(&gate_up_linear)?; // [n, 2*intermediate]
                 let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
                 let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
-                (gate.apply(&candle_nn::Activation::GeluPytorchTanh)? * up)?
+                let hidden_act = (gate.apply(&candle_nn::Activation::GeluPytorchTanh)? * up)?;
+                let down_linear = self.down_proj.expert_linear(expert_idx)?;
+                let out = hidden_act.apply(&down_linear)?; // [n, hidden]
+                let w_tensor = Tensor::from_vec(tok_weights, n, device)?
+                    .to_dtype(dtype)?
+                    .unsqueeze(1)?;
+                let out_scaled = out.broadcast_mul(&w_tensor)?;
+                result = result.index_add(&idx_tensor, &out_scaled, 0)?;
+                continue;
             };
 
-            // down[expert_idx]: [hidden, intermediate]
-            let down_linear = self.down_proj.expert_linear(expert_idx)?;
-            let expert_out = hidden_act.apply(&down_linear)?; // [n, hidden]
-
-            // Scale by routing weight and scatter-add.
-            let w_tensor = Tensor::from_vec(tok_weights, n, device)?
-                .to_dtype(dtype)?
-                .unsqueeze(1)?; // [n, 1]
-            let expert_out_scaled = expert_out.broadcast_mul(&w_tensor)?;
-            result = result.index_add(&idx_tensor, &expert_out_scaled, 0)?;
+            // Decode path: simple accumulation (single token = simple add).
+            result = (result + expert_out)?;
         }
 
         Ok(result)
