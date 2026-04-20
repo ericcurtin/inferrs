@@ -141,6 +141,10 @@ pub(super) struct Gemma4MoeRouter {
     scalar_root_size: f64,
     rms_eps: f64,
     top_k: usize,
+    /// Pre-allocated all-ones RMSNorm weight for rms_norm_no_scale via RmsNorm.
+    /// Using the standard fused RMSNorm kernel (1 dispatch) vs the 6-dispatch
+    /// ad-hoc path (BF16→F32, sqr, mean, sqrt, div, F32→BF16).
+    ones_norm: candle_nn::RmsNorm,
 }
 
 impl Gemma4MoeRouter {
@@ -160,6 +164,11 @@ impl Gemma4MoeRouter {
         let per_expert_scale = vb
             .get(cfg.num_experts, "per_expert_scale")?
             .to_dtype(cfg.dtype)?;
+        // Pre-allocate all-ones weight for rms_norm_no_scale.
+        // Using RmsNorm with weight=1 is equivalent to rms_norm_no_scale and
+        // uses the fused 1-dispatch kernel vs the 6-dispatch ad-hoc path.
+        let ones_weight = Tensor::ones(cfg.hidden_size, cfg.dtype, vb.device())?;
+        let ones_norm = candle_nn::RmsNorm::new(ones_weight, cfg.rms_norm_eps);
         Ok(Self {
             proj,
             scale,
@@ -167,12 +176,15 @@ impl Gemma4MoeRouter {
             scalar_root_size: (cfg.hidden_size as f64).powf(-0.5),
             rms_eps: cfg.rms_norm_eps,
             top_k: cfg.top_k_experts,
+            ones_norm,
         })
     }
 
     /// Returns `(top_k_weights, top_k_indices)`, both `[seq, top_k]`.
     pub(super) fn forward(&self, hidden: &Tensor) -> Result<(Tensor, Tensor)> {
-        let normed = rms_norm_no_scale(hidden, self.rms_eps)?;
+        // Use RmsNorm with all-ones weight (≡ rms_norm_no_scale) to get a single
+        // fused kernel dispatch instead of the 6-dispatch ad-hoc path.
+        let normed = self.ones_norm.forward(hidden)?;
         let scaled = (normed.broadcast_mul(&self.scale)? * self.scalar_root_size)?;
         let logits = scaled.apply(&self.proj)?;
         let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;

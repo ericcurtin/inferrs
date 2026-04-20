@@ -3738,10 +3738,10 @@ impl DecoderLayer {
         // Only applied when:
         //  - Metal BF16 single-token decode (xs is [1,1,hidden_size] BF16)
         //  - MLP gate_proj AND up_proj are Q4K (E4B path; E2B uses Q8_0 bf16i)
-        //  - No MoE (MoE needs BF16 input for routing)
+        //  - MoE does NOT prevent this optimization: the shared MLP processes xs before
+        //    routing, and the router uses `residual` (BF16), not shared_mlp_out.
         #[cfg(feature = "metal")]
-        let shared_mlp_out = if self.moe.is_none()
-            && xs.dtype() == DType::BF16
+        let shared_mlp_out = if xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
             && xs.rank() >= 2
             && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
@@ -3786,10 +3786,10 @@ impl DecoderLayer {
         // Dense path: single MLP + post-norm + residual (fused).
         // MoE path: combine shared MLP with sparse experts, then post-norm + residual.
         let xs = if let Some(moe) = &self.moe {
-            // MoE: combine shared and sparse branches, then apply post_feedforward_layernorm.
+            // MoE: combine shared and sparse branches, then fused norm + residual add.
+            // Uses forward_add (rms_norm_add) instead of separate norm+add (2 dispatches → 1).
             let combined = moe.forward(&shared_mlp_out, residual)?;
-            let ffn_out = combined.apply(&self.post_feedforward_layernorm)?;
-            (residual + ffn_out)?
+            self.post_feedforward_layernorm.forward_add(&combined, residual)?
         } else {
             // Dense: fused post_feedforward_layernorm + residual_add.
             self.post_feedforward_layernorm
