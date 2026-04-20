@@ -3621,7 +3621,7 @@ impl DecoderLayer {
                 });
             }
             // MoE path: combine shared MLP output with sparse expert outputs.
-            let ffn_out = if let Some(moe) = &self.moe {
+            let ffn_out = if let Some(moe) = &mut self.moe {
                 match moe.forward(&mlp_out, &xs_residual) {
                     Ok(combined) => combined,
                     Err(e) => return Some(Err(e)),
@@ -3794,7 +3794,7 @@ impl DecoderLayer {
 
         // Dense path: single MLP + post-norm + residual (fused).
         // MoE path: combine shared MLP with sparse experts, then post-norm + residual.
-        let xs = if let Some(moe) = &self.moe {
+        let xs = if let Some(moe) = &mut self.moe {
             // MoE: combine shared and sparse branches, then fused norm + residual add.
             // Uses forward_add (rms_norm_add) instead of separate norm+add (2 dispatches → 1).
             let combined = moe.forward(&shared_mlp_out, residual)?;

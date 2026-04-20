@@ -329,11 +329,12 @@ impl Gemma4MoeExperts {
     /// `hidden`:        [seq, hidden]   — normed by `pre_feedforward_layernorm_2`
     /// `top_k_indices`: [seq, top_k] u32
     /// `top_k_weights`: [seq, top_k]
-    pub(super) fn forward(
+    pub(super) fn forward_into(
         &self,
         hidden: &Tensor,
         top_k_indices: &Tensor,
         top_k_weights: &Tensor,
+        _result_buf: Option<&Tensor>,
     ) -> Result<Tensor> {
         let seq_len = hidden.dim(0)?;
         let hidden_size = hidden.dim(1)?;
@@ -445,6 +446,11 @@ pub(super) struct Gemma4MoeBlock {
     post_ffw_norm_1: RmsNorm, // normalises the shared MLP output
     pre_ffw_norm_2: RmsNorm,  // normalises residual before sparse experts
     post_ffw_norm_2: RmsNorm, // normalises sparse expert output
+    /// Pre-allocated output buffers for the three RMSNorm calls (BF16, Metal only).
+    /// Avoids 105 Metal buffer allocations per decode step for E2B (3 × 35 layers).
+    norm1_buf: Option<Tensor>,   // output of post_ffw_norm_1
+    norm2_buf: Option<Tensor>,   // output of pre_ffw_norm_2
+    norm3_buf: Option<Tensor>,   // output of post_ffw_norm_2
 }
 
 impl Gemma4MoeBlock {
@@ -478,6 +484,9 @@ impl Gemma4MoeBlock {
             post_ffw_norm_1,
             pre_ffw_norm_2,
             post_ffw_norm_2,
+            norm1_buf: None,
+            norm2_buf: None,
+            norm3_buf: None,
         })
     }
 
@@ -485,21 +494,103 @@ impl Gemma4MoeBlock {
     ///
     /// `shared_mlp_out` — output of the shared dense MLP, before `post_feedforward_layernorm`.
     /// `residual`       — pre-FFN hidden state; used for routing and sparse-path normalisation.
-    pub(super) fn forward(&self, shared_mlp_out: &Tensor, residual: &Tensor) -> Result<Tensor> {
-        let shared_normed = self.post_ffw_norm_1.forward(shared_mlp_out)?;
-
+    pub(super) fn forward(&mut self, shared_mlp_out: &Tensor, residual: &Tensor) -> Result<Tensor> {
         // Flatten to 2-D for routing (handles batch > 1).
         let orig_shape = residual.shape().clone();
         let h = *orig_shape.dims().last().unwrap();
         let flat = residual.reshape(((), h))?; // [batch*seq, hidden]
 
+        // Lazily allocate pre-alloc norm buffers (2-D shape matching flat/sparse_out).
+        let flat_elem = flat.elem_count();
+        #[cfg(feature = "metal")]
+        {
+            use candle_core::DType;
+            if shared_mlp_out.dtype() == DType::BF16
+                && matches!(shared_mlp_out.device(), candle_core::Device::Metal(_))
+            {
+                let needs = |buf: &Option<Tensor>| {
+                    buf.as_ref().is_none_or(|t| t.elem_count() != flat_elem || t.dtype() != DType::BF16)
+                };
+                if needs(&self.norm1_buf) {
+                    self.norm1_buf = Some(Tensor::zeros(shared_mlp_out.shape(), DType::BF16, shared_mlp_out.device())?);
+                }
+                if needs(&self.norm2_buf) {
+                    self.norm2_buf = Some(Tensor::zeros(flat.shape(), DType::BF16, flat.device())?);
+                }
+                if needs(&self.norm3_buf) {
+                    self.norm3_buf = Some(Tensor::zeros(flat.shape(), DType::BF16, flat.device())?);
+                }
+
+            }
+        }
+
+        // post_ffw_norm_1: normalise shared MLP output.
+        let shared_normed = {
+            #[cfg(feature = "metal")]
+            {
+                if let Some(buf) = &self.norm1_buf {
+                    if self.post_ffw_norm_1.forward_prealloc(shared_mlp_out, buf) {
+                        buf.clone()
+                    } else {
+                        self.post_ffw_norm_1.forward(shared_mlp_out)?
+                    }
+                } else {
+                    self.post_ffw_norm_1.forward(shared_mlp_out)?
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            self.post_ffw_norm_1.forward(shared_mlp_out)?
+        };
+
         let (top_k_weights, top_k_indices) = self.router.forward(&flat)?;
-        let normed_2 = self.pre_ffw_norm_2.forward(&flat)?;
-        let sparse_out = self
-            .experts
-            .forward(&normed_2, &top_k_indices, &top_k_weights)?;
+
+        // pre_ffw_norm_2: normalise residual (flat) for expert dispatch.
+        let normed_2 = {
+            #[cfg(feature = "metal")]
+            {
+                if let Some(buf) = &self.norm2_buf {
+                    if self.pre_ffw_norm_2.forward_prealloc(&flat, buf) {
+                        buf.clone()
+                    } else {
+                        self.pre_ffw_norm_2.forward(&flat)?
+                    }
+                } else {
+                    self.pre_ffw_norm_2.forward(&flat)?
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            self.pre_ffw_norm_2.forward(&flat)?
+        };
+
+        // Expert dispatch.
+        let sparse_out = self.experts.forward_into(
+            &normed_2, &top_k_indices, &top_k_weights, None
+        )?;
         let sparse_out = sparse_out.reshape(&orig_shape)?;
-        let sparse_normed = self.post_ffw_norm_2.forward(&sparse_out)?;
+
+        // post_ffw_norm_2: normalise sparse expert output.
+        let sparse_normed = {
+            // sparse_out may not be contiguous after reshape (if orig_shape != flat.shape).
+            let sparse_flat = if orig_shape.dims() != flat.shape().dims() {
+                sparse_out.reshape(flat.shape())?
+            } else {
+                sparse_out
+            };
+            #[cfg(feature = "metal")]
+            {
+                if let Some(buf) = &self.norm3_buf {
+                    if self.post_ffw_norm_2.forward_prealloc(&sparse_flat, buf) {
+                        buf.reshape(&orig_shape)?
+                    } else {
+                        self.post_ffw_norm_2.forward(&sparse_flat)?.reshape(&orig_shape)?
+                    }
+                } else {
+                    self.post_ffw_norm_2.forward(&sparse_flat)?.reshape(&orig_shape)?
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            self.post_ffw_norm_2.forward(&sparse_flat)?.reshape(&orig_shape)?
+        };
 
         shared_normed + sparse_normed
     }
