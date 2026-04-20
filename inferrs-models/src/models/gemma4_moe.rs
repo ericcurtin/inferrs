@@ -265,12 +265,11 @@ impl Gemma4MoeRouter {
                     idx_vec.push(eidx as u32);
                     w_vec.push(raw_w * inv_sum);
                 }
-                let device = hidden.device();
-                // Create indices on CPU (forward_into will to_device(CPU) anyway).
+                // Both tensors stay on CPU: forward_into syncs indices to CPU anyway,
+                // and weights_vec is read back immediately via to_vec1 / metal_bf16_read.
+                // This avoids 2 Metal buffer allocations + 1 BF16 cast dispatch.
                 let top_k_indices = Tensor::from_vec(idx_vec, (1, top_k), &Device::Cpu)?;
-                // Weights go to GPU as BF16 for the SAXPY kernel.
-                let top_k_weights = Tensor::from_vec(w_vec, (1, top_k), device)?
-                    .to_dtype(probs.dtype())?;
+                let top_k_weights = Tensor::from_vec(w_vec, (1, top_k), &Device::Cpu)?;
                 return Ok((top_k_weights, top_k_indices, &self.per_expert_scale_cpu));
             }
         }
