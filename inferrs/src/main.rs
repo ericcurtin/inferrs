@@ -12,6 +12,7 @@ mod rm;
 mod run;
 mod sampler;
 mod server;
+mod tool_calls;
 mod stop;
 mod tokenizer;
 mod util;
@@ -98,6 +99,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub max_seq_len: usize,
 
+    /// Prefill at most this many prompt tokens per model forward (reduces VRAM
+    /// spikes on long prompts; similar to llama.cpp `--batch-size` during eval).
+    /// 0 = one forward over the entire prompt.
+    #[arg(long, default_value_t = 512)]
+    pub prefill_chunk_tokens: usize,
+
     /// Device: cpu, cuda, or metal
     #[arg(long, default_value = "auto")]
     pub device: String,
@@ -144,9 +151,24 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 50)]
     pub top_k: usize,
 
+    /// Default min-p sampling (0 = disabled)
+    #[arg(long, default_value_t = 0.0)]
+    pub min_p: f64,
+
+    /// Default OpenAI-style presence penalty (0 = disabled)
+    #[arg(long, default_value_t = 0.0)]
+    pub presence_penalty: f64,
+
     /// Default max tokens to generate
     #[arg(long, default_value_t = 2048)]
     pub max_tokens: usize,
+
+    /// Accept for compatibility with llama.cpp launch scripts.  inferrs does
+    /// not execute the tokenizer's Jinja `chat_template` string; it uses
+    /// built-in Rust formatters from `tokenizer_config.json` heuristics, except Qwen3.6 which
+    /// uses the embedded `chat_templates/qwen3.6.jinja` via Minijinja.
+    #[arg(long, default_value_t = false)]
+    pub jinja: bool,
 
     /// Fraction of GPU/CPU memory to reserve for paged KV blocks (vLLM-style block management).
     /// e.g. `--paged-attention=0.9` reserves 90% of available memory.
@@ -155,6 +177,11 @@ pub struct ServeArgs {
     #[arg(long, num_args(0..=1), default_missing_value("0.9"), require_equals(true),
           value_name = "FRACTION")]
     pub paged_attention: Option<f64>,
+
+    /// Override MoE top-k experts activated per token (default: from model config).
+    /// Lower values (e.g. 2) are faster; higher values (e.g. 8) improve quality.
+    #[arg(long, value_name = "K")]
+    pub moe_top_k: Option<usize>,
 
     /// TurboQuant KV cache compression bit-width (Qwen3/Gemma4).
     /// Enabled by default at 8 bits (~2× KV memory reduction, near-lossless quality).
@@ -469,6 +496,26 @@ impl ServeArgs {
                 BackendKind::Cpu => {}
             }
         }
+
+        // Optional `libinferrs_backend_cuda.so` probes are packaging sugar; candle
+        // already dlopens CUDA/ROCm/MUSA via cudarc on `Device::new_cuda(0)`.
+        #[cfg(any(
+            target_os = "linux",
+            all(target_os = "windows", target_arch = "x86_64")
+        ))]
+        match candle_core::Device::new_cuda(0) {
+            Ok(device) => {
+                tracing::info!(
+                    "Using CUDA-compatible GPU (runtime init; inferrs backend plugin not required)"
+                );
+                disable_cuda_event_tracking(&device);
+                return Ok(device);
+            }
+            Err(e) => {
+                tracing::debug!("CUDA runtime init unavailable: {e:#}");
+            }
+        }
+
         tracing::info!("Using CPU device");
         Ok(candle_core::Device::Cpu)
     }

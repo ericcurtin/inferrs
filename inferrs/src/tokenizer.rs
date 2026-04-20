@@ -245,6 +245,9 @@ pub enum ChatTemplate {
     ChatML,
     /// Qwen3.5 ChatML with thinking disabled (<think>\n\n</think>\n\n prefix on assistant turn)
     Qwen35,
+    /// Qwen3.6: `chat_templates/qwen3.6.jinja` rendered with Minijinja (not the tokenizer JSON string).
+    /// Distinguished from [`ChatTemplate::Qwen35`] when `tokenizer_config.json` heuristics overlap.
+    Qwen36,
     /// Gemma2 format: <start_of_turn>role\ncontent<end_of_turn> with BOS prefix
     Gemma,
     /// Gemma3 format: <start_of_turn>role\ncontent<end_of_turn> without BOS prefix, model turn
@@ -308,6 +311,25 @@ pub struct Tokenizer {
     pub bos_token: Option<String>,
 }
 
+/// Pick [`ChatTemplate`] from architecture hints and `tokenizer_config.json`.
+///
+/// Qwen3.6 often ships a `chat_template` string that still mentions `enable_thinking` like 3.5,
+/// so [`detect_chat_template`] alone would classify the model as [`ChatTemplate::Qwen35`].
+/// When the weight config resolves to [`inferrs_models::config::ModelArchitecture::Qwen36`],
+/// we select [`ChatTemplate::Qwen36`] so logs and code paths stay series-accurate even though
+/// Jinja is not executed here.
+fn resolve_chat_template(
+    arch_override: Option<&inferrs_models::config::ModelArchitecture>,
+    config: &Option<TokenizerConfig>,
+) -> ChatTemplate {
+    match arch_override {
+        Some(inferrs_models::config::ModelArchitecture::Gemma4) => ChatTemplate::Gemma4,
+        Some(inferrs_models::config::ModelArchitecture::Phi3) => ChatTemplate::Phi,
+        Some(inferrs_models::config::ModelArchitecture::Qwen36) => ChatTemplate::Qwen36,
+        _ => detect_chat_template(config),
+    }
+}
+
 impl Tokenizer {
     pub fn from_file_with_arch(
         tokenizer_path: &Path,
@@ -319,12 +341,7 @@ impl Tokenizer {
 
         let config = tokenizer_config_path.and_then(|p| TokenizerConfig::from_file(p).ok());
 
-        // Detect chat template, optionally overriding based on known architecture
-        let chat_template = match arch_override {
-            Some(inferrs_models::config::ModelArchitecture::Gemma4) => ChatTemplate::Gemma4,
-            Some(inferrs_models::config::ModelArchitecture::Phi3) => ChatTemplate::Phi,
-            _ => detect_chat_template(&config),
-        };
+        let chat_template = resolve_chat_template(arch_override, &config);
 
         let eos_token = config.as_ref().and_then(|c| c.eos_token_str());
 
@@ -405,11 +422,27 @@ impl Tokenizer {
         Ok(text)
     }
 
+    /// True if this template has native tool-calling support and should receive
+    /// the raw tools JSON rather than the generic plain-text injection.
+    pub fn uses_native_tools(&self) -> bool {
+        matches!(self.chat_template, ChatTemplate::Qwen36)
+    }
+
     /// Apply chat template to messages and return the prompt string.
-    pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
+    ///
+    /// `tools` is the raw OpenAI-format tools array from the request.  Templates
+    /// that handle tools natively (see [`Self::uses_native_tools`]) use it to
+    /// render the correct tool block; others ignore it (the caller is responsible
+    /// for injecting a plain-text summary before calling this method).
+    pub fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
         let prompt = match &self.chat_template {
             ChatTemplate::ChatML => apply_chatml(messages, &self.bos_token),
             ChatTemplate::Qwen35 => apply_qwen35(messages),
+            ChatTemplate::Qwen36 => apply_qwen36(messages, tools)?,
             ChatTemplate::Gemma => apply_gemma(messages, &self.bos_token),
             ChatTemplate::Gemma3 => apply_gemma3(messages),
             ChatTemplate::Gemma4 => apply_gemma4(messages),
@@ -421,8 +454,17 @@ impl Tokenizer {
 
     /// Apply chat template, encode, and return token IDs ready for inference.
     pub fn apply_chat_template_and_encode(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        let prompt = self.apply_chat_template(messages)?;
-        // For chat templates, don't add special tokens - the template handles them
+        self.apply_chat_template_and_encode_with_tools(messages, None)
+    }
+
+    /// Same as [`apply_chat_template_and_encode`] but forwards the raw tools
+    /// JSON to templates that support native tool rendering.
+    pub fn apply_chat_template_and_encode_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<Vec<u32>> {
+        let prompt = self.apply_chat_template(messages, tools)?;
         self.encode(&prompt, false)
     }
 
@@ -542,16 +584,101 @@ fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String
     apply_chatml_inner(messages, "")
 }
 
+/// Suffix after `<|im_start|>assistant\n` for Qwen3.5 when `enable_thinking=false` in upstream
+/// `tokenizer_config.json` Jinja (empty thinking block, then answer).
+const QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX: &str =
+    "<think>\n\n</think>\n\n";
+
 /// Qwen3.5 ChatML template with thinking disabled.
 ///
-/// Identical to ChatML but appends `<think>\n\n</think>\n\n` after the
-/// `<|im_start|>assistant\n` prefix.  This matches the model's chat template
-/// when `enable_thinking=false`, which instructs the model to emit an empty
-/// thinking block and proceed directly to the answer.  Without this prefix
-/// the model enters thinking mode and prepends a long chain-of-thought before
-/// the actual reply.
+/// Appends [`QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX`] after `<|im_start|>assistant\n`.
+/// Without this prefix the model tends to enter thinking mode and prepend chain-of-thought.
 fn apply_qwen35(messages: &[ChatMessage]) -> String {
-    apply_chatml_inner(messages, "<think>\n\n</think>\n\n")
+    apply_chatml_inner(messages, QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX)
+}
+
+/// Qwen3.6 ChatML template.
+///
+/// When `tools` is provided the system block is rendered in Qwen3.6's native
+/// tool-calling format so the model outputs well-formed `<tool_call>` XML.
+/// Without tools the output is identical to Qwen3.5 except that prior
+/// assistant turns have `<think>...</think>` stripped.
+fn apply_qwen36(messages: &[ChatMessage], tools: Option<&serde_json::Value>) -> Result<String> {
+    let normalized = normalize_messages(messages, |role| match role {
+        Role::System => "system",
+        Role::User | Role::Tool | Role::Function => "user",
+        Role::Assistant => "assistant",
+    });
+
+    let mut prompt = String::new();
+
+    // Render the system block.  When tools are present it follows the format
+    // from Qwen3.6's tokenizer_config.json Jinja template exactly, with any
+    // existing system message appended after the tool block.
+    let tools_arr = tools.and_then(|t| t.as_array()).filter(|a| !a.is_empty());
+    if let Some(arr) = tools_arr {
+        prompt.push_str("<|im_start|>system\n");
+        prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for tool in arr {
+            prompt.push('\n');
+            prompt.push_str(&serde_json::to_string(tool).unwrap_or_default());
+        }
+        prompt.push_str("\n</tools>");
+        prompt.push_str(
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+             <tool_call>\n\
+             <function=example_function_name>\n\
+             <parameter=example_parameter_1>\nvalue_1\n</parameter>\n\
+             <parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n\
+             </function>\n\
+             </tool_call>\n\n\
+             <IMPORTANT>\n\
+             Reminder:\n\
+             - Function calls MUST follow the specified format\n\
+             - Required parameters MUST be specified\n\
+             - You may provide optional reasoning BEFORE the function call, but NOT after\n\
+             - If no function call is needed, answer normally\n\
+             </IMPORTANT>",
+        );
+        // Append an existing system message if present.
+        if let Some((_, sys_content)) = normalized.first().filter(|(r, _)| *r == "system") {
+            let trimmed = sys_content.trim();
+            if !trimmed.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(trimmed);
+            }
+        }
+        prompt.push_str("<|im_end|>\n");
+    }
+
+    for (role, content) in &normalized {
+        // Skip system when tools were already rendered above.
+        if *role == "system" && tools_arr.is_some() {
+            continue;
+        }
+        let body: &str = if *role == "assistant" {
+            strip_think_block(content)
+        } else {
+            content.as_str()
+        };
+        prompt.push_str(&format!("<|im_start|>{role}\n{body}<|im_end|>\n"));
+    }
+
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt.push_str(QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX);
+    Ok(prompt)
+}
+
+/// Strip a leading `<think>…</think>` block from an assistant turn.
+///
+/// Returns the content that follows `</think>`, left-trimmed of newlines.
+/// If no closing tag is found the original string is returned unchanged.
+fn strip_think_block(s: &str) -> &str {
+    if let Some(end) = s.find("</think>") {
+        s[end + 8..].trim_start_matches('\n')
+    } else {
+        s
+    }
 }
 
 fn apply_gemma(messages: &[ChatMessage], bos_token: &Option<String>) -> String {
@@ -882,9 +1009,41 @@ mod tests {
     }
 
     #[test]
+    fn resolve_chat_template_qwen36_not_labeled_as_qwen35() {
+        let config = Some(TokenizerConfig {
+            chat_template: Some("<|im_start|>...enable_thinking...".to_string()),
+            bos_token: None,
+            eos_token: None,
+        });
+        assert!(matches!(
+            resolve_chat_template(
+                Some(&inferrs_models::config::ModelArchitecture::Qwen36),
+                &config
+            ),
+            ChatTemplate::Qwen36
+        ));
+        assert!(matches!(
+            resolve_chat_template(
+                Some(&inferrs_models::config::ModelArchitecture::Qwen35),
+                &config
+            ),
+            ChatTemplate::Qwen35
+        ));
+    }
+
+    #[test]
     fn qwen35_template_has_no_think_prefix() {
         let msgs = vec![user_msg("Hello!")];
         let prompt = apply_qwen35(&msgs);
+        assert!(prompt.contains("<|im_start|>user\nHello!<|im_end|>"));
+        // Literal must match QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX (concat! is literal-only).
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn qwen36_jinja_single_user_matches_template() {
+        let msgs = vec![user_msg("Hello!")];
+        let prompt = apply_qwen36(&msgs, None).expect("template render");
         assert!(prompt.contains("<|im_start|>user\nHello!<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }

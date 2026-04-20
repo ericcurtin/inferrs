@@ -72,11 +72,17 @@ impl TensorInfo {
         let mut raw_data = vec![0u8; size_in_bytes];
         reader.seek(std::io::SeekFrom::Start(tensor_data_offset + self.offset))?;
         reader.read_exact(&mut raw_data)?;
+        // IQ quants: Candle CUDA has native kernels; load on GPU. Other backends still use CPU.
+        let load_device = if self.ggml_dtype.requires_cpu_fallback() && !matches!(device, Device::Cuda(_)) {
+            &Device::Cpu
+        } else {
+            device
+        };
         super::ggml_file::qtensor_from_ggml(
             self.ggml_dtype,
             &raw_data,
             self.shape.dims().to_vec(),
-            device,
+            load_device,
         )
     }
 }

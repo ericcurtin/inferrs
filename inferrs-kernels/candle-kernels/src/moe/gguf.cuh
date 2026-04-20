@@ -1436,3 +1436,5 @@ inline __device__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
     y[64] = convert_from_half<dst_t>(__hmul(d, __int2half_rn(sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32))));
     y[96] = convert_from_half<dst_t>(__hmul(d, __int2half_rn(sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32))));
 }
+
+#include "iq_vec_dot.cuh"

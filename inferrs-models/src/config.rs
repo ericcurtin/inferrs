@@ -88,7 +88,7 @@ pub struct Gemma4VisionConfig {
     pub hidden_activation: String,
 }
 
-/// Qwen vision encoder configuration (shared by Qwen3.5 and Qwen3-VL).
+/// Qwen vision encoder configuration (shared by Qwen3.5/Qwen3.6 and Qwen3-VL).
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
 #[allow(dead_code)]
@@ -157,7 +157,7 @@ impl<'de> serde::Deserialize<'de> for VisionConfig {
         let raw = serde_json::Value::deserialize(de)?;
         let model_type = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
         match model_type {
-            "qwen3_5" | "qwen3_vl" => {
+            "qwen3_5" | "qwen3_5_moe" | "qwen3_6" | "qwen3_6_moe" | "qwen3_vl" => {
                 let cfg: QwenVisionConfig =
                     serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
                 Ok(VisionConfig::Qwen(cfg))
@@ -182,7 +182,7 @@ where
     let Some(val) = raw else { return Ok(None) };
     let model_type = val.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
     match model_type {
-        "qwen3_5" | "qwen3_vl" => {
+        "qwen3_5" | "qwen3_5_moe" | "qwen3_6" | "qwen3_6_moe" | "qwen3_vl" => {
             let cfg: QwenVisionConfig =
                 serde_json::from_value(val).map_err(serde::de::Error::custom)?;
             Ok(Some(VisionConfig::Qwen(cfg)))
@@ -201,23 +201,24 @@ pub enum ModelArchitecture {
     Qwen2,
     Qwen3,
     Qwen35,
+    Qwen36,
     Gemma2,
     Gemma3,
     Gemma4,
     Phi3,
 }
 
-/// Rope parameters nested object (used in Qwen3.5 text_config).
+/// Rope parameters nested object (used in Qwen3.5/Qwen3.6 text_config).
 #[derive(Debug, Deserialize, Default)]
 pub struct RopeParameters {
     pub rope_theta: Option<f64>,
     pub partial_rotary_factor: Option<f64>,
 }
 
-/// Shared text_config nested object (used by Qwen3.5 and Gemma4).
+/// Shared text_config nested object (used by Qwen3.5/Qwen3.6 and Gemma4).
 #[derive(Debug, Deserialize)]
 pub struct TextConfig {
-    // Qwen3.5 fields
+    // Qwen3.5/Qwen3.6 fields
     pub vocab_size: Option<usize>,
     pub hidden_size: Option<usize>,
     pub intermediate_size: Option<usize>,
@@ -237,7 +238,7 @@ pub struct TextConfig {
     #[serde(default)]
     pub rope_parameters: RopeParameters,
 
-    // Qwen3.5 MTP fields
+    // Qwen3.5/Qwen3.6 MTP fields
     pub mtp_num_hidden_layers: Option<usize>,
 
     // Gemma4-specific text_config fields
@@ -260,6 +261,8 @@ pub struct TextConfig {
     // Gemma4 MoE fields (26B A4B variant)
     pub enable_moe_block: Option<bool>,
     pub num_experts: Option<usize>,
+    /// MoE routing top-k (Transformers `num_experts_per_tok`).
+    pub num_experts_per_tok: Option<usize>,
     pub top_k_experts: Option<usize>,
     pub moe_intermediate_size: Option<usize>,
 }
@@ -319,6 +322,15 @@ pub struct RawConfig {
 /// Default epsilon for RMS normalization layers across all model families.
 const RMS_NORM_EPS_DEFAULT: f64 = 1e-6;
 
+/// `Qwen/Qwen3.6-*` models still publish `model_type: "qwen3_5_moe"` and
+/// `Qwen3_5MoeForConditionalGeneration` in `config.json` for Transformers
+/// compatibility.  Use the HuggingFace repo id (or local folder name) to pick
+/// the 3.6 code path when the user loads from a 3.6-tagged repo.
+fn hf_repo_suggests_qwen36(repo_id: &str) -> bool {
+    let lower = repo_id.to_ascii_lowercase();
+    lower.contains("qwen3.6") || lower.contains("qwen3_6")
+}
+
 impl RawConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("Failed to read config.json")?;
@@ -327,9 +339,38 @@ impl RawConfig {
         Ok(config)
     }
 
-    pub fn detect_architecture(&self) -> Result<ModelArchitecture> {
+    /// `hf_model_id` should be the HuggingFace repo id passed on the CLI
+    /// (e.g. `unsloth/Qwen3.6-35B-A3B-GGUF`) or `None` when unavailable.
+    pub fn detect_architecture(&self, hf_model_id: Option<&str>) -> Result<ModelArchitecture> {
+        if let Some(repo) = hf_model_id {
+            if hf_repo_suggests_qwen36(repo) {
+                let matches_upstream_qwen36_tags = matches!(
+                    self.model_type.as_deref(),
+                    Some("qwen3_6" | "qwen3_6_moe")
+                ) || matches!(
+                    self.text_config
+                        .as_ref()
+                        .and_then(|t| t.model_type.as_deref()),
+                    Some("qwen3_6_moe_text" | "qwen3_6_text" | "qwen3_6" | "qwen3_6_moe")
+                );
+                let matches_legacy_qwen35_shim = matches!(
+                    self.model_type.as_deref(),
+                    Some("qwen3_5_moe" | "qwen3_5")
+                ) || self.architectures.as_ref().is_some_and(|a| {
+                    a.iter()
+                        .any(|x| x.contains("Qwen3_5") && !x.contains("Qwen3_6"))
+                });
+                if matches_upstream_qwen36_tags || matches_legacy_qwen35_shim {
+                    return Ok(ModelArchitecture::Qwen36);
+                }
+            }
+        }
+
         if let Some(archs) = &self.architectures {
             for arch in archs {
+                if arch.contains("Qwen3_6") {
+                    return Ok(ModelArchitecture::Qwen36);
+                }
                 if arch.contains("Qwen3_5") {
                     return Ok(ModelArchitecture::Qwen35);
                 }
@@ -358,7 +399,8 @@ impl RawConfig {
             match model_type.as_str() {
                 "qwen2" | "qwen2_5" => return Ok(ModelArchitecture::Qwen2),
                 "qwen3" => return Ok(ModelArchitecture::Qwen3),
-                "qwen3_5" => return Ok(ModelArchitecture::Qwen35),
+                "qwen3_5" | "qwen3_5_moe" => return Ok(ModelArchitecture::Qwen35),
+                "qwen3_6" | "qwen3_6_moe" => return Ok(ModelArchitecture::Qwen36),
                 "gemma4" => return Ok(ModelArchitecture::Gemma4),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
                 "gemma2" => return Ok(ModelArchitecture::Gemma2),
@@ -686,6 +728,98 @@ impl RawConfig {
         }
     }
 
+    pub fn to_qwen36_config(
+        &self,
+        dtype: DType,
+        device: Device,
+        turbo_quant_bits: Option<u8>,
+    ) -> crate::models::qwen3_6::Qwen35Config {
+        use crate::models::qwen3_6::{LayerType, Qwen35Config};
+
+        let tc = self.text_config.as_ref();
+
+        let vocab_size = tc.and_then(|t| t.vocab_size).unwrap_or(248320);
+        let hidden_size = tc.and_then(|t| t.hidden_size).unwrap_or(1024);
+        let intermediate_size = tc.and_then(|t| t.intermediate_size).unwrap_or(3584);
+        let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(24);
+        let num_attention_heads = tc.and_then(|t| t.num_attention_heads).unwrap_or(8);
+        let num_key_value_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(2);
+        let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
+        let rms_norm_eps = tc
+            .and_then(|t| t.rms_norm_eps)
+            .unwrap_or(RMS_NORM_EPS_DEFAULT);
+        let tie_word_embeddings = tc.and_then(|t| t.tie_word_embeddings).unwrap_or(true);
+        let full_attention_interval = tc.and_then(|t| t.full_attention_interval).unwrap_or(4);
+        let linear_conv_kernel_dim = tc.and_then(|t| t.linear_conv_kernel_dim).unwrap_or(4);
+        let linear_key_head_dim = tc.and_then(|t| t.linear_key_head_dim).unwrap_or(128);
+        let linear_value_head_dim = tc.and_then(|t| t.linear_value_head_dim).unwrap_or(128);
+        let linear_num_key_heads = tc.and_then(|t| t.linear_num_key_heads).unwrap_or(16);
+        let linear_num_value_heads = tc.and_then(|t| t.linear_num_value_heads).unwrap_or(16);
+
+        let rope_theta = tc
+            .map(|t| t.rope_parameters.rope_theta.unwrap_or(10_000_000.0))
+            .unwrap_or(10_000_000.0);
+        let partial_rotary_factor = tc
+            .map(|t| t.rope_parameters.partial_rotary_factor.unwrap_or(0.25))
+            .unwrap_or(0.25);
+
+        let layer_types: Vec<LayerType> =
+            if let Some(types) = tc.and_then(|t| t.layer_types.as_ref()) {
+                types
+                    .iter()
+                    .map(|s| LayerType {
+                        is_full_attention: s == "full_attention",
+                    })
+                    .collect()
+            } else {
+                (0..num_hidden_layers)
+                    .map(|i| LayerType {
+                        is_full_attention: (i + 1) % full_attention_interval == 0,
+                    })
+                    .collect()
+            };
+
+        let num_experts = tc.and_then(|t| t.num_experts).unwrap_or(1);
+        let enable_moe_block = tc.and_then(|t| t.enable_moe_block).unwrap_or(false);
+        let moe_enabled = enable_moe_block || num_experts > 1;
+        let moe_top_k = tc
+            .and_then(|t| t.num_experts_per_tok)
+            .or(tc.and_then(|t| t.top_k_experts))
+            .unwrap_or(1);
+        let moe_intermediate_size = tc
+            .and_then(|t| t.moe_intermediate_size)
+            .unwrap_or(intermediate_size);
+
+        Qwen35Config {
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            linear_num_key_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            linear_num_value_heads,
+            linear_conv_kernel_dim,
+            full_attention_interval,
+            rms_norm_eps,
+            rope_theta,
+            partial_rotary_factor,
+            layer_types,
+            tie_word_embeddings,
+            dtype,
+            device,
+            turbo_quant_bits,
+            mtp_num_hidden_layers: tc.and_then(|t| t.mtp_num_hidden_layers).unwrap_or(0),
+            moe_enabled,
+            num_experts,
+            moe_top_k,
+            moe_intermediate_size,
+        }
+    }
+
     /// Return the effective maximum sequence length that the model's KV cache
     /// can hold.
     ///
@@ -703,13 +837,14 @@ impl RawConfig {
             ModelArchitecture::Gemma2 => self.max_position_embeddings.unwrap_or(8192),
             ModelArchitecture::Qwen2 => self.max_position_embeddings.unwrap_or(131072),
             ModelArchitecture::Qwen3 => self.max_position_embeddings.unwrap_or(40960),
-            ModelArchitecture::Qwen35 => {
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36 => {
                 let tc = self.text_config.as_ref();
-                // Qwen3.5 uses linear attention for most layers; the full-attn
-                // layers have no artificial cap.
-                tc.and_then(|t| t.num_hidden_layers)
-                    .map(|_| usize::MAX) // effectively unlimited
-                    .unwrap_or(usize::MAX)
+                // Use `text_config.max_position_embeddings` (model context window)
+                // instead of an unbounded value so KV / request limits match HF.
+                // Qwen3.5/3.6 nest all model params under text_config.
+                // 131072 matches the published context window for both series.
+                 tc.and_then(|t| t.max_position_embeddings)
+                    .unwrap_or(131072)
             }
             ModelArchitecture::Gemma4 => {
                 // Gemma4 interleaves local sliding-window layers with global
@@ -763,6 +898,25 @@ impl RawConfig {
                         .count()
                 } else {
                     // Fallback: every full_attention_interval-th layer is full-attention.
+                    (0..num_hidden_layers)
+                        .filter(|i| (i + 1) % full_attention_interval == 0)
+                        .count()
+                };
+                (num_kv_heads, head_dim, num_full_attn)
+            }
+            ModelArchitecture::Qwen36 => {
+                let tc = self.text_config.as_ref();
+                let num_kv_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(2);
+                let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
+                let num_hidden_layers = tc.and_then(|t| t.num_hidden_layers).unwrap_or(24);
+                let full_attention_interval =
+                    tc.and_then(|t| t.full_attention_interval).unwrap_or(4);
+                let num_full_attn = if let Some(types) = tc.and_then(|t| t.layer_types.as_ref()) {
+                    types
+                        .iter()
+                        .filter(|s| s.as_str() == "full_attention")
+                        .count()
+                } else {
                     (0..num_hidden_layers)
                         .filter(|i| (i + 1) % full_attention_interval == 0)
                         .count()
@@ -889,14 +1043,45 @@ mod tests {
     #[test]
     fn detect_qwen2_architecture() {
         let cfg = config_with_arch(&["Qwen2ForCausalLM"], "qwen2");
-        assert_eq!(cfg.detect_architecture().unwrap(), ModelArchitecture::Qwen2);
+        assert_eq!(
+            cfg.detect_architecture(None).unwrap(),
+            ModelArchitecture::Qwen2
+        );
+    }
+
+    #[test]
+    fn detect_qwen36_architecture() {
+        let cfg = config_with_arch(&["Qwen3_6ForCausalLM"], "qwen3_6");
+        assert_eq!(
+            cfg.detect_architecture(None).unwrap(),
+            ModelArchitecture::Qwen36
+        );
+    }
+
+    /// Mirrors `Qwen/Qwen3.6-35B-A3B` as of 2026-04: `model_type` / `architectures`
+    /// still say Qwen3.5 while the repo id carries the real series.
+    #[test]
+    fn detect_qwen36_when_hf_config_reuses_qwen3_5_tags() {
+        let cfg = config_with_arch(
+            &["Qwen3_5MoeForConditionalGeneration"],
+            "qwen3_5_moe",
+        );
+        assert_eq!(
+            cfg.detect_architecture(Some("unsloth/Qwen3.6-35B-A3B-GGUF"))
+                .unwrap(),
+            ModelArchitecture::Qwen36
+        );
+        assert_eq!(
+            cfg.detect_architecture(None).unwrap(),
+            ModelArchitecture::Qwen35
+        );
     }
 
     #[test]
     fn detect_gemma2_architecture() {
         let cfg = config_with_arch(&["Gemma2ForCausalLM"], "gemma2");
         assert_eq!(
-            cfg.detect_architecture().unwrap(),
+            cfg.detect_architecture(None).unwrap(),
             ModelArchitecture::Gemma2
         );
     }
@@ -905,7 +1090,7 @@ mod tests {
     fn detect_gemma3_architecture() {
         let cfg = config_with_arch(&["Gemma3ForCausalLM"], "gemma3");
         assert_eq!(
-            cfg.detect_architecture().unwrap(),
+            cfg.detect_architecture(None).unwrap(),
             ModelArchitecture::Gemma3
         );
     }
@@ -915,7 +1100,7 @@ mod tests {
         // A config with both Gemma3 and Gemma2 in the architecture list should pick Gemma3.
         let cfg = config_with_arch(&["Gemma3ForCausalLM", "Gemma2ForCausalLM"], "gemma3");
         assert_eq!(
-            cfg.detect_architecture().unwrap(),
+            cfg.detect_architecture(None).unwrap(),
             ModelArchitecture::Gemma3
         );
     }
@@ -923,7 +1108,7 @@ mod tests {
     #[test]
     fn unsupported_architecture_errors() {
         let cfg = config_with_arch(&["LlamaForCausalLM"], "llama");
-        assert!(cfg.detect_architecture().is_err());
+        assert!(cfg.detect_architecture(None).is_err());
     }
 
     #[test]
@@ -939,12 +1124,18 @@ mod tests {
     #[test]
     fn detect_phi3_architecture() {
         let cfg = config_with_arch(&["Phi3ForCausalLM"], "phi3");
-        assert_eq!(cfg.detect_architecture().unwrap(), ModelArchitecture::Phi3);
+        assert_eq!(
+            cfg.detect_architecture(None).unwrap(),
+            ModelArchitecture::Phi3
+        );
     }
 
     #[test]
     fn detect_phi3_by_model_type() {
         let cfg = config_with_arch(&["UnknownArch"], "phi3");
-        assert_eq!(cfg.detect_architecture().unwrap(), ModelArchitecture::Phi3);
+        assert_eq!(
+            cfg.detect_architecture(None).unwrap(),
+            ModelArchitecture::Phi3
+        );
     }
 }

@@ -229,6 +229,8 @@ pub struct ChatCompletionChoice {
 pub struct ChatCompletionMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<crate::tool_calls::ToolCall>,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,6 +257,8 @@ pub struct DeltaMessage {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tool_calls: Vec<crate::tool_calls::ToolCall>,
     /// Thinking/reasoning content — populated when the model is inside a
     /// `<think>…</think>` block.  Matches vllm's `delta.reasoning_content`
     /// and llama-server's default `reasoning_content_delta` behaviour.
@@ -1458,11 +1462,21 @@ async fn wait_for_slot_load(
 }
 
 pub async fn run(args: ServeArgs) -> Result<()> {
+    if args.jinja {
+        tracing::info!(
+            "`--jinja`: Qwen3.6 uses the embedded `chat_templates/qwen3.6.jinja` (Minijinja); \
+             other architectures use native Rust templates inferred from tokenizer_config.json \
+             (HF `chat_template` Jinja is not executed for those)."
+        );
+    }
+
     let default_params = SamplingParams {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
         max_tokens: args.max_tokens,
+        min_p: args.min_p,
+        presence_penalty: args.presence_penalty,
         ..SamplingParams::default()
     };
 
@@ -1502,7 +1516,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
             .await;
             let lm_result = match result {
                 Ok(Ok(lm)) => Ok(Arc::new(lm)),
-                Ok(Err(e)) => Err(e.to_string()),
+                Ok(Err(e)) => Err(format!("{e:#}")),
                 Err(e) => Err(format!("model load panicked: {e}")),
             };
             // Update slot first so /health flips to 200, then wake waiters.
@@ -1511,7 +1525,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
                 *guard = match &lm_result {
                     Ok(lm) => ModelSlot::Ready(Arc::clone(lm)),
                     Err(e) => {
-                        tracing::error!("Model load failed: {e}");
+                        tracing::error!("Model load failed: {}", e);
                         ModelSlot::Failed(e.clone())
                     }
                 };
@@ -1713,26 +1727,28 @@ async fn chat_completions(
     // ── Audio preprocessing ──────────────────────────────────────────────────
     let has_audio = req.messages.iter().any(|m| m.audio.is_some());
 
-    // When the caller provides tool definitions (e.g. from an OpenClaw agent
-    // runtime), prepend a synthetic system message that describes the available
-    // tools in plain text.  This gives models that do not natively process
-    // OpenAI tool schemas (e.g. Gemma) the information they need to reason
-    // about tool calls, without triggering schema-validation failures inside
-    // the model or the chat template renderer.
+    // Inject tool definitions into the prompt.
     //
-    // If the message list already begins with a system message the tool
-    // summary is appended to it so the context stays in a single system turn
-    // (avoiding two consecutive system messages which some templates reject).
-    // Done before the audio/non-audio split so both paths share one injection.
+    // Templates with native tool support (Qwen36) receive the raw JSON array
+    // and render the correct tool block themselves.  All other models get a
+    // plain-text summary prepended to the system message — a generic fallback
+    // that works for models without a dedicated tool-calling chat template.
     let messages_with_tools: Vec<ChatMessage>;
     let messages = if let Some(ref tools) = req.tools {
         tracing::info!(
-            "Request {}: tools provided — injecting as system context",
-            request_id
+            "Request {}: tools provided — injecting as {} context",
+            request_id,
+            if tokenizer.uses_native_tools() { "native" } else { "plain-text system" }
         );
-        let tool_summary = format_tools_as_system_context(tools);
-        messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
-        &messages_with_tools[..]
+        if tokenizer.uses_native_tools() {
+            // Native path: tools are passed directly to apply_chat_template; no
+            // pre-injection into messages needed.
+            &req.messages[..]
+        } else {
+            let tool_summary = format_tools_as_system_context(tools);
+            messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
+            &messages_with_tools[..]
+        }
     } else {
         &req.messages[..]
     };
@@ -1868,7 +1884,9 @@ async fn chat_completions(
 
         (tokens, None, Some(image_ctx))
     } else {
-        let tokens = match tokenizer.apply_chat_template_and_encode(messages) {
+        let tokens = match tokenizer
+            .apply_chat_template_and_encode_with_tools(messages, req.tools.as_ref())
+        {
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
         };
@@ -1950,7 +1968,7 @@ async fn chat_completions(
             return Err(server_error("Engine unavailable"));
         }
 
-        let stream = make_sse_stream(token_rx, request_id, model_id, created);
+        let stream = make_sse_stream(token_rx, request_id, model_id, created, tokenizer.uses_native_tools());
         Ok(Sse::new(stream).into_response())
     } else {
         // Non-streaming response
@@ -1976,6 +1994,15 @@ async fn chat_completions(
                 } else {
                     Some(token_logprobs_to_choice(&result.token_logprobs))
                 };
+                let tc_outcome = if tokenizer.uses_native_tools() {
+                    crate::tool_calls::process(result.output_text, result.finish_reason)
+                } else {
+                    crate::tool_calls::ToolCallOutcome {
+                        content: result.output_text,
+                        tool_calls: vec![],
+                        finish_reason: result.finish_reason,
+                    }
+                };
                 let response = ChatCompletionResponse {
                     id: request_id,
                     object: "chat.completion",
@@ -1985,9 +2012,10 @@ async fn chat_completions(
                         index: 0,
                         message: ChatCompletionMessage {
                             role: "assistant".to_string(),
-                            content: result.output_text,
+                            content: tc_outcome.content,
+                            tool_calls: tc_outcome.tool_calls,
                         },
-                        finish_reason: Some(result.finish_reason),
+                        finish_reason: Some(tc_outcome.finish_reason),
                         logprobs: choice_logprobs,
                     }],
                     usage: UsageInfo {
@@ -2056,6 +2084,7 @@ fn make_sse_stream(
     request_id: String,
     model_id: String,
     created: u64,
+    uses_native_tools: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         // First chunk: role
@@ -2070,6 +2099,7 @@ fn make_sse_stream(
                     role: Some("assistant".to_string()),
                     content: None,
                     reasoning_content: None,
+                    tool_calls: vec![],
                 },
                 finish_reason: None,
                 logprobs: None,
@@ -2080,10 +2110,17 @@ fn make_sse_stream(
             None => return,
         }
 
+        // When native tools are active we buffer all content so we can run the
+        // tool-call adapter over the complete output before emitting anything.
+        // For normal responses the buffer stays empty and chunks stream through.
+        let mut content_buf = String::new();
+        let mut buffered_chunks: Vec<Event> = Vec::new();
+
         // Token chunks
         while let Some(token) = token_rx.recv().await {
             // Don't send EOS token text as content.
             let is_stop = token.finish_reason.as_deref() == Some("stop");
+            let finish_reason = token.finish_reason.clone();
             let content = if is_stop || token.text.is_empty() {
                 None
             } else {
@@ -2096,7 +2133,7 @@ fn make_sse_stream(
             };
 
             // Skip chunks that carry no text and no finish signal.
-            if content.is_none() && reasoning_content.is_none() && token.finish_reason.is_none() {
+            if content.is_none() && reasoning_content.is_none() && finish_reason.is_none() {
                 continue;
             }
 
@@ -2104,8 +2141,6 @@ fn make_sse_stream(
             let chunk_logprobs = token.logprob.as_ref().map(|lp| {
                 let token_text = content.clone().unwrap_or_default();
                 let bytes = Some(token_text.as_bytes().to_vec());
-                // Use pre-decoded text from the engine; fall back to the token
-                // ID in angle-bracket notation only if decoding was skipped.
                 let top_logprobs = lp
                     .top_logprobs
                     .iter()
@@ -2137,25 +2172,112 @@ fn make_sse_stream(
                 }
             });
 
-            let chunk = ChatCompletionStreamResponse {
-                id: request_id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_id.clone(),
-                choices: vec![ChatCompletionStreamChoice {
-                    index: 0,
-                    delta: DeltaMessage {
-                        role: None,
-                        content,
-                        reasoning_content,
-                    },
-                    finish_reason: token.finish_reason,
-                    logprobs: chunk_logprobs,
-                }],
-            };
-            match to_sse_event(&chunk, "chat stream chunk") {
-                Some(event) => yield Ok(event),
-                None => break,
+            if uses_native_tools {
+                // Accumulate content; hold all chunks until generation ends.
+                if let Some(ref text) = content {
+                    content_buf.push_str(text);
+                }
+
+                if finish_reason.is_some() {
+                    // Run the adapter over the complete output.
+                    let outcome = crate::tool_calls::process(
+                        content_buf.clone(),
+                        finish_reason.clone().unwrap_or_default(),
+                    );
+
+                    if !outcome.tool_calls.is_empty() {
+                        // Emit a single delta with tool_calls; suppress buffered content.
+                        let tc_chunk = ChatCompletionStreamResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_id.clone(),
+                            choices: vec![ChatCompletionStreamChoice {
+                                index: 0,
+                                delta: DeltaMessage {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                    tool_calls: outcome.tool_calls,
+                                },
+                                finish_reason: Some(outcome.finish_reason),
+                                logprobs: None,
+                            }],
+                        };
+                        if let Some(event) = to_sse_event(&tc_chunk, "tool_calls chunk") {
+                            yield Ok(event);
+                        }
+                    } else {
+                        // No tool calls — flush buffered chunks then the stop chunk.
+                        for event in buffered_chunks.drain(..) {
+                            yield Ok(event);
+                        }
+                        let stop_chunk = ChatCompletionStreamResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_id.clone(),
+                            choices: vec![ChatCompletionStreamChoice {
+                                index: 0,
+                                delta: DeltaMessage {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                    tool_calls: vec![],
+                                },
+                                finish_reason: Some(outcome.finish_reason),
+                                logprobs: chunk_logprobs,
+                            }],
+                        };
+                        if let Some(event) = to_sse_event(&stop_chunk, "stop chunk") {
+                            yield Ok(event);
+                        }
+                    }
+                } else {
+                    // Mid-stream: buffer the chunk for potential flush.
+                    let chunk = ChatCompletionStreamResponse {
+                        id: request_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_id.clone(),
+                        choices: vec![ChatCompletionStreamChoice {
+                            index: 0,
+                            delta: DeltaMessage {
+                                role: None,
+                                content,
+                                reasoning_content,
+                                tool_calls: vec![],
+                            },
+                            finish_reason: None,
+                            logprobs: chunk_logprobs,
+                        }],
+                    };
+                    if let Some(event) = to_sse_event(&chunk, "buffered chunk") {
+                        buffered_chunks.push(event);
+                    }
+                }
+            } else {
+                let chunk = ChatCompletionStreamResponse {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_id.clone(),
+                    choices: vec![ChatCompletionStreamChoice {
+                        index: 0,
+                        delta: DeltaMessage {
+                            role: None,
+                            content,
+                            reasoning_content,
+                            tool_calls: vec![],
+                        },
+                        finish_reason,
+                        logprobs: chunk_logprobs,
+                    }],
+                };
+                match to_sse_event(&chunk, "chat stream chunk") {
+                    Some(event) => yield Ok(event),
+                    None => break,
+                }
             }
         }
 

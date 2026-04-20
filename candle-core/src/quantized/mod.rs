@@ -99,6 +99,9 @@ impl QStorage {
                 GgmlDType::Q5K => metal::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS => {
+                    Ok(Self::Cpu(dtype.from_data(data)))
+                }
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
             },
             Device::Cuda(d) => match dtype {
@@ -116,6 +119,9 @@ impl QStorage {
                 GgmlDType::Q5K => cuda::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::IQ2XS => cuda::load_quantized(d, as_t_slice::<BlockIQ2XS>(data)),
+                GgmlDType::IQ3XXS => cuda::load_quantized(d, as_t_slice::<BlockIQ3XXS>(data)),
+                GgmlDType::IQ4XS => cuda::load_quantized(d, as_t_slice::<BlockIQ4XS>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
         }
@@ -267,6 +273,9 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    IQ2XS,
+    IQ3XXS,
+    IQ4XS,
 }
 
 impl GgmlDType {
@@ -286,6 +295,9 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            23 => Self::IQ4XS,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
@@ -309,9 +321,16 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ4XS => 23,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
         }
+    }
+
+    pub fn requires_cpu_fallback(self) -> bool {
+        matches!(self, Self::IQ2XS | Self::IQ3XXS | Self::IQ4XS)
     }
 
     /// The block dtype
@@ -331,6 +350,11 @@ impl GgmlDType {
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::IQ2XS => Box::new(vec![BlockIQ2XS::zeros(); elem_count / BlockIQ2XS::BLCK_SIZE]),
+            Self::IQ3XXS => {
+                Box::new(vec![BlockIQ3XXS::zeros(); elem_count / BlockIQ3XXS::BLCK_SIZE])
+            }
+            Self::IQ4XS => Box::new(vec![BlockIQ4XS::zeros(); elem_count / BlockIQ4XS::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -351,6 +375,9 @@ impl GgmlDType {
             Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
+            Self::IQ2XS => Box::new(as_t_slice::<BlockIQ2XS>(data).to_vec()),
+            Self::IQ3XXS => Box::new(as_t_slice::<BlockIQ3XXS>(data).to_vec()),
+            Self::IQ4XS => Box::new(as_t_slice::<BlockIQ4XS>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
         }
     }
@@ -374,6 +401,9 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::IQ2XS => std::mem::size_of::<BlockIQ2XS>(),
+            Self::IQ3XXS => std::mem::size_of::<BlockIQ3XXS>(),
+            Self::IQ4XS => std::mem::size_of::<BlockIQ4XS>(),
         }
     }
 
@@ -388,7 +418,15 @@ impl GgmlDType {
             Self::Q5_1 => k_quants::QK5_1,
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ2XS
+            | Self::IQ3XXS
+            | Self::IQ4XS => k_quants::QK_K,
         }
     }
 }
@@ -652,6 +690,61 @@ impl QTensor {
         self.storage.data()
     }
 
+    /// Split fused expert weights along the leading expert axis into `num_experts`
+    /// separate [`QTensor`]s with shape `per_expert_shape`.
+    ///
+    /// On CUDA, uses device-to-device copies per expert (see
+    /// [`cuda::QCudaStorage::split_moe_experts_dtod`]).  Otherwise copies via the
+    /// host (`data()` + [`QStorage::from_data`]), which matches the legacy path.
+    pub fn split_moe_experts(
+        qt: &std::sync::Arc<Self>,
+        num_experts: usize,
+        per_expert_shape: Shape,
+    ) -> Result<Vec<std::sync::Arc<Self>>> {
+        let per_elems = per_expert_shape.elem_count();
+        let device = qt.device();
+        #[cfg(feature = "cuda")]
+        {
+            if matches!(device, Device::Cuda(_)) {
+                if let QStorage::Cuda(s) = &qt.storage {
+                    let storages = s.split_moe_experts_dtod(num_experts, per_elems)?;
+                    let mut v = Vec::with_capacity(num_experts);
+                    for st in storages {
+                        v.push(std::sync::Arc::new(Self::new(
+                            QStorage::Cuda(st),
+                            per_expert_shape.clone(),
+                        )?));
+                    }
+                    return Ok(v);
+                }
+            }
+        }
+
+        let dtype_q = qt.dtype();
+        let raw = qt.data()?;
+        let raw = raw.as_ref();
+        if raw.len() % num_experts != 0 {
+            crate::bail!(
+                "split_moe_experts: raw byte count {} is not divisible by num_experts {}",
+                raw.len(),
+                num_experts
+            );
+        }
+        let bytes_per_expert = raw.len() / num_experts;
+        let mut experts = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let start = e * bytes_per_expert;
+            let end = start + bytes_per_expert;
+            let chunk = raw[start..end].to_vec();
+            let storage = QStorage::from_data(Cow::Owned(chunk), &device, dtype_q)?;
+            experts.push(std::sync::Arc::new(Self::new(
+                storage,
+                per_expert_shape.clone(),
+            )?));
+        }
+        Ok(experts)
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
@@ -838,7 +931,12 @@ thread_local! {
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         let dequantize = match qtensor.dtype() {
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
+            GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ4XS => true,
             _ => DEQUANTIZE_ALL.with(|b| *b),
         };
         let t = if dequantize {
