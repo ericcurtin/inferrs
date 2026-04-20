@@ -170,9 +170,11 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub store: Option<serde_json::Value>,
-    /// OpenAI reasoning effort hint.  Accepted and silently ignored.
+    /// OpenAI reasoning effort hint.  On Qwen3.5 any non-null value enables
+    /// chain-of-thought (the chat template stops pre-filling an empty
+    /// `<think>…</think>` block, letting the model emit its own).  Ignored
+    /// on templates that don't support thinking.
     #[serde(default)]
-    #[allow(dead_code)]
     pub reasoning_effort: Option<serde_json::Value>,
 }
 
@@ -233,6 +235,24 @@ pub struct ChatCompletionChoice {
 pub struct ChatCompletionMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    /// OpenAI wire format requires a JSON-encoded *string* here (clients
+    /// re-parse).  `OllamaFunctionCall.arguments` uses an object instead.
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +284,29 @@ pub struct DeltaMessage {
     /// and llama-server's default `reasoning_content_delta` behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<StreamingToolCall>>,
+}
+
+/// Streaming counterpart of [`ToolCall`]: `id`/`kind`/`function.name` ride
+/// only on the first chunk of a call, subsequent chunks carry
+/// `function.arguments` fragments.
+#[derive(Debug, Serialize, Clone)]
+pub struct StreamingToolCall {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    pub function: StreamingFunctionCall,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct StreamingFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -590,9 +633,14 @@ pub struct OllamaChatRequest {
     /// chain-of-thought will be returned in the `thinking` field.
     #[serde(default)]
     pub think: Option<bool>,
+    /// OpenAI-style tool definitions (`[{type:"function", function:{...}}]`).
+    /// Consumed by templates that render tool-calling natively (Qwen3.5);
+    /// ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
 }
 
-/// A single message in an Ollama chat request.
+/// A single message in an Ollama chat request or response.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OllamaChatMessage {
     pub role: String,
@@ -603,6 +651,30 @@ pub struct OllamaChatMessage {
     /// Text from inside `<think>…</think>` tags when thinking is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// Inbound and outbound shapes differ (history: `[{function:{…}}]`,
+    /// response: `[{type:"function", function:{index,name,arguments}}]`), so
+    /// this stays opaque and conversion lives in the handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// Ollama name for OpenAI's `tool_call_id` on `role:"tool"` messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct OllamaToolCall {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: OllamaFunctionCall,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct OllamaFunctionCall {
+    pub index: u32,
+    pub name: String,
+    /// JSON object (the Ollama wire format diverges from OpenAI, which uses
+    /// a JSON-encoded string — see `FunctionCall.arguments`).
+    pub arguments: serde_json::Value,
 }
 
 /// Sampling options passed inside an Ollama request.
@@ -1718,28 +1790,39 @@ async fn chat_completions(
     // ── Audio preprocessing ──────────────────────────────────────────────────
     let has_audio = req.messages.iter().any(|m| m.audio.is_some());
 
-    // When the caller provides tool definitions (e.g. from an OpenClaw agent
-    // runtime), prepend a synthetic system message that describes the available
-    // tools in plain text.  This gives models that do not natively process
-    // OpenAI tool schemas (e.g. Gemma) the information they need to reason
-    // about tool calls, without triggering schema-validation failures inside
-    // the model or the chat template renderer.
+    // When the caller provides tool definitions, two paths exist:
     //
-    // If the message list already begins with a system message the tool
-    // summary is appended to it so the context stays in a single system turn
-    // (avoiding two consecutive system messages which some templates reject).
+    // - Templates that render tools natively (Qwen3.5): pass `req.tools`
+    //   straight through to `apply_chat_template` — the template emits the
+    //   `<tools>…</tools>` block and the instruction to return
+    //   `<tool_call>{…}</tool_call>`.  Prose injection would duplicate.
+    //
+    // - Other templates (Gemma, ChatML, Phi, …): fold the tool definitions
+    //   into a synthetic system message in plain text, merging into any
+    //   existing system turn so the model sees a single system block.
+    //
     // Done before the audio/non-audio split so both paths share one injection.
+    let tools_native =
+        crate::tokenizer::chat_template_handles_tools_natively(&tokenizer.chat_template);
     let messages_with_tools: Vec<ChatMessage>;
-    let messages = if let Some(ref tools) = req.tools {
-        tracing::info!(
-            "Request {}: tools provided — injecting as system context",
-            request_id
-        );
-        let tool_summary = format_tools_as_system_context(tools);
-        messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
-        &messages_with_tools[..]
-    } else {
-        &req.messages[..]
+    let messages: &[ChatMessage] = match (req.tools.as_ref(), tools_native) {
+        (Some(_), true) => {
+            tracing::info!(
+                "Request {}: tools provided — rendered natively via chat template",
+                request_id
+            );
+            &req.messages[..]
+        }
+        (Some(tools), false) => {
+            tracing::info!(
+                "Request {}: tools provided — injecting as system context",
+                request_id
+            );
+            let tool_summary = format_tools_as_system_context(tools);
+            messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
+            &messages_with_tools[..]
+        }
+        (None, _) => &req.messages[..],
     };
 
     let has_images = req.messages.iter().any(|m| !m.content.images.is_empty());
@@ -1873,7 +1956,16 @@ async fn chat_completions(
 
         (tokens, None, Some(image_ctx))
     } else {
-        let tokens = match tokenizer.apply_chat_template_and_encode(messages) {
+        // Pass `req.tools` through: templates that handle tools natively
+        // (Qwen3.5) render them into the prompt; others ignore the arg.
+        // Thinking: OpenAI `reasoning_effort` — presence of any non-null
+        // value toggles the Qwen3.5 `<think>` pre-fill off.
+        let enable_thinking = req.reasoning_effort.as_ref().is_some_and(|v| !v.is_null());
+        let tokens = match tokenizer.apply_chat_template_and_encode(
+            messages,
+            req.tools.as_ref(),
+            enable_thinking,
+        ) {
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
         };
@@ -1956,7 +2048,21 @@ async fn chat_completions(
             return Err(server_error("Engine unavailable"));
         }
 
-        let stream = make_sse_stream(token_rx, request_id, model_id, created);
+        // When the active template handles tools natively and the caller
+        // supplied tools, install a per-request `ToolCallStreamState` that
+        // routes `<tool_call>…</tool_call>` tokens out of `delta.content`
+        // and into `delta.tool_calls`.
+        let tool_state = if tools_native && req.tools.is_some() {
+            let filter = crate::tool_call_parser::ToolCallFilter::from_tokenizer(tokenizer);
+            if filter.is_enabled() {
+                Some(crate::tool_call_parser::ToolCallStreamState::new(filter))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let stream = make_sse_stream(token_rx, request_id, model_id, created, tool_state);
         Ok(Sse::new(stream).into_response())
     } else {
         // Non-streaming response
@@ -1982,6 +2088,42 @@ async fn chat_completions(
                 } else {
                     Some(token_logprobs_to_choice(&result.token_logprobs))
                 };
+
+                // Parse `<tool_call>…</tool_call>` blocks out of the output
+                // when the active template renders tool calls natively and
+                // tools were provided in the request.
+                let (content, tool_calls, finish_reason) = if tools_native && req.tools.is_some() {
+                    let (clean, parsed) =
+                        crate::tool_call_parser::extract_tool_calls(&result.output_text);
+                    if parsed.is_empty() {
+                        (result.output_text, None, result.finish_reason)
+                    } else {
+                        let calls: Vec<ToolCall> = parsed
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, c)| ToolCall {
+                                id: format!("call_{i}"),
+                                kind: "function",
+                                function: FunctionCall {
+                                    name: c.name,
+                                    arguments: c.arguments,
+                                },
+                            })
+                            .collect();
+                        // OpenAI convention: when the model returned tool
+                        // calls, `finish_reason` is `"tool_calls"` even if
+                        // the sampler reported `"stop"`.
+                        let fr = if result.finish_reason == "stop" {
+                            "tool_calls".to_string()
+                        } else {
+                            result.finish_reason
+                        };
+                        (clean, Some(calls), fr)
+                    }
+                } else {
+                    (result.output_text, None, result.finish_reason)
+                };
+
                 let response = ChatCompletionResponse {
                     id: request_id,
                     object: "chat.completion",
@@ -1991,9 +2133,10 @@ async fn chat_completions(
                         index: 0,
                         message: ChatCompletionMessage {
                             role: "assistant".to_string(),
-                            content: result.output_text,
+                            content,
+                            tool_calls,
                         },
-                        finish_reason: Some(result.finish_reason),
+                        finish_reason: Some(finish_reason),
                         logprobs: choice_logprobs,
                     }],
                     usage: UsageInfo {
@@ -2062,8 +2205,14 @@ fn make_sse_stream(
     request_id: String,
     model_id: String,
     created: u64,
+    tool_state: Option<crate::tool_call_parser::ToolCallStreamState>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    use crate::tool_call_parser::ToolCallStreamEvent;
+
     async_stream::stream! {
+        let mut tool_state = tool_state;
+        let mut emitted_tool_call = false;
+
         // First chunk: role
         let first_chunk = ChatCompletionStreamResponse {
             id: request_id.clone(),
@@ -2076,6 +2225,7 @@ fn make_sse_stream(
                     role: Some("assistant".to_string()),
                     content: None,
                     reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
                 logprobs: None,
@@ -2090,58 +2240,125 @@ fn make_sse_stream(
         while let Some(token) = token_rx.recv().await {
             // Don't send EOS token text as content.
             let is_stop = token.finish_reason.as_deref() == Some("stop");
-            let content = if is_stop || token.text.is_empty() {
-                None
+
+            // Route this token through the tool-call filter when active.
+            // The filter classifies each token as content, tool-call start,
+            // tool-call arguments delta, or tool-call end.
+            let (content, tool_calls_delta) = if let Some(state) = tool_state.as_mut() {
+                let events = state.push_token(token.token_id, &token.text);
+                let mut content_acc = String::new();
+                let mut tc_deltas: Vec<StreamingToolCall> = Vec::new();
+                for ev in events {
+                    match ev {
+                        ToolCallStreamEvent::Content(s) => content_acc.push_str(&s),
+                        ToolCallStreamEvent::ToolCallStart { index, id, name } => {
+                            emitted_tool_call = true;
+                            tc_deltas.push(StreamingToolCall {
+                                index,
+                                id: Some(id),
+                                kind: Some("function"),
+                                function: StreamingFunctionCall {
+                                    name: Some(name),
+                                    arguments: Some(String::new()),
+                                },
+                            });
+                        }
+                        ToolCallStreamEvent::ToolCallArgsDelta { index, delta } => {
+                            tc_deltas.push(StreamingToolCall {
+                                index,
+                                id: None,
+                                kind: None,
+                                function: StreamingFunctionCall {
+                                    name: None,
+                                    arguments: Some(delta),
+                                },
+                            });
+                        }
+                        ToolCallStreamEvent::ToolCallEnd { .. } => {}
+                    }
+                }
+                let c = if is_stop || content_acc.is_empty() {
+                    None
+                } else {
+                    Some(content_acc)
+                };
+                let tc = if tc_deltas.is_empty() {
+                    None
+                } else {
+                    Some(tc_deltas)
+                };
+                (c, tc)
             } else {
-                Some(token.text.clone())
+                let c = if is_stop || token.text.is_empty() {
+                    None
+                } else {
+                    Some(token.text.clone())
+                };
+                (c, None)
             };
+
             let reasoning_content = if token.reasoning_content.is_empty() {
                 None
             } else {
                 Some(token.reasoning_content)
             };
 
-            // Skip chunks that carry no text and no finish signal.
-            if content.is_none() && reasoning_content.is_none() && token.finish_reason.is_none() {
+            // Skip chunks that carry no text, no tool_calls, and no finish signal.
+            if content.is_none()
+                && reasoning_content.is_none()
+                && tool_calls_delta.is_none()
+                && token.finish_reason.is_none()
+            {
                 continue;
             }
 
-            // Build per-token logprob if present.
-            let chunk_logprobs = token.logprob.as_ref().map(|lp| {
-                let token_text = content.clone().unwrap_or_default();
-                let bytes = Some(token_text.as_bytes().to_vec());
-                // Use pre-decoded text from the engine; fall back to the token
-                // ID in angle-bracket notation only if decoding was skipped.
-                let top_logprobs = lp
-                    .top_logprobs
-                    .iter()
-                    .zip(
-                        lp.top_logprob_texts
-                            .iter()
-                            .map(Some)
-                            .chain(std::iter::repeat(None)),
-                    )
-                    .map(|(&(tid, tlp), text)| {
-                        let tok_text = text
-                            .cloned()
-                            .unwrap_or_else(|| format!("<{}>", tid));
-                        let tok_bytes = Some(tok_text.as_bytes().to_vec());
-                        TopLogprobEntry {
-                            token: tok_text,
-                            logprob: tlp,
-                            bytes: tok_bytes,
-                        }
-                    })
-                    .collect();
-                ChoiceLogprobs {
-                    content: vec![LogprobEntry {
-                        token: token_text,
-                        logprob: lp.logprob,
-                        bytes,
-                        top_logprobs,
-                    }],
-                }
-            });
+            // Per-token logprob only when the token's text actually landed in
+            // `content` — delimiter and tool-call-body tokens don't carry a
+            // meaningful per-character logprob for the client.
+            let chunk_logprobs = if content.is_some() {
+                token.logprob.as_ref().map(|lp| {
+                    let token_text = content.clone().unwrap_or_default();
+                    let bytes = Some(token_text.as_bytes().to_vec());
+                    let top_logprobs = lp
+                        .top_logprobs
+                        .iter()
+                        .zip(
+                            lp.top_logprob_texts
+                                .iter()
+                                .map(Some)
+                                .chain(std::iter::repeat(None)),
+                        )
+                        .map(|(&(tid, tlp), text)| {
+                            let tok_text = text
+                                .cloned()
+                                .unwrap_or_else(|| format!("<{}>", tid));
+                            let tok_bytes = Some(tok_text.as_bytes().to_vec());
+                            TopLogprobEntry {
+                                token: tok_text,
+                                logprob: tlp,
+                                bytes: tok_bytes,
+                            }
+                        })
+                        .collect();
+                    ChoiceLogprobs {
+                        content: vec![LogprobEntry {
+                            token: token_text,
+                            logprob: lp.logprob,
+                            bytes,
+                            top_logprobs,
+                        }],
+                    }
+                })
+            } else {
+                None
+            };
+
+            // Override sampler's "stop" to "tool_calls" when the model
+            // emitted at least one tool call (OpenAI convention).
+            let finish_reason = match token.finish_reason.as_deref() {
+                Some("stop") if emitted_tool_call => Some("tool_calls".to_string()),
+                _ => token.finish_reason,
+            };
 
             let chunk = ChatCompletionStreamResponse {
                 id: request_id.clone(),
@@ -2154,14 +2371,46 @@ fn make_sse_stream(
                         role: None,
                         content,
                         reasoning_content,
+                        tool_calls: tool_calls_delta,
                     },
-                    finish_reason: token.finish_reason,
+                    finish_reason,
                     logprobs: chunk_logprobs,
                 }],
             };
             match to_sse_event(&chunk, "chat stream chunk") {
                 Some(event) => yield Ok(event),
                 None => break,
+            }
+        }
+
+        // Flush any residual unclosed call buffer as plain content (fail-safe).
+        if let Some(state) = tool_state.as_mut() {
+            for ev in state.flush() {
+                if let ToolCallStreamEvent::Content(text) = ev {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let chunk = ChatCompletionStreamResponse {
+                        id: request_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_id.clone(),
+                        choices: vec![ChatCompletionStreamChoice {
+                            index: 0,
+                            delta: DeltaMessage {
+                                role: None,
+                                content: Some(text),
+                                reasoning_content: None,
+                                tool_calls: None,
+                            },
+                            finish_reason: None,
+                            logprobs: None,
+                        }],
+                    };
+                    if let Some(event) = to_sse_event(&chunk, "chat stream flush") {
+                        yield Ok(event);
+                    }
+                }
             }
         }
 
@@ -2437,7 +2686,8 @@ async fn anthropic_messages(
     // Convert Anthropic messages (with optional top-level system) to ChatMessage list.
     let chat_messages = anthropic_messages_to_chat(req.system.as_deref(), &req.messages);
 
-    let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&chat_messages) {
+    let prompt_tokens = match tokenizer.apply_chat_template_and_encode(&chat_messages, None, false)
+    {
         Ok(tokens) => tokens,
         Err(e) => {
             return Err(anthropic_error(
@@ -3905,7 +4155,7 @@ async fn ollama_generate(
             tool_calls: None,
             tool_call_id: None,
         });
-        tokenizer.apply_chat_template_and_encode(&msgs)
+        tokenizer.apply_chat_template_and_encode(&msgs, None, false)
     }
     .map_err(|e| {
         (
@@ -4127,13 +4377,17 @@ async fn ollama_chat(
         .map_err(|(s, j)| (s, Json(serde_json::json!({"error": j.0.error.message}))))?;
 
     // Convert Ollama messages to internal ChatMessage format.
-    let chat_messages: Vec<ChatMessage> = req
+    let chat_messages_raw: Vec<ChatMessage> = req
         .messages
         .iter()
         .map(|m| {
+            // Ollama uses `role:"tool"` for tool-response turns (vs OpenAI's
+            // own "tool" role).  Map it to Role::Tool so the chat template
+            // can wrap it in `<tool_response>…</tool_response>`.
             let role = match m.role.as_str() {
                 "system" => Role::System,
                 "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
                 _ => Role::User,
             };
             // Convert Ollama base64 `images` array to ImageInput objects using
@@ -4152,11 +4406,27 @@ async fn ollama_chat(
                     images,
                 },
                 audio: None,
-                tool_calls: None,
-                tool_call_id: None,
+                tool_calls: m.tool_calls.clone(),
+                // Ollama sends `tool_name` where OpenAI sends `tool_call_id`;
+                // internally we use the OpenAI naming.
+                tool_call_id: m.tool_name.clone(),
             }
         })
         .collect();
+
+    // Tools injection: for templates that render tool-calls natively (Qwen3.5)
+    // we pass `req.tools` straight through to the template; for others we
+    // fall back to prose-injected system context (so e.g. Gemma still gets
+    // the tool signatures in readable form).
+    let tools_native =
+        crate::tokenizer::chat_template_handles_tools_natively(&tokenizer.chat_template);
+    let chat_messages: Vec<ChatMessage> = match (req.tools.as_ref(), tools_native) {
+        (Some(tools), false) => {
+            let tool_summary = format_tools_as_system_context(tools);
+            inject_tools_into_messages(&chat_messages_raw, &tool_summary)
+        }
+        _ => chat_messages_raw,
+    };
 
     let has_images = chat_messages.iter().any(|m| !m.content.images.is_empty());
 
@@ -4244,8 +4514,19 @@ async fn ollama_chat(
 
         (tokens, Some(ctx))
     } else {
+        // Pass `req.tools` through: native-handling templates render them into
+        // the prompt; others ignore the arg (prose injection happened above).
+        let template_tools = if tools_native {
+            req.tools.as_ref()
+        } else {
+            None
+        };
+        // Thinking: Ollama `think: true` stops the Qwen3.5 template from
+        // pre-filling an empty `<think>…</think>` block, letting the model
+        // emit its own reasoning.
+        let enable_thinking = req.think.unwrap_or(false);
         let tokens = tokenizer
-            .apply_chat_template_and_encode(&chat_messages)
+            .apply_chat_template_and_encode(&chat_messages, template_tools, enable_thinking)
             .map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -4310,6 +4591,17 @@ async fn ollama_chat(
             ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, image_ctx, params)
                 .await?;
 
+        let tool_state = if tools_native && req.tools.is_some() {
+            let filter = crate::tool_call_parser::ToolCallFilter::from_tokenizer(tokenizer);
+            if filter.is_enabled() {
+                Some(crate::tool_call_parser::ToolCallStreamState::new(filter))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let model_name = req.model.clone();
         let stream = make_ollama_chat_stream(
             token_rx,
@@ -4317,6 +4609,7 @@ async fn ollama_chat(
             created_at,
             think_enabled,
             prompt_eval_count,
+            tool_state,
         );
         Ok((
             [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
@@ -4340,6 +4633,48 @@ async fn ollama_chat(
             (None, result.output_text)
         };
 
+        // When the active template renders tool calls natively and the
+        // caller supplied tools, split `<tool_call>…</tool_call>` blocks out
+        // of `content` into a structured `tool_calls` field.  Ollama wire
+        // format uses an `arguments` object (not a JSON-encoded string).
+        let (content, tool_calls_value, done_reason) = if tools_native && req.tools.is_some() {
+            let (clean, parsed) = crate::tool_call_parser::extract_tool_calls(&content);
+            if parsed.is_empty() {
+                (
+                    content,
+                    None,
+                    Some(ollama_done_reason(&result.finish_reason)),
+                )
+            } else {
+                let calls: Vec<OllamaToolCall> = parsed
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| OllamaToolCall {
+                        kind: "function",
+                        function: OllamaFunctionCall {
+                            index: i as u32,
+                            name: c.name,
+                            arguments: serde_json::from_str(&c.arguments)
+                                .unwrap_or(serde_json::Value::Object(Default::default())),
+                        },
+                    })
+                    .collect();
+                let val = serde_json::to_value(&calls).ok();
+                let dr = if result.finish_reason == "stop" {
+                    Some("tool_calls".to_string())
+                } else {
+                    Some(ollama_done_reason(&result.finish_reason))
+                };
+                (clean, val, dr)
+            }
+        } else {
+            (
+                content,
+                None,
+                Some(ollama_done_reason(&result.finish_reason)),
+            )
+        };
+
         Ok(Json(OllamaChatResponse {
             model: req.model,
             created_at,
@@ -4348,9 +4683,11 @@ async fn ollama_chat(
                 content,
                 images: vec![],
                 thinking,
+                tool_calls: tool_calls_value,
+                tool_name: None,
             },
             done: true,
-            done_reason: Some(ollama_done_reason(&result.finish_reason)),
+            done_reason,
             prompt_eval_count: result.prompt_tokens,
             eval_count: result.completion_tokens,
             total_duration: result.total_duration_ns,
@@ -4368,17 +4705,72 @@ fn make_ollama_chat_stream(
     created_at: String,
     think_enabled: bool,
     prompt_eval_count: usize,
+    tool_state: Option<crate::tool_call_parser::ToolCallStreamState>,
 ) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    use crate::tool_call_parser::ToolCallStreamEvent;
+
     async_stream::stream! {
         let mut eval_count: usize = 0;
+        let mut tool_state = tool_state;
+        let mut emitted_any_tool_call = false;
+        // Per-in-progress-call args accumulator: (index, name, args_json_string).
+        let mut in_progress: Vec<(u32, String, String)> = Vec::new();
 
         while let Some(token) = token_rx.recv().await {
             let is_final = token.finish_reason.is_some();
-            let content_text = if token.finish_reason.as_deref() == Some("stop") {
+            let raw_content = if token.finish_reason.as_deref() == Some("stop") {
                 String::new()
             } else {
                 eval_count += 1;
-                token.text
+                token.text.clone()
+            };
+
+            // Route this token through the tool-call filter, if active.
+            // Ollama wire format expects complete `OllamaToolCall` objects per
+            // chunk (not OpenAI-style deltas), so we accumulate args across
+            // tokens and only emit the finished call on `ToolCallEnd`.
+            let (content_text, tool_calls_this_chunk) = if let Some(state) = tool_state.as_mut() {
+                let events = state.push_token(token.token_id, &token.text);
+                let mut content_acc = String::new();
+                let mut finished: Vec<OllamaToolCall> = Vec::new();
+                for ev in events {
+                    match ev {
+                        ToolCallStreamEvent::Content(s) => content_acc.push_str(&s),
+                        ToolCallStreamEvent::ToolCallStart { index, name, .. } => {
+                            emitted_any_tool_call = true;
+                            in_progress.push((index, name, String::new()));
+                        }
+                        ToolCallStreamEvent::ToolCallArgsDelta { index, delta } => {
+                            if let Some(entry) =
+                                in_progress.iter_mut().find(|(i, _, _)| *i == index)
+                            {
+                                entry.2.push_str(&delta);
+                            }
+                        }
+                        ToolCallStreamEvent::ToolCallEnd { index } => {
+                            if let Some(pos) =
+                                in_progress.iter().position(|(i, _, _)| *i == index)
+                            {
+                                let (idx, name, args_str) = in_progress.remove(pos);
+                                let arguments: serde_json::Value =
+                                    serde_json::from_str(&args_str).unwrap_or(
+                                        serde_json::Value::Object(Default::default()),
+                                    );
+                                finished.push(OllamaToolCall {
+                                    kind: "function",
+                                    function: OllamaFunctionCall {
+                                        index: idx,
+                                        name,
+                                        arguments,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                (content_acc, finished)
+            } else {
+                (raw_content, Vec::new())
             };
 
             // The engine's ThinkFilter has already split content and reasoning
@@ -4398,7 +4790,18 @@ fn make_ollama_chat_stream(
                 (None, content_text)
             };
 
+            let tool_calls_value = if tool_calls_this_chunk.is_empty() {
+                None
+            } else {
+                serde_json::to_value(&tool_calls_this_chunk).ok()
+            };
+
             let chunk = if is_final {
+                let done_reason = match token.finish_reason.as_deref() {
+                    Some("stop") if emitted_any_tool_call => Some("tool_calls".to_string()),
+                    Some(fr) => Some(ollama_done_reason(fr)),
+                    None => None,
+                };
                 OllamaChatChunk {
                     model: model_name.clone(),
                     created_at: created_at.clone(),
@@ -4407,9 +4810,11 @@ fn make_ollama_chat_stream(
                         content: content_text,
                         images: vec![],
                         thinking,
+                        tool_calls: tool_calls_value,
+                        tool_name: None,
                     },
                     done: true,
-                    done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
+                    done_reason,
                     prompt_eval_count: Some(prompt_eval_count),
                     eval_count: Some(eval_count),
                     total_duration: token.total_duration_ns,
@@ -4426,6 +4831,8 @@ fn make_ollama_chat_stream(
                         content: content_text,
                         images: vec![],
                         thinking,
+                        tool_calls: tool_calls_value,
+                        tool_name: None,
                     },
                     done: false,
                     done_reason: None,

@@ -406,10 +406,24 @@ impl Tokenizer {
     }
 
     /// Apply chat template to messages and return the prompt string.
-    pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
+    ///
+    /// - `tools` is only consumed by templates that render function-calling
+    ///   natively (currently Qwen3.5).  For others it's ignored — the caller
+    ///   remains responsible for injecting tools as prose via
+    ///   `format_tools_as_system_context` if desired.
+    /// - `enable_thinking` is only consumed by Qwen3.5: when `false` the
+    ///   assistant turn is primed with `<think>\n\n</think>\n\n` so the model
+    ///   skips chain-of-thought; when `true` the suffix is omitted and the
+    ///   model may emit its own `<think>…</think>` block.
+    pub fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<String> {
         let prompt = match &self.chat_template {
             ChatTemplate::ChatML => apply_chatml(messages, &self.bos_token),
-            ChatTemplate::Qwen35 => apply_qwen35(messages),
+            ChatTemplate::Qwen35 => apply_qwen35(messages, tools, enable_thinking),
             ChatTemplate::Gemma => apply_gemma(messages, &self.bos_token),
             ChatTemplate::Gemma3 => apply_gemma3(messages),
             ChatTemplate::Gemma4 => apply_gemma4(messages),
@@ -420,8 +434,13 @@ impl Tokenizer {
     }
 
     /// Apply chat template, encode, and return token IDs ready for inference.
-    pub fn apply_chat_template_and_encode(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        let prompt = self.apply_chat_template(messages)?;
+    pub fn apply_chat_template_and_encode(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<Vec<u32>> {
+        let prompt = self.apply_chat_template(messages, tools, enable_thinking)?;
         // For chat templates, don't add special tokens - the template handles them
         self.encode(&prompt, false)
     }
@@ -542,16 +561,163 @@ fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String
     apply_chatml_inner(messages, "")
 }
 
-/// Qwen3.5 ChatML template with thinking disabled.
+/// Return `true` when the template renders tools/tool_calls/tool_responses
+/// natively from the `ChatMessage` struct.  When this returns true the HTTP
+/// handler must pass the incoming `tools` payload through to
+/// `apply_chat_template` and skip prose injection via
+/// `format_tools_as_system_context`; otherwise the model would see the tools
+/// block twice.
+pub fn chat_template_handles_tools_natively(kind: &ChatTemplate) -> bool {
+    matches!(kind, ChatTemplate::Qwen35)
+}
+
+/// Qwen3.5 chat template, 1:1 with `Qwen/Qwen3-Next-*-Instruct` jinja.
 ///
-/// Identical to ChatML but appends `<think>\n\n</think>\n\n` after the
-/// `<|im_start|>assistant\n` prefix.  This matches the model's chat template
-/// when `enable_thinking=false`, which instructs the model to emit an empty
-/// thinking block and proceed directly to the answer.  Without this prefix
-/// the model enters thinking mode and prepends a long chain-of-thought before
-/// the actual reply.
-fn apply_qwen35(messages: &[ChatMessage]) -> String {
-    apply_chatml_inner(messages, "<think>\n\n</think>\n\n")
+/// Unlike `apply_chatml` this function:
+///
+/// - Emits the native `<tools>…</tools>` + `<tool_call>…</tool_call>`
+///   instruction block when `tools` is present (so the model emits structured
+///   calls instead of falling back to Hermes-style XML).
+/// - Renders assistant-turn `tool_calls` as `<tool_call>{"name": …}…</tool_call>`
+///   (the jinja version keeps history turns that carry only tool_calls — they
+///   are NOT dropped here, unlike `normalize_messages`).
+/// - Wraps `role:"tool"` messages in `<tool_response>…</tool_response>`,
+///   grouping consecutive tool messages under a single user turn.
+///
+/// `enable_thinking = false` (the inferrs default) appends
+/// `<think>\n\n</think>\n\n` after `<|im_start|>assistant\n`, priming the
+/// model to skip its chain-of-thought block.  `enable_thinking = true`
+/// omits the suffix so the model can emit its own `<think>…</think>` —
+/// this is what the Ollama `think: true` flag and the OpenAI
+/// `reasoning_effort` field (when present and non-null) map to.
+fn apply_qwen35(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+    enable_thinking: bool,
+) -> String {
+    let mut prompt = String::new();
+
+    // Only treat tools as "present" when it's a non-empty JSON array.
+    let tool_array: Option<&Vec<serde_json::Value>> =
+        tools.and_then(|v| v.as_array()).filter(|a| !a.is_empty());
+
+    let first_is_system = matches!(messages.first().map(|m| &m.role), Some(Role::System));
+
+    // ── Prelude: system + optional tools block ──
+    if let Some(tools_arr) = tool_array {
+        prompt.push_str("<|im_start|>system\n");
+        if first_is_system {
+            prompt.push_str(&messages[0].content.text);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+        );
+        for tool in tools_arr {
+            prompt.push('\n');
+            prompt.push_str(&serde_json::to_string(tool).unwrap_or_else(|_| "null".to_string()));
+        }
+        prompt.push_str(
+            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
+        );
+    } else if first_is_system {
+        prompt.push_str("<|im_start|>system\n");
+        prompt.push_str(&messages[0].content.text);
+        prompt.push_str("<|im_end|>\n");
+    }
+
+    // If the first message was consumed above, skip it in the main loop.
+    let start_idx = if first_is_system { 1 } else { 0 };
+
+    // Track whether a `<|im_start|>user` tool-response group is currently open.
+    let mut tool_group_open = false;
+
+    for idx in start_idx..messages.len() {
+        let msg = &messages[idx];
+        let content = msg.content.text.as_str();
+
+        match msg.role {
+            Role::User => {
+                if tool_group_open {
+                    prompt.push_str("<|im_end|>\n");
+                    tool_group_open = false;
+                }
+                prompt.push_str("<|im_start|>user\n");
+                prompt.push_str(content);
+                prompt.push_str("<|im_end|>\n");
+            }
+            Role::System => {
+                if tool_group_open {
+                    prompt.push_str("<|im_end|>\n");
+                    tool_group_open = false;
+                }
+                prompt.push_str("<|im_start|>system\n");
+                prompt.push_str(content);
+                prompt.push_str("<|im_end|>\n");
+            }
+            Role::Assistant => {
+                if tool_group_open {
+                    prompt.push_str("<|im_end|>\n");
+                    tool_group_open = false;
+                }
+                prompt.push_str("<|im_start|>assistant\n");
+                prompt.push_str(content);
+                if let Some(calls) = msg.tool_calls.as_ref().and_then(|v| v.as_array()) {
+                    let content_nonempty = !content.is_empty();
+                    for (i, call) in calls.iter().enumerate() {
+                        // Unwrap `{ function: {...} }` (OpenAI nested) to match
+                        // the jinja `{%- set tool_call = tool_call.function %}`.
+                        let inner = call.get("function").unwrap_or(call);
+                        // Jinja: `(loop.first and content) or (not loop.first)` → '\n'
+                        if (i == 0 && content_nonempty) || i > 0 {
+                            prompt.push('\n');
+                        }
+                        let name = inner.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        prompt.push_str("<tool_call>\n{\"name\": \"");
+                        prompt.push_str(name);
+                        prompt.push_str("\", \"arguments\": ");
+                        match inner.get("arguments") {
+                            // Pre-stringified JSON (OpenAI wire format): emit raw.
+                            Some(serde_json::Value::String(s)) => prompt.push_str(s),
+                            Some(other) => prompt.push_str(
+                                &serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+                            ),
+                            None => prompt.push_str("{}"),
+                        }
+                        prompt.push_str("}\n</tool_call>");
+                    }
+                }
+                prompt.push_str("<|im_end|>\n");
+            }
+            Role::Tool | Role::Function => {
+                if !tool_group_open {
+                    prompt.push_str("<|im_start|>user");
+                    tool_group_open = true;
+                }
+                prompt.push_str("\n<tool_response>\n");
+                prompt.push_str(content);
+                prompt.push_str("\n</tool_response>");
+                let next_is_tool = messages
+                    .get(idx + 1)
+                    .is_some_and(|n| matches!(n.role, Role::Tool | Role::Function));
+                if !next_is_tool {
+                    prompt.push_str("<|im_end|>\n");
+                    tool_group_open = false;
+                }
+            }
+        }
+    }
+
+    // (No post-loop `tool_group_open` close — the inline branch always
+    // closes the group on the last tool message, since `messages.get(idx+1)`
+    // returns None and `next_is_tool` is false.)
+
+    prompt.push_str("<|im_start|>assistant\n");
+    if !enable_thinking {
+        // Pre-fill an empty thinking block so the model skips chain-of-thought.
+        prompt.push_str("<think>\n\n</think>\n\n");
+    }
+    prompt
 }
 
 fn apply_gemma(messages: &[ChatMessage], bos_token: &Option<String>) -> String {
@@ -884,9 +1050,202 @@ mod tests {
     #[test]
     fn qwen35_template_has_no_think_prefix() {
         let msgs = vec![user_msg("Hello!")];
-        let prompt = apply_qwen35(&msgs);
+        let prompt = apply_qwen35(&msgs, None, false);
         assert!(prompt.contains("<|im_start|>user\nHello!<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn qwen35_enable_thinking_omits_empty_think_block() {
+        let msgs = vec![user_msg("Hello!")];
+        let prompt = apply_qwen35(&msgs, None, true);
+        // No prefilled `<think>…</think>` — model is free to emit its own.
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+        assert!(!prompt.contains("<think>"));
+    }
+
+    fn assistant_tool_call_msg(content: &str, tool_calls: serde_json::Value) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            audio: None,
+            content: MessageContent::from_string(content),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    fn tool_result_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Tool,
+            audio: None,
+            content: MessageContent::from_string(content),
+            tool_calls: None,
+            tool_call_id: Some("c1".to_string()),
+        }
+    }
+
+    #[test]
+    fn qwen35_tools_with_system_renders_tools_block() {
+        let msgs = vec![system_msg("You are helpful."), user_msg("What time is it?")];
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "description": "Return the current time.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }
+        ]);
+        let prompt = apply_qwen35(&msgs, Some(&tools), false);
+        assert!(
+            prompt.starts_with("<|im_start|>system\nYou are helpful.\n\n# Tools\n\n"),
+            "prompt: {prompt}"
+        );
+        assert!(prompt.contains(
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>"
+        ));
+        assert!(prompt.contains("\"name\":\"get_time\""));
+        assert!(prompt.contains(
+            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n"
+        ));
+        assert!(prompt.contains("<|im_start|>user\nWhat time is it?<|im_end|>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn qwen35_tools_without_system_still_emits_tools_block() {
+        let msgs = vec![user_msg("Hi")];
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"f","parameters":{"type":"object"}}}
+        ]);
+        let prompt = apply_qwen35(&msgs, Some(&tools), false);
+        // `<|im_start|>system\n` immediately followed by `# Tools` (no intervening
+        // system content) when no system message is present.
+        assert!(prompt.starts_with("<|im_start|>system\n# Tools\n\n"));
+        assert!(prompt.contains("<|im_start|>user\nHi<|im_end|>"));
+    }
+
+    #[test]
+    fn qwen35_empty_tools_array_skips_tools_block() {
+        let msgs = vec![user_msg("Hi")];
+        let tools = serde_json::json!([]);
+        let prompt = apply_qwen35(&msgs, Some(&tools), false);
+        assert!(!prompt.contains("# Tools"));
+        assert!(!prompt.contains("<tools>"));
+    }
+
+    #[test]
+    fn qwen35_assistant_toolcall_empty_content_no_leading_newline() {
+        // Nested OpenAI format: {id, type, function:{name, arguments}}
+        let calls = serde_json::json!([
+            {"id":"c1","type":"function","function":{"name":"f","arguments":{"x":1}}}
+        ]);
+        let msgs = vec![
+            user_msg("go"),
+            assistant_tool_call_msg("", calls),
+            tool_result_msg("42"),
+        ];
+        let prompt = apply_qwen35(&msgs, None, false);
+        // No '\n' between `<|im_start|>assistant\n` and `<tool_call>` when content is empty.
+        assert!(prompt.contains("<|im_start|>assistant\n<tool_call>\n"));
+        assert!(prompt.contains("\"name\": \"f\""));
+        assert!(prompt.contains("\"arguments\": {\"x\":1}"));
+        assert!(prompt.contains("</tool_call><|im_end|>\n"));
+    }
+
+    #[test]
+    fn qwen35_assistant_toolcall_with_content_prepends_newline() {
+        let calls = serde_json::json!([
+            {"function":{"name":"f","arguments":{}}}
+        ]);
+        let msgs = vec![
+            user_msg("go"),
+            assistant_tool_call_msg("Thinking...", calls),
+        ];
+        let prompt = apply_qwen35(&msgs, None, false);
+        // '\n' between content and `<tool_call>` when content is non-empty.
+        assert!(prompt.contains("<|im_start|>assistant\nThinking...\n<tool_call>\n"));
+    }
+
+    #[test]
+    fn qwen35_multiple_toolcalls_separated_by_newline() {
+        let calls = serde_json::json!([
+            {"function":{"name":"a","arguments":{}}},
+            {"function":{"name":"b","arguments":{"k":"v"}}}
+        ]);
+        let msgs = vec![user_msg("go"), assistant_tool_call_msg("", calls)];
+        let prompt = apply_qwen35(&msgs, None, false);
+        // Second call is preceded by '\n' even when assistant content is empty.
+        let a_pos = prompt.find("\"name\": \"a\"").expect("call a present");
+        let b_pos = prompt.find("\"name\": \"b\"").expect("call b present");
+        assert!(a_pos < b_pos);
+        assert!(prompt.contains("</tool_call>\n<tool_call>"));
+    }
+
+    #[test]
+    fn qwen35_flat_toolcall_also_renders() {
+        // Flat format (no `function` wrapper): {name, arguments}.
+        let calls = serde_json::json!([{"name":"f","arguments":{"x":1}}]);
+        let msgs = vec![user_msg("go"), assistant_tool_call_msg("", calls)];
+        let prompt = apply_qwen35(&msgs, None, false);
+        assert!(prompt.contains("\"name\": \"f\""));
+        assert!(prompt.contains("\"arguments\": {\"x\":1}"));
+    }
+
+    #[test]
+    fn qwen35_string_arguments_passed_raw() {
+        // When arguments is already a JSON-encoded string, emit it as-is
+        // (matching the jinja `{%- if tool_call.arguments is string %}` branch).
+        let calls = serde_json::json!([
+            {"function":{"name":"f","arguments":"{\"x\":1}"}}
+        ]);
+        let msgs = vec![user_msg("go"), assistant_tool_call_msg("", calls)];
+        let prompt = apply_qwen35(&msgs, None, false);
+        assert!(prompt.contains("\"arguments\": {\"x\":1}"));
+        // No double-quoting: should NOT contain `"arguments": "{`.
+        assert!(!prompt.contains("\"arguments\": \"{"));
+    }
+
+    #[test]
+    fn qwen35_two_consecutive_tool_responses_share_user_turn() {
+        let calls = serde_json::json!([
+            {"function":{"name":"a","arguments":{}}},
+            {"function":{"name":"b","arguments":{}}}
+        ]);
+        let msgs = vec![
+            user_msg("go"),
+            assistant_tool_call_msg("", calls),
+            tool_result_msg("res_a"),
+            tool_result_msg("res_b"),
+            user_msg("next"),
+        ];
+        let prompt = apply_qwen35(&msgs, None, false);
+        // Two `<tool_response>` blocks inside a single `<|im_start|>user` turn.
+        let user_starts: Vec<_> = prompt.match_indices("<|im_start|>user").collect();
+        // Expect 3: initial "go", tool-response group, final "next".
+        assert_eq!(user_starts.len(), 3, "prompt: {prompt}");
+        assert!(prompt.contains(
+            "<|im_start|>user\n<tool_response>\nres_a\n</tool_response>\n<tool_response>\nres_b\n</tool_response><|im_end|>\n"
+        ));
+    }
+
+    #[test]
+    fn qwen35_tool_call_in_history_is_not_dropped() {
+        // Regression guard: the ChatML path drops assistant turns with empty
+        // content + tool_calls; the Qwen35 path must render them.
+        let calls = serde_json::json!([
+            {"function":{"name":"f","arguments":{}}}
+        ]);
+        let msgs = vec![
+            user_msg("go"),
+            assistant_tool_call_msg("", calls),
+            tool_result_msg("done"),
+            user_msg("thanks"),
+        ];
+        let prompt = apply_qwen35(&msgs, None, false);
+        assert!(prompt.contains("<tool_call>"));
+        assert!(prompt.contains("\"name\": \"f\""));
     }
 
     #[test]

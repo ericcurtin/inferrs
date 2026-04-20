@@ -14,6 +14,7 @@ mod sampler;
 mod server;
 mod stop;
 mod tokenizer;
+mod tool_call_parser;
 mod util;
 
 use anyhow::Result;
