@@ -176,7 +176,9 @@ pub(super) struct Gemma4MoeRouter {
     /// Precomputed scale * scalar_root_size: [hidden_size].
     /// Avoids a separate scalar-multiply dispatch per forward call.
     scale_normalized: Tensor,
-    per_expert_scale: Tensor,
+    /// Per-expert learned scale factors, cached on CPU as F32.
+    /// Used in forward_into to multiply routing weights without GPU dispatches.
+    per_expert_scale_cpu: Vec<f32>,
     top_k: usize,
     /// Pre-allocated all-ones RMSNorm weight for rms_norm_no_scale via RmsNorm.
     /// Using the standard fused RMSNorm kernel (1 dispatch) vs the 6-dispatch
@@ -202,9 +204,13 @@ impl Gemma4MoeRouter {
         // dispatch on every router forward call. hidden_size^{-0.5} is a constant.
         let scalar_root_size = (cfg.hidden_size as f64).powf(-0.5);
         let scale_normalized = (scale * scalar_root_size)?;
-        let per_expert_scale = vb
+        // Cache per_expert_scale on CPU as F32 to avoid GPU index_select + mul
+        // dispatches in the hot decode path (saves 4 GPU dispatches per MoE layer).
+        let per_expert_scale_cpu = vb
             .get(cfg.num_experts, "per_expert_scale")?
-            .to_dtype(cfg.dtype)?;
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<f32>()?;
         // Pre-allocate all-ones weight for rms_norm_no_scale.
         // Using RmsNorm with weight=1 is equivalent to rms_norm_no_scale and
         // uses the fused 1-dispatch kernel vs the 6-dispatch ad-hoc path.
@@ -213,14 +219,19 @@ impl Gemma4MoeRouter {
         Ok(Self {
             proj,
             scale_normalized,
-            per_expert_scale,
+            per_expert_scale_cpu,
             top_k: cfg.top_k_experts,
             ones_norm,
         })
     }
 
-    /// Returns `(top_k_weights, top_k_indices)`, both `[seq, top_k]`.
-    pub(super) fn forward(&self, hidden: &Tensor) -> Result<(Tensor, Tensor)> {
+    /// Returns `(top_k_weights, top_k_indices, per_expert_scale_cpu)`.
+    ///
+    /// `top_k_weights` are renormalised but NOT yet scaled by `per_expert_scale`.
+    /// The scale is applied on CPU in `Gemma4MoeExperts::forward_into` after the
+    /// GPU→CPU sync, eliminating 4 GPU dispatches (index_select + reshape + mul +
+    /// flatten) per MoE layer per decode step (4 × 35 = 140 saves/step).
+    pub(super) fn forward(&self, hidden: &Tensor) -> Result<(Tensor, Tensor, &[f32])> {
         // Use RmsNorm with all-ones weight (≡ rms_norm_no_scale) to get a single
         // fused kernel dispatch instead of the 6-dispatch ad-hoc path.
         let normed = self.ones_norm.forward(hidden)?;
@@ -238,12 +249,8 @@ impl Gemma4MoeRouter {
         // Renormalise weights to sum=1 per token.
         let sum = top_k_weights.sum_keepdim(D::Minus1)?;
         let top_k_weights = top_k_weights.broadcast_div(&sum)?;
-        // Apply per-expert learned scale.
-        let flat_idx = top_k_indices.flatten_all()?;
-        let expert_scales = self.per_expert_scale.index_select(&flat_idx, 0)?;
-        let expert_scales = expert_scales.reshape(top_k_indices.shape())?;
-        let top_k_weights = (top_k_weights * expert_scales)?;
-        Ok((top_k_weights, top_k_indices))
+        // per_expert_scale is applied on CPU in forward_into (saves 4 GPU dispatches).
+        Ok((top_k_weights, top_k_indices, &self.per_expert_scale_cpu))
     }
 }
 
@@ -380,7 +387,7 @@ impl Gemma4MoeExperts {
         hidden: &Tensor,
         top_k_indices: &Tensor,
         top_k_weights: &Tensor,
-        _result_buf: Option<&Tensor>,
+        per_expert_scale_cpu: &[f32],
     ) -> Result<Tensor> {
         let seq_len = hidden.dim(0)?;
         let hidden_size = hidden.dim(1)?;
@@ -397,7 +404,7 @@ impl Gemma4MoeExperts {
         // Avoid GPU BF16→F32 cast: read Metal buffer directly and convert on CPU.
         // Saves 1 GPU dispatch per MoE layer per decode step (35 saves total).
         #[cfg(feature = "metal")]
-        let weights_vec = metal_bf16_tensor_to_f32_vec(&top_k_weights)
+        let weights_vec = metal_bf16_tensor_to_f32_vec(top_k_weights)
             .unwrap_or_else(|| {
                 top_k_weights
                     .to_dtype(DType::F32).unwrap()
@@ -413,11 +420,15 @@ impl Gemma4MoeExperts {
             .to_vec1::<f32>()?;
 
         // Build per-expert token lists: expert_tokens[e] = [(token_idx, weight), ...]
+        // Apply per_expert_scale on CPU (eliminates 4 GPU dispatches per MoE layer).
         let mut expert_tokens: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.num_experts];
         for t in 0..seq_len {
             for k in 0..top_k {
                 let eidx = indices_vec[t * top_k + k] as usize;
-                let w = weights_vec[t * top_k + k];
+                let raw_w = weights_vec[t * top_k + k];
+                // Apply per_expert_scale on CPU instead of a GPU index_select+mul chain.
+                let scale = per_expert_scale_cpu.get(eidx).copied().unwrap_or(1.0f32);
+                let w = raw_w * scale;
                 expert_tokens[eidx].push((t as u32, w));
             }
         }
@@ -632,7 +643,7 @@ impl Gemma4MoeBlock {
             self.post_ffw_norm_1.forward(shared_mlp_out)?
         };
 
-        let (top_k_weights, top_k_indices) = self.router.forward(&flat)?;
+        let (top_k_weights, top_k_indices, per_expert_scale_cpu) = self.router.forward(&flat)?;
 
         // pre_ffw_norm_2: normalise residual (flat) for expert dispatch.
         let normed_2 = {
@@ -654,7 +665,7 @@ impl Gemma4MoeBlock {
 
         // Expert dispatch.
         let sparse_out = self.experts.forward_into(
-            &normed_2, &top_k_indices, &top_k_weights, None
+            &normed_2, &top_k_indices, &top_k_weights, per_expert_scale_cpu
         )?;
         let sparse_out = sparse_out.reshape(&orig_shape)?;
 
