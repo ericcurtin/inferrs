@@ -22,7 +22,7 @@
 //! scatter-dispatch kernel (future work).
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
+use candle_nn::{rms_norm, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
 use crate::models::gemma4::Gemma4Config;
@@ -208,7 +208,6 @@ impl Gemma4MoeRouter {
 pub(super) struct Gemma4MoeExperts {
     gate_up_proj: MoeExpertWeights,
     down_proj: MoeExpertWeights,
-    act_fn: Activation,
     num_experts: usize,
     moe_intermediate_size: usize,
 }
@@ -286,7 +285,6 @@ impl Gemma4MoeExperts {
         Ok(Self {
             gate_up_proj,
             down_proj,
-            act_fn: cfg.hidden_activation,
             num_experts: cfg.num_experts,
             moe_intermediate_size: cfg.moe_intermediate_size,
         })
@@ -350,10 +348,22 @@ impl Gemma4MoeExperts {
             let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
             let gate_up_out = current.apply(&gate_up_linear)?; // [n, 2*intermediate]
 
-            let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
-            let up =
-                gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
-            let hidden_act = (self.act_fn.forward(&gate)? * up)?;
+            // For decode (n=1): reshape [1, 2*intermediate] → [2, intermediate]
+            // so gate and up are contiguous rows, enabling gelu_mul fused kernel
+            // (1 dispatch vs gelu + mul = 2). Saves ~8 experts × 42 layers = 336
+            // fewer dispatches per decode step.
+            // For prefill (n>1): use narrow + standard act+mul (non-contiguous views
+            // but only used during prefill, not the decode hot path).
+            let hidden_act = if n == 1 {
+                let split = gate_up_out.reshape((2, self.moe_intermediate_size))?;
+                let gate = split.narrow(0, 0, 1)?;   // [1, intermediate], contiguous
+                let up = split.narrow(0, 1, 1)?;      // [1, intermediate], contiguous
+                candle_nn::ops::gelu_mul(&gate, &up)?
+            } else {
+                let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
+                let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
+                (gate.apply(&candle_nn::Activation::GeluPytorchTanh)? * up)?
+            };
 
             // down[expert_idx]: [hidden, intermediate]
             let down_linear = self.down_proj.expert_linear(expert_idx)?;

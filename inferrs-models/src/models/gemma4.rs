@@ -757,7 +757,7 @@ impl Mlp {
     /// xs must be F32, single-token [1,1,hidden].
     #[cfg(feature = "metal")]
     fn decode_forward_q4k(&mut self, xs: &Tensor) -> Option<Result<Tensor>> {
-        // Prealloc hit path.
+        // Prealloc hit path (steady state — no allocations).
         if let (Some(gate_pa), Some(up_pa)) = (self.gate_out.as_ref(), self.up_out.as_ref()) {
             if gate_pa.dtype() == DType::F32 && up_pa.dtype() == DType::F32 {
                 if self.gate_proj.forward_paired_q4k_prealloc(&self.up_proj, xs, gate_pa, up_pa) {

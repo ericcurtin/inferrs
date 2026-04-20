@@ -1469,6 +1469,95 @@ pub fn call_quantized_matmul_mv2_q4k_gelu_mul_f32(
     Ok(())
 }
 
+/// Fused paired Q4K GEMV with gelu_mul: BF16 input → single F32 gelu_mul output.
+/// Computes gate=GEMV(src0_gate, src1_bf16), up=GEMV(src0_up, src1_bf16),
+/// then dst[i] = gelu_tanh(gate[i]) * up[i] in one dispatch.
+/// Saves 1 dispatch per MLP layer vs paired Q4K bf16i GEMV + separate gelu_mul.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv2_q4k_bf16i_gelu_mul_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    src1_bf16: &Buffer,
+    src1_offset: usize,
+    src0_gate: &Buffer,
+    src0_gate_offset: usize,
+    src0_up: &Buffer,
+    src0_up_offset: usize,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+    let (nth0, nth1, align) = (32usize, 2usize, 4usize);
+    let thread_groups_count = MTLSize {
+        width: divide(ne01 as usize, align),
+        height: ne11 as usize,
+        depth: (ne12 * ne13) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Quantized,
+        "kernel_mul_mv2_q4_K_bf16i_gelu_mul_f32",
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (src0_gate, src0_gate_offset),
+            (src0_up, src0_up_offset),
+            (src1_bf16, src1_offset),
+            (dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0_gate, MTLResourceUsage::Read);
+    encoder.use_resource(src0_up, MTLResourceUsage::Read);
+    encoder.use_resource(src1_bf16, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Fused QKV triple Q4K GEMV: computes `dst_q = src0_q @ src1`,
 /// `dst_k = src0_k @ src1`, and `dst_v = src0_v @ src1` in a single
 /// Metal dispatch.

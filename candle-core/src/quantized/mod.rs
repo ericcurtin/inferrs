@@ -1866,6 +1866,38 @@ impl QTensor {
         }
     }
 
+    /// Fused paired Q4K BF16i GEMV + gelu_mul: BF16 input → single F32 gelu_mul output.
+    pub fn fwd_mv2_q4k_bf16i_gelu_mul_f32_prealloc(
+        &self,
+        up: &QTensor,
+        xs: &Tensor,
+        out: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match (&self.storage, &up.storage) {
+            (QStorage::Metal(gate_m), QStorage::Metal(up_m)) => {
+                gate_m.fwd_mv2_q4k_bf16i_gelu_mul_f32_prealloc(
+                    &self.shape, up_m, &up.shape,
+                    &xs_s, &xs_l,
+                    out_metal.buffer(), 0,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn fwd_mv2_q4k_prealloc(
         &self,
         other: &QTensor,

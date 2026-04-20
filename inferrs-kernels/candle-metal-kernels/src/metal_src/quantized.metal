@@ -6684,11 +6684,127 @@ kernel void kernel_mul_mv2_q4_K_bf16i_f32(
             dst_f32_b[first_row_a + row] = sum_b;
         }
     }
-}
+ }
 
-/// Fused paired Q4K F32-input GEMV with in-place gelu_mul.
+/// Fused paired Q4K BF16-input GEMV with in-place gelu_mul.
 ///
 /// Computes:
+///   gate_out = GEMV(src0_gate, src1_bf16)   [Q4K weights, BF16 activation]
+///   up_out   = GEMV(src0_up,   src1_bf16)
+///   dst[i]   = gelu_tanh(gate_out[i]) * up_out[i]  [F32 output]
+///
+/// Replaces 2 separate dispatches (kernel_mul_mv2_q4_K_bf16i_f32 +
+/// gelu_mul kernel) with a single dispatch, saving 1 Metal dispatch per
+/// MLP layer per decode step (~35 dispatches / step for Gemma4-E4B).
+///
+/// Grid and threadgroup are identical to kernel_mul_mv2_q4_K_bf16i_f32:
+///   Grid: (ceil(ne01/4), ne11, ne12*ne13), TG: (32, 2, 1) = 64 threads.
+[[host_name("kernel_mul_mv2_q4_K_bf16i_gelu_mul_f32")]]
+kernel void kernel_mul_mv2_q4_K_bf16i_gelu_mul_f32(
+        device const  void   * src0_gate,
+        device const  void   * src0_up,
+        device const ushort  * src1_bf16,   // BF16 activation
+        device       float   * dst,         // output: gelu(gate) * up, F32
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // Re-interpret BF16 input as F32 (bit-shift conversion).
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    const int ix = tiisg/8, it = tiisg%8, iq2 = it/4, ir2 = it%4;
+    const int nb = ne00/QK_K, r0 = tgpig.x;
+    const int r1 = tgpig.y, im = tgpig.z;
+    const int first_row = (r0 * N_SG_Q4K + sgitg) * N_DST_Q4K;
+
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+
+    device const block_q4_K * xg = (device const block_q4_K *)src0_gate + first_row*nb + off0;
+    device const block_q4_K * xu = (device const block_q4_K *)src0_up   + first_row*nb + off0;
+    device const ushort * y4u = src1_bf16 + r1*ne10 + im*ne00*ne1 + ix*QK_K + 64*iq2 + 8*ir2;
+
+    float yl[16], yh[16];
+    float sumf_g[N_DST_Q4K]={0.f}, sumf_u[N_DST_Q4K]={0.f};
+    const int step = sizeof(block_q4_K) * nb / 2;
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f,0.f,0.f,0.f};
+        for (int i = 0; i < 8; ++i) {
+            yl[i+0]=as_type<float>(uint(y4u[i+  0])<<16); sumy[0]+=yl[i+0];
+            yl[i+8]=as_type<float>(uint(y4u[i+ 32])<<16); sumy[1]+=yl[i+8];
+            yh[i+0]=as_type<float>(uint(y4u[i+128])<<16); sumy[2]+=yh[i+0];
+            yh[i+8]=as_type<float>(uint(y4u[i+160])<<16); sumy[3]+=yh[i+8];
+        }
+        // Gate matrix
+        {
+            device const uint16_t * scg = (device const uint16_t *)xg[ib].scales + iq2;
+            device const uint16_t * qg1 = (device const uint16_t *)xg[ib].qs + 16*iq2 + 4*ir2;
+            device const half     * dhg = &xg[ib].d;
+            for (short row = 0; row < N_DST_Q4K; row++) {
+                sc16[0] = scg[0] & kmask1; sc16[1] = scg[2] & kmask1;
+                sc16[2] = ((scg[4]>>0)&kmask2)|((scg[0]&kmask3)>>2);
+                sc16[3] = ((scg[4]>>4)&kmask2)|((scg[2]&kmask3)>>2);
+                device const uint16_t * qg2 = qg1 + 32;
+                float4 acc1={0.f,0.f,0.f,0.f}, acc2={0.f,0.f,0.f,0.f};
+                for (int i=0;i<4;++i){acc1[0]+=yl[2*i+0]*(qg1[i]&0x000F);acc1[1]+=yl[2*i+1]*(qg1[i]&0x0F00);acc1[2]+=yl[2*i+8]*(qg1[i]&0x00F0);acc1[3]+=yl[2*i+9]*(qg1[i]&0xF000);acc2[0]+=yh[2*i+0]*(qg2[i]&0x000F);acc2[1]+=yh[2*i+1]*(qg2[i]&0x0F00);acc2[2]+=yh[2*i+8]*(qg2[i]&0x00F0);acc2[3]+=yh[2*i+9]*(qg2[i]&0xF000);}
+                sumf_g[row]+=dhg[0]*((acc1[0]+1.f/256.f*acc1[1])*sc8[0]+(acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f+(acc2[0]+1.f/256.f*acc2[1])*sc8[4]+(acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f)-dhg[1]*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
+                qg1+=step; scg+=step; dhg+=step;
+            }
+        }
+        // Up matrix
+        {
+            device const uint16_t * scu = (device const uint16_t *)xu[ib].scales + iq2;
+            device const uint16_t * qu1 = (device const uint16_t *)xu[ib].qs + 16*iq2 + 4*ir2;
+            device const half     * dhu = &xu[ib].d;
+            for (short row = 0; row < N_DST_Q4K; row++) {
+                sc16[0] = scu[0] & kmask1; sc16[1] = scu[2] & kmask1;
+                sc16[2] = ((scu[4]>>0)&kmask2)|((scu[0]&kmask3)>>2);
+                sc16[3] = ((scu[4]>>4)&kmask2)|((scu[2]&kmask3)>>2);
+                device const uint16_t * qu2 = qu1 + 32;
+                float4 acc1={0.f,0.f,0.f,0.f}, acc2={0.f,0.f,0.f,0.f};
+                for (int i=0;i<4;++i){acc1[0]+=yl[2*i+0]*(qu1[i]&0x000F);acc1[1]+=yl[2*i+1]*(qu1[i]&0x0F00);acc1[2]+=yl[2*i+8]*(qu1[i]&0x00F0);acc1[3]+=yl[2*i+9]*(qu1[i]&0xF000);acc2[0]+=yh[2*i+0]*(qu2[i]&0x000F);acc2[1]+=yh[2*i+1]*(qu2[i]&0x0F00);acc2[2]+=yh[2*i+8]*(qu2[i]&0x00F0);acc2[3]+=yh[2*i+9]*(qu2[i]&0xF000);}
+                sumf_u[row]+=dhu[0]*((acc1[0]+1.f/256.f*acc1[1])*sc8[0]+(acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f+(acc2[0]+1.f/256.f*acc2[1])*sc8[4]+(acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f)-dhu[1]*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
+                qu1+=step; scu+=step; dhu+=step;
+            }
+        }
+        y4u += 4*QK_K;
+    }
+    // gelu_tanh(gate) * up → single output
+    constexpr float kAlpha = 0.7978845608028654f;
+    constexpr float kBeta  = 0.044715f;
+    device float * dst_row = dst + (int64_t)im*ne0*ne1 + (int64_t)r1*ne0;
+    for (int row = 0; row < N_DST_Q4K && first_row + row < ne0; ++row) {
+        float gate_tot = simd_sum(sumf_g[row]);
+        float up_tot   = simd_sum(sumf_u[row]);
+        if (tiisg == 0) {
+            float t = kAlpha * (gate_tot + kBeta * gate_tot * gate_tot * gate_tot);
+            float gelu = 0.5f * gate_tot * (1.0f + precise::tanh(t));
+            dst_row[first_row + row] = gelu * up_tot;
+        }
+    }
+}
+
+ /// Fused paired Q4K F32-input GEMV with in-place gelu_mul.
+ ///
+ /// Computes:
 ///   gate_out = GEMV(src0_gate, src1_f32)   [Q4K weights, F32 activation]
 ///   up_out   = GEMV(src0_up,   src1_f32)
 ///   dst[i]   = gelu_tanh(gate_out[i]) * up_out[i]  [F32 output]
