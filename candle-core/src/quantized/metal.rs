@@ -2890,7 +2890,10 @@ impl QMetalStorage {
         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
         let encoder = device.command_encoder()?;
 
-        assert_eq!(storage.dtype(), DType::F32);
+        let src_dtype = storage.dtype();
+        if src_dtype != DType::F32 && src_dtype != DType::BF16 {
+            crate::bail!("quantized matmul fwd requires F32 or BF16 input, got {src_dtype:?}");
+        }
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
@@ -2913,6 +2916,43 @@ impl QMetalStorage {
         let src1_l = crate::Layout::contiguous(
             [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
         );
+
+        // Fast path: BF16 activation input — use the bf16inp kernel to avoid a
+        // BF16→F32 cast dispatch and halve the src1 bandwidth vs the F32 path.
+        if src_dtype == DType::BF16 {
+            let dispatched = candle_metal_kernels::call_quantized_matmul_mm_t_bf16inp(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                src0_l.dims(),
+                &src0_stride,
+                &self.buffer,
+                src1_l.dims(),
+                src1_l.stride(), // element strides (fn multiplies by BF16_SIZE=2 internally)
+                storage.buffer(),
+                src1_l.start_offset() * DType::BF16.size_in_bytes(), // byte offset
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            if dispatched {
+                let dst_storage =
+                    crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+                return Ok((dst_storage, dst_shape));
+            }
+            // Fallback: dtype has no bf16inp kernel. Drop back to F32 path by passing
+            // strides as if the data were F32 (same byte width as F32 strides for the
+            // call below). This branch is only reached for Q3K / Q2K etc. which are
+            // not used by the models in the current benchmark.
+            // The data will be misread — raise an error rather than silently corrupt.
+            crate::bail!(
+                "quantized matmul: BF16 activation input not supported for dtype {:?}; \
+                 caller should convert to F32 first",
+                self.dtype
+            );
+        }
 
         candle_metal_kernels::call_quantized_matmul_mm_t(
             device.device(),

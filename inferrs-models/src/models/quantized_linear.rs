@@ -123,6 +123,7 @@ impl Module for QLinear {
                 // converts BF16 input inline, eliminating a separate to_dtype dispatch.
                 // CUDA + BF16: patched dequantize_matmul_vec fuses BF16→Q8_1 internally.
                 // Other: standard F32 conversion path.
+                let seq_len = xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0);
                 let r = if matches!(xs.device(), candle_core::Device::Cuda(_))
                     && orig_dtype == DType::BF16
                 {
@@ -131,7 +132,7 @@ impl Module for QLinear {
                 } else if cfg!(feature = "metal")
                     && orig_dtype == DType::BF16
                     && matches!(xs.device(), candle_core::Device::Metal(_))
-                    && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+                    && seq_len == 1
                 {
                     // Metal single-token decode: use bf16i path for Q4K and Q8_0
                     // to avoid a separate BF16→F32 cast kernel dispatch.
@@ -140,6 +141,19 @@ impl Module for QLinear {
                     } else {
                         self.inner.forward(&xs.to_dtype(DType::F32)?)?
                     }
+                } else if cfg!(feature = "metal")
+                    && orig_dtype == DType::BF16
+                    && matches!(xs.device(), candle_core::Device::Metal(_))
+                    && seq_len > 1
+                    && (self.is_q4k() || matches!(&self.inner,
+                        candle_core::quantized::QMatMul::QTensor(q) if
+                            q.dtype() == candle_core::quantized::GgmlDType::Q6K))
+                {
+                    // Metal multi-token prefill (Q4K/Q6K only): pass BF16 directly to the
+                    // GEMM kernel (kernel_mul_mm_q4_K_bf16inp / q6_K_bf16inp).
+                    // Eliminates the BF16→F32 cast dispatch and halves src1 bandwidth.
+                    // Q8_0 is weight-bandwidth bound; BF16 input doesn't help there.
+                    self.inner.forward(xs)?
                 } else {
                     let xs_f32 = if orig_dtype == DType::F32 {
                         xs.clone()
@@ -1059,6 +1073,46 @@ impl QLinear {
                 }
             }
         }
+    }
+
+    /// Multi-token (prefill) GEMM with BF16 input, returning F32 output.
+    ///
+    /// On Metal with quantized weights (Q4K, Q8_0, Q6K), dispatches the
+    /// `kernel_mul_mm_q*_bf16inp` kernel directly.  This eliminates both:
+    ///   - the BF16→F32 input cast (1 kernel dispatch)
+    ///   - the F32→BF16 output cast (1 kernel dispatch)
+    /// compared with the `xs.to_dtype(F32)` + `forward_f32()` + `to_dtype(BF16)` round-trip.
+    ///
+    /// Returns `None` when the fast path is unavailable (non-Metal, non-quantized,
+    /// single-token, or unsupported dtype); caller falls back to `forward_f32`.
+    #[cfg(feature = "metal")]
+    pub fn forward_mm_bf16inp_f32(&self, xs_bf16: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        if xs_bf16.dtype() != candle_core::DType::BF16 {
+            return None;
+        }
+        if !matches!(xs_bf16.device(), candle_core::Device::Metal(_)) {
+            return None;
+        }
+        // Only for multi-token (prefill): single-token uses the GEMV path.
+        let seq_len = xs_bf16.dim(xs_bf16.rank().saturating_sub(2)).unwrap_or(0);
+        if seq_len <= 1 {
+            return None;
+        }
+        // Only Q4K and Q6K benefit from BF16 input on prefill (activation-bandwidth bound).
+        // Q8_0 models are weight-bandwidth bound; the BF16 activation optimization provides
+        // negligible or negative gain due to the conversion overhead.
+        if !(self.is_q4k() || matches!(&self.inner,
+            candle_core::quantized::QMatMul::QTensor(q)
+            if q.dtype() == candle_core::quantized::GgmlDType::Q6K))
+        {
+            return None;
+        }
+        // Dispatch: QMatMul::forward(bf16) → QTensor::metal_fwd → QMetalStorage::fwd
+        // which calls call_quantized_matmul_mm_t_bf16inp → returns F32 output directly.
+        Some(self.inner.forward(xs_bf16))
     }
 }
 

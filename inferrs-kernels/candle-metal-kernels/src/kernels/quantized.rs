@@ -2828,6 +2828,110 @@ pub fn call_quantized_matmul_mm_t(
     Ok(())
 }
 
+/// Quantized GEMM with BF16 activation input: `dst[F32] = src1[BF16] @ src0[quantized]ᵀ`.
+///
+/// Like `call_quantized_matmul_mm_t` but src1 strides are in BF16 element units (×2 bytes)
+/// and the Metal kernel reads BF16 activations directly, eliminating the BF16→F32 pre-cast.
+/// Only Q4K, Q8_0, and Q6K are supported (the common prefill dtypes).
+/// Returns `false` when the dtype has no BF16-input kernel; caller falls back to F32 path.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_t_bf16inp(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    src0_shape: &[usize],
+    src0_stride: &[usize],
+    src0: &Buffer,
+    src1_shape: &[usize],
+    src1_stride_elems: &[usize], // strides in elements (not bytes)
+    src1: &Buffer,
+    src1_offset: usize,
+    dst_shape: &[usize],
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<bool, MetalKernelError> {
+    let name = match dtype {
+        GgmlDType::Q4K => "kernel_mul_mm_q4_K_bf16inp",
+        GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_bf16inp",
+        GgmlDType::Q6K => "kernel_mul_mm_q6_K_bf16inp",
+        _ => return Ok(false),
+    };
+
+    // Everything is in reverse
+    let ne00 = src0_shape[src0_shape.len() - 1] as i64;
+    let ne01 = src0_shape[src0_shape.len() - 2] as i64;
+    let ne02 = src0_shape[src0_shape.len() - 3] as i64;
+    let ne03 = src0_shape[src0_shape.len() - 4] as i64;
+
+    let nb01 = src0_stride[src0_stride.len() - 2] as i64;
+    let nb02 = src0_stride[src0_stride.len() - 3] as i64;
+    let nb03 = src0_stride[src0_stride.len() - 4] as i64;
+
+    let ne11 = src1_shape[src1_shape.len() - 2] as i64;
+    let ne12 = src1_shape[src1_shape.len() - 3] as i64;
+    let ne13 = src1_shape[src1_shape.len() - 4] as i64;
+
+    // BF16 = 2 bytes per element
+    const BF16_SIZE: i64 = 2;
+    let nb10 = src1_stride_elems[src1_stride_elems.len() - 1] as i64 * BF16_SIZE;
+    let nb11 = src1_stride_elems[src1_stride_elems.len() - 2] as i64 * BF16_SIZE;
+    let nb12 = src1_stride_elems[src1_stride_elems.len() - 3] as i64 * BF16_SIZE;
+    let nb13 = src1_stride_elems[src1_stride_elems.len() - 4] as i64 * BF16_SIZE;
+
+    let ne0 = dst_shape[dst_shape.len() - 1] as i64;
+    let ne1 = dst_shape[dst_shape.len() - 2] as i64;
+    let r2 = (ne12 / ne02) as u32;
+    let r3 = (ne13 / ne03) as u32;
+
+    let thread_groups_count = MTLSize {
+        width: divide(ne11 as usize, 32),
+        height: divide(ne01 as usize, 64),
+        depth: (ne12 * ne13) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            src0,
+            (src1, src1_offset),
+            (dst, dst_offset),
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            nb03,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            nb13,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0, MTLResourceUsage::Read);
+    encoder.use_resource(src1, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+
+    encoder.set_threadgroup_memory_length(0, 8192);
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(true)
+}
+
 /// Batch-cast 3 F32 buffers (Q, K, V GEMV outputs) to BF16 in one dispatch.
 /// Saves 2 dispatches vs 3 separate to_dtype(BF16) calls for Q/K/V back-casts.
 #[allow(clippy::too_many_arguments)]

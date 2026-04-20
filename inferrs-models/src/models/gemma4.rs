@@ -855,11 +855,35 @@ impl Module for Mlp {
 
         if use_quantized {
             let orig_dtype = xs.dtype();
-            let xs_f32 = if orig_dtype != DType::F32 { xs.to_dtype(DType::F32)? } else { xs.clone() };
 
             // Try paired GEMVs for single-token decode fallback (non-Metal or non-BF16).
             #[allow(unused_variables)]
             let is_single_token = xs.rank() >= 2 && xs.dim(xs.rank() - 2).unwrap_or(0) == 1;
+
+            // Prefill (multi-token) BF16 GEMM path on Metal for Q4K models (E4B):
+            // forward_mm_bf16inp_f32 dispatches kernel_mul_mm_q4_K_bf16inp directly,
+            // returning F32 output WITHOUT a BF16→F32 input cast.
+            // Saves 1 cast dispatch (BF16→F32) per gate/up projection + 50% src1 bandwidth.
+            // The down_proj takes F32 input, so no output cast is needed either.
+            // Note: Q8_0 models (E2B) are weight-bandwidth-bound; skipping BF16 inp there.
+            #[cfg(feature = "metal")]
+            if let (Some(gate_res), Some(up_res)) = (
+                self.gate_proj.forward_mm_bf16inp_f32(xs),
+                self.up_proj.forward_mm_bf16inp_f32(xs),
+            ) {
+                let gate_f32 = gate_res?;
+                let up_f32 = up_res?;
+                let hidden_act = candle_nn::ops::gelu_mul(&gate_f32, &up_f32)?;
+                // down_proj: F32 input → BF16 output (or F32 then cast)
+                if let Some(bf16_out) = self.down_proj.forward_q8_0_bf16o(&hidden_act)
+                    .or_else(|| self.down_proj.forward_q4k_bf16o(&hidden_act))
+                {
+                    return bf16_out;
+                }
+                return self.down_proj.forward_f32(&hidden_act)?.to_dtype(orig_dtype);
+            }
+
+            let xs_f32 = if orig_dtype != DType::F32 { xs.to_dtype(DType::F32)? } else { xs.clone() };
 
             #[cfg(feature = "metal")]
             if is_single_token {
@@ -1895,10 +1919,12 @@ impl Attention {
                     .forward_f32(&xs_f32)?
                     .to_dtype(orig_dtype)?
                     .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                self.v_proj
-                    .forward_f32(&xs_f32)?
-                    .to_dtype(orig_dtype)?
-                    .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                self.v_proj.forward(xs)?.reshape((
+                    b_sz,
+                    q_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                ))?,
             )
         } else {
             (
