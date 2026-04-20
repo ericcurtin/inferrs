@@ -352,8 +352,8 @@ impl Gemma4MoeExperts {
         let top_k = top_k_indices.dim(1)?;
 
         // Move routing data to CPU for the dispatch loop.
+        // top_k_indices is already U32 (arg_sort returns U32); no dtype cast needed.
         let indices_vec = top_k_indices
-            .to_dtype(DType::U32)?
             .to_device(&Device::Cpu)?
             .flatten_all()?
             .to_vec1::<u32>()?;
