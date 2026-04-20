@@ -1187,6 +1187,92 @@ pub fn call_quantized_matmul_mv_q4k_f32_saxpy_bf16(
     Ok(())
 }
 
+/// Q4K GEMV (BF16 input) with in-place scaled accumulate into BF16 buffer.
+///
+/// Computes: result_bf16[i] += w * GEMV(lhs_q4k, rhs_bf16)[i]
+///
+/// Same as call_quantized_matmul_mv_q4k_f32_saxpy_bf16 but takes BF16 input directly,
+/// eliminating the BF16→F32 cast dispatch before SAXPY. Saves 1 dispatch per expert
+/// per MoE layer (8 experts × 35 layers = 280 saves per decode step).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_q4k_bf16i_saxpy_bf16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, m, n, k): (usize, usize, usize, usize),
+    rhs: &Buffer,          // BF16 activation (gelu_mul output)
+    rhs_offset: usize,
+    lhs: &Buffer,          // Q4K down_proj weight
+    lhs_offset: usize,
+    result_bf16: &Buffer,  // BF16 accumulation buffer (read-write)
+    result_offset: usize,
+    w: f32,                // routing weight scalar
+) -> Result<(), MetalKernelError> {
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+    let align = 2usize;
+    let thread_groups_count = MTLSize {
+        width: divide(ne01 as usize, align),
+        height: ne11 as usize,
+        depth: (ne12 * ne13) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 32,
+        height: 2,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q4_K_bf16i_saxpy_bf16")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (
+            (lhs, lhs_offset),
+            (rhs, rhs_offset),
+            (result_bf16, result_offset),
+            w,
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(lhs, MTLResourceUsage::Read);
+    encoder.use_resource(rhs, MTLResourceUsage::Read);
+    encoder.use_resource(result_bf16, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Fused double Q4K GEMV: computes `dst_a = src0_a @ src1` and/// of length `n` each.
 ///
 /// This halves the command-encoder overhead vs two sequential

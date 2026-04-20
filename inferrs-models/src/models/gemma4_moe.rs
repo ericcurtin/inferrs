@@ -21,12 +21,47 @@
 //! one small host-read per MoE layer.  A full fix requires a custom Metal/CUDA
 //! scatter-dispatch kernel (future work).
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Storage, Tensor, D};
 use candle_nn::{rms_norm, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
 use crate::models::gemma4::Gemma4Config;
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
+
+/// Read a small BF16 Metal tensor directly as F32 without issuing a GPU cast dispatch.
+///
+/// On Apple Silicon (unified memory), the Metal buffer is always CPU-accessible via
+/// `buffer.contents()`. We read the BF16 bytes and upcast to F32 on CPU, saving
+/// one GPU kernel dispatch per call. Falls back to the standard GPU path on failure.
+#[cfg(feature = "metal")]
+fn metal_bf16_tensor_to_f32_vec(t: &Tensor) -> Option<Vec<f32>> {
+    if t.dtype() != DType::BF16 {
+        return None;
+    }
+    let (storage, layout) = t.storage_and_layout();
+    let Storage::Metal(ms) = &*storage else {
+        return None;
+    };
+    let n = t.elem_count();
+    let offset_bytes = layout.start_offset() * 2; // 2 bytes per BF16
+    let buf = ms.buffer();
+    let ptr = buf.contents();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Metal unified-memory buffer contents() is always CPU-visible on Apple Silicon.
+    // The data is contiguous after start_offset (layout.is_contiguous() not strictly
+    // required here since we're reading n elements linearly — valid for gather outputs
+    // which candle always makes contiguous).
+    let result = unsafe {
+        let src = (ptr as *const u8).add(offset_bytes) as *const u16;
+        (0..n).map(|i| {
+            // BF16 = upper 16 bits of F32 IEEE 754.
+            f32::from_bits(((*src.add(i)) as u32) << 16)
+        }).collect::<Vec<f32>>()
+    };
+    Some(result)
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -359,6 +394,18 @@ impl Gemma4MoeExperts {
             .to_device(&Device::Cpu)?
             .flatten_all()?
             .to_vec1::<u32>()?;
+        // Avoid GPU BF16→F32 cast: read Metal buffer directly and convert on CPU.
+        // Saves 1 GPU dispatch per MoE layer per decode step (35 saves total).
+        #[cfg(feature = "metal")]
+        let weights_vec = metal_bf16_tensor_to_f32_vec(&top_k_weights)
+            .unwrap_or_else(|| {
+                top_k_weights
+                    .to_dtype(DType::F32).unwrap()
+                    .to_device(&Device::Cpu).unwrap()
+                    .flatten_all().unwrap()
+                    .to_vec1::<f32>().unwrap()
+            });
+        #[cfg(not(feature = "metal"))]
         let weights_vec = top_k_weights
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
@@ -426,7 +473,7 @@ impl Gemma4MoeExperts {
                 };
                 // Fast path (Metal, BF16, Q4K): fused down_proj GEMV + w-scale + accumulate.
                 // hidden_act (BF16) → F32 (1 dispatch) → SAXPY into result (1 dispatch).
-                // Saves 2 dispatches vs standard: down GEMV (2) + scale (1) + add (1) = 4.
+                // Saves 2 dispatches vs standard: down GEMV(1) + scale(1) + add(1) = 3.
                 #[cfg(feature = "metal")]
                 if hidden_act.dtype() == DType::BF16
                     && matches!(hidden_act.device(), candle_core::Device::Metal(_))

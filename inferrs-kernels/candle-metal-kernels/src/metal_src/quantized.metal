@@ -6443,6 +6443,100 @@ kernel void kernel_mul_mv_q4_K_f32_saxpy_bf16(
     }
 }
 
+/// Q4K GEMV (BF16 input) with in-place scaled accumulate into BF16 buffer.
+///
+/// Computes: result_bf16[i] += w * GEMV(src0_q4k, src1_bf16)[i]
+///
+/// Same as kernel_mul_mv_q4_K_f32_saxpy_bf16 but takes BF16 input directly,
+/// eliminating the BF16→F32 cast before calling the SAXPY kernel.
+/// Saves 1 dispatch per expert per MoE layer (8 experts × 35 layers = 280 saves/step).
+///
+/// Grid and threadgroup identical to v2: (ceil(ne01/2), ne11, ne12*ne13), TG: (32, 2, 1).
+[[host_name("kernel_mul_mv_q4_K_bf16i_saxpy_bf16")]]
+kernel void kernel_mul_mv_q4_K_bf16i_saxpy_bf16(
+        device const  void   * src0,
+        device const ushort  * src1,        // BF16 activation input
+        device       ushort  * result_bf16,  // in-place BF16 accumulation buffer
+        constant   float     & w,            // routing weight scalar
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    const short tx = (short)tiisg;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = r0 * N_SG_Q4K + (int)sgitg;
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+    const uint offset0 = (i12/r2)*(ne01*(ne00/QK_K)) + (i13/r3)*(ne01*(ne00/QK_K)*ne02);
+
+    device const block_q4_K * x = (device const block_q4_K *) src0 + first_row * (ne00/QK_K) + offset0;
+    // BF16 input: each element is a ushort; convert to float4 groups in the inner loop.
+    device const ushort * y_bf16 = src1 + r1 * ne10 + im * ne00 * ne1;
+
+    const int nb   = ne00 / QK_K;
+    const int nchk = nb * 16;
+
+    float sumf = 0.0f;
+
+    for (int ich = tx; ich < nchk; ich += 32) {
+        const int ib = ich / 16;
+        const int il = ich % 16;
+        const int base = ib * QK_K + il * 16;
+
+        // Load 16 BF16 values and upcast to float4 × 4.
+        float4 y0 = float4(as_type<float>(uint(y_bf16[base+ 0]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 1]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 2]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 3]) << 16));
+        float4 y1 = float4(as_type<float>(uint(y_bf16[base+ 4]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 5]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 6]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 7]) << 16));
+        float4 y2 = float4(as_type<float>(uint(y_bf16[base+ 8]) << 16),
+                           as_type<float>(uint(y_bf16[base+ 9]) << 16),
+                           as_type<float>(uint(y_bf16[base+10]) << 16),
+                           as_type<float>(uint(y_bf16[base+11]) << 16));
+        float4 y3 = float4(as_type<float>(uint(y_bf16[base+12]) << 16),
+                           as_type<float>(uint(y_bf16[base+13]) << 16),
+                           as_type<float>(uint(y_bf16[base+14]) << 16),
+                           as_type<float>(uint(y_bf16[base+15]) << 16));
+
+        sumf += dot(q4k_deq4(x + ib, il, 0), y0);
+        sumf += dot(q4k_deq4(x + ib, il, 1), y1);
+        sumf += dot(q4k_deq4(x + ib, il, 2), y2);
+        sumf += dot(q4k_deq4(x + ib, il, 3), y3);
+    }
+
+    const float all_sum = simd_sum(sumf);
+
+    if (tiisg == 0 && first_row < ne01) {
+        const int64_t dst_idx = (int64_t)im * ne0 * ne1 + (int64_t)r1 * ne0 + first_row;
+        const ushort old_bf16 = result_bf16[dst_idx];
+        const float old_f32 = as_type<float>(uint(old_bf16) << 16);
+        const float new_f32 = old_f32 + w * all_sum;
+        result_bf16[dst_idx] = (ushort)(as_type<uint>(new_f32) >> 16);
+    }
+}
+
 // Forward declaration — defined at kernel_mul_mv_q4_K_f32_to_bf16_impl below.
 void kernel_mul_mv_q4_K_f32_to_bf16_impl(
         device const  void   * src0,
