@@ -1830,6 +1830,42 @@ impl QTensor {
 
     /// Paired Q4K GEMV into pre-allocated F32 tensors.
     /// Returns `true` if dispatch succeeded; caller reuses `out_a` and `out_b`.
+    /// Fused Q4K paired GEMV + gelu_mul: F32 input → single F32 output (into pre-allocated buffer).
+    /// Saves 1 Metal dispatch per MLP layer per decode step for E4B models.
+    pub fn fwd_mv2_q4k_gelu_mul_f32_prealloc(
+        &self,
+        other: &QTensor,
+        xs: &Tensor,
+        out: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::F32 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(gate_m), QStorage::Metal(up_m)) => {
+                gate_m.fwd_mv2_q4k_gelu_mul_f32_prealloc(
+                    up_m,
+                    &self.shape,
+                    &xs_s,
+                    &xs_l,
+                    out_metal.buffer(),
+                    0,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn fwd_mv2_q4k_prealloc(
         &self,
         other: &QTensor,

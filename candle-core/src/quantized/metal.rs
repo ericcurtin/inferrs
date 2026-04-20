@@ -1360,6 +1360,62 @@ impl QMetalStorage {
         Ok(true)
     }
 
+    /// Fused paired Q4K GEMV + gelu_mul: F32 input → single F32 gelu_mul output.
+    /// Saves 1 dispatch per MLP layer vs paired GEMV + separate gelu_mul (E4B decode hot path).
+    pub fn fwd_mv2_q4k_gelu_mul_f32_prealloc(
+        &self,
+        other: &QMetalStorage,
+        self_shape: &Shape,
+        storage: &MetalStorage, // F32 activation input
+        layout: &crate::Layout,
+        dst: &Buffer,
+        dst_offset_bytes: usize,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K || other.dtype != GgmlDType::Q4K {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let src_shape = layout.shape();
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let src1_off = (layout.start_offset() + batch_id * k) * DType::F32.size_in_bytes();
+            let d_off = dst_offset_bytes + batch_id * n * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv2_q4k_gelu_mul_f32(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                src1_off,
+                &self.buffer,
+                self.offset,
+                &other.buffer,
+                other.offset,
+                d_off,
+                dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Paired Q8_0 GEMV: computes (self @ xs, other @ xs) in one Metal dispatch.
     /// Used for fused gate+up MLP with Q8_0 weights (E2B Q8_0_full recipe).
     pub fn fwd_mv2_q8_0(

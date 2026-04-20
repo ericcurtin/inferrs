@@ -869,6 +869,28 @@ impl QLinear {
             .unwrap_or(false)
     }
 
+    /// Fused Q4K gate+up GEMV + gelu_mul: F32 input → single F32 output (prealloc).
+    /// Saves 1 Metal dispatch per MLP layer vs paired GEMV + separate gelu_mul.
+    pub fn forward_paired_q4k_gelu_mul_f32_prealloc(
+        &self,
+        other: &QLinear,
+        xs_f32: &Tensor,
+        out: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() || other.bias.is_some() {
+            return false;
+        }
+        if xs_f32.dtype() != candle_core::DType::F32 || out.dtype() != candle_core::DType::F32 {
+            return false;
+        }
+        let (qt_self, qt_other) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return false,
+        };
+        qt_self.fwd_mv2_q4k_gelu_mul_f32_prealloc(qt_other, xs_f32, out)
+            .unwrap_or(false)
+    }
+
     /// Forward pass that takes an already-F32 input and returns F32 output.
     ///
     /// When the underlying QMatMul is a QTensor (quantized GGUF path), the
