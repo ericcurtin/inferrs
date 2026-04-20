@@ -54,11 +54,7 @@ impl PagedCacheConfig {
         // Each block holds block_size tokens × num_kv_heads × head_dim × 2 (K+V) per layer.
         let bytes_per_block =
             block_size * num_kv_heads * head_dim * 2 * num_layers * bytes_per_element;
-        let num_blocks = if bytes_per_block == 0 {
-            0
-        } else {
-            available / bytes_per_block
-        };
+        let num_blocks = available.checked_div(bytes_per_block).unwrap_or(0);
         Self {
             block_size,
             num_blocks,

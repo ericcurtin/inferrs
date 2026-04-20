@@ -2487,3 +2487,322 @@ fn commands_concurrent_acquisition() {
 
     commands.wait_until_completed().unwrap();
 }
+
+// ── compute_decay_gate kernel tests ──────────────────────────────────────────
+//
+// These tests call `call_compute_decay_gate` directly, compare against a Rust
+// reference, and cover: shapes, dtypes (F32 + BF16 input), edge cases
+// (zero/large/negative inputs), multi-head broadcast of dt_bias/a_exp.
+
+fn softplus_ref(x: f32) -> f32 {
+    // numerically stable: max(x,0) + log(1 + exp(-|x|))
+    x.max(0.0) + (1.0 + (-x.abs()).exp()).ln()
+}
+
+fn compute_decay_gate_ref(
+    a_input: &[f32],
+    dt_bias: &[f32], // [n_heads]
+    a_exp: &[f32],   // [n_heads]
+    n_heads: usize,
+) -> Vec<f32> {
+    a_input
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            let h = i % n_heads;
+            let sp = softplus_ref(a + dt_bias[h]);
+            (-a_exp[h] * sp).exp()
+        })
+        .collect()
+}
+
+fn run_compute_decay_gate_f32(
+    a_input: &[f32],
+    dt_bias: &[f32],
+    a_exp: &[f32],
+    n_total: usize,
+    n_heads: usize,
+) -> Vec<f32> {
+    let dev = device();
+    let queue = dev.new_command_queue().unwrap();
+    let semaphore = Arc::new(CommandSemaphore::new());
+    let command_buffer = create_command_buffer(&queue, semaphore).unwrap();
+    let kernels = Kernels::new();
+
+    let a_buf = new_buffer(&dev, a_input);
+    let dt_buf = new_buffer(&dev, dt_bias);
+    let ae_buf = new_buffer(&dev, a_exp);
+    let out_buf = dev
+        .new_buffer(n_total * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    call_compute_decay_gate(
+        &dev,
+        &command_buffer,
+        &kernels,
+        &a_buf,
+        &dt_buf,
+        &ae_buf,
+        &out_buf,
+        n_heads,
+        n_total,
+        false, // F32 input
+    )
+    .unwrap();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    read_to_vec::<f32>(&out_buf, n_total)
+}
+
+fn run_compute_decay_gate_bf16(
+    a_input_f32: &[f32],
+    dt_bias: &[f32],
+    a_exp: &[f32],
+    n_total: usize,
+    n_heads: usize,
+) -> Vec<f32> {
+    let dev = device();
+    let queue = dev.new_command_queue().unwrap();
+    let semaphore = Arc::new(CommandSemaphore::new());
+    let command_buffer = create_command_buffer(&queue, semaphore).unwrap();
+    let kernels = Kernels::new();
+
+    let a_bf16: Vec<bf16> = a_input_f32.iter().map(|&x| bf16::from_f32(x)).collect();
+    let a_buf = new_buffer(&dev, &a_bf16);
+    let dt_buf = new_buffer(&dev, dt_bias);
+    let ae_buf = new_buffer(&dev, a_exp);
+    let out_buf = dev
+        .new_buffer(n_total * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    call_compute_decay_gate(
+        &dev,
+        &command_buffer,
+        &kernels,
+        &a_buf,
+        &dt_buf,
+        &ae_buf,
+        &out_buf,
+        n_heads,
+        n_total,
+        true, // BF16 input
+    )
+    .unwrap();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    read_to_vec::<f32>(&out_buf, n_total)
+}
+
+fn cdg_max_abs(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+fn cdg_max_rel(got: &[f32], ref_: &[f32]) -> f32 {
+    got.iter()
+        .zip(ref_.iter())
+        .map(|(g, r)| {
+            let denom = r.abs().max(1e-6);
+            (g - r).abs() / denom
+        })
+        .fold(0.0f32, f32::max)
+}
+
+#[test]
+fn compute_decay_gate_f32_single_head() {
+    let a_input = vec![0.5f32, -1.0, 2.0, 0.0];
+    let dt_bias = vec![0.1f32];
+    let a_exp = vec![1.5f32];
+    let n_total = a_input.len();
+    let n_heads = 1;
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    let diff = cdg_max_abs(&got, &expected);
+    assert!(diff < 1e-5, "single_head: max abs diff {diff:.2e}");
+}
+
+#[test]
+fn compute_decay_gate_f32_multi_head() {
+    let n_heads = 4;
+    let n_total = 16;
+    let a_input: Vec<f32> = (0..n_total).map(|i| (i as f32) * 0.3 - 2.0).collect();
+    let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.2).collect();
+    let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.5).collect();
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    let diff = cdg_max_abs(&got, &expected);
+    assert!(diff < 1e-5, "multi_head: max abs diff {diff:.2e}");
+}
+
+#[test]
+fn compute_decay_gate_f32_0_8b_shape() {
+    // Qwen3.5-0.8B: n_value_heads=16, b=1, t=1
+    let n_heads = 16;
+    let n_total = n_heads;
+    let a_input: Vec<f32> = (0..n_total).map(|i| (i as f32) * 0.1 - 0.8).collect();
+    let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.05 - 0.4).collect();
+    let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.3).collect();
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    let diff = cdg_max_abs(&got, &expected);
+    assert!(diff < 1e-5, "0_8b_shape: max abs diff {diff:.2e}");
+}
+
+#[test]
+fn compute_decay_gate_f32_4b_shape() {
+    // Qwen3.5-4B: n_value_heads=32, b=1, t=1
+    let n_heads = 32;
+    let n_total = n_heads;
+    let a_input: Vec<f32> = (0..n_total).map(|i| (i as f32) * 0.07 - 1.0).collect();
+    let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.03 - 0.5).collect();
+    let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.25).collect();
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    let diff = cdg_max_abs(&got, &expected);
+    assert!(diff < 1e-5, "4b_shape: max abs diff {diff:.2e}");
+}
+
+#[test]
+fn compute_decay_gate_bf16_vs_f32_ref() {
+    let n_heads = 16;
+    let n_total = n_heads;
+    let a_input: Vec<f32> = (0..n_total).map(|i| (i as f32) * 0.15 - 1.0).collect();
+    let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.05).collect();
+    let a_exp: Vec<f32> = vec![1.0f32; n_heads];
+
+    let got_bf16 = run_compute_decay_gate_bf16(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    // BF16 has ~2 decimal digits of precision.
+    let rel = cdg_max_rel(&got_bf16, &expected);
+    assert!(rel < 1e-2, "bf16_vs_f32: max rel diff {rel:.2e}");
+}
+
+#[test]
+fn compute_decay_gate_zero_a_input() {
+    // a_input=0 → g = exp(-a_exp * softplus(dt_bias))
+    let n_heads = 4;
+    let n_total = n_heads;
+    let a_input = vec![0.0f32; n_total];
+    let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.5).collect();
+    let a_exp = vec![2.0f32; n_heads];
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    let diff = cdg_max_abs(&got, &expected);
+    assert!(diff < 1e-5, "zero_a_input: max abs diff {diff:.2e}");
+    for &g in &got {
+        assert!(
+            g > 0.0 && g <= 1.0 + 1e-5,
+            "zero_a_input: g={g} out of (0,1]"
+        );
+    }
+}
+
+#[test]
+fn compute_decay_gate_large_positive_a() {
+    // softplus(50) ≈ 50 → g ≈ exp(-50) ≈ 0
+    let n_heads = 4;
+    let n_total = n_heads;
+    let a_input = vec![50.0f32; n_total];
+    let dt_bias = vec![0.0f32; n_heads];
+    let a_exp = vec![1.0f32; n_heads];
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    for &g in &got {
+        assert!(g.is_finite(), "large_pos_a: NaN/inf");
+        assert!(
+            g >= 0.0 && g < 1e-10,
+            "large_pos_a: expected near-zero, got {g}"
+        );
+    }
+}
+
+#[test]
+fn compute_decay_gate_large_negative_a() {
+    // softplus(-50) ≈ 0 → g ≈ exp(0) = 1
+    let n_heads = 4;
+    let n_total = n_heads;
+    let a_input = vec![-50.0f32; n_total];
+    let dt_bias = vec![0.0f32; n_heads];
+    let a_exp = vec![1.0f32; n_heads];
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    for &g in &got {
+        assert!(g.is_finite(), "large_neg_a: NaN/inf");
+        assert!((g - 1.0).abs() < 1e-4, "large_neg_a: expected g≈1, got {g}");
+    }
+}
+
+#[test]
+fn compute_decay_gate_zero_a_exp() {
+    // a_exp=0 → g = exp(0) = 1 regardless of input
+    let n_heads = 8;
+    let n_total = n_heads;
+    let a_input: Vec<f32> = (0..n_total).map(|i| i as f32).collect();
+    let dt_bias = vec![0.0f32; n_heads];
+    let a_exp = vec![0.0f32; n_heads];
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    for &g in &got {
+        assert!((g - 1.0).abs() < 1e-5, "zero_a_exp: expected g=1, got {g}");
+    }
+}
+
+#[test]
+fn compute_decay_gate_multi_token_batch() {
+    // b=2, t=4, n_heads=4 — exercises the b*t*n_heads flattening
+    let n_heads = 4;
+    let b = 2;
+    let t = 4;
+    let n_total = b * t * n_heads;
+    let a_input: Vec<f32> = (0..n_total).map(|i| (i as f32) * 0.1 - 1.0).collect();
+    let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.2 - 0.3).collect();
+    let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.4).collect();
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    let expected = compute_decay_gate_ref(&a_input, &dt_bias, &a_exp, n_heads);
+
+    let diff = cdg_max_abs(&got, &expected);
+    assert!(diff < 1e-5, "multi_token_batch: max abs diff {diff:.2e}");
+}
+
+#[test]
+fn compute_decay_gate_output_range() {
+    // g must always be in (0, 1] for any finite input
+    let n_heads = 16;
+    let n_total = n_heads * 8;
+    let a_input: Vec<f32> = (0..n_total)
+        .map(|i| match i % 4 {
+            0 => i as f32 * 0.5,
+            1 => -(i as f32) * 0.5,
+            2 => 20.0,
+            _ => -20.0,
+        })
+        .collect();
+    let dt_bias = vec![0.1f32; n_heads];
+    let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.2).collect();
+
+    let got = run_compute_decay_gate_f32(&a_input, &dt_bias, &a_exp, n_total, n_heads);
+    for (i, &g) in got.iter().enumerate() {
+        // g = exp(-a_exp * softplus(...)) is mathematically in (0,1], but extreme
+        // inputs (a_input ~ 60, a_exp ~ 3.2) give log_g < -87 which underflows to
+        // 0 in f32.  We accept g=0 as a valid underflow; NaN/inf and g>1 are errors.
+        assert!(g.is_finite(), "output_range: NaN/inf at index {i}");
+        assert!(g >= 0.0, "output_range: g<0 at index {i} (g={g})");
+        assert!(g <= 1.0 + 1e-5, "output_range: g>1 at index {i} (g={g})");
+    }
+}

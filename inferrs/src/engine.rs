@@ -947,9 +947,12 @@ fn query_device_memory(device: &Device) -> usize {
     match device {
         #[cfg(target_os = "macos")]
         Device::Metal(metal_dev) => metal_dev.metal_device().recommended_max_working_set_size(),
-        #[cfg(any(
-            target_os = "linux",
-            all(target_os = "windows", target_arch = "x86_64")
+        #[cfg(all(
+            feature = "cuda",
+            any(
+                target_os = "linux",
+                all(target_os = "windows", target_arch = "x86_64")
+            )
         ))]
         Device::Cuda(cuda_dev) => {
             // Query total and free from cuMemGetInfo_v2, then decide which to use.
@@ -1016,9 +1019,12 @@ fn query_device_memory(device: &Device) -> usize {
 ///
 /// Uses `libloading` instead of raw `libc::dlopen` so the same code compiles
 /// on Linux (`libcuda.so.1`) and Windows (`nvcuda.dll`).
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    feature = "cuda",
+    any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    )
 ))]
 fn query_cuda_mem_info() -> Option<(usize, usize)> {
     use libloading::{Library, Symbol};
@@ -1053,9 +1059,12 @@ fn query_cuda_mem_info() -> Option<(usize, usize)> {
 /// On these platforms `cuMemGetInfo` reports system RAM, not a separate GPU
 /// pool.  vllm detects these by SM capability and substitutes
 /// `psutil.virtual_memory().available` for the free-memory baseline.
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    feature = "cuda",
+    any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    )
 ))]
 fn is_cuda_uma_platform(_cuda_dev: &candle_core::CudaDevice) -> bool {
     use libloading::{Library, Symbol};
@@ -1111,7 +1120,7 @@ fn is_cuda_uma_platform(_cuda_dev: &candle_core::CudaDevice) -> bool {
 
 /// Read `MemAvailable` from `/proc/meminfo` and return it in kibibytes.
 /// Returns `None` on any error (non-Linux, parse failure, etc.).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "android")))]
 fn read_proc_meminfo_available_kb() -> Option<usize> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in content.lines() {
@@ -1519,11 +1528,16 @@ impl Engine {
                 // Active only for single-sequence batches without grammar
                 // constraints (grammar masking is incompatible with multi-token
                 // verification) and only during the decode phase.
+                #[cfg(target_os = "macos")]
+                let on_metal = matches!(device, candle_core::Device::Metal(_));
+                #[cfg(not(target_os = "macos"))]
+                let on_metal = false;
                 let use_mtp = seq.prefilled
                     && active_count == 1   // single-sequence: no shared-KV conflicts
                     && seq.grammar_fsm.is_none()
                     && !seq.sampling_params.logprobs  // logprobs not supported with MTP
-                    && paged.is_none(); // MTP forward calls use internal concat-KV, not PagedKvStore
+                    && paged.is_none() // MTP forward calls use internal concat-KV, not PagedKvStore
+                    && !on_metal; // Metal dispatch overhead makes MTP slower than baseline
 
                 if use_mtp {
                     let last_token = match seq.output_tokens.last() {

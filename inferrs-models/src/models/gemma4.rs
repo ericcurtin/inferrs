@@ -21,6 +21,8 @@
 //! * All language-model weights live under `model.language_model.*`.
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
+#[cfg(feature = "metal")]
+use candle_nn::ops::sdpa_gqa_fused_decode;
 use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
@@ -1491,64 +1493,96 @@ impl Attention {
             //   - softcapping=sc if softcapping is set, else 1.0 (no-op)
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
 
-            // Pre-allocated 2-pass SDPA (Metal only) for donor layers.
+            // GQA fused decode for sliding layers (head_dim=256, gqa_factor ∈ {4,8}).
+            // sdpa_vector_gqa_1pass: 1 threadgroup per KV-head vs 1 per Q-head in
+            // sdpa_vector — 8× fewer threadgroups for E2B (gqa_factor=8), 4× for E4B.
+            //
+            // Must be attempted BEFORE the 2-pass path: sdpa_2pass_prealloc always
+            // returns Some for BF16 + head_dim=256, so the GQA path would be
+            // unreachable if placed after it.
             #[cfg(feature = "metal")]
-            if self.sdpa_2pass_intermediate.is_none()
-                && matches!(query_states.device(), candle_core::Device::Metal(_))
+            let gqa_result: Option<Tensor> = if self.head_dim == 256
+                && matches!(self.num_kv_groups, 4 | 8)
                 && query_states.dtype() == DType::BF16
-                && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
             {
-                const NBLOCKS: usize = 32;
-                let dev = query_states.device();
-                self.sdpa_2pass_intermediate = Some(Tensor::zeros(
-                    (self.num_heads, NBLOCKS, self.head_dim),
-                    DType::F32,
-                    dev,
-                )?);
-                self.sdpa_2pass_sums =
-                    Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
-                self.sdpa_2pass_maxs =
-                    Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
-            }
-            #[cfg(feature = "metal")]
-            let donor_attn = if let (Some(interm), Some(sums), Some(maxs)) = (
-                &self.sdpa_2pass_intermediate,
-                &self.sdpa_2pass_sums,
-                &self.sdpa_2pass_maxs,
-            ) {
-                candle_nn::ops::sdpa_2pass_prealloc(
+                sdpa_gqa_fused_decode(
                     &query_states,
                     &key_states,
                     &value_states,
                     1.0_f32,
                     softcapping,
-                    interm,
-                    sums,
-                    maxs,
                 )?
             } else {
                 None
             };
             #[cfg(not(feature = "metal"))]
-            let donor_attn: Option<candle_core::Tensor> = None;
+            let gqa_result: Option<Tensor> = None;
 
-            let attn_result = if let Some(a) = donor_attn {
-                a
+            if let Some(gqa_out) = gqa_result {
+                gqa_out
+                    .transpose(1, 2)?
+                    .reshape((b_sz, q_len, ()))?
+                    .apply(&self.o_proj)?
             } else {
-                candle_nn::ops::sdpa(
-                    &query_states,
-                    &key_states,
-                    &value_states,
-                    None,
-                    false,
-                    1.0_f32,
-                    softcapping,
-                )?
-            };
-            attn_result
-                .transpose(1, 2)?
-                .reshape((b_sz, q_len, ()))?
-                .apply(&self.o_proj)?
+                // Pre-allocated 2-pass SDPA (Metal only).
+                #[cfg(feature = "metal")]
+                if self.sdpa_2pass_intermediate.is_none()
+                    && matches!(query_states.device(), candle_core::Device::Metal(_))
+                    && query_states.dtype() == DType::BF16
+                    && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+                {
+                    const NBLOCKS: usize = 32;
+                    let dev = query_states.device();
+                    self.sdpa_2pass_intermediate = Some(Tensor::zeros(
+                        (self.num_heads, NBLOCKS, self.head_dim),
+                        DType::F32,
+                        dev,
+                    )?);
+                    self.sdpa_2pass_sums =
+                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                    self.sdpa_2pass_maxs =
+                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                }
+                #[cfg(feature = "metal")]
+                let donor_attn = if let (Some(interm), Some(sums), Some(maxs)) = (
+                    &self.sdpa_2pass_intermediate,
+                    &self.sdpa_2pass_sums,
+                    &self.sdpa_2pass_maxs,
+                ) {
+                    candle_nn::ops::sdpa_2pass_prealloc(
+                        &query_states,
+                        &key_states,
+                        &value_states,
+                        1.0_f32,
+                        softcapping,
+                        interm,
+                        sums,
+                        maxs,
+                    )?
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "metal"))]
+                let donor_attn: Option<candle_core::Tensor> = None;
+
+                let attn_result = if let Some(a) = donor_attn {
+                    a
+                } else {
+                    candle_nn::ops::sdpa(
+                        &query_states,
+                        &key_states,
+                        &value_states,
+                        None,
+                        false,
+                        1.0_f32,
+                        softcapping,
+                    )?
+                };
+                attn_result
+                    .transpose(1, 2)?
+                    .reshape((b_sz, q_len, ()))?
+                    .apply(&self.o_proj)?
+            }
         } else {
             // Manual GQA path: use Q-reshape to avoid materializing expanded K/V.
             //

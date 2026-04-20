@@ -1,6 +1,6 @@
 //go:build !cshared
 
-// inferrs-oci-pull — OCI model pull helper for inferrs (standalone CLI).
+// inferrs-oci-models — OCI model helper for inferrs (standalone CLI).
 //
 // Uses Docker Model Runner's distribution library (containerd transport)
 // to pull models from OCI registries.  Shares the same store as DMR at
@@ -8,9 +8,9 @@
 //
 // Commands:
 //
-//	inferrs-oci-pull pull  <reference>   Pull a model and print the bundle path.
-//	inferrs-oci-pull bundle <reference>  Print the bundle path for an already-pulled model.
-//	inferrs-oci-pull list                List all models in the store (tag\tid).
+//	inferrs-oci-models pull  <reference>   Pull a model and print the bundle path.
+//	inferrs-oci-models bundle <reference>  Print the bundle path for an already-pulled model.
+//	inferrs-oci-models list                List all models in the store (tag\tid).
 package main
 
 import (
@@ -113,7 +113,7 @@ func cmdList() error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: inferrs-oci-pull <command> [args]\n\n")
+	fmt.Fprintf(os.Stderr, "Usage: inferrs-oci-models <command> [args]\n\n")
 	fmt.Fprintf(os.Stderr, "Commands:\n")
 	fmt.Fprintf(os.Stderr, "  pull  <reference>   Pull a model and print bundle path\n")
 	fmt.Fprintf(os.Stderr, "  bundle <reference>  Print bundle path for existing model\n")
@@ -130,13 +130,13 @@ func main() {
 	switch os.Args[1] {
 	case "pull":
 		if len(os.Args) < 3 {
-			fmt.Fprintf(os.Stderr, "Usage: inferrs-oci-pull pull <reference>\n")
+			fmt.Fprintf(os.Stderr, "Usage: inferrs-oci-models pull <reference>\n")
 			os.Exit(1)
 		}
 		err = cmdPull(os.Args[2])
 	case "bundle":
 		if len(os.Args) < 3 {
-			fmt.Fprintf(os.Stderr, "Usage: inferrs-oci-pull bundle <reference>\n")
+			fmt.Fprintf(os.Stderr, "Usage: inferrs-oci-models bundle <reference>\n")
 			os.Exit(1)
 		}
 		err = cmdBundle(os.Args[2])

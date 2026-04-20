@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
-// On-demand loading of the Go OCI shared library (libocipull) via dlopen.
+// On-demand loading of the Go OCI shared library (libocimodels) via dlopen.
 //
 // The library is NOT linked at build time — it is loaded lazily the first
 // time an OCI operation is requested.  This keeps the inferrs binary small
@@ -50,13 +50,13 @@ static OCI_LIB: OnceLock<Result<OciLib, String>> = OnceLock::new();
 
 /// Platform-specific library filename.
 #[cfg(target_os = "macos")]
-const LIB_NAME: &str = "libocipull.dylib";
+const LIB_NAME: &str = "libocimodels.dylib";
 #[cfg(target_os = "linux")]
-const LIB_NAME: &str = "libocipull.so";
+const LIB_NAME: &str = "libocimodels.so";
 #[cfg(target_os = "windows")]
-const LIB_NAME: &str = "ocipull.dll";
+const LIB_NAME: &str = "ocimodels.dll";
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-const LIB_NAME: &str = "libocipull.so";
+const LIB_NAME: &str = "libocimodels.so";
 
 /// Try to load the OCI shared library, returning a reference to the resolved
 /// function pointers.  The library is loaded at most once; subsequent calls

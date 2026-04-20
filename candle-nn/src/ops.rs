@@ -619,6 +619,150 @@ impl candle::CustomOp2 for RmsNorm {
     }
 }
 
+/// Fused decay gate for GatedDeltaNet SSM layers (Metal + CUDA fast path).
+///
+/// Computes `g = exp(-a_exp[h] * softplus(a_input + dt_bias[h]))` element-wise
+/// in a single GPU kernel dispatch.
+///
+/// # Arguments
+/// * `a_input`  — `[b, t, n_heads]`, F32 **or** BF16, contiguous
+/// * `dt_bias`  — `[n_heads]`, F32, contiguous
+/// * `a_exp`    — `[n_heads]`, F32, contiguous  (`= A_log.exp()`, precomputed)
+///
+/// Returns `[b, t, n_heads]` F32.
+///
+/// Returns `None` when the fast path is not applicable (non-Metal/non-CUDA
+/// device, unsupported dtype, non-contiguous layout, or non-zero offset) —
+/// caller must fall back to the element-wise chain.
+pub fn compute_decay_gate(
+    a_input: &candle::Tensor,
+    dt_bias: &candle::Tensor,
+    a_exp: &candle::Tensor,
+) -> Option<candle::Result<candle::Tensor>> {
+    #[cfg(feature = "metal")]
+    {
+        use candle::Storage;
+
+        // Only BF16 or F32 input is supported.
+        let bf16_input = match a_input.dtype() {
+            candle::DType::BF16 => true,
+            candle::DType::F32 => false,
+            _ => return None,
+        };
+
+        // All tensors must be contiguous.
+        if !a_input.is_contiguous() || !dt_bias.is_contiguous() || !a_exp.is_contiguous() {
+            return None;
+        }
+
+        let device = match a_input.device() {
+            candle::Device::Metal(d) => d.clone(),
+            _ => return None,
+        };
+
+        // dt_bias and a_exp must be F32.
+        if dt_bias.dtype() != candle::DType::F32 || a_exp.dtype() != candle::DType::F32 {
+            return None;
+        }
+
+        let n_total = a_input.elem_count();
+
+        // n_heads = last dim of a_input
+        let dims = a_input.dims();
+        if dims.is_empty() {
+            return None;
+        }
+        let n_heads = dims[dims.len() - 1];
+
+        // Offsets must be zero.
+        let (a_s, a_l) = a_input.storage_and_layout();
+        let (dt_s, dt_l) = dt_bias.storage_and_layout();
+        let (ae_s, ae_l) = a_exp.storage_and_layout();
+
+        if a_l.start_offset() != 0 || dt_l.start_offset() != 0 || ae_l.start_offset() != 0 {
+            drop((a_s, dt_s, ae_s));
+            return None;
+        }
+
+        let (a_m, dt_m, ae_m) = match (&*a_s, &*dt_s, &*ae_s) {
+            (Storage::Metal(am), Storage::Metal(dm), Storage::Metal(em)) => (am, dm, em),
+            _ => return None,
+        };
+
+        let out_buf = match device.new_buffer(n_total, candle::DType::F32, "decay_gate") {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        let encoder = match device.command_encoder() {
+            Ok(e) => e,
+            Err(e) => return Some(Err(e)),
+        };
+        encoder.set_label("compute_decay_gate");
+
+        if let Err(e) = candle_metal_kernels::call_compute_decay_gate(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            a_m.buffer(),
+            dt_m.buffer(),
+            ae_m.buffer(),
+            &out_buf,
+            n_heads,
+            n_total,
+            bf16_input,
+        )
+        .map_err(candle::Error::wrap)
+        {
+            return Some(Err(e));
+        }
+
+        drop((a_s, dt_s, ae_s));
+
+        let out_storage =
+            candle::MetalStorage::new(out_buf, device.clone(), n_total, candle::DType::F32);
+        let out = candle::Tensor::from_storage(
+            candle::Storage::Metal(out_storage),
+            a_input.shape().clone(),
+            candle::op::BackpropOp::none(),
+            false,
+        );
+        return Some(Ok(out));
+    }
+    #[cfg(feature = "cuda")]
+    {
+        // Two-tier validation, matching the pattern of `cuda_flash_attn.rs`:
+        //
+        //   Tier 1 (here): soft preconditions — if any fail, return `None` so
+        //     the caller can fall through to the element-wise reference path.
+        //     Mirrors the Metal branch above so both backends reject the SAME
+        //     inputs identically. If you change one, change the other.
+        //   Tier 2 (`cuda_linear_attn::compute_decay_gate_cuda`): hard
+        //     preconditions — `bail!` on violation. Defense-in-depth: the
+        //     dispatch lives in a standalone module whose contract is asserted
+        //     regardless of how it was reached.
+        //
+        // The duplication is intentional: tier 1 returns `None` for a graceful
+        // fall-through (no panic), tier 2 bails for programmer error.
+        let dtype_ok = matches!(a_input.dtype(), candle::DType::BF16 | candle::DType::F32);
+        let on_cuda = matches!(a_input.device(), candle::Device::Cuda(_));
+        let contiguous = a_input.is_contiguous() && dt_bias.is_contiguous() && a_exp.is_contiguous();
+        let f32_params =
+            dt_bias.dtype() == candle::DType::F32 && a_exp.dtype() == candle::DType::F32;
+        let zero_off = a_input.layout().start_offset() == 0
+            && dt_bias.layout().start_offset() == 0
+            && a_exp.layout().start_offset() == 0;
+        let dims_ok = !a_input.dims().is_empty();
+        if dtype_ok && on_cuda && contiguous && f32_params && zero_off && dims_ok {
+            return Some(candle::cuda_linear_attn::compute_decay_gate_cuda(
+                a_input, dt_bias, a_exp,
+            ));
+        }
+    }
+    #[allow(unused_variables, unreachable_code)]
+    let _ = (a_input, dt_bias, a_exp);
+    None
+}
+
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
@@ -1625,4 +1769,80 @@ pub fn sdpa_gqa_fused_decode(
         false,
     );
     Ok(Some(result))
+}
+
+/// CUDA flash-attention decode fast path for GQA models.
+///
+/// Calls `candle_core::cuda_flash_attn::flash_attn_decode_cuda` (kernels
+/// `flash_attn_decode_bf16_d{64,128,256,512}`) when every precondition is met:
+///
+/// - device is CUDA,
+/// - `q` dtype is BF16,
+/// - `q.dim(-1)` ∈ {64, 128, 256, 512},
+/// - single-token decode (`q.dim(-2) == 1`),
+/// - no mask, softcapping ≈ 1.0.
+///
+/// Returns `Ok(None)` in every other case so the caller can fall back to the
+/// regular [`sdpa`] path without any behavioural change.
+///
+/// The underlying kernel returns F32; this wrapper casts the output back to BF16
+/// to match the dtype invariant downstream attention blocks expect (o_proj etc.).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_cuda_flash(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    do_causal: bool,
+    scale: f32,
+    softcapping: f32,
+) -> Result<Option<Tensor>> {
+    // Any deviation from the supported envelope → fall through.
+    if mask.is_some() || do_causal {
+        return Ok(None);
+    }
+    if (softcapping - 1.0).abs() > f32::EPSILON {
+        return Ok(None);
+    }
+    if q.dtype() != candle::DType::BF16 {
+        return Ok(None);
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        if !matches!(q.device(), candle::Device::Cuda(_)) {
+            return Ok(None);
+        }
+        if q.rank() < 2 {
+            return Ok(None);
+        }
+        let q_dims = q.dims();
+        let q_len = q_dims[q_dims.len() - 2];
+        if q_len != 1 {
+            return Ok(None);
+        }
+        let head_dim = q_dims[q_dims.len() - 1];
+        if !matches!(head_dim, 64 | 128 | 256 | 512) {
+            return Ok(None);
+        }
+
+        // flash_attn_decode_cuda returns [1, n_q_heads, 1, head_dim] F32.
+        // We cast back to BF16 for two reasons:
+        //   1. Dtype uniformity with the Metal `sdpa` path, so callers can treat
+        //      both backends identically (residual add, layernorm, o_proj all
+        //      assume the attention output has the model dtype).
+        //   2. On CUDA, `o_proj` (Linear) runs BF16·BF16 matmul natively via
+        //      cuBLAS — no extra internal cast. Keeping F32 here would force
+        //      the caller to cast anyway before o_proj, just later.
+        // The F32→BF16 cast is a single element-wise pass, cheap vs. the
+        // attention kernel itself.
+        let out_f32 = candle::cuda_flash_attn::flash_attn_decode_cuda(q, k, v, scale)?;
+        let out_bf16 = out_f32.to_dtype(candle::DType::BF16)?;
+        Ok(Some(out_bf16))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (q, k, v, scale);
+        Ok(None)
+    }
 }

@@ -11,8 +11,11 @@
 #[cfg(target_os = "macos")]
 pub use candle_metal_kernels as metal;
 
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    feature = "cuda",
+    any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    )
 ))]
 pub use candle_kernels as cuda;

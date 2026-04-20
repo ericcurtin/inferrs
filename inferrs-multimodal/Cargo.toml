@@ -23,14 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 
+# On macOS always enable Metal: the framework is part of the system SDK, so
+# there is no external toolchain concern (unlike CUDA on Linux / Windows,
+# which stays opt-in via the `cuda` feature above).
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-candle-core = { workspace = true, features = ["cuda"] }
-candle-nn = { workspace = true, features = ["cuda"] }
-
-[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
-candle-core = { workspace = true, features = ["cuda"] }
-candle-nn = { workspace = true, features = ["cuda"] }

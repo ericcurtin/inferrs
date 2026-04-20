@@ -7,7 +7,7 @@
 //! The build fails loudly if the compressed output exceeds 1 MiB so that the
 //! size budget is enforced at compile time rather than discovered at runtime.
 //!
-//! Note: the Go OCI shared library (`libocipull`) is loaded on demand via
+//! Note: the Go OCI shared library (`libocimodels`) is loaded on demand via
 //! `dlopen` at runtime (see `pull.rs`), so no link-time configuration is
 //! needed here.
 

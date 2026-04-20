@@ -72,6 +72,15 @@ impl QLinear {
     pub fn is_quantized(&self) -> bool {
         matches!(self.inner, QMatMul::QTensor(_))
     }
+
+    /// Returns the underlying weight tensor if this is a dense (non-quantized) layer.
+    /// Returns `None` for quantized (GGUF) weights.
+    pub fn dense_weight(&self) -> Option<&Tensor> {
+        match &self.inner {
+            QMatMul::Tensor(w) | QMatMul::TensorF16(w) => Some(w),
+            _ => None,
+        }
+    }
 }
 
 impl Module for QLinear {
@@ -137,21 +146,6 @@ impl Module for QLinear {
 }
 
 impl QLinear {
-    /// Forward pass that takes an already-F32 input and returns F32 output.
-    ///
-    /// When the underlying QMatMul is a QTensor (quantized GGUF path), the
-    /// CUDA/Metal GEMV kernel requires F32 input.  If the caller has already
-    /// converted the activation to F32 (e.g. to amortise the cost across
-    /// multiple QLinear calls that share the same input), calling this method
-    /// directly skips the two dtype-conversion kernel launches that
-    /// `forward()` would add.
-    ///
-    /// For the Dense path (QMatMul::Tensor), this falls through to a
-    /// standard matmul and then converts the result to F32 if needed.
-    #[cfg(feature = "metal")]
-    /// Fused QKV triple Q4K GEMV on Metal: compute `(self @ xs, kw @ xs, vw @ xs)`
-    /// in a single Metal kernel dispatch.  Q and K/V may have different output
-    /// sizes (GQA).  Returns `None` when the fused path is unavailable.
     /// BF16-input Q4K GEMV: eliminates per-GEMV BF16->F32 conversion dispatch.
     /// Returns None when unavailable (non-Metal, non-Q4K, or non-BF16 input).
     #[cfg(feature = "metal")]
@@ -221,6 +215,17 @@ impl QLinear {
         }
     }
 
+    /// Forward pass that takes an already-F32 input and returns F32 output.
+    ///
+    /// When the underlying QMatMul is a QTensor (quantized GGUF path), the
+    /// CUDA/Metal GEMV kernel requires F32 input.  If the caller has already
+    /// converted the activation to F32 (e.g. to amortise the cost across
+    /// multiple QLinear calls that share the same input), calling this method
+    /// directly skips the two dtype-conversion kernel launches that
+    /// `forward()` would add.
+    ///
+    /// For the Dense path (QMatMul::Tensor), this falls through to a
+    /// standard matmul and then converts the result to F32 if needed.
     pub fn forward_f32(&self, xs_f32: &Tensor) -> Result<Tensor> {
         debug_assert_eq!(xs_f32.dtype(), DType::F32, "forward_f32 requires F32 input");
         match &self.inner {

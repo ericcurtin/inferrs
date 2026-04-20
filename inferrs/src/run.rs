@@ -60,6 +60,23 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2048)]
     pub max_tokens: usize,
 
+    /// Repetition penalty (llama.cpp style): divides positive logits and
+    /// multiplies negative logits of previously-seen tokens.
+    /// 1.0 = disabled.  Default 1.1 (llama.cpp default).
+    #[arg(long, default_value_t = 1.1)]
+    pub repetition_penalty: f64,
+
+    /// Number of most-recent tokens to consider for repetition/frequency
+    /// penalties.  0 = disabled.  Default 64 (llama.cpp default).
+    #[arg(long, default_value_t = 64)]
+    pub repeat_last_n: usize,
+
+    /// Frequency penalty (OpenAI style): subtracts `frequency_penalty × count`
+    /// from each token's logit, penalising tokens proportional to how often
+    /// they have appeared in the context.  0.0 = disabled (default).
+    #[arg(long, default_value_t = 0.0)]
+    pub frequency_penalty: f64,
+
     // ── Server connection ─────────────────────────────────────────────────────
     /// Address of the `inferrs serve` daemon.
     /// Overrides `INFERRS_HOST`.  Defaults to `127.0.0.1`.
@@ -165,6 +182,9 @@ struct SamplingParams {
     top_p: f64,
     top_k: usize,
     max_tokens: usize,
+    repetition_penalty: f64,
+    repeat_last_n: usize,
+    frequency_penalty: f64,
 }
 
 impl SamplingParams {
@@ -174,6 +194,9 @@ impl SamplingParams {
             top_p: args.top_p,
             top_k: args.top_k,
             max_tokens: args.max_tokens,
+            repetition_penalty: args.repetition_penalty,
+            repeat_last_n: args.repeat_last_n,
+            frequency_penalty: args.frequency_penalty,
         }
     }
 }
@@ -209,6 +232,22 @@ struct ChatOptions {
     top_p: f64,
     top_k: usize,
     num_predict: usize,
+    #[serde(skip_serializing_if = "is_default_repeat_penalty")]
+    repeat_penalty: f64,
+    #[serde(skip_serializing_if = "is_default_repeat_last_n")]
+    repeat_last_n: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    frequency_penalty: f64,
+}
+
+fn is_default_repeat_penalty(v: &f64) -> bool {
+    (*v - 1.1).abs() < 1e-9
+}
+fn is_zero(v: &f64) -> bool {
+    v.abs() < 1e-9
+}
+fn is_default_repeat_last_n(v: &usize) -> bool {
+    *v == 64
 }
 
 /// One NDJSON line from a streaming `/api/chat` response.
@@ -305,6 +344,9 @@ async fn chat_stream(
             top_p: params.top_p,
             top_k: params.top_k,
             num_predict: params.max_tokens,
+            repeat_penalty: params.repetition_penalty,
+            repeat_last_n: params.repeat_last_n,
+            frequency_penalty: params.frequency_penalty,
         }),
     };
 
@@ -353,7 +395,7 @@ async fn audio_stream(
         ]
     }));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
@@ -362,6 +404,15 @@ async fn audio_stream(
         "top_p": params.top_p,
         "top_k": params.top_k,
     });
+    if !is_default_repeat_penalty(&params.repetition_penalty) {
+        body["repetition_penalty"] = serde_json::json!(params.repetition_penalty);
+    }
+    if !is_default_repeat_last_n(&params.repeat_last_n) {
+        body["repeat_last_n"] = serde_json::json!(params.repeat_last_n);
+    }
+    if !is_zero(&params.frequency_penalty) {
+        body["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
+    }
 
     let response = client
         .post(&url)
@@ -687,6 +738,9 @@ async fn repl(
     let mut top_p = args.top_p;
     let mut top_k = args.top_k;
     let mut max_tokens = args.max_tokens;
+    let repetition_penalty = args.repetition_penalty;
+    let repeat_last_n = args.repeat_last_n;
+    let frequency_penalty = args.frequency_penalty;
 
     let mut multiline = MultilineState::None;
     let mut buf = String::new();
@@ -790,6 +844,9 @@ async fn repl(
                 top_p,
                 top_k,
                 max_tokens,
+                repetition_penalty,
+                repeat_last_n,
+                frequency_penalty,
             },
         )
         .await
@@ -992,47 +1049,37 @@ fn read_line() -> Result<ReadResult> {
                     return Ok(ReadResult::Interrupt);
                 }
 
-                KeyCode::Backspace => {
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        buf.remove(cursor_pos);
-                        execute!(stdout, cursor::MoveLeft(1))?;
-                        redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
-                    }
+                KeyCode::Backspace if cursor_pos > 0 => {
+                    cursor_pos -= 1;
+                    buf.remove(cursor_pos);
+                    execute!(stdout, cursor::MoveLeft(1))?;
+                    redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
                 }
 
-                KeyCode::Delete => {
-                    if cursor_pos < buf.len() {
-                        buf.remove(cursor_pos);
-                        redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
-                    }
+                KeyCode::Delete if cursor_pos < buf.len() => {
+                    buf.remove(cursor_pos);
+                    redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
                 }
 
-                KeyCode::Left => {
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        execute!(stdout, cursor::MoveLeft(1))?;
-                    }
+                KeyCode::Left if cursor_pos > 0 => {
+                    cursor_pos -= 1;
+                    execute!(stdout, cursor::MoveLeft(1))?;
                 }
 
-                KeyCode::Right => {
-                    if cursor_pos < buf.len() {
-                        cursor_pos += 1;
-                        execute!(stdout, cursor::MoveRight(1))?;
-                    }
+                KeyCode::Right if cursor_pos < buf.len() => {
+                    cursor_pos += 1;
+                    execute!(stdout, cursor::MoveRight(1))?;
                 }
 
-                KeyCode::Home => {
-                    if cursor_pos > 0 {
-                        execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                        cursor_pos = 0;
-                    }
+                KeyCode::Home if cursor_pos > 0 => {
+                    execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
+                    cursor_pos = 0;
                 }
-                KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor_pos > 0 {
-                        execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                        cursor_pos = 0;
-                    }
+                KeyCode::Char('a')
+                    if modifiers.contains(KeyModifiers::CONTROL) && cursor_pos > 0 =>
+                {
+                    execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
+                    cursor_pos = 0;
                 }
 
                 KeyCode::End => {
@@ -1055,30 +1102,30 @@ fn read_line() -> Result<ReadResult> {
                     execute!(stdout, terminal::Clear(ClearType::UntilNewLine))?;
                 }
 
-                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor_pos > 0 {
-                        execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                        buf.drain(..cursor_pos);
-                        cursor_pos = 0;
-                        redraw_from_cursor(&mut stdout, &buf, 0)?;
-                    }
+                KeyCode::Char('u')
+                    if modifiers.contains(KeyModifiers::CONTROL) && cursor_pos > 0 =>
+                {
+                    execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
+                    buf.drain(..cursor_pos);
+                    cursor_pos = 0;
+                    redraw_from_cursor(&mut stdout, &buf, 0)?;
                 }
 
-                KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor_pos > 0 {
-                        let mut end = cursor_pos;
-                        while end > 0 && buf[end - 1] == ' ' {
-                            end -= 1;
-                        }
-                        while end > 0 && buf[end - 1] != ' ' {
-                            end -= 1;
-                        }
-                        let deleted = cursor_pos - end;
-                        execute!(stdout, cursor::MoveLeft(deleted as u16))?;
-                        buf.drain(end..cursor_pos);
-                        cursor_pos = end;
-                        redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
+                KeyCode::Char('w')
+                    if modifiers.contains(KeyModifiers::CONTROL) && cursor_pos > 0 =>
+                {
+                    let mut end = cursor_pos;
+                    while end > 0 && buf[end - 1] == ' ' {
+                        end -= 1;
                     }
+                    while end > 0 && buf[end - 1] != ' ' {
+                        end -= 1;
+                    }
+                    let deleted = cursor_pos - end;
+                    execute!(stdout, cursor::MoveLeft(deleted as u16))?;
+                    buf.drain(end..cursor_pos);
+                    cursor_pos = end;
+                    redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
                 }
 
                 KeyCode::Char(c) => {

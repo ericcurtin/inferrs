@@ -94,7 +94,8 @@ jobs:
       - name: Build main binary + CUDA backend plugin
         run: |
           cargo build --release --target x86_64-unknown-linux-gnu \
-            -p inferrs -p inferrs-backend-cuda
+            -p inferrs -p inferrs-backend-cuda \
+            --features inferrs/cuda
 
       # ── ROCm backend plugin ──────────────────────────────────────────────
       - name: Install ROCm toolkit
@@ -214,7 +215,8 @@ jobs:
       - name: Build main binary + CUDA backend plugin
         run: |
           cargo build --release --target aarch64-unknown-linux-gnu \
-            -p inferrs -p inferrs-backend-cuda
+            -p inferrs -p inferrs-backend-cuda \
+            --features inferrs/cuda
 
       # ── ROCm backend plugin ───────────────────────────────────────────────
       # AMD's ROCm apt repository only publishes binary-amd64 packages; there
@@ -320,7 +322,8 @@ jobs:
       - name: Build main binary + CUDA backend plugin
         run: |
           cargo build --release --target x86_64-pc-windows-msvc `
-            -p inferrs -p inferrs-backend-cuda
+            -p inferrs -p inferrs-backend-cuda `
+            --features inferrs/cuda
 
       # ── ROCm backend plugin (Windows x86_64, ROCm HIP SDK) ──────────────
       # AMD does not publish the HIP SDK on Chocolatey; install via the

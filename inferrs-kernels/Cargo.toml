@@ -11,11 +11,16 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+# Opt-in: enables the patched CUDA kernels crate.  Gated because its
+# build.rs invokes nvcc / nvidia-smi, which are absent on hosts without a
+# CUDA toolkit.  The Makefile enables this on Linux / Windows x86_64.
+cuda = ["dep:candle-kernels"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-metal-kernels = { path = "candle-metal-kernels" }
 
+# `candle-kernels` is the patched CUDA kernels crate.  Only meaningful on
+# Linux / Windows x86_64, and only compiled when the `cuda` feature is
+# enabled (because its build.rs shells out to nvcc / nvidia-smi).
 [target.'cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))'.dependencies]
-candle-kernels = { path = "candle-kernels" }
-
-[dependencies]
+candle-kernels = { path = "candle-kernels", optional = true }

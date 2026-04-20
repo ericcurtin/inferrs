@@ -53,8 +53,16 @@ impl std::fmt::Display for TurboQuantArg {
 }
 
 #[derive(Parser)]
-#[command(name = "inferrs", about = "A TurboQuant inference server")]
+#[command(
+    name = "inferrs",
+    about = "A TurboQuant inference server",
+    version = env!("CARGO_PKG_VERSION"),
+    disable_version_flag = true
+)]
 struct Cli {
+    /// Print version
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -231,15 +239,19 @@ pub struct ServeArgs {
 ///
 /// Disabling is safe as long as no tensors are shared across different
 /// CUDA streams, which is the case for inferrs.
-fn disable_cuda_event_tracking(_device: &candle_core::Device) {
-    // disable_event_tracking is only compiled in when candle-core has the
-    // "cuda" feature, which on this project is enabled on Linux and Windows
-    // x86_64 (CUDA is not available on Windows ARM).
-    #[cfg(any(
+///
+/// Only compiled when the `cuda` Cargo feature is enabled (otherwise the
+/// stub `CudaDevice` has no `disable_event_tracking` method and every call
+/// site is `#[cfg]`-out).
+#[cfg(all(
+    feature = "cuda",
+    any(
         target_os = "linux",
         all(target_os = "windows", target_arch = "x86_64")
-    ))]
-    if let candle_core::Device::Cuda(cuda_dev) = _device {
+    )
+))]
+fn disable_cuda_event_tracking(device: &candle_core::Device) {
+    if let candle_core::Device::Cuda(cuda_dev) = device {
         unsafe {
             cuda_dev.disable_event_tracking();
         }
@@ -251,9 +263,19 @@ impl ServeArgs {
         match self.device.as_str() {
             "cpu" => Ok(candle_core::Device::Cpu),
             "cuda" => {
-                let device = candle_core::Device::new_cuda(0)?;
-                disable_cuda_event_tracking(&device);
-                Ok(device)
+                #[cfg(feature = "cuda")]
+                {
+                    let device = candle_core::Device::new_cuda(0)?;
+                    disable_cuda_event_tracking(&device);
+                    Ok(device)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    anyhow::bail!(
+                        "CUDA support is not compiled in — rebuild with \
+                         `--features cuda` to enable the CUDA device"
+                    )
+                }
             }
             "metal" => {
                 let device = candle_core::Device::new_metal(0)?;
@@ -314,26 +336,40 @@ impl ServeArgs {
                     all(target_os = "windows", target_arch = "x86_64")
                 ))]
                 BackendKind::Cuda => {
-                    let device = candle_core::Device::new_cuda(0)?;
-                    tracing::info!("Using CUDA device (via plugin)");
-                    disable_cuda_event_tracking(&device);
-                    return Ok(device);
+                    #[cfg(feature = "cuda")]
+                    {
+                        let device = candle_core::Device::new_cuda(0)?;
+                        tracing::info!("Using CUDA device (via plugin)");
+                        disable_cuda_event_tracking(&device);
+                        return Ok(device);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    tracing::info!(
+                        "CUDA plugin detected but binary was built without \
+                         `--features cuda` — falling back to CPU"
+                    );
                 }
                 #[cfg(any(
                     target_os = "linux",
                     all(target_os = "windows", target_arch = "x86_64")
                 ))]
                 BackendKind::Musa => {
-                    // Moore Threads MUSA mirrors the CUDA API.  candle-core's
-                    // `cuda` feature covers MUSA when the binary is loaded in
-                    // an environment with the MUSA runtime libraries present.
+                    // Moore Threads MUSA mirrors the CUDA API.
                     // `Device::new_cuda(0)` resolves through cudarc's
                     // fallback-dynamic-loading, which at runtime binds to the
                     // MUSA-compatible symbols instead of the NVIDIA ones.
-                    let device = candle_core::Device::new_cuda(0)?;
-                    tracing::info!("Using MUSA device / Moore Threads GPU (via plugin)");
-                    disable_cuda_event_tracking(&device);
-                    return Ok(device);
+                    #[cfg(feature = "cuda")]
+                    {
+                        let device = candle_core::Device::new_cuda(0)?;
+                        tracing::info!("Using MUSA device / Moore Threads GPU (via plugin)");
+                        disable_cuda_event_tracking(&device);
+                        return Ok(device);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    tracing::info!(
+                        "MUSA plugin detected but binary was built without \
+                         `--features cuda` — falling back to CPU"
+                    );
                 }
                 #[cfg(any(
                     target_os = "linux",
@@ -341,12 +377,18 @@ impl ServeArgs {
                 ))]
                 BackendKind::Rocm => {
                     // ROCm uses the same HIP/CUDA device path in candle.
-                    // Supported on Linux x86_64, Linux aarch64, and Windows
-                    // x86_64 (via AMD HIP SDK / ROCm 5.5+).
-                    let device = candle_core::Device::new_cuda(0)?;
-                    tracing::info!("Using ROCm device (via plugin)");
-                    disable_cuda_event_tracking(&device);
-                    return Ok(device);
+                    #[cfg(feature = "cuda")]
+                    {
+                        let device = candle_core::Device::new_cuda(0)?;
+                        tracing::info!("Using ROCm device (via plugin)");
+                        disable_cuda_event_tracking(&device);
+                        return Ok(device);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    tracing::info!(
+                        "ROCm plugin detected but binary was built without \
+                         `--features cuda` — falling back to CPU"
+                    );
                 }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 BackendKind::Cann => {
@@ -441,22 +483,46 @@ impl ServeArgs {
             use crate::backend::BackendKind;
             match crate::backend::detect_backend() {
                 BackendKind::Cuda => {
-                    let device = candle_core::Device::new_cuda(0)?;
-                    tracing::info!("Using CUDA device (via plugin)");
-                    disable_cuda_event_tracking(&device);
-                    return Ok(device);
+                    #[cfg(feature = "cuda")]
+                    {
+                        let device = candle_core::Device::new_cuda(0)?;
+                        tracing::info!("Using CUDA device (via plugin)");
+                        disable_cuda_event_tracking(&device);
+                        return Ok(device);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    tracing::info!(
+                        "CUDA plugin detected but binary was built without \
+                         `--features cuda` — falling back to CPU"
+                    );
                 }
                 BackendKind::Musa => {
-                    let device = candle_core::Device::new_cuda(0)?;
-                    tracing::info!("Using MUSA device / Moore Threads GPU (via plugin)");
-                    disable_cuda_event_tracking(&device);
-                    return Ok(device);
+                    #[cfg(feature = "cuda")]
+                    {
+                        let device = candle_core::Device::new_cuda(0)?;
+                        tracing::info!("Using MUSA device / Moore Threads GPU (via plugin)");
+                        disable_cuda_event_tracking(&device);
+                        return Ok(device);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    tracing::info!(
+                        "MUSA plugin detected but binary was built without \
+                         `--features cuda` — falling back to CPU"
+                    );
                 }
                 BackendKind::Rocm => {
-                    let device = candle_core::Device::new_cuda(0)?;
-                    tracing::info!("Using ROCm device (via plugin)");
-                    disable_cuda_event_tracking(&device);
-                    return Ok(device);
+                    #[cfg(feature = "cuda")]
+                    {
+                        let device = candle_core::Device::new_cuda(0)?;
+                        tracing::info!("Using ROCm device (via plugin)");
+                        disable_cuda_event_tracking(&device);
+                        return Ok(device);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    tracing::info!(
+                        "ROCm plugin detected but binary was built without \
+                         `--features cuda` — falling back to CPU"
+                    );
                 }
                 BackendKind::Vulkan => {
                     tracing::info!(

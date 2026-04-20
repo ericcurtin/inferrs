@@ -30,7 +30,12 @@ pub struct SamplingParams {
     pub top_k: usize,
     /// llama.cpp / Ollama `repeat_penalty`: divides positive logits and
     /// multiplies negative logits of previously-seen tokens.  1.0 = disabled.
+    /// Default 1.1 (llama.cpp default) — mild suppression of repeated tokens.
     pub repetition_penalty: f64,
+    /// Number of most-recent tokens to consider for `repetition_penalty` and
+    /// `frequency_penalty`.  Mirrors llama.cpp `repeat_last_n`.
+    /// 0 = disabled (penalty not applied).  Default: 64.
+    pub repeat_last_n: usize,
     /// OpenAI `frequency_penalty`: subtracts `frequency_penalty * count` from
     /// each token's logit, penalising tokens proportional to how often they
     /// have already appeared.  0.0 = disabled.  Typical range: [0.0, 2.0].
@@ -84,7 +89,8 @@ impl Default for SamplingParams {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 50,
-            repetition_penalty: 1.0,
+            repetition_penalty: 1.1,
+            repeat_last_n: 64,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             min_p: 0.0,
@@ -148,10 +154,19 @@ pub fn sample_token(
     // ── Greedy fast-path ─────────────────────────────────────────────────────
     // Argmax in native dtype (bf16/f32) avoids a full-vocab dtype conversion.
     // Only safe when nothing modifies relative ordering (no penalties/biases).
+    //
+    // Window previous_tokens to the last `repeat_last_n` tokens (llama.cpp
+    // semantics: 0 = disabled, any other value = use last N tokens).
+    let penalty_tokens: &[u32] = if params.repeat_last_n == 0 {
+        &[]
+    } else {
+        let start = previous_tokens.len().saturating_sub(params.repeat_last_n);
+        &previous_tokens[start..]
+    };
     let has_penalty = (params.repetition_penalty != 1.0
         || params.frequency_penalty != 0.0
         || params.presence_penalty != 0.0)
-        && !previous_tokens.is_empty();
+        && !penalty_tokens.is_empty();
     let has_bias = !params.logit_bias.is_empty();
     if params.temperature < SAMPLING_EPS && !has_penalty && !has_bias && !params.logprobs {
         let token_id = logits.argmax(0)?.to_scalar::<u32>()?;
@@ -171,10 +186,15 @@ pub fn sample_token(
 
     // ── 2. Repetition penalty (llama.cpp / Ollama) ────────────────────────────
     // Formula: logit / penalty if logit ≥ 0, logit * penalty if logit < 0.
-    if params.repetition_penalty != 1.0 && !previous_tokens.is_empty() {
+    // Applied only to tokens within the `repeat_last_n` window.
+    // Guard against 1.0 (no-op) and 0.0 (would divide by zero).
+    if params.repetition_penalty != 1.0
+        && params.repetition_penalty != 0.0
+        && !penalty_tokens.is_empty()
+    {
         let p = params.repetition_penalty as f32;
         let mut seen = std::collections::HashSet::new();
-        for &id in previous_tokens {
+        for &id in penalty_tokens {
             if id as usize >= vocab || !seen.insert(id) {
                 continue;
             }
@@ -184,13 +204,14 @@ pub fn sample_token(
     }
 
     // ── 3. Frequency + presence penalties (OpenAI) ────────────────────────────
+    // Applied only to tokens within the `repeat_last_n` window.
     if (params.frequency_penalty != 0.0 || params.presence_penalty != 0.0)
-        && !previous_tokens.is_empty()
+        && !penalty_tokens.is_empty()
     {
         let fp = params.frequency_penalty as f32;
         let pp = params.presence_penalty as f32;
         let mut counts: HashMap<u32, u32> = HashMap::new();
-        for &id in previous_tokens {
+        for &id in penalty_tokens {
             if (id as usize) < vocab {
                 *counts.entry(id).or_insert(0) += 1;
             }
@@ -550,4 +571,130 @@ fn rand_state_thread_local() -> u64 {
         s.set(x);
         x
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    /// Default params have llama.cpp-matching values.
+    #[test]
+    fn defaults_match_llama_cpp() {
+        let p = SamplingParams::default();
+        assert!(
+            (p.repetition_penalty - 1.1).abs() < 1e-9,
+            "repetition_penalty default should be 1.1, got {}",
+            p.repetition_penalty
+        );
+        assert_eq!(p.repeat_last_n, 64, "repeat_last_n default should be 64");
+        assert!(
+            p.frequency_penalty.abs() < 1e-9,
+            "frequency_penalty default should be 0.0"
+        );
+    }
+
+    /// Tokens OUTSIDE the repeat_last_n window must NOT be penalised.
+    ///
+    /// Setup: vocab size 4, logits all 1.0.
+    /// previous_tokens = [0, 1, 2, 3] (4 tokens).
+    /// repeat_last_n = 2  →  only tokens [2, 3] are in the window.
+    /// After penalty (1.5), tokens 0 and 1 should be unchanged (still 1.0),
+    /// tokens 2 and 3 should be divided: 1.0 / 1.5 ≈ 0.6667.
+    #[test]
+    fn repeat_last_n_windows_correctly() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 1.5,
+            repeat_last_n: 2,
+            ..SamplingParams::default()
+        };
+        let previous = vec![0u32, 1, 2, 3];
+        // Build a (vocab=4,) logits tensor via sample_token's internal path.
+        // We extract the post-penalty logits by using greedy (temp=0) and
+        // checking which token is selected, but for a direct check we call
+        // the internal logic by constructing a discriminating logit vector:
+        // Give token 0 a much higher logit than token 2 — if token 0 is
+        // penalised we'd select token 2 instead.
+        // Token 1 is the runner-up at 8.0.  Token 0 outside window → 10.0 / 1.0
+        // = 10.0 still wins.  Token 0 inside window → 10.0 / 1.5 ≈ 6.67 < 8.0
+        // → token 1 wins.
+        let base: Vec<f32> = vec![10.0, 8.0, 0.0, 0.0];
+        let t = Tensor::from_vec(base, 4usize, &Device::Cpu).unwrap();
+        let (tok, _) = sample_token(&t, &params, &previous).unwrap();
+        // Token 0 is OUTSIDE the window → not penalised → still highest logit.
+        assert_eq!(tok, 0, "token 0 (outside window) should win; got {tok}");
+
+        // Now put token 0 INSIDE the window — 10.0/1.5 ≈ 6.67 < 8.0 → token 1 wins.
+        let previous_with_0_in_window = vec![1u32, 2, 3, 0]; // 0 is in last 2
+        let (tok2, _) = sample_token(&t, &params, &previous_with_0_in_window).unwrap();
+        assert_eq!(
+            tok2, 1,
+            "token 0 (inside window) should be penalised below token 1 (8.0); got {tok2}"
+        );
+    }
+
+    /// repeat_last_n = 0 disables the penalty entirely — even tokens in the
+    /// immediate history are not suppressed.
+    #[test]
+    fn repeat_last_n_zero_disables_penalty() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 2.0, // strong penalty if applied
+            repeat_last_n: 0,        // disabled
+            ..SamplingParams::default()
+        };
+        let previous = vec![0u32]; // token 0 was just emitted
+        let base: Vec<f32> = vec![10.0, 0.0, 0.0, 0.0];
+        let t = Tensor::from_vec(base, 4usize, &Device::Cpu).unwrap();
+        let (tok, _) = sample_token(&t, &params, &previous).unwrap();
+        assert_eq!(tok, 0, "penalty disabled; token 0 should still win");
+    }
+
+    /// When history is shorter than repeat_last_n the entire history is used
+    /// (no out-of-bounds / saturation issues).
+    #[test]
+    fn repeat_last_n_longer_than_history_uses_full_history() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 1.5,
+            repeat_last_n: 64, // window >> history length
+            ..SamplingParams::default()
+        };
+        let previous = vec![0u32]; // only 1 token in history
+        let base: Vec<f32> = vec![10.0, 5.0];
+        let t = Tensor::from_vec(base, 2usize, &Device::Cpu).unwrap();
+        let (tok, _) = sample_token(&t, &params, &previous).unwrap();
+        // 10.0 / 1.5 ≈ 6.67, still > 5.0, so token 0 still wins but is penalised
+        assert_eq!(tok, 0, "token 0 still highest even after penalty");
+
+        // Now use a penalty strong enough to flip the winner.
+        let strong = SamplingParams {
+            repetition_penalty: 10.0,
+            ..params
+        };
+        let (tok2, _) = sample_token(&t, &strong, &previous).unwrap();
+        assert_eq!(tok2, 1, "strong penalty should suppress token 0");
+    }
+
+    /// repetition_penalty=0.0 must not divide by zero; behaves as disabled.
+    #[test]
+    fn repetition_penalty_zero_does_not_divide_by_zero() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 0.0,
+            repeat_last_n: 64,
+            ..SamplingParams::default()
+        };
+        let previous = vec![0u32];
+        let base: Vec<f32> = vec![10.0, 5.0];
+        let t = Tensor::from_vec(base, 2usize, &Device::Cpu).unwrap();
+        // Should not panic; token 0 wins since no penalty is applied.
+        let (tok, _) = sample_token(&t, &params, &previous).unwrap();
+        assert_eq!(tok, 0, "zero penalty acts as disabled; token 0 still wins");
+    }
 }

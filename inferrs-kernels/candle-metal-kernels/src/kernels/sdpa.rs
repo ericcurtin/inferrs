@@ -642,7 +642,6 @@ pub fn call_sdpa_vector_gqa_1pass(
     Ok(true)
 }
 
-
 /// Flash attention (llama.cpp flash_attn_ext_vec port) — 32 parallel workgroups.
 /// Only for BF16 + head_dim=256 single-token decode.
 /// Returns Ok(false) when unavailable.
@@ -666,26 +665,38 @@ pub fn call_flash_attn_ext_vec_main(
     gqa_factor: i32,
     n_q_heads: usize,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Sdpa, "flash_attn_ext_vec_bf16_256_main")?;
+    let pipeline =
+        kernels.load_pipeline(device, Source::Sdpa, "flash_attn_ext_vec_bf16_256_main")?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (
-        (q_buffer, q_offset),
-        (k_buffer, k_offset),
-        (v_buffer, v_offset),
-        tmp,
-        n,
-        k_stride,
-        v_stride,
-        scale,
-        gqa_factor
-    ));
+    set_params!(
+        encoder,
+        (
+            (q_buffer, q_offset),
+            (k_buffer, k_offset),
+            (v_buffer, v_offset),
+            tmp,
+            n,
+            k_stride,
+            v_stride,
+            scale,
+            gqa_factor
+        )
+    );
 
     // Grid: (1, n_q_heads, NWG=32); TG: (32, 1, 1) = 1 simdgroup
-    let grid = MTLSize { width: 1, height: n_q_heads, depth: FLASH_NWG };
-    let tg   = MTLSize { width: 32, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: 1,
+        height: n_q_heads,
+        depth: FLASH_NWG,
+    };
+    let tg = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
 
     encoder.use_resource(q_buffer, MTLResourceUsage::Read);
     encoder.use_resource(k_buffer, MTLResourceUsage::Read);
@@ -705,7 +716,8 @@ pub fn call_flash_attn_ext_vec_reduce(
     output: &Buffer,
     n_q_heads: usize,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Sdpa, "flash_attn_ext_vec_bf16_256_reduce")?;
+    let pipeline =
+        kernels.load_pipeline(device, Source::Sdpa, "flash_attn_ext_vec_bf16_256_reduce")?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -713,8 +725,16 @@ pub fn call_flash_attn_ext_vec_reduce(
     set_params!(encoder, (tmp, output));
 
     // Grid: (n_q_heads, 1, 1); TG: (32, 1, 1) = 1 simdgroup (32 threads = 32 workgroups)
-    let grid = MTLSize { width: n_q_heads, height: 1, depth: 1 };
-    let tg   = MTLSize { width: 32, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_q_heads,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
 
     encoder.use_resource(tmp, MTLResourceUsage::Read);
     encoder.use_resource(output, MTLResourceUsage::Write);
@@ -724,7 +744,7 @@ pub fn call_flash_attn_ext_vec_reduce(
 
 pub const SDPA_2PASS_BLOCKS: usize = 32;
 /// For N<=512: fewer blocks = more tokens/simdgroup = better GPU utilization
-pub const SDPA_2PASS_BLOCKS_OPT: usize = 8;  // unused
+pub const SDPA_2PASS_BLOCKS_OPT: usize = 8; // unused
 
 /// BN=1 2-pass: single simdgroup per block, no intra-block barriers.
 /// Matches llama.cpp flash_attn_ext_vec architecture for optimal GPU wave occupancy.
@@ -769,18 +789,39 @@ pub fn call_sdpa_vector_2pass_bn1(
     // Pass 1: BN=1, grid=(1, n_q_heads, NBLOCKS=32), TG=(32,1,1)
     {
         let constants = Some(ConstantValues::new(vec![(20, Value::Bool(false))]));
-        let pipeline = kernels.load_pipeline_with_constants(device, Source::Sdpa, name_pass1, constants)?;
+        let pipeline =
+            kernels.load_pipeline_with_constants(device, Source::Sdpa, name_pass1, constants)?;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        set_params!(encoder, (
-            (q_buffer, q_offset), (k_buffer, k_offset), (v_buffer, v_offset),
-            intermediate, sums, maxs,
-            gqa_factor, n, kstride, vstride, alpha, softcapping
-        ));
+        set_params!(
+            encoder,
+            (
+                (q_buffer, q_offset),
+                (k_buffer, k_offset),
+                (v_buffer, v_offset),
+                intermediate,
+                sums,
+                maxs,
+                gqa_factor,
+                n,
+                kstride,
+                vstride,
+                alpha,
+                softcapping
+            )
+        );
         // 32 threads per TG (BN=1, 1 simdgroup = 32 threads)
-        let grid = MTLSize { width: 1, height: b, depth: SDPA_2PASS_BLOCKS };
-        let tg   = MTLSize { width: 32, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: 1,
+            height: b,
+            depth: SDPA_2PASS_BLOCKS,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
         encoder.use_resource(q_buffer, MTLResourceUsage::Read);
         encoder.use_resource(k_buffer, MTLResourceUsage::Read);
         encoder.use_resource(v_buffer, MTLResourceUsage::Read);
@@ -802,8 +843,16 @@ pub fn call_sdpa_vector_2pass_bn1(
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         set_params!(encoder, (intermediate, sums, maxs, output));
-        let grid = MTLSize { width: 1, height: b, depth: 1 };
-        let tg   = MTLSize { width: SDPA_2PASS_BLOCKS * 32, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: 1,
+            height: b,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: SDPA_2PASS_BLOCKS * 32,
+            height: 1,
+            depth: 1,
+        };
         encoder.use_resource(intermediate, MTLResourceUsage::Read);
         encoder.use_resource(sums, MTLResourceUsage::Read);
         encoder.use_resource(maxs, MTLResourceUsage::Read);
@@ -839,7 +888,7 @@ pub fn call_sdpa_vector_2pass_nb8(
     itype: SdpaDType,
 ) -> Result<bool, MetalKernelError> {
     let bk = q_shape.last().unwrap();
-    const NBLOCKS_OPT: usize = SDPA_2PASS_BLOCKS_OPT;  // = 8
+    const NBLOCKS_OPT: usize = SDPA_2PASS_BLOCKS_OPT; // = 8
 
     let name_pass1 = match (bk, itype) {
         (256, SdpaDType::BF16) => "sdpa_vector_2pass_1_nb8_bfloat16_t_256",
@@ -859,13 +908,33 @@ pub fn call_sdpa_vector_2pass_nb8(
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
-        set_params!(encoder, (
-            (q_buffer, q_offset), (k_buffer, k_offset), (v_buffer, v_offset),
-            intermediate, sums, maxs,
-            gqa_factor, n, kstride, vstride, alpha, softcapping
-        ));
-        let grid = MTLSize { width: 1, height: b, depth: NBLOCKS_OPT };
-        let tg   = MTLSize { width: 8 * 32, height: 1, depth: 1 };
+        set_params!(
+            encoder,
+            (
+                (q_buffer, q_offset),
+                (k_buffer, k_offset),
+                (v_buffer, v_offset),
+                intermediate,
+                sums,
+                maxs,
+                gqa_factor,
+                n,
+                kstride,
+                vstride,
+                alpha,
+                softcapping
+            )
+        );
+        let grid = MTLSize {
+            width: 1,
+            height: b,
+            depth: NBLOCKS_OPT,
+        };
+        let tg = MTLSize {
+            width: 8 * 32,
+            height: 1,
+            depth: 1,
+        };
         encoder.use_resource(q_buffer, MTLResourceUsage::Read);
         encoder.use_resource(k_buffer, MTLResourceUsage::Read);
         encoder.use_resource(v_buffer, MTLResourceUsage::Read);
@@ -887,8 +956,16 @@ pub fn call_sdpa_vector_2pass_nb8(
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         set_params!(encoder, (intermediate, sums, maxs, output));
-        let grid = MTLSize { width: 1, height: b, depth: 1 };
-        let tg   = MTLSize { width: NBLOCKS_OPT * 32, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: 1,
+            height: b,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: NBLOCKS_OPT * 32,
+            height: 1,
+            depth: 1,
+        };
         encoder.use_resource(intermediate, MTLResourceUsage::Read);
         encoder.use_resource(sums, MTLResourceUsage::Read);
         encoder.use_resource(maxs, MTLResourceUsage::Read);

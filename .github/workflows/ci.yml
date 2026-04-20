@@ -32,10 +32,14 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-      # No Go setup needed: libocipull is loaded via dlopen at runtime, not
+      # No Go setup needed: libocimodels is loaded via dlopen at runtime, not
       # linked at build time, so clippy and rustfmt work without it.
       - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
-      - run: cargo clippy -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan -- -D warnings
+      # Lint the CUDA-enabled code path too (this job runs on Linux with the
+      # CUDA toolkit installed above).  Without `--features inferrs/cuda` the
+      # `#[cfg(feature = "cuda")]` blocks in `main.rs` / `engine.rs` are not
+      # type-checked, so regressions can slip through.
+      - run: cargo clippy -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan --features inferrs/cuda -- -D warnings
 
   build:
     name: Build (${{ matrix.target }})
@@ -127,7 +131,7 @@ jobs:
           $gitLink = "C:\Program Files\Git\usr\bin\link.exe"
           if (Test-Path $gitLink) { Rename-Item $gitLink "link.exe.bak" }
 
-      # ── Go OCI library (libocipull) ──────────────────────────────────────
+      # ── Go OCI library (libocimodels) ─────────────────────────────────────
       # The Go shared library is loaded on demand via dlopen (see pull.rs),
       # so it is NOT required at build/link time.  We build it here so it
       # can be shipped alongside the binary for runtime OCI support.
@@ -136,28 +140,28 @@ jobs:
         if: matrix.target != 'aarch64-pc-windows-msvc'
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
-          go-version-file: oci-pull/go.mod
-          cache-dependency-path: oci-pull/go.sum
+          go-version-file: oci-models/go.mod
+          cache-dependency-path: oci-models/go.sum
 
-      - name: Build libocipull (Go C shared library for OCI pulls)
+      - name: Build libocimodels (Go C shared library for OCI models)
         if: matrix.target != 'aarch64-pc-windows-msvc'
         shell: bash
         run: |
           mkdir -p target/debug
-          cd oci-pull
+          cd oci-models
           case "${{ runner.os }}" in
             macOS)
               CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
-                -ldflags="-extldflags '-Wl,-install_name,@rpath/libocipull.dylib'" \
-                -o ../target/debug/libocipull.dylib .
+                -ldflags="-extldflags '-Wl,-install_name,@rpath/libocimodels.dylib'" \
+                -o ../target/debug/libocimodels.dylib .
               ;;
             Linux)
               CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
-                -o ../target/debug/libocipull.so .
+                -o ../target/debug/libocimodels.so .
               ;;
             Windows)
               CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
-                -o ../target/debug/ocipull.dll .
+                -o ../target/debug/ocimodels.dll .
               ;;
           esac
 
@@ -168,12 +172,21 @@ jobs:
       - name: Test
         shell: bash
         run: |
+          # Enable the main binary's `cuda` feature on targets where the CUDA
+          # toolkit was installed above; without it, the CUDA code paths in
+          # `main.rs` / `engine.rs` are `#[cfg]`-out and wouldn't be covered.
+          FEATURES=""
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-pc-windows-msvc)
+              FEATURES="--features inferrs/cuda"
+              ;;
+          esac
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
             # --no-run: the test binary crashes at startup without nvcuda.dll
             # on GPU-less CI runners; just verify compilation succeeds.
-            cargo test --no-run -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
+            cargo test --no-run $FEATURES -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
           else
             # inferrs-backend-musa has no compile-time MUSA SDK dependency, so
             # it builds and runs (probe returns 1 = unavailable) on all runners.
-            cargo test -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
+            cargo test $FEATURES -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
           fi

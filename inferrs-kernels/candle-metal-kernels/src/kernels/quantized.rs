@@ -197,26 +197,64 @@ pub fn call_quantized_matmul_mv_q4k_bf16i(
     let ne01 = n as i64;
     let ne02 = b as i64;
     let ne03 = 1i64;
-    let nb00 = 0i64; let nb01 = 0i64; let nb02 = 0i64;
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
     let ne10 = k as i64;
     let ne11 = m as i64;
     let ne12 = b as i64;
     let ne13 = 1i64;
-    let nb10 = 0i64; let nb11 = 0i64; let nb12 = 0i64;
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
     let ne0 = n as i64;
     let ne1 = m as i64;
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
     // Same dispatch params as Q4K: align=4, nth0=32, nth1=2
-    let nth0 = 32usize; let nth1 = 2usize; let align = 4usize;
-    let thread_groups_count = MTLSize { width: divide(ne01 as usize, align), height: ne11 as usize, depth: (ne12 * ne13) as usize };
-    let threads_per_threadgroup = MTLSize { width: nth0, height: nth1, depth: 1 };
-    let pipeline = kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q4_K_bf16i_f32")?;
+    let nth0 = 32usize;
+    let nth1 = 2usize;
+    let align = 4usize;
+    let thread_groups_count = MTLSize {
+        width: divide(ne01 as usize, align),
+        height: ne11 as usize,
+        depth: (ne12 * ne13) as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+    let pipeline =
+        kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_q4_K_bf16i_f32")?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     // buf(0)=weight(rhs/Q4K), buf(1)=activation(lhs/BF16), buf(2)=output
-    set_params!(encoder, ((rhs, rhs_offset), (lhs, lhs_offset), (dst, dst_offset), ne00, ne01, ne02, nb00, nb01, nb02, ne10, ne11, ne12, nb10, nb11, nb12, ne0, ne1, r2, r3));
+    set_params!(
+        encoder,
+        (
+            (rhs, rhs_offset),
+            (lhs, lhs_offset),
+            (dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
     encoder.use_resource(lhs, MTLResourceUsage::Read);
     encoder.use_resource(rhs, MTLResourceUsage::Read);
     encoder.use_resource(dst, MTLResourceUsage::Write);

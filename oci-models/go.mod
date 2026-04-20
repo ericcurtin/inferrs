@@ -1,4 +1,4 @@
-module github.com/ericcurtin/inferrs/oci-pull
+module github.com/ericcurtin/inferrs/oci-models
 
 go 1.25.8
 
