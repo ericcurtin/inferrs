@@ -3545,8 +3545,8 @@ impl DecoderLayer {
         per_layer_input: Option<&Tensor>,
     ) -> Option<Result<Tensor>> {
         use candle_core::DType;
-        // Only for Metal, BF16, single-token decode, Q4K or Q8_0 MLP, no MoE.
-        if attn_out.dtype() != DType::BF16 || self.moe.is_some() {
+        // Only for Metal, BF16, single-token decode, Q4K or Q8_0 MLP.
+        if attn_out.dtype() != DType::BF16 {
             return None;
         }
         let is_q4k = self.mlp.gate_proj.is_q4k() && self.mlp.up_proj.is_q4k();
@@ -3620,17 +3620,26 @@ impl DecoderLayer {
                     Err(e) => return Some(Err(e)),
                 });
             }
+            // MoE path: combine shared MLP output with sparse expert outputs.
+            let ffn_out = if let Some(moe) = &self.moe {
+                match moe.forward(&mlp_out, &xs_residual) {
+                    Ok(combined) => combined,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                mlp_out
+            };
             let xs = if let Some(pfn_out) = self.post_ffn_add_out.as_ref() {
-                if self.post_feedforward_layernorm.forward_add_prealloc(&mlp_out, &xs_residual, pfn_out) {
+                if self.post_feedforward_layernorm.forward_add_prealloc(&ffn_out, &xs_residual, pfn_out) {
                     pfn_out.clone()
                 } else {
-                    match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                    match self.post_feedforward_layernorm.forward_add(&ffn_out, &xs_residual) {
                         Ok(o) => o,
                         Err(e) => return Some(Err(e)),
                     }
                 }
             } else {
-                match self.post_feedforward_layernorm.forward_add(&mlp_out, &xs_residual) {
+                match self.post_feedforward_layernorm.forward_add(&ffn_out, &xs_residual) {
                     Ok(o) => o,
                     Err(e) => return Some(Err(e)),
                 }

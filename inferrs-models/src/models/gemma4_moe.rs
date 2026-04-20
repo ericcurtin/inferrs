@@ -220,6 +220,10 @@ impl Gemma4MoeRouter {
 pub(super) struct Gemma4MoeExperts {
     gate_up_proj: MoeExpertWeights,
     down_proj: MoeExpertWeights,
+    /// Pre-cached QLinear wrappers for each expert (GGUF path only).
+    /// Avoids 560 heap allocations per decode step (16 per MoE layer × 35 layers).
+    gate_up_linears: Vec<QLinear>,
+    down_linears: Vec<QLinear>,
     num_experts: usize,
     moe_intermediate_size: usize,
 }
@@ -294,9 +298,27 @@ impl Gemma4MoeExperts {
                 MoeExpertWeights::Dense(down),
             )
         };
+        // Pre-cache QLinear wrappers for each expert (GGUF path: Quantized variant).
+        // This avoids 16 heap allocations per MoE layer per decode step.
+        let gate_up_linears: Vec<QLinear> = if let MoeExpertWeights::Quantized(_) = &gate_up_proj {
+            (0..cfg.num_experts)
+                .map(|e| gate_up_proj.expert_linear(e))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let down_linears: Vec<QLinear> = if let MoeExpertWeights::Quantized(_) = &down_proj {
+            (0..cfg.num_experts)
+                .map(|e| down_proj.expert_linear(e))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             gate_up_proj,
             down_proj,
+            gate_up_linears,
+            down_linears,
             num_experts: cfg.num_experts,
             moe_intermediate_size: cfg.moe_intermediate_size,
         })
@@ -361,16 +383,24 @@ impl Gemma4MoeExperts {
             let expert_out = if is_decode && n == 1 {
                 // Decode fast path: single token at index 0, weight is a scalar.
                 let w = tokens[0].1;
-                // current = hidden (the full [1, hidden] single-token tensor).
-                let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
-                let gate_up_out = hidden.apply(&gate_up_linear)?; // [1, 2*intermediate]
+                // Use pre-cached QLinear wrappers (avoids 2 heap allocs per expert per step).
+                let gate_up_out = if !self.gate_up_linears.is_empty() {
+                    hidden.apply(&self.gate_up_linears[expert_idx])?
+                } else {
+                    let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
+                    hidden.apply(&gate_up_linear)?
+                }; // [1, 2*intermediate]
                 // Reshape to [2, intermediate] for contiguous gate/up views.
                 let split = gate_up_out.reshape((2, self.moe_intermediate_size))?;
                 let gate = split.narrow(0, 0, 1)?;  // [1, intermediate], contiguous
                 let up = split.narrow(0, 1, 1)?;     // [1, intermediate], contiguous
                 let hidden_act = candle_nn::ops::gelu_mul(&gate, &up)?;
-                let down_linear = self.down_proj.expert_linear(expert_idx)?;
-                let out = hidden_act.apply(&down_linear)?; // [1, hidden]
+                let out = if !self.down_linears.is_empty() {
+                    hidden_act.apply(&self.down_linears[expert_idx])?
+                } else {
+                    let down_linear = self.down_proj.expert_linear(expert_idx)?;
+                    hidden_act.apply(&down_linear)?
+                }; // [1, hidden]
                 // Scale by routing weight. Cast to result dtype if needed.
                 let out_dtype = if out.dtype() == dtype { out } else { out.to_dtype(dtype)? };
                 (out_dtype * w as f64)?
