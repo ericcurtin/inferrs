@@ -3415,6 +3415,8 @@ impl DecoderLayer {
                             #[cfg(feature = "metal")]
                             if pli.gate.forward_q8_0_bf16i_gelu_mul_bf16i_f32_prealloc(
                                 &xs, pli_input, pa)
+                                || pli.gate.forward_q4k_bf16i_gelu_mul_bf16i_f32_prealloc(
+                                &xs, pli_input, pa)
                             {
                                 break 'fused pa.clone();
                             }

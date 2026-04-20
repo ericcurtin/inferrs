@@ -962,6 +962,44 @@ impl QTensor {
         }
     }
 
+    /// Q4K BF16i GEMV fused with gelu_tanh × pli_embed (BF16) → F32 output (prealloc).
+    ///
+    /// For the Gemma-4 E4B PLI gate: computes `gelu(GEMV(self, xs)) × pli_embed` in one dispatch.
+    /// Saves 1 Metal dispatch vs separate Q4K BF16i GEMV + gelu_mul.
+    pub fn fwd_mv_q4k_bf16i_gelu_mul_bf16i_f32_prealloc(
+        &self,
+        xs: &Tensor,
+        pli_embed: &Tensor,
+        out: &Tensor,
+    ) -> Result<bool> {
+        if xs.dtype() != DType::BF16 || pli_embed.dtype() != DType::BF16 || out.dtype() != DType::F32 {
+            return Ok(false);
+        }
+        let xs_g = xs.storage();
+        let (xs_s, xs_l) = match &*xs_g {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        let pli_g = pli_embed.storage();
+        let (pli_s, pli_l) = match &*pli_g {
+            Storage::Metal(s) => (s.clone(), pli_embed.layout().clone()),
+            _ => return Ok(false),
+        };
+        let out_g = out.storage();
+        let out_metal = match &*out_g {
+            Storage::Metal(m) => m,
+            _ => return Ok(false),
+        };
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_q4k_bf16i_gelu_mul_bf16i_f32_prealloc(
+                    &self.shape, &xs_s, &xs_l, &pli_s, &pli_l, out_metal.buffer(), 0,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Paired Q8_0 BF16i GEMV with fused gelu_mul → F32 output (prealloc).
     ///
     /// Computes `gelu_tanh(GEMV(self=gate, xs)) * GEMV(up, xs)` in one dispatch.

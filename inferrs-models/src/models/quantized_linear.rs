@@ -350,6 +350,25 @@ impl QLinear {
             .unwrap_or(false)
     }
 
+    /// Q4K BF16i GEMV fused with gelu_tanh × pli_embed (BF16) → F32 output (prealloc).
+    /// For the Gemma-4 E4B PLI gate: saves 1 Metal dispatch vs separate GEMV + gelu_mul.
+    pub fn forward_q4k_bf16i_gelu_mul_bf16i_f32_prealloc(
+        &self,
+        xs_bf16: &Tensor,
+        pli_embed: &Tensor,
+        out: &Tensor,
+    ) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q4k_bf16i_gelu_mul_bf16i_f32_prealloc(xs_bf16, pli_embed, out)
+            .unwrap_or(false)
+    }
+
     /// Q8_0 GEMV: BF16 input → BF16 output.
     /// Eliminates both the BF16→F32 pre-cast and the F32→BF16 post-cast.
     /// Used for o_proj and PLI projection in the decode path.
