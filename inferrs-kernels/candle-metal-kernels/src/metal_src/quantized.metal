@@ -9703,8 +9703,10 @@ kernel void kernel_mul_mm(device const  uchar * src0,
                           uint                  tiitg[[thread_index_in_threadgroup]],
                           uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    threadgroup T     * sa = (threadgroup T     *)(shared_memory);
-    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+    threadgroup T    * sa = (threadgroup T    *)(shared_memory);
+    // sb stores src1 activations in F16 (half) to halve shared memory footprint vs F32,
+    // enabling higher threadgroup occupancy.  Values are converted F32/BF16→F16 on load.
+    threadgroup half * sb = (threadgroup half *)(shared_memory + 4096);
 
     const uint r0 = tgpig.y;
     const uint r1 = tgpig.x;
@@ -9718,9 +9720,9 @@ kernel void kernel_mul_mm(device const  uchar * src0,
     short thread_row = ((short)tiitg/THREAD_PER_ROW) < n_rows ? ((short)tiitg/THREAD_PER_ROW) : n_rows - 1;
     short thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
 
-    simdgroup_T8x8     ma[4];
-    simdgroup_float8x8 mb[2];
-    simdgroup_float8x8 mc[8];
+    simdgroup_T8x8    ma[4];
+    simdgroup_half8x8 mb[2];  // F16 activations in shared memory
+    simdgroup_float8x8 mc[8]; // F32 accumulator for precision
 
     for (short i = 0; i < 8; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
@@ -9754,10 +9756,10 @@ kernel void kernel_mul_mm(device const  uchar * src0,
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        // Load activations from src1 into threadgroup float buffer, converting TIn→float.
-        // For F32 input this is a direct store; for BF16 input the matrix constructor
-        // widens each bfloat element to float with no additional kernel dispatches.
-        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = float2x4(*((device matrix<TIn, 2, 4> *) y));
+        // Load activations from src1 into threadgroup half (F16) buffer, converting TIn→half.
+        // Storing in F16 halves shared memory for src1 vs F32, improving threadgroup occupancy.
+        // F32/BF16 → F16 conversion: half2x4 matrix constructor does element-wise narrowing.
+        *(threadgroup half2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = half2x4(*((device matrix<TIn, 2, 4> *) y));
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2+nl-1)/nl : x;
@@ -9766,8 +9768,8 @@ kernel void kernel_mul_mm(device const  uchar * src0,
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // load matrices from threadgroup memory and conduct outer products
-        threadgroup T     * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
-        threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+        threadgroup T    * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
+        threadgroup half * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
 
         #pragma unroll(4)
         for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
