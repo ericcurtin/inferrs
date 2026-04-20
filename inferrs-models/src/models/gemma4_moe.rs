@@ -231,6 +231,10 @@ impl Gemma4MoeRouter {
     /// The scale is applied on CPU in `Gemma4MoeExperts::forward_into` after the
     /// GPU→CPU sync, eliminating 4 GPU dispatches (index_select + reshape + mul +
     /// flatten) per MoE layer per decode step (4 × 35 = 140 saves/step).
+    ///
+    /// For decode (seq_len=1) on Metal: the top-k selection and renorm are done
+    /// entirely on CPU using the direct Metal buffer read, saving 6 GPU dispatches
+    /// (arg_sort + narrow + contiguous + gather + sum + broadcast_div per step).
     pub(super) fn forward(&self, hidden: &Tensor) -> Result<(Tensor, Tensor, &[f32])> {
         // Use RmsNorm with all-ones weight (≡ rms_norm_no_scale) to get a single
         // fused kernel dispatch instead of the 6-dispatch ad-hoc path.
@@ -240,6 +244,38 @@ impl Gemma4MoeRouter {
         let scaled = normed.broadcast_mul(&self.scale_normalized)?;
         let logits = scaled.apply(&self.proj)?;
         let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
+
+        // Decode fast path: do top-k + renorm on CPU using direct Metal buffer read.
+        // Saves 6 GPU dispatches vs arg_sort + narrow + contiguous + gather + sum + div.
+        // seq_len=1 means probs is [1, num_experts] — trivially small for CPU processing.
+        #[cfg(feature = "metal")]
+        if probs.dim(0).unwrap_or(0) == 1 {
+            if let Some(probs_f32) = metal_bf16_tensor_to_f32_vec(&probs) {
+                let num_experts = probs_f32.len();
+                // Find top-k indices by sorting (k=8 << 128, partial sort is fine).
+                let mut indexed: Vec<(usize, f32)> = probs_f32.iter().copied().enumerate().collect();
+                indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let top_k = self.top_k.min(num_experts);
+                // Renormalise top-k weights.
+                let raw_sum: f32 = indexed[..top_k].iter().map(|&(_, w)| w).sum();
+                let inv_sum = if raw_sum > 0.0 { 1.0 / raw_sum } else { 1.0 };
+                let mut idx_vec = Vec::with_capacity(top_k);
+                let mut w_vec = Vec::with_capacity(top_k);
+                for &(eidx, raw_w) in &indexed[..top_k] {
+                    idx_vec.push(eidx as u32);
+                    w_vec.push(raw_w * inv_sum);
+                }
+                let device = hidden.device();
+                // Create indices on CPU (forward_into will to_device(CPU) anyway).
+                let top_k_indices = Tensor::from_vec(idx_vec, (1, top_k), &Device::Cpu)?;
+                // Weights go to GPU as BF16 for the SAXPY kernel.
+                let top_k_weights = Tensor::from_vec(w_vec, (1, top_k), device)?
+                    .to_dtype(probs.dtype())?;
+                return Ok((top_k_weights, top_k_indices, &self.per_expert_scale_cpu));
+            }
+        }
+
+        // General path (prefill, non-Metal, or fallback).
         // Top-k: sort descending, take first k, then gather probabilities.
         let top_k_indices = probs
             .arg_sort_last_dim(false)? // false = descending (largest first)
