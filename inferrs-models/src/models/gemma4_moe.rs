@@ -596,13 +596,23 @@ impl Gemma4MoeExperts {
                 let tok_weights: Vec<f32> = tokens.iter().map(|&(_, w)| w).collect();
                 let idx_tensor = Tensor::from_vec(tok_pos, n, device)?;
                 let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
-                let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
-                let gate_up_out = current.apply(&gate_up_linear)?; // [n, 2*intermediate]
+                // Use pre-cached QLinear wrappers when available (same as decode path).
+                // Avoids 2 heap allocs per expert per step in the prefill path too.
+                let gate_up_out = if !self.gate_up_linears.is_empty() {
+                    current.apply(&self.gate_up_linears[expert_idx])?
+                } else {
+                    let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
+                    current.apply(&gate_up_linear)?
+                }; // [n, 2*intermediate]
                 let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
                 let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
-                let hidden_act = (gate.apply(&candle_nn::Activation::GeluPytorchTanh)? * up)?;
-                let down_linear = self.down_proj.expert_linear(expert_idx)?;
-                let out = hidden_act.apply(&down_linear)?; // [n, hidden]
+                let hidden_act = candle_nn::ops::gelu_mul(&gate, &up)?;
+                let out = if !self.down_linears.is_empty() {
+                    hidden_act.apply(&self.down_linears[expert_idx])?
+                } else {
+                    let down_linear = self.down_proj.expert_linear(expert_idx)?;
+                    hidden_act.apply(&down_linear)?
+                }; // [n, hidden]
                 let w_tensor = Tensor::from_vec(tok_weights, n, device)?
                     .to_dtype(dtype)?
                     .unsqueeze(1)?;

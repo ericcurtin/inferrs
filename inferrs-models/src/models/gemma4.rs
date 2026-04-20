@@ -860,12 +860,11 @@ impl Module for Mlp {
             #[allow(unused_variables)]
             let is_single_token = xs.rank() >= 2 && xs.dim(xs.rank() - 2).unwrap_or(0) == 1;
 
-            // Prefill (multi-token) BF16 GEMM path on Metal for Q4K models (E4B):
-            // forward_mm_bf16inp_f32 dispatches kernel_mul_mm_q4_K_bf16inp directly,
+            // Prefill (multi-token) BF16 GEMM path on Metal for Q4K/Q6K/Q8_0:
+            // forward_mm_bf16inp_f32 dispatches kernel_mul_mm_q*_bf16inp directly,
             // returning F32 output WITHOUT a BF16→F32 input cast.
             // Saves 1 cast dispatch (BF16→F32) per gate/up projection + 50% src1 bandwidth.
             // The down_proj takes F32 input, so no output cast is needed either.
-            // Note: Q8_0 models (E2B) are weight-bandwidth-bound; skipping BF16 inp there.
             #[cfg(feature = "metal")]
             if let (Some(gate_res), Some(up_res)) = (
                 self.gate_proj.forward_mm_bf16inp_f32(xs),

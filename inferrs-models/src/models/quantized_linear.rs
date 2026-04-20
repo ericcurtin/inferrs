@@ -147,12 +147,15 @@ impl Module for QLinear {
                     && seq_len > 1
                     && (self.is_q4k() || matches!(&self.inner,
                         candle_core::quantized::QMatMul::QTensor(q) if
-                            q.dtype() == candle_core::quantized::GgmlDType::Q6K))
+                            matches!(q.dtype(),
+                                candle_core::quantized::GgmlDType::Q6K |
+                                candle_core::quantized::GgmlDType::Q8_0)))
                 {
-                    // Metal multi-token prefill (Q4K/Q6K only): pass BF16 directly to the
-                    // GEMM kernel (kernel_mul_mm_q4_K_bf16inp / q6_K_bf16inp).
+                    // Metal multi-token prefill (Q4K/Q6K/Q8_0): pass BF16 directly to the
+                    // GEMM kernel (kernel_mul_mm_q*_bf16inp).
                     // Eliminates the BF16→F32 cast dispatch and halves src1 bandwidth.
-                    // Q8_0 is weight-bandwidth bound; BF16 input doesn't help there.
+                    // For seq_len=512, activation tensor is 512×7168; halving that bandwidth
+                    // benefits all quantization types including Q8_0.
                     self.inner.forward(xs)?
                 } else {
                     let xs_f32 = if orig_dtype == DType::F32 {
@@ -1101,10 +1104,14 @@ impl QLinear {
         if seq_len <= 1 {
             return None;
         }
-        // Only Q4K and Q6K benefit from BF16 input on prefill (activation-bandwidth bound).
-        // Q8_0 models are weight-bandwidth bound; the BF16 activation optimization provides
-        // negligible or negative gain due to the conversion overhead.
-        if !(self.is_q4k() || matches!(&self.inner,
+        // Q4K, Q6K, and Q8_0 all benefit from BF16 activation input on prefill.
+        // For seq_len=512, activation tensor is 512×7168 elements; BF16 vs F32 halves
+        // activation bandwidth. The Metal kernel kernel_mul_mm_q8_0_bf16inp exists and
+        // is dispatched automatically by call_quantized_matmul_mm_t_bf16inp.
+        let is_q8_0 = matches!(&self.inner,
+            candle_core::quantized::QMatMul::QTensor(q)
+            if q.dtype() == candle_core::quantized::GgmlDType::Q8_0);
+        if !(self.is_q4k() || is_q8_0 || matches!(&self.inner,
             candle_core::quantized::QMatMul::QTensor(q)
             if q.dtype() == candle_core::quantized::GgmlDType::Q6K))
         {
