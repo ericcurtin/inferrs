@@ -6361,6 +6361,88 @@ kernel void kernel_mul_mv_q4_K_f32_v2(
     }
 }
 
+/// Q4K GEMV (F32 input) with in-place scaled accumulate into BF16 buffer.
+///
+/// Computes: result_bf16[i] += w * GEMV(src0_q4k, src1_f32)[i]
+///
+/// Eliminates 2 dispatches vs the standard path (scale + accumulate after GEMV)
+/// saving significant overhead for MoE expert dispatch loops.
+///
+/// Grid and threadgroup are identical to kernel_mul_mv_q4_K_f32_v2:
+///   Grid: (ceil(ne01/2), ne11, ne12*ne13), TG: (32, 2, 1) = 64 threads.
+[[host_name("kernel_mul_mv_q4_K_f32_saxpy_bf16")]]
+kernel void kernel_mul_mv_q4_K_f32_saxpy_bf16(
+        device const  void   * src0,
+        device const float   * src1,
+        device       ushort  * result_bf16,  // in-place BF16 accumulation buffer
+        constant   float     & w,            // routing weight scalar
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // Each simdgroup (32 threads) handles exactly 1 output row.
+    const short tx = (short)tiisg;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = r0 * N_SG_Q4K + (int)sgitg;
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+    const uint offset0 = (i12/r2)*(ne01*(ne00/QK_K)) + (i13/r3)*(ne01*(ne00/QK_K)*ne02);
+
+    device const block_q4_K * x = (device const block_q4_K *) src0 + first_row * (ne00/QK_K) + offset0;
+    device const float       * y = src1 + r1 * ne10 + im * ne00 * ne1;
+
+    const int nb    = ne00 / QK_K;
+    const int nchk  = nb * 16;
+
+    float sumf = 0.0f;
+
+    for (int ich = tx; ich < nchk; ich += 32) {
+        const int ib = ich / 16;
+        const int il = ich % 16;
+
+        device const float * yc = y + ib * QK_K + il * 16;
+
+        sumf += dot(q4k_deq4(x + ib, il, 0), float4(yc[ 0], yc[ 1], yc[ 2], yc[ 3]));
+        sumf += dot(q4k_deq4(x + ib, il, 1), float4(yc[ 4], yc[ 5], yc[ 6], yc[ 7]));
+        sumf += dot(q4k_deq4(x + ib, il, 2), float4(yc[ 8], yc[ 9], yc[10], yc[11]));
+        sumf += dot(q4k_deq4(x + ib, il, 3), float4(yc[12], yc[13], yc[14], yc[15]));
+    }
+
+    const float all_sum = simd_sum(sumf);
+
+    // Thread 0 accumulates: result_bf16[i] += w * all_sum
+    if (tiisg == 0 && first_row < ne01) {
+        const int64_t dst_idx = (int64_t)im * ne0 * ne1 + (int64_t)r1 * ne0 + first_row;
+        // Read existing BF16 value, add w * GEMV result, write back as BF16.
+        // BF16 = upper 16 bits of F32 IEEE 754 representation.
+        const ushort old_bf16 = result_bf16[dst_idx];
+        const float old_f32 = as_type<float>(uint(old_bf16) << 16);
+        const float new_f32 = old_f32 + w * all_sum;
+        result_bf16[dst_idx] = (ushort)(as_type<uint>(new_f32) >> 16);
+    }
+}
+
 // Forward declaration — defined at kernel_mul_mv_q4_K_f32_to_bf16_impl below.
 void kernel_mul_mv_q4_K_f32_to_bf16_impl(
         device const  void   * src0,

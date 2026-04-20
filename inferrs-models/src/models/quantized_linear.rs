@@ -933,6 +933,33 @@ impl QLinear {
             .unwrap_or(false)
     }
 
+    /// Q4K GEMV (F32 input) + in-place scaled accumulate into pre-allocated BF16 buffer.
+    ///
+    /// Computes: `result_bf16[i] += w * GEMV(self, xs_f32)[i]` in one Metal dispatch.
+    /// Saves 2 dispatches vs: down_proj GEMV + w-scale + accumulate.
+    /// For MoE decode: eliminates 2 × num_active_experts dispatches per MoE layer.
+    #[cfg(feature = "metal")]
+    #[allow(dead_code)]
+    pub fn forward_q4k_f32_saxpy_bf16(&self, xs_f32: &Tensor, result: &Tensor, w: f32) -> bool {
+        if self.bias.is_some() {
+            return false;
+        }
+        if xs_f32.dtype() != candle_core::DType::F32 {
+            return false;
+        }
+        if result.dtype() != candle_core::DType::BF16 {
+            return false;
+        }
+        if !matches!(xs_f32.device(), candle_core::Device::Metal(_)) {
+            return false;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return false,
+        };
+        qt.fwd_mv_q4k_f32_saxpy_bf16(xs_f32, result, w).unwrap_or(false)
+    }
+
     /// Forward pass that takes an already-F32 input and returns F32 output.
     ///
     /// When the underlying QMatMul is a QTensor (quantized GGUF path), the

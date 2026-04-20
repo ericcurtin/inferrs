@@ -33,6 +33,8 @@ use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 // ---------------------------------------------------------------------------
 
 /// RMSNorm without a learned scale (used for router pre-normalisation).
+/// Only used in unit tests; production code uses `ones_norm` (single fused dispatch).
+#[allow(dead_code)]
 pub(super) fn rms_norm_no_scale(xs: &Tensor, eps: f64) -> Result<Tensor> {
     let orig_dtype = xs.dtype();
     let xs_f32 = if orig_dtype == DType::F32 {
@@ -390,7 +392,7 @@ impl Gemma4MoeExperts {
             }
             let n = tokens.len();
 
-            let expert_out = if is_decode && n == 1 {
+            if is_decode && n == 1 {
                 // Decode fast path: single token at index 0, weight is a scalar.
                 let w = tokens[0].1;
                 // Use pre-cached QLinear wrappers (avoids 2 heap allocs per expert per step).
@@ -422,6 +424,23 @@ impl Gemma4MoeExperts {
                 } else {
                     candle_nn::ops::gelu_mul(&gate, &up)?
                 };
+                // Fast path (Metal, BF16, Q4K): fused down_proj GEMV + w-scale + accumulate.
+                // hidden_act (BF16) → F32 (1 dispatch) → SAXPY into result (1 dispatch).
+                // Saves 2 dispatches vs standard: down GEMV (2) + scale (1) + add (1) = 4.
+                #[cfg(feature = "metal")]
+                if hidden_act.dtype() == DType::BF16
+                    && matches!(hidden_act.device(), candle_core::Device::Metal(_))
+                    && dtype == DType::BF16
+                    && !self.down_linears.is_empty()
+                {
+                    let hidden_act_f32 = hidden_act.to_dtype(DType::F32)?;
+                    if self.down_linears[expert_idx].forward_q4k_f32_saxpy_bf16(
+                        &hidden_act_f32, &result, w)
+                    {
+                        continue; // SAXPY accumulated into result; move to next expert.
+                    }
+                }
+                // Fallback: standard path (down GEMV + scale + accumulate).
                 let out = if !self.down_linears.is_empty() {
                     hidden_act.apply(&self.down_linears[expert_idx])?
                 } else {
@@ -430,9 +449,11 @@ impl Gemma4MoeExperts {
                 }; // [1, hidden]
                 // Scale by routing weight. Cast to result dtype if needed.
                 let out_dtype = if out.dtype() == dtype { out } else { out.to_dtype(dtype)? };
-                (out_dtype * w as f64)?
-            } else {
-                // Prefill / multi-token path: general scatter dispatch.
+                result = (result + (out_dtype * w as f64)?)?;
+                continue;
+            }
+            // Prefill / multi-token path: general scatter dispatch.
+            {
                 let tok_pos: Vec<u32> = tokens.iter().map(|&(t, _)| t).collect();
                 let tok_weights: Vec<f32> = tokens.iter().map(|&(_, w)| w).collect();
                 let idx_tensor = Tensor::from_vec(tok_pos, n, device)?;
@@ -449,11 +470,7 @@ impl Gemma4MoeExperts {
                     .unsqueeze(1)?;
                 let out_scaled = out.broadcast_mul(&w_tensor)?;
                 result = result.index_add(&idx_tensor, &out_scaled, 0)?;
-                continue;
-            };
-
-            // Decode path: simple accumulation (single token = simple add).
-            result = (result + expert_out)?;
+            }
         }
 
         Ok(result)
