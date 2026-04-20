@@ -136,10 +136,10 @@ fn split_expert_qtensor(
 #[derive(Debug, Clone)]
 pub(super) struct Gemma4MoeRouter {
     proj: QLinear,
-    scale: Tensor,
+    /// Precomputed scale * scalar_root_size: [hidden_size].
+    /// Avoids a separate scalar-multiply dispatch per forward call.
+    scale_normalized: Tensor,
     per_expert_scale: Tensor,
-    scalar_root_size: f64,
-    rms_eps: f64,
     top_k: usize,
     /// Pre-allocated all-ones RMSNorm weight for rms_norm_no_scale via RmsNorm.
     /// Using the standard fused RMSNorm kernel (1 dispatch) vs the 6-dispatch
@@ -161,6 +161,10 @@ impl Gemma4MoeRouter {
             qvb.map(|q| q.pp("proj")).as_ref(),
         )?;
         let scale = vb.get(cfg.hidden_size, "scale")?.to_dtype(cfg.dtype)?;
+        // Precompute scale * scalar_root_size at init time to avoid a scalar-mul
+        // dispatch on every router forward call. hidden_size^{-0.5} is a constant.
+        let scalar_root_size = (cfg.hidden_size as f64).powf(-0.5);
+        let scale_normalized = (scale * scalar_root_size)?;
         let per_expert_scale = vb
             .get(cfg.num_experts, "per_expert_scale")?
             .to_dtype(cfg.dtype)?;
@@ -171,10 +175,8 @@ impl Gemma4MoeRouter {
         let ones_norm = candle_nn::RmsNorm::new(ones_weight, cfg.rms_norm_eps);
         Ok(Self {
             proj,
-            scale,
+            scale_normalized,
             per_expert_scale,
-            scalar_root_size: (cfg.hidden_size as f64).powf(-0.5),
-            rms_eps: cfg.rms_norm_eps,
             top_k: cfg.top_k_experts,
             ones_norm,
         })
@@ -185,7 +187,9 @@ impl Gemma4MoeRouter {
         // Use RmsNorm with all-ones weight (≡ rms_norm_no_scale) to get a single
         // fused kernel dispatch instead of the 6-dispatch ad-hoc path.
         let normed = self.ones_norm.forward(hidden)?;
-        let scaled = (normed.broadcast_mul(&self.scale)? * self.scalar_root_size)?;
+        // scale_normalized = scale * scalar_root_size was precomputed at init.
+        // One broadcast_mul dispatch instead of two (broadcast_mul + scalar mul).
+        let scaled = normed.broadcast_mul(&self.scale_normalized)?;
         let logits = scaled.apply(&self.proj)?;
         let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
         // Top-k: sort descending, take first k, then gather probabilities.
@@ -226,6 +230,10 @@ pub(super) struct Gemma4MoeExperts {
     down_linears: Vec<QLinear>,
     num_experts: usize,
     moe_intermediate_size: usize,
+    /// Pre-allocated gelu_mul output buffer: [1, moe_intermediate_size].
+    /// Reused across all 8 expert dispatches per decode step (same shape/dtype).
+    /// Avoids 8 Metal buffer allocations per MoE layer per decode step.
+    gelu_out: Option<candle_core::Tensor>,
 }
 
 impl Gemma4MoeExperts {
@@ -321,6 +329,7 @@ impl Gemma4MoeExperts {
             down_linears,
             num_experts: cfg.num_experts,
             moe_intermediate_size: cfg.moe_intermediate_size,
+            gelu_out: None,
         })
     }
 
@@ -330,7 +339,7 @@ impl Gemma4MoeExperts {
     /// `top_k_indices`: [seq, top_k] u32
     /// `top_k_weights`: [seq, top_k]
     pub(super) fn forward_into(
-        &self,
+        &mut self,
         hidden: &Tensor,
         top_k_indices: &Tensor,
         top_k_weights: &Tensor,
@@ -395,7 +404,24 @@ impl Gemma4MoeExperts {
                 let split = gate_up_out.reshape((2, self.moe_intermediate_size))?;
                 let gate = split.narrow(0, 0, 1)?;  // [1, intermediate], contiguous
                 let up = split.narrow(0, 1, 1)?;     // [1, intermediate], contiguous
-                let hidden_act = candle_nn::ops::gelu_mul(&gate, &up)?;
+                // Use prealloc gelu_mul buffer to avoid Metal buffer allocation per expert.
+                // The same [1, moe_intermediate_size] buffer is reused across all 8 experts.
+                let gelu_elem = self.moe_intermediate_size;
+                let gelu_ok = self.gelu_out.as_ref()
+                    .is_some_and(|t| t.elem_count() == gelu_elem && t.dtype() == gate.dtype());
+                if !gelu_ok {
+                    self.gelu_out = Some(Tensor::zeros(
+                        gate.shape(), gate.dtype(), gate.device())?);
+                }
+                let hidden_act = if let Some(buf) = &self.gelu_out {
+                    if candle_nn::ops::gelu_mul_prealloc(&gate, &up, buf) {
+                        buf.clone()
+                    } else {
+                        candle_nn::ops::gelu_mul(&gate, &up)?
+                    }
+                } else {
+                    candle_nn::ops::gelu_mul(&gate, &up)?
+                };
                 let out = if !self.down_linears.is_empty() {
                     hidden_act.apply(&self.down_linears[expert_idx])?
                 } else {
@@ -753,20 +779,24 @@ mod tests {
 
         // Build a router with controlled weights:
         //   proj: random [num_experts, hidden] — we just need valid logits
-        //   scale: ones [hidden]
+        //   scale: ones [hidden] (precomputed: scale * scalar_root_size)
         //   per_expert_scale: ones [num_experts]  (so it doesn't affect sum)
         let proj_w = Tensor::randn(0f32, 1.0, (num_experts, hidden), &dev).unwrap();
         let proj = QLinear::from_tensor(proj_w, None);
-        let scale = Tensor::ones(hidden, DType::F32, &dev).unwrap();
+        let scalar_root_size = (hidden as f64).powf(-0.5);
+        // scale_normalized = scale * scalar_root_size (precomputed at init)
+        let scale_normalized = (Tensor::ones(hidden, DType::F32, &dev).unwrap()
+            * scalar_root_size).unwrap();
         let per_expert_scale = Tensor::ones(num_experts, DType::F32, &dev).unwrap();
+        let ones_weight = Tensor::ones(hidden, DType::F32, &dev).unwrap();
+        let ones_norm = candle_nn::RmsNorm::new(ones_weight, 1e-6);
 
         let router = Gemma4MoeRouter {
             proj,
-            scale,
+            scale_normalized,
             per_expert_scale,
-            scalar_root_size: (hidden as f64).powf(-0.5),
-            rms_eps: 1e-6,
             top_k,
+            ones_norm,
         };
 
         // Two tokens of random hidden states.
