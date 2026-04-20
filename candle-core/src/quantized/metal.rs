@@ -565,6 +565,69 @@ impl QMetalStorage {
         Ok(true)
     }
 
+    /// Q8_0 BF16-input SAXPY: result_bf16[i] += w * Q8_0_GEMV(self, src)[i].
+    ///
+    /// Saves 2 GPU dispatches per MoE expert for E2B (Q8_0) vs standard path:
+    /// (GEMV + scale + add → 1 dispatch).
+    pub fn fwd_mv_q8_0_bf16i_saxpy_bf16(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        result: &crate::MetalStorage,
+        result_offset_bytes: usize,
+        w: f32,
+    ) -> Result<bool> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q8_0 {
+            return Ok(false);
+        }
+        if storage.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        if result.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        if !layout.is_contiguous() {
+            return Ok(false);
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            return Ok(false);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let m = match src_shape.rank() {
+            3 => src_shape.dims()[0] * src_shape.dims()[1],
+            2 => src_shape.dims()[0],
+            _ => return Ok(false),
+        };
+        let last_k = src_shape.dims()[src_shape.rank() - 1];
+        if last_k != k {
+            return Ok(false);
+        }
+        let device = storage.device().clone();
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            let rhs_offset = (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes();
+            let result_off = result_offset_bytes + batch_id * n * DType::BF16.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv_q8_0_bf16i_saxpy_bf16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                rhs_offset,
+                &self.buffer,
+                self.offset,
+                result.buffer(),
+                result_off,
+                w,
+            )
+            .map_err(MetalError::from)?;
+        }
+        Ok(true)
+    }
+
     /// Q8_0 GEMV with F32 input and BF16 output.
     /// Uses `kernel_mul_mv_q8_0_f32_to_bf16` — eliminates the F32→BF16 `to_dtype`
     /// dispatch after down_proj / pli_projection.

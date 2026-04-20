@@ -850,6 +850,48 @@ impl QTensor {
         }
     }
 
+    /// Q8_0 BF16-input SAXPY: result_bf16[i] += w * Q8_0_GEMV(self, xs_bf16)[i].
+    ///
+    /// Saves 2 dispatches per MoE expert for E2B (Q8_0 weights) vs standard path.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_q8_0_bf16i_saxpy_bf16(
+        &self,
+        xs: &Tensor,
+        result: &Tensor,
+        w: f32,
+    ) -> Result<bool> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(false),
+        };
+        if xs.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let result_storage_guard = result.storage();
+        let result_storage = match &*result_storage_guard {
+            Storage::Metal(s) => s.clone(),
+            _ => return Ok(false),
+        };
+        if result.dtype() != DType::BF16 {
+            return Ok(false);
+        }
+        let result_offset_bytes = result.layout().start_offset() * DType::BF16.size_in_bytes();
+        match &self.storage {
+            QStorage::Metal(m) => {
+                m.fwd_mv_q8_0_bf16i_saxpy_bf16(
+                    &self.shape,
+                    &xs_storage,
+                    &xs_layout,
+                    &result_storage,
+                    result_offset_bytes,
+                    w,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Q8_0 GEMV with F32 input and BF16 output.
     /// Saves 1 dispatch vs `forward_f32 + to_dtype(BF16)` for down_proj / pli_projection.
     #[cfg(feature = "metal")]

@@ -3444,6 +3444,67 @@ kernel void kernel_mul_mv_q8_0_bf16i_to_bf16(
         shmem, tgpig, tiisg, sgitg);
 }
 
+/// Q8_0 BF16-input SAXPY: result_bf16[i] += w * Q8_0_GEMV(src0, src1_bf16)[i].
+///
+/// Fuses GEMV + scaled accumulate into a single Metal dispatch.
+/// Saves 2 dispatches per MoE expert vs standard (cast(1) + GEMV(1) + scale+add(1)).
+/// For E2B decode: 8 experts × 35 layers = 280 saved dispatches per token.
+[[host_name("kernel_mul_mv_q8_0_bf16i_saxpy_bf16")]]
+kernel void kernel_mul_mv_q8_0_bf16i_saxpy_bf16(
+        device const  void   * src0,
+        device const ushort  * src1_bf16,   // BF16 activation input
+        device       ushort  * result_bf16,  // in-place BF16 accumulation buffer
+        constant   float     & w,            // routing weight scalar
+        constant   int64_t & ne00, constant   int64_t & ne01, constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne0,  constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 2, NSG = 4, NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = ne00/QK8_0;
+    const int r0 = tgpig.x * NR0, r1 = tgpig.y, im = tgpig.z;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = r0*nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q8_0 * x = (device const block_q8_0 *)src0 + off0;
+    device const ushort * y = src1_bf16 + r1*ne10 + im*ne00*ne1;
+    const int ix = tiisg/(NW/NQ), il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NQ], sumf[NR0] = {0.f};
+    device const ushort * yb = y + ib0*QK8_0 + il*NQ;
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (int i = 0; i < NQ; ++i) { yl[i] = as_type<float>(uint(yb[i]) << 16); }
+        for (int row = 0; row < NR0; ++row) {
+            device const int8_t * qs = x[ib + row*nb].qs + il*NQ;
+            float s = 0.f;
+            for (int i = 0; i < NQ; ++i) { s += qs[i] * yl[i]; }
+            sumf[row] += s * x[ib + row*nb].d;
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+    threadgroup float shmem[NW * NR0];
+    for (int row = 0; row < NR0; ++row) {
+        if (sgitg == 0) { shmem[NW*row + tiisg] = 0.f; }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int row = 0; row < NR0; ++row) { if (tiisg == 0) { shmem[NW*row + sgitg] = sumf[row]; } }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int row = 0; row < NR0; ++row) {
+        float tot = simd_sum(shmem[NW*row + tiisg]);
+        if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {
+            const int64_t dst_idx = r1*(int64_t)ne0 + im*(int64_t)ne0*(int64_t)ne1 + r0 + row;
+            const ushort old_bf16 = result_bf16[dst_idx];
+            const float old_f32 = as_type<float>(uint(old_bf16) << 16);
+            const float new_f32 = old_f32 + w * tot;
+            result_bf16[dst_idx] = (ushort)(as_type<uint>(new_f32) >> 16);
+        }
+    }
+}
+
 /// TQ2_0 GEMV: block_tq2_0 (QK_K=256 ternary weights, 66 bytes) x F32 input -> F32 output.
 ///
 /// Block layout: qs[64] || half d  (66 bytes total).

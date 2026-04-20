@@ -555,12 +555,19 @@ impl Gemma4MoeExperts {
                         result = Some(self.result_buf.as_ref().unwrap().clone());
                     }
                     let acc = result.as_ref().unwrap();
+                    // Try Q4K BF16i SAXPY first (E4B path).
                     if self.down_linears[expert_idx].forward_q4k_bf16i_saxpy_bf16(
                         &hidden_act, acc, w)
                     {
                         continue; // SAXPY accumulated into result; move to next expert.
                     }
-                    // Fallback to F32 cast path if BF16i SAXPY not available.
+                    // Try Q8_0 BF16i SAXPY (E2B path) — saves cast(1) + GEMV(1) + add(1) = 3→1.
+                    if self.down_linears[expert_idx].forward_q8_0_bf16i_saxpy_bf16(
+                        &hidden_act, acc, w)
+                    {
+                        continue;
+                    }
+                    // Fallback to F32 cast + Q4K SAXPY if BF16i not available.
                     let hidden_act_f32 = hidden_act.to_dtype(DType::F32)?;
                     if self.down_linears[expert_idx].forward_q4k_f32_saxpy_bf16(
                         &hidden_act_f32, acc, w)
