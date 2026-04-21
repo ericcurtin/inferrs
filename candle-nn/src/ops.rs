@@ -1771,22 +1771,28 @@ pub fn sdpa_gqa_fused_decode(
     Ok(Some(result))
 }
 
-/// CUDA flash-attention decode fast path for GQA models.
+/// CUDA flash-attention fast path for BF16 GQA models (decode and prefill).
 ///
-/// Calls `candle_core::cuda_flash_attn::flash_attn_decode_cuda` (kernels
-/// `flash_attn_decode_bf16_d{64,128,256,512}`) when every precondition is met:
+/// Dispatches to one of two kernels depending on `q_len`:
 ///
-/// - device is CUDA,
-/// - `q` dtype is BF16,
-/// - `q.dim(-1)` ∈ {64, 128, 256, 512},
-/// - single-token decode (`q.dim(-2) == 1`),
-/// - no mask, softcapping ≈ 1.0.
+/// **Decode** (`q_len == 1`, `do_causal = false`):
+///   `flash_attn_decode_bf16_d{64,128,256,512}` from `flash_attn.cu`.
+///   No causal mask needed for single-query decode.
 ///
-/// Returns `Ok(None)` in every other case so the caller can fall back to the
-/// regular [`sdpa`] path without any behavioural change.
+/// **Prefill** (`q_len > 1`, `do_causal = true`):
+///   `flash_attn_prefill_bf16_d{128,256}` from `flash_attn_prefill.cu`.
+///   SM80+ (Ampere / Ada, RTX 30xx+) required; returns `Ok(None)` on older GPUs
+///   via the CUDA driver error path (caller falls back to `gqa_attention_no_expand`).
 ///
-/// The underlying kernel returns F32; this wrapper casts the output back to BF16
-/// to match the dtype invariant downstream attention blocks expect (o_proj etc.).
+/// Returns `Ok(None)` when any precondition is unmet:
+/// - device is not CUDA,
+/// - dtype is not BF16,
+/// - mask provided or softcapping ≠ 1.0,
+/// - head_dim not in the supported set,
+/// - `do_causal` doesn't match the `q_len == 1` / `q_len > 1` convention.
+///
+/// The kernel output (F32) is cast back to BF16 before returning, matching the
+/// dtype invariant that downstream ops (o_proj, layernorm) expect.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_cuda_flash(
     q: &Tensor,
@@ -1797,8 +1803,8 @@ pub fn sdpa_cuda_flash(
     scale: f32,
     softcapping: f32,
 ) -> Result<Option<Tensor>> {
-    // Any deviation from the supported envelope → fall through.
-    if mask.is_some() || do_causal {
+    // Common guards shared by decode and prefill paths.
+    if mask.is_some() {
         return Ok(None);
     }
     if (softcapping - 1.0).abs() > f32::EPSILON {
@@ -1818,31 +1824,92 @@ pub fn sdpa_cuda_flash(
         }
         let q_dims = q.dims();
         let q_len = q_dims[q_dims.len() - 2];
-        if q_len != 1 {
-            return Ok(None);
-        }
         let head_dim = q_dims[q_dims.len() - 1];
-        if !matches!(head_dim, 64 | 128 | 256 | 512) {
-            return Ok(None);
+
+        if q_len == 1 {
+            // Decode path: no causal mask needed for single-query attention.
+            if do_causal {
+                return Ok(None);
+            }
+            if !matches!(head_dim, 64 | 128 | 256 | 512) {
+                return Ok(None);
+            }
+            let out_f32 = candle::cuda_flash_attn::flash_attn_decode_cuda(q, k, v, scale)?;
+            return Ok(Some(out_f32.to_dtype(candle::DType::BF16)?));
         }
 
-        // flash_attn_decode_cuda returns [1, n_q_heads, 1, head_dim] F32.
-        // We cast back to BF16 for two reasons:
-        //   1. Dtype uniformity with the Metal `sdpa` path, so callers can treat
-        //      both backends identically (residual add, layernorm, o_proj all
-        //      assume the attention output has the model dtype).
-        //   2. On CUDA, `o_proj` (Linear) runs BF16·BF16 matmul natively via
-        //      cuBLAS — no extra internal cast. Keeping F32 here would force
-        //      the caller to cast anyway before o_proj, just later.
-        // The F32→BF16 cast is a single element-wise pass, cheap vs. the
-        // attention kernel itself.
-        let out_f32 = candle::cuda_flash_attn::flash_attn_decode_cuda(q, k, v, scale)?;
-        let out_bf16 = out_f32.to_dtype(candle::DType::BF16)?;
-        Ok(Some(out_bf16))
+        // Prefill path (q_len > 1): causal required, head_dim limited to {128, 256}.
+        if !do_causal {
+            return Ok(None);
+        }
+        if !matches!(head_dim, 128 | 256) {
+            return Ok(None);
+        }
+        let out_f32 = candle::cuda_flash_attn::flash_attn_prefill_cuda(q, k, v, scale)?;
+        Ok(Some(out_f32.to_dtype(candle::DType::BF16)?))
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (q, k, v, scale);
+        let _ = (q, k, v, scale, do_causal);
         Ok(None)
+    }
+}
+
+/// Metal flash-attention prefill fast path (q_len > 8) for BF16 GQA models.
+///
+/// Routes to `steel_attention_bfloat16_*` via [`sdpa`] with `do_causal = true`.
+/// Only activated when `q_len > 8` because for shorter sequences the Metal SDPA
+/// dispatcher selects the *vector* kernel (`q_seq <= 8`) which does NOT apply
+/// the causal mask and would produce silently wrong outputs (review BUG 1).
+///
+/// For `q_len ∈ [1, 8]` on Metal, the caller must use the existing `sdpa`
+/// decode path (t == 1) or fall back to `gqa_attention_no_expand` with an
+/// explicit causal mask.
+///
+/// Returns `Ok(None)` when any precondition is unmet:
+/// - device is not Metal,
+/// - `q_len <= 8` (use the existing `t == 1` path instead),
+/// - dtype is not BF16,
+/// - softcapping ≠ 1.0,
+/// - head_dim not in {32,64,72,80,96,128,256} (steel kernel set),
+/// - or `sdpa` itself bails (shape mismatch, etc.).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_metal_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+) -> Result<Option<Tensor>> {
+    if q.dtype() != candle::DType::BF16 {
+        return Ok(None);
+    }
+    if (softcapping - 1.0).abs() > f32::EPSILON {
+        return Ok(None);
+    }
+    if !matches!(q.device(), candle::Device::Metal(_)) {
+        return Ok(None);
+    }
+    if q.rank() < 2 {
+        return Ok(None);
+    }
+    let q_dims = q.dims();
+    let q_len = q_dims[q_dims.len() - 2];
+    let head_dim = q_dims[q_dims.len() - 1];
+
+    // Steel prefill kernel requires q_len > 8 (vector kernel for ≤ 8 lacks causal).
+    if q_len <= 8 {
+        return Ok(None);
+    }
+    // Supported head_dims for steel_attention (call_sdpa_full).
+    if !matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256) {
+        return Ok(None);
+    }
+
+    // sdpa() dispatches to call_sdpa_full (steel_attention) with do_causal=true.
+    // Wrap errors as None so the caller can fall back cleanly.
+    match sdpa(q, k, v, None, true, scale, softcapping) {
+        Ok(out) => Ok(Some(out)),
+        Err(_) => Ok(None),
     }
 }
