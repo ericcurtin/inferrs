@@ -1,16 +1,21 @@
 //! `inferrs pull` — pre-download a model to the local cache.
 //!
 //! Reference resolution:
-//!   - `oneword`                → OCI pull from docker.io/ai (via Go helper)
+//!   - `oneword`                → OCI pull via `POST /api/pull` on the server
 //!   - `wordone/wordtwo`        → HuggingFace pull (default for org/model)
 //!   - `hf.co/org/model`        → HuggingFace pull
 //!   - `huggingface.co/org/model` → HuggingFace pull
-//!   - `docker.io/org/model`    → OCI pull (via Go helper)
-//!   - `registry.io/org/model`  → OCI pull (via Go helper)
+//!   - `docker.io/org/model`    → OCI pull via `POST /api/pull` on the server
+//!   - `registry.io/org/model`  → OCI pull via `POST /api/pull` on the server
+//!
+//! OCI pulls are delegated to the `inferrs serve` daemon through its
+//! Ollama-compatible `/api/pull` endpoint.  If the server is not running,
+//! it is auto-started (same pattern as `inferrs run`).
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::ffi::{CStr, CString};
+use std::io::Write;
 use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -223,6 +228,9 @@ fn find_in_path(file_name: &str) -> Option<PathBuf> {
 // CLI args
 // ---------------------------------------------------------------------------
 
+/// Default port for the Ollama-compatible API.
+const DEFAULT_PORT: u16 = 17434;
+
 #[derive(Parser, Clone)]
 pub struct PullArgs {
     /// Model reference.
@@ -262,6 +270,41 @@ pub struct PullArgs {
     #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
           value_name = "FORMAT")]
     pub quantize: Option<String>,
+
+    // ── Server connection (OCI pulls only) ────────────────────────────────────
+    /// Address of the `inferrs serve` daemon.
+    /// Overrides `INFERRS_HOST`.  Defaults to `127.0.0.1`.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Port of the `inferrs serve` daemon.
+    /// Overrides the port part of `INFERRS_HOST`.  Defaults to 17434.
+    #[arg(long, default_value_t = DEFAULT_PORT)]
+    pub port: u16,
+}
+
+impl PullArgs {
+    /// Resolve the base URL for the server, matching the pattern used by
+    /// `inferrs run` and `inferrs stop`.
+    fn server_url(&self) -> String {
+        let from_flags = self.host != "127.0.0.1" || self.port != DEFAULT_PORT;
+        if from_flags {
+            return format!("http://{}:{}", self.host, self.port);
+        }
+
+        if let Ok(env) = std::env::var("INFERRS_HOST") {
+            let env = env.trim().to_string();
+            if !env.is_empty() {
+                return if env.starts_with("http://") || env.starts_with("https://") {
+                    env
+                } else {
+                    format!("http://{env}")
+                };
+            }
+        }
+
+        format!("http://{}:{}", self.host, self.port)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,13 +427,154 @@ pub fn oci_bundle_path(reference: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// OCI pull via HTTP — NDJSON progress rendering
+// ---------------------------------------------------------------------------
+
+/// One NDJSON status object from `POST /api/pull` (Ollama-compatible).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[allow(dead_code)]
+struct PullStatus {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    completed: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Format a byte count as a human-readable string (e.g. "1.2 GB").
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Pull an OCI model via the server's `/api/pull` endpoint with streaming
+/// progress, rendering Ollama-style output to the terminal.
+async fn oci_pull_via_server(model: &str, base_url: &str) -> Result<()> {
+    use futures::StreamExt;
+
+    let client = reqwest::Client::new();
+
+    // Ensure the daemon is up, auto-starting it when needed.
+    crate::run::ensure_server_running(&client, base_url).await?;
+
+    let url = format!("{base_url}/api/pull");
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": true,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url} failed"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Server returned {status}: {text}");
+    }
+
+    // Drain the NDJSON stream and render progress.
+    let mut stdout = std::io::stderr();
+    let mut byte_stream = response.bytes_stream();
+    let mut line_buf = String::new();
+    let mut last_was_progress = false;
+
+    while let Some(chunk) = byte_stream.next().await {
+        let chunk = chunk.context("Error reading pull response stream")?;
+        let text = std::str::from_utf8(&chunk).context("Non-UTF-8 bytes in pull response")?;
+        line_buf.push_str(text);
+
+        while let Some(newline_pos) = line_buf.find('\n') {
+            let line = line_buf[..newline_pos].trim().to_string();
+            line_buf.drain(..=newline_pos);
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let status: PullStatus = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Warning: failed to parse pull progress: {e}");
+                    continue;
+                }
+            };
+
+            // Check for errors
+            if let Some(ref err) = status.error {
+                if last_was_progress {
+                    eprintln!(); // newline after progress bar
+                }
+                anyhow::bail!("Pull failed: {err}");
+            }
+
+            // Render progress
+            if let (Some(ref msg), Some(total), Some(completed)) =
+                (&status.status, status.total, status.completed)
+            {
+                if total > 0 {
+                    let pct = (completed as f64 / total as f64 * 100.0).min(100.0);
+                    let bar_width = 30;
+                    let filled = (pct / 100.0 * bar_width as f64) as usize;
+                    let empty = bar_width - filled;
+                    write!(
+                        stdout,
+                        "\r{msg}  {pct:5.1}% [{}>{}] {}/{}  ",
+                        "█".repeat(filled),
+                        "░".repeat(empty),
+                        human_bytes(completed),
+                        human_bytes(total),
+                    )?;
+                    stdout.flush()?;
+                    last_was_progress = true;
+                    continue;
+                }
+            }
+
+            // Status-only line (no progress bar)
+            if let Some(ref msg) = status.status {
+                if last_was_progress {
+                    eprintln!(); // newline after progress bar
+                    last_was_progress = false;
+                }
+                eprintln!("{msg}");
+            }
+        }
+    }
+
+    if last_was_progress {
+        eprintln!(); // final newline after progress bar
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // `inferrs pull` entry point
 // ---------------------------------------------------------------------------
 
-pub fn run(args: PullArgs) -> Result<()> {
+pub async fn run(args: PullArgs) -> Result<()> {
     match classify_reference(&args.model) {
         RefKind::Oci => {
-            // [7] --revision is only meaningful for HuggingFace references.
+            // --revision is only meaningful for HuggingFace references.
             if args.revision != "main" {
                 anyhow::bail!(
                     "--revision is not supported for OCI references \
@@ -401,9 +585,8 @@ pub fn run(args: PullArgs) -> Result<()> {
                 );
             }
 
-            let bundle_path = oci_pull_model(&args.model)?;
-            println!("Pulled {} (OCI)", args.model);
-            println!("  bundle: {}", bundle_path.display());
+            let base_url = args.server_url();
+            oci_pull_via_server(&args.model, &base_url).await?;
         }
         RefKind::HuggingFace => {
             // Strip explicit HF prefixes for the HF Hub API

@@ -554,7 +554,7 @@ async fn main() -> Result<()> {
             bench::run(args)?;
         }
         Commands::Pull(args) => {
-            pull::run(args)?;
+            pull::run(args).await?;
         }
         Commands::Rm(args) => {
             rm::run(args)?;

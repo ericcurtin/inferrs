@@ -280,7 +280,7 @@ struct OaiChunk {
 
 /// Probe the server with `HEAD /` (Ollama heartbeat endpoint).
 /// Returns `true` if the server responded, `false` if connection was refused.
-async fn heartbeat(client: &Client, base_url: &str) -> bool {
+pub async fn heartbeat(client: &Client, base_url: &str) -> bool {
     let url = format!("{base_url}/");
     client.head(&url).send().await.is_ok()
 }
@@ -291,7 +291,7 @@ async fn heartbeat(client: &Client, base_url: &str) -> bool {
 /// the server is not up, spawn `inferrs serve` (no arguments — the bare daemon,
 /// just like `ollama serve`) using the same executable that is currently
 /// running, then poll every 200 ms until it responds (up to 60 s).
-async fn ensure_server_running(client: &Client, base_url: &str) -> Result<()> {
+pub async fn ensure_server_running(client: &Client, base_url: &str) -> Result<()> {
     if heartbeat(client, base_url).await {
         return Ok(());
     }
