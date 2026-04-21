@@ -169,6 +169,268 @@ pub struct BlockQ8K {
 }
 const _: () = assert!(4 + QK_K + QK_K / 16 * 2 == std::mem::size_of::<BlockQ8K>());
 
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ2XS {
+    pub(crate) d: f16,
+    pub(crate) qs: [u16; QK_K / 8],
+    pub(crate) scales: [u8; QK_K / 32],
+}
+const _: () =
+    assert!(2 + (QK_K / 8) * 2 + (QK_K / 32) == std::mem::size_of::<BlockIQ2XS>());
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ3XXS {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; 3 * QK_K / 8],
+}
+const _: () = assert!(2 + 3 * (QK_K / 8) == std::mem::size_of::<BlockIQ3XXS>());
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ4XS {
+    pub(crate) d: f16,
+    pub(crate) scales_h: u16,
+    pub(crate) scales_l: [u8; QK_K / 64],
+    pub(crate) qs: [u8; QK_K / 2],
+}
+const _: () =
+    assert!(2 + 2 + (QK_K / 64) + (QK_K / 2) == std::mem::size_of::<BlockIQ4XS>());
+
+const METAL_QUANTIZED_SRC: &str =
+    include_str!("../../../inferrs-kernels/candle-metal-kernels/src/metal_src/quantized.metal");
+
+fn parse_table_u8<const N: usize>(name: &str) -> [u8; N] {
+    let body = parse_table_body(name);
+    let mut out = [0u8; N];
+    for (idx, token) in body.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        out[idx] = parse_int(token) as u8;
+    }
+    out
+}
+
+fn parse_table_u32<const N: usize>(name: &str) -> [u32; N] {
+    let body = parse_table_body(name);
+    let mut out = [0u32; N];
+    for (idx, token) in body.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        out[idx] = parse_int(token) as u32;
+    }
+    out
+}
+
+fn parse_table_u64<const N: usize>(name: &str) -> [u64; N] {
+    let body = parse_table_body(name);
+    let mut out = [0u64; N];
+    for (idx, token) in body.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        out[idx] = parse_int(token);
+    }
+    out
+}
+
+fn parse_float_table<const N: usize>(name: &str) -> [f32; N] {
+    let marker = format!("{name}[{N}] = {{");
+    let start = METAL_QUANTIZED_SRC
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing table {name}"));
+    let rest = &METAL_QUANTIZED_SRC[start + marker.len()..];
+    let end = rest.find("};").unwrap_or_else(|| panic!("unterminated table {name}"));
+    let body = &rest[..end];
+    let mut out = [0f32; N];
+    for (idx, token) in body.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        out[idx] = token
+            .trim_end_matches('f')
+            .parse::<f32>()
+            .unwrap_or_else(|_| panic!("bad float token {token} in {name}"));
+    }
+    out
+}
+
+fn parse_table_body(name: &str) -> &'static str {
+    let marker = format!("{name}, ");
+    let start = METAL_QUANTIZED_SRC
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing table {name}"));
+    let rest = &METAL_QUANTIZED_SRC[start..];
+    let body_start = rest
+        .find('\n')
+        .map(|i| i + 1)
+        .unwrap_or_else(|| panic!("malformed table {name}"));
+    let rest = &rest[body_start..];
+    let end = rest
+        .find("GGML_TABLE_END()")
+        .unwrap_or_else(|| panic!("unterminated table {name}"));
+    &rest[..end]
+}
+
+fn parse_int(token: &str) -> u64 {
+    if let Some(hex) = token.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).unwrap_or_else(|_| panic!("bad hex token {token}"))
+    } else {
+        token
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("bad int token {token}"))
+    }
+}
+
+fn kmask_iq2xs() -> &'static [u8; 8] {
+    static TABLE: std::sync::OnceLock<[u8; 8]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parse_table_u8("kmask_iq2xs"))
+}
+
+fn ksigns_iq2xs() -> &'static [u8; 128] {
+    static TABLE: std::sync::OnceLock<[u8; 128]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parse_table_u8("ksigns_iq2xs"))
+}
+
+fn iq2xs_grid() -> &'static [u64; 512] {
+    static TABLE: std::sync::OnceLock<[u64; 512]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parse_table_u64("iq2xs_grid"))
+}
+
+fn iq3xxs_grid() -> &'static [u32; 256] {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parse_table_u32("iq3xxs_grid"))
+}
+
+fn kvalues_iq4nl_f() -> &'static [f32; 16] {
+    static TABLE: std::sync::OnceLock<[f32; 16]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parse_float_table("kvalues_iq4nl_f"))
+}
+
+fn sign(mask: u8, bit: usize) -> f32 {
+    if mask & kmask_iq2xs()[bit] != 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+impl GgmlType for BlockIQ2XS {
+    const DTYPE: GgmlDType = GgmlDType::IQ2XS;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        for (block, y) in group_for_dequantization(xs, ys) {
+            let d = block.d.to_f32();
+            for ib32 in 0..(QK_K / 32) {
+                let q2 = &block.qs[4 * ib32..4 * ib32 + 4];
+                for il in 0..2 {
+                    let dl = d * (0.5 + ((block.scales[ib32] >> (4 * il)) & 0xf) as f32) * 0.25;
+                    for part in 0..2 {
+                        let packed = q2[2 * il + part];
+                        let grid = iq2xs_grid()[(packed & 511) as usize].to_le_bytes();
+                        let signs = ksigns_iq2xs()[(packed >> 9) as usize];
+                        let base = ib32 * 32 + il * 16 + part * 8;
+                        for i in 0..8 {
+                            y[base + i] = dl * grid[i] as f32 * sign(signs, i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("IQ2_XS quantization is not implemented")
+    }
+
+    fn vec_dot(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        panic!("IQ2_XS vec_dot is not implemented")
+    }
+
+    fn vec_dot_unopt(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        panic!("IQ2_XS vec_dot is not implemented")
+    }
+}
+
+impl GgmlType for BlockIQ3XXS {
+    const DTYPE: GgmlDType = GgmlDType::IQ3XXS;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        for (block, y) in group_for_dequantization(xs, ys) {
+            let d = block.d.to_f32();
+            for ib32 in 0..(QK_K / 32) {
+                let q3 = &block.qs[8 * ib32..8 * ib32 + 8];
+                let gas_offset = QK_K / 4 + 4 * ib32;
+                let aux32 = LittleEndian::read_u32(&block.qs[gas_offset..gas_offset + 4]);
+                for il in 0..2 {
+                    let dl = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                    let signs_lo = ksigns_iq2xs()[((aux32 >> (14 * il)) & 127) as usize];
+                    let signs_hi = ksigns_iq2xs()[((aux32 >> (14 * il + 7)) & 127) as usize];
+                    for pair in 0..2 {
+                        let grid1 = iq3xxs_grid()[q3[4 * il + 2 * pair] as usize].to_le_bytes();
+                        let grid2 =
+                            iq3xxs_grid()[q3[4 * il + 2 * pair + 1] as usize].to_le_bytes();
+                        let base = ib32 * 32 + il * 16 + pair * 8;
+                        let signs = if pair == 0 { signs_lo } else { signs_hi };
+                        for i in 0..4 {
+                            y[base + i] = dl * grid1[i] as f32 * sign(signs, i);
+                            y[base + 4 + i] = dl * grid2[i] as f32 * sign(signs, i + 4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("IQ3_XXS quantization is not implemented")
+    }
+
+    fn vec_dot(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        panic!("IQ3_XXS vec_dot is not implemented")
+    }
+
+    fn vec_dot_unopt(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        panic!("IQ3_XXS vec_dot is not implemented")
+    }
+}
+
+impl GgmlType for BlockIQ4XS {
+    const DTYPE: GgmlDType = GgmlDType::IQ4XS;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        for (block, y) in group_for_dequantization(xs, ys) {
+            let d_base = block.d.to_f32();
+            for ib32 in 0..(QK_K / 32) {
+                let ls = ((block.scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf)
+                    | ((((block.scales_h >> (2 * ib32)) & 0x3) as u8) << 4);
+                let d = d_base * (ls as i32 - 32) as f32;
+                let q4 = &block.qs[16 * ib32..16 * ib32 + 16];
+                for il in 0..2 {
+                    for group in 0..4 {
+                        let offset = 4 * group;
+                        let aux32 = LittleEndian::read_u32(&q4[offset..offset + 4]);
+                        let bytes = ((aux32 >> (4 * il)) & 0x0f0f0f0f).to_le_bytes();
+                        let base = ib32 * 32 + il * 16 + group * 4;
+                        for i in 0..4 {
+                            y[base + i] = d * kvalues_iq4nl_f()[bytes[i] as usize];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("IQ4_XS quantization is not implemented")
+    }
+
+    fn vec_dot(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        panic!("IQ4_XS vec_dot is not implemented")
+    }
+
+    fn vec_dot_unopt(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        panic!("IQ4_XS vec_dot is not implemented")
+    }
+}
+
 impl GgmlType for BlockQ4_0 {
     const DTYPE: GgmlDType = GgmlDType::Q4_0;
     const BLCK_SIZE: usize = QK4_0;

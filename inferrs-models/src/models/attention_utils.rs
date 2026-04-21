@@ -423,27 +423,33 @@ pub fn concat_kv_cache(
 
 /// Append `k`/`v` to the per-layer KV cache, with optional TurboQuant compression.
 ///
-/// Three-path strategy:
-/// - **Prefill** (`seqlen_offset == 0 && t > 1`): plain concat — avoids the TQ
-///   overhead during the long prompt phase.
-/// - **First decode step** (TQ enabled, cache empty): adopt the prefill tensors into
-///   TQ's warmup buffer (zero-copy), then append + dequantize.
-/// - **Subsequent decode / no TQ**: plain concat.
+/// When TQ is enabled, all forwards (prefill and decode) go through TQ:
+/// - **Prefill** (`t > 1`): `TurboQuantKvCache::append` stores tokens in the warmup
+///   buffer via `slice_set` into a pre-allocated GPU tensor — no `Tensor::cat`
+///   allocation per chunk, no uncompressed bf16 accumulation in `kv_cache`.
+/// - **Decode** (`t == 1`): append + dequantize; TQ flushes to compressed storage
+///   once `warmup_seq_len` is exceeded.
+///
+/// `kv_cache` is unused when TQ is active.  The `adopt_warmup_buffer` call on
+/// the first decode step is a safety net for model impls that also write to
+/// `kv_cache` directly; in the normal path it is a no-op.
+///
+/// Without TQ: plain GPU concat for all token counts.
 ///
 /// Returns the full `(k, v)` to use for attention, shaped
 /// `[b, num_kv_heads, total_seq_len, head_dim]`.
 pub fn append_kv_tq(
     k: Tensor,
     v: Tensor,
-    seqlen_offset: usize,
+    _seqlen_offset: usize,
     t: usize,
     kv_cache: &mut Option<(Tensor, Tensor)>,
     tq_cache: &mut Option<TurboQuantKvCache>,
 ) -> Result<(Tensor, Tensor)> {
-    if seqlen_offset == 0 && t > 1 {
-        concat_kv_cache(k, v, kv_cache)
-    } else if let Some(tq) = tq_cache {
-        if tq.is_empty() {
+    if let Some(tq) = tq_cache {
+        // Safety net: if a model impl wrote to kv_cache during prefill, adopt it
+        // into TQ on the first decode step rather than losing those tokens.
+        if t == 1 && tq.is_empty() {
             if let Some((k_cache, v_cache)) = kv_cache.take() {
                 tq.adopt_warmup_buffer(k_cache, v_cache)?;
             }

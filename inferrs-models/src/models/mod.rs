@@ -10,6 +10,9 @@ pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_5_linear_attn_scan;
+pub mod qwen3_6;
+pub mod qwen3_6_linear_attn_scan;
+pub(crate) mod qwen36_moe;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -630,6 +633,107 @@ impl CausalLM for Qwen35ModelWrapper {
     }
 }
 
+/// A Qwen3.6 model wrapper.
+struct Qwen36ModelWrapper {
+    inner: qwen3_6::Qwen35Model,
+}
+
+impl CausalLM for Qwen36ModelWrapper {
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        self.inner.forward(input_ids, seqlen_offset)
+    }
+
+    fn forward_with_hidden(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        if self.inner.mtp.is_some() {
+            let (logits, hidden) = self
+                .inner
+                .forward_returning_hidden(input_ids, seqlen_offset)?;
+            Ok((logits, Some(hidden)))
+        } else {
+            let logits = self.inner.forward(input_ids, seqlen_offset)?;
+            Ok((logits, None))
+        }
+    }
+
+    fn mtp_draft(
+        &mut self,
+        hidden: &Tensor,
+        anchor_token: u32,
+        num_draft: usize,
+        _seqlen_offset: usize,
+    ) -> Option<Result<MtpDraftTokens>> {
+        let mtp = self.inner.mtp.as_mut()?;
+        mtp.clear_kv_cache();
+
+        let mut results = Vec::with_capacity(num_draft);
+        let mut cur_hidden = hidden.clone();
+        let mut cur_token = anchor_token;
+        let embed_weight = self.inner.embed_tokens.embeddings().clone();
+
+        for i in 0..num_draft {
+            let embed = match qwen3_6::MtpModule::embed_token(&embed_weight, cur_token) {
+                Ok(e) => e,
+                Err(e) => return Some(Err(e)),
+            };
+            let (draft_logits, draft_hidden) = match mtp.draft_step(&cur_hidden, &embed, i) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            let flat = match draft_logits.squeeze(0).and_then(|t| t.squeeze(0)) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let logits_vec: Vec<f32> = match flat
+                .to_dtype(candle_core::DType::F32)
+                .and_then(|t| t.to_vec1())
+            {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let draft_token = logits_vec
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+
+            let mut one_hot = vec![0.0f32; logits_vec.len()];
+            one_hot[draft_token as usize] = 1.0;
+            results.push((draft_token, one_hot));
+            cur_hidden = draft_hidden;
+            cur_token = draft_token;
+        }
+        Some(Ok(results))
+    }
+
+    fn forward_full_logits(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Option<Result<Tensor>> {
+        Some(self.inner.forward_full(input_ids, seqlen_offset))
+    }
+
+    fn forward_paged(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &BlockTable,
+        kv_store: &mut PagedKvStore,
+    ) -> Result<Tensor> {
+        self.inner
+            .forward_paged(input_ids, seqlen_offset, block_table, kv_store)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.inner.clear_kv_cache();
+    }
+}
+
 /// A lazy [`candle_nn::var_builder::SimpleBackend`] backed by a GGUF file.
 ///
 /// Tensors are dequantized on demand — only when the model calls
@@ -820,7 +924,9 @@ fn gguf_rename_tensor(name: &str, arch: &ModelArchitecture) -> String {
     //   Qwen3.5, Gemma4
     // All others nest under `model.*`.
     let layer_prefix = match arch {
-        ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => "model.language_model.",
+        ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36 | ModelArchitecture::Gemma4 => {
+            "model.language_model."
+        }
         _ => "model.",
     };
 
@@ -838,8 +944,9 @@ fn gguf_rename_tensor(name: &str, arch: &ModelArchitecture) -> String {
         return "output_norm.weight".into();
     }
 
-    // lm_head → output  (only models with untied heads have this tensor)
-    if name == "lm_head.weight" {
+    // lm_head → output.weight (separate output projection when tie_word_embeddings=false)
+    let lm_path = format!("{layer_prefix}lm_head.weight");
+    if name == lm_path {
         return "output.weight".into();
     }
 
@@ -874,6 +981,31 @@ fn gguf_rename_tensor(name: &str, arch: &ModelArchitecture) -> String {
 /// Map a single layer suffix (e.g. `self_attn.q_proj.weight`) to its GGUF
 /// equivalent (e.g. `attn_q.weight`).
 fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
+    // Qwen3.6 external GGUF (llama.cpp): linear layers use fused `attn_qkv` + `attn_gate`,
+    // Mamba-style `ssm_*` tensors, split MoE `ffn_gate_exps` / `ffn_up_exps`, and
+    // `post_attention_norm` (not `ffn_norm`).  HF-style names are unchanged.
+    if matches!(arch, ModelArchitecture::Qwen36) {
+        if let Some(m) = match suffix {
+            "linear_attn.in_proj_qkv.weight" => Some("attn_qkv.weight"),
+            "linear_attn.in_proj_z.weight" => Some("attn_gate.weight"),
+            "linear_attn.in_proj_a.weight" => Some("ssm_alpha.weight"),
+            "linear_attn.in_proj_b.weight" => Some("ssm_beta.weight"),
+            "linear_attn.A_log" => Some("ssm_a"),
+            "linear_attn.conv1d.weight" => Some("ssm_conv1d.weight"),
+            "linear_attn.dt_bias" => Some("ssm_dt.bias"),
+            "linear_attn.norm.weight" => Some("ssm_norm.weight"),
+            "linear_attn.out_proj.weight" => Some("ssm_out.weight"),
+            "mlp.gate_exps.weight" => Some("ffn_gate_exps.weight"),
+            "mlp.up_exps.weight" => Some("ffn_up_exps.weight"),
+            // Dense hybrid layers (fused SwiGLU gate+up, no `_exps` suffix — see llama.cpp
+            // `pattern_ffn_gate_up_weight` matching `ffn_gate_up(_exps)?`).
+            "mlp.gate_up.weight" => Some("ffn_gate_up.weight"),
+            _ => None,
+        } {
+            return m.to_string();
+        }
+    }
+
     // ── Attention projections ────────────────────────────────────────────
     let mapped = match suffix {
         // Separate Q/K/V (Qwen2/3/3.5, Gemma2/3/4)
@@ -896,17 +1028,28 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "mlp.gate_proj.weight" => "ffn_gate.weight",
         "mlp.up_proj.weight" => "ffn_up.weight",
         "mlp.down_proj.weight" => "ffn_down.weight",
+        // Qwen3.5 / Qwen3.6 MoE (llama.cpp)
+        "mlp.gate_inp.weight" => "ffn_gate_inp.weight",
+        "mlp.gate_inp.bias" => "ffn_gate_inp.bias",
+        "mlp.gate_up_exps.weight" => "ffn_gate_up_exps.weight",
+        "mlp.down_exps.weight" => "ffn_down_exps.weight",
+        "mlp.gate_inp_shexp.weight" => "ffn_gate_inp_shexp.weight",
+        "mlp.gate_shexp.weight" => "ffn_gate_shexp.weight",
+        "mlp.up_shexp.weight" => "ffn_up_shexp.weight",
+        "mlp.down_shexp.weight" => "ffn_down_shexp.weight",
         // Phi3 fused gate_up_proj
         "mlp.gate_up_proj.weight" => "ffn_up.weight",
 
         // ── Norms ────────────────────────────────────────────────────────
         "input_layernorm.weight" => "attn_norm.weight",
         "post_attention_layernorm.weight" => {
-            // Gemma2/3/4 use this as "post_attention_norm", everyone else as "ffn_norm"
+            // Gemma2/3/4 and Qwen3.6 (llama.cpp external GGUF) use post_attention_norm;
+            // Qwen3.5 and older Qwen2-style GGUFs keep ffn_norm.
             match arch {
                 ModelArchitecture::Gemma2
                 | ModelArchitecture::Gemma3
                 | ModelArchitecture::Gemma4 => "post_attention_norm.weight",
+                ModelArchitecture::Qwen36 => "post_attention_norm.weight",
                 _ => "ffn_norm.weight",
             }
         }
@@ -927,6 +1070,10 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "linear_attn.in_proj_a.weight" => "linear_attn_in_proj_a.weight",
         "linear_attn.in_proj_b.weight" => "linear_attn_in_proj_b.weight",
         "linear_attn.out_proj.weight" => "linear_attn_out_proj.weight",
+        "linear_attn.conv1d.weight" => "linear_attn.conv1d.weight",
+        "linear_attn.A_log" => "linear_attn.A_log",
+        "linear_attn.dt_bias" => "linear_attn.dt_bias",
+        "linear_attn.norm.weight" => "linear_attn.norm.weight",
 
         // Fallback: pass through the suffix unchanged so that `blk.{idx}.`
         // prefix is still applied.  This handles any tensors not explicitly
@@ -941,7 +1088,9 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
 /// model code looking up HF-style paths can find the right tensors.
 fn gguf_reverse_rename_tensor(gguf_name: &str, arch: &ModelArchitecture) -> String {
     let layer_prefix = match arch {
-        ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => "model.language_model.",
+        ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36 | ModelArchitecture::Gemma4 => {
+            "model.language_model."
+        }
         _ => "model.",
     };
 
@@ -949,7 +1098,7 @@ fn gguf_reverse_rename_tensor(gguf_name: &str, arch: &ModelArchitecture) -> Stri
     match gguf_name {
         "token_embd.weight" => return format!("{layer_prefix}embed_tokens.weight"),
         "output_norm.weight" => return format!("{layer_prefix}norm.weight"),
-        "output.weight" => return "lm_head.weight".into(),
+        "output.weight" => return format!("{layer_prefix}lm_head.weight"),
         _ => {}
     }
 
@@ -982,6 +1131,26 @@ fn gguf_reverse_rename_tensor(gguf_name: &str, arch: &ModelArchitecture) -> Stri
 
 /// Reverse-map a GGUF block suffix to its HF equivalent.
 fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
+    if matches!(arch, ModelArchitecture::Qwen36) {
+        if let Some(m) = match suffix {
+            "attn_qkv.weight" => Some("linear_attn.in_proj_qkv.weight"),
+            "attn_gate.weight" => Some("linear_attn.in_proj_z.weight"),
+            "ssm_alpha.weight" => Some("linear_attn.in_proj_a.weight"),
+            "ssm_beta.weight" => Some("linear_attn.in_proj_b.weight"),
+            "ssm_a" => Some("linear_attn.A_log"),
+            "ssm_conv1d.weight" => Some("linear_attn.conv1d.weight"),
+            "ssm_dt.bias" => Some("linear_attn.dt_bias"),
+            "ssm_norm.weight" => Some("linear_attn.norm.weight"),
+            "ssm_out.weight" => Some("linear_attn.out_proj.weight"),
+            "ffn_gate_exps.weight" => Some("mlp.gate_exps.weight"),
+            "ffn_up_exps.weight" => Some("mlp.up_exps.weight"),
+            "ffn_gate_up.weight" => Some("mlp.gate_up.weight"),
+            _ => None,
+        } {
+            return m.to_string();
+        }
+    }
+
     let mapped = match suffix {
         "attn_q.weight" => "self_attn.q_proj.weight",
         "attn_q.bias" => "self_attn.q_proj.bias",
@@ -1000,6 +1169,14 @@ fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
             _ => "mlp.up_proj.weight",
         },
         "ffn_down.weight" => "mlp.down_proj.weight",
+        "ffn_gate_inp.weight" => "mlp.gate_inp.weight",
+        "ffn_gate_inp.bias" => "mlp.gate_inp.bias",
+        "ffn_gate_up_exps.weight" => "mlp.gate_up_exps.weight",
+        "ffn_down_exps.weight" => "mlp.down_exps.weight",
+        "ffn_gate_inp_shexp.weight" => "mlp.gate_inp_shexp.weight",
+        "ffn_gate_shexp.weight" => "mlp.gate_shexp.weight",
+        "ffn_up_shexp.weight" => "mlp.up_shexp.weight",
+        "ffn_down_shexp.weight" => "mlp.down_shexp.weight",
         "attn_norm.weight" => "input_layernorm.weight",
         "ffn_norm.weight" => match arch {
             ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
@@ -1013,6 +1190,16 @@ fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "proj.weight" => "per_layer_projection.weight",
         "post_norm.weight" => "post_per_layer_input_norm.weight",
         "layer_output_scale.weight" => "layer_scalar",
+        // Qwen3.5 / Qwen3.6 linear-attn (GGUF uses underscored names)
+        "linear_attn_in_proj_qkv.weight" => "linear_attn.in_proj_qkv.weight",
+        "linear_attn_in_proj_z.weight" => "linear_attn.in_proj_z.weight",
+        "linear_attn_in_proj_a.weight" => "linear_attn.in_proj_a.weight",
+        "linear_attn_in_proj_b.weight" => "linear_attn.in_proj_b.weight",
+        "linear_attn_out_proj.weight" => "linear_attn.out_proj.weight",
+        "linear_attn.conv1d.weight" => "linear_attn.conv1d.weight",
+        "linear_attn.A_log" => "linear_attn.A_log",
+        "linear_attn.dt_bias" => "linear_attn.dt_bias",
+        "linear_attn.norm.weight" => "linear_attn.norm.weight",
         // Passthrough for unknown suffixes
         other => return other.to_string(),
     };
@@ -1029,6 +1216,7 @@ pub fn load_model(
     dtype: DType,
     device: &Device,
     turbo_quant_bits: Option<u8>,
+    moe_top_k_override: Option<usize>,
     config_path: &Path,
 ) -> Result<Box<dyn CausalLM>> {
     tracing::info!("Loading model weights ({:?} architecture)...", arch);
@@ -1073,7 +1261,7 @@ pub fn load_model(
     // twice (quantized + dequantized), doubling memory usage.
     let qvb: Option<QGgufVarBuilder> = if matches!(
         arch,
-        ModelArchitecture::Gemma4 | ModelArchitecture::Qwen35
+        ModelArchitecture::Gemma4 | ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36
     ) {
         gguf_path.and_then(|p| {
             match QGgufVarBuilder::from_gguf(p, device) {
@@ -1115,7 +1303,10 @@ pub fn load_model(
     // TurboQuant is on by default; warn if this architecture doesn't support it.
     if turbo_quant_bits.is_some() {
         match arch {
-            ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => {}
+            ModelArchitecture::Qwen3
+            | ModelArchitecture::Qwen35
+            | ModelArchitecture::Qwen36
+            | ModelArchitecture::Gemma4 => {}
             other => {
                 tracing::warn!(
                     "--turbo-quant is not supported for {:?} and will be ignored. \
@@ -1192,6 +1383,22 @@ pub fn load_model(
             );
             Box::new(Qwen35ModelWrapper {
                 inner: qwen3_5::Qwen35Model::new(&config, vb, qvb.as_ref())?,
+            })
+        }
+        ModelArchitecture::Qwen36 => {
+            let mut config = raw_config.to_qwen36_config(dtype, device.clone(), turbo_quant_bits);
+            if let Some(k) = moe_top_k_override {
+                config.moe_top_k = k;
+            }
+            tracing::info!(
+                "Qwen3.6 config: {} layers, {} attn heads, {} hidden, {} kv_heads",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.num_key_value_heads,
+            );
+            Box::new(Qwen36ModelWrapper {
+                inner: qwen3_6::Qwen35Model::new(&config, vb, qvb.as_ref())?,
             })
         }
         ModelArchitecture::Gemma4 => {
@@ -1425,9 +1632,8 @@ mod tests {
                     "model.layers.9.mlp.down_proj.weight",
                     "blk.9.ffn_down.weight",
                 ),
-                // ── lm_head (Gemma3 has tied embeddings; but the rename function
-                // maps any lm_head.weight → output.weight regardless of arch)
-                ("lm_head.weight", "output.weight"),
+                // lm_head lives under model.* for Gemma3
+                ("model.lm_head.weight", "output.weight"),
                 // ── passthrough ────────────────────────────────────────────
                 (
                     "model.some_future_tensor.weight",
@@ -1532,8 +1738,7 @@ mod tests {
                     "model.language_model.layers.1.layer_scalar",
                     "blk.1.layer_output_scale.weight",
                 ),
-                // ── lm_head (mapped globally to output.weight regardless of arch) ──
-                ("lm_head.weight", "output.weight"),
+                ("model.language_model.lm_head.weight", "output.weight"),
                 // ── passthrough ────────────────────────────────────────────
                 (
                     "model.some_future_tensor.weight",
@@ -1551,7 +1756,7 @@ mod tests {
                 // ── globals ────────────────────────────────────────────────
                 ("model.embed_tokens.weight", "token_embd.weight"),
                 ("model.norm.weight", "output_norm.weight"),
-                ("lm_head.weight", "output.weight"),
+                ("model.lm_head.weight", "output.weight"),
                 // ── fused QKV and output projection ───────────────────────
                 (
                     "model.layers.0.self_attn.qkv_proj.weight",
@@ -1596,7 +1801,7 @@ mod tests {
                 // ── globals ────────────────────────────────────────────────
                 ("model.embed_tokens.weight", "token_embd.weight"),
                 ("model.norm.weight", "output_norm.weight"),
-                ("lm_head.weight", "output.weight"),
+                ("model.lm_head.weight", "output.weight"),
                 // ── attention ──────────────────────────────────────────────
                 (
                     "model.layers.0.self_attn.q_proj.weight",
@@ -1667,6 +1872,10 @@ mod tests {
                     "token_embd.weight",
                 ),
                 ("model.language_model.norm.weight", "output_norm.weight"),
+                (
+                    "model.language_model.lm_head.weight",
+                    "output.weight",
+                ),
                 // ── full-attention layer ───────────────────────────────────
                 (
                     "model.language_model.layers.0.self_attn.q_proj.weight",
@@ -1740,6 +1949,48 @@ mod tests {
                 (
                     "model.some_future_tensor.weight",
                     "model.some_future_tensor.weight",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_qwen36_rename_table() {
+        check(
+            &ModelArchitecture::Qwen36,
+            &[
+                (
+                    "model.language_model.lm_head.weight",
+                    "output.weight",
+                ),
+                (
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                    "blk.0.attn_qkv.weight",
+                ),
+                (
+                    "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+                    "blk.0.attn_gate.weight",
+                ),
+                (
+                    "model.language_model.layers.0.linear_attn.A_log",
+                    "blk.0.ssm_a",
+                ),
+                (
+                    "model.language_model.layers.0.post_attention_layernorm.weight",
+                    "blk.0.post_attention_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.0.mlp.gate_exps.weight",
+                    "blk.0.ffn_gate_exps.weight",
+                ),
+                (
+                    "model.language_model.layers.0.mlp.up_exps.weight",
+                    "blk.0.ffn_up_exps.weight",
+                ),
+                // Full-attention layers still use split Q/K/V (not attn_qkv).
+                (
+                    "model.language_model.layers.3.self_attn.q_proj.weight",
+                    "blk.3.attn_q.weight",
                 ),
             ],
         );

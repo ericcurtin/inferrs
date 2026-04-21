@@ -19,9 +19,11 @@ pub enum Id {
     Sort,
     Ternary,
     Unary,
+    /// IQ2_XS / IQ3_XX / IQ4_XS kernels (`iq_dequant.cu`), separate TU from `quantized.cu`.
+    IqDequant,
 }
 
-pub const ALL_IDS: [Id; 14] = [
+pub const ALL_IDS: [Id; 15] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -36,6 +38,7 @@ pub const ALL_IDS: [Id; 14] = [
     Id::Sort,
     Id::Ternary,
     Id::Unary,
+    Id::IqDequant,
 ];
 
 pub struct Module {
@@ -87,5 +90,6 @@ mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);
 mdl!(TERNARY, Ternary);
 mdl!(UNARY, Unary);
+mdl!(IQ_DEQUANT, IqDequant);
 
 pub mod ffi;

@@ -397,13 +397,41 @@ impl QGgufVarBuilder {
         self.load_qtensor(&name).ok().flatten()
     }
 
+    /// True if the GGUF metadata lists this tensor (after HF→GGUF name remap).
+    ///
+    /// Does **not** load weights — use this for routing decisions.  `get_qtensor_named`
+    /// loads into VRAM/RAM; using it only to test presence can mis-classify layers when
+    /// allocation fails (e.g. transient OOM) as `None`.
+    pub fn has_qtensor_named(&self, suffix: &str) -> bool {
+        let name = self.full_name(suffix);
+        let gguf_name: std::borrow::Cow<str> = if let Some(g) = self.name_remap.get(&name) {
+            std::borrow::Cow::Borrowed(g.as_str())
+        } else {
+            std::borrow::Cow::Borrowed(name.as_str())
+        };
+        self.content.tensor_infos.contains_key(gguf_name.as_ref())
+    }
+
     /// Build a bias-free `QLinear` from the "weight" tensor at the current path.
     ///
     /// Errors if the tensor is absent from the GGUF file.
     pub fn qlinear_weight(&self) -> Result<QLinear> {
         let name = self.full_name("weight");
         match self.load_qtensor(&name)? {
-            Some(qt) => QLinear::from_qtensor(qt, None),
+            Some(qt) => {
+                if (qt.dtype().requires_cpu_fallback() && !matches!(self.device, Device::Cuda(_)))
+                    || qt.rank() == 1
+                {
+                    // IQ types without CUDA kernels: dequantize on the target device.
+                    // 1-D weights (e.g. ffn_gate_inp_shexp stored as [in_features] in some
+                    // GGUFs) must be unsqueezed to [1, in_features] so QMatMul can call .t().
+                    let weight = qt.dequantize(&self.device)?;
+                    let weight = if weight.rank() == 1 { weight.unsqueeze(0)? } else { weight };
+                    Ok(QLinear::from_tensor(weight, None))
+                } else {
+                    QLinear::from_qtensor(qt, None)
+                }
+            }
             None => candle_core::bail!("QGgufVarBuilder: tensor not found: {name}"),
         }
     }
@@ -412,7 +440,23 @@ impl QGgufVarBuilder {
     pub fn try_qlinear_weight(&self) -> Option<Result<QLinear>> {
         let name = self.full_name("weight");
         match self.load_qtensor(&name) {
-            Ok(Some(qt)) => Some(QLinear::from_qtensor(qt, None)),
+            Ok(Some(qt)) => Some(
+                if (qt.dtype().requires_cpu_fallback() && !matches!(self.device, Device::Cuda(_)))
+                    || qt.rank() == 1
+                {
+                    qt.dequantize(&self.device)
+                        .and_then(|weight| {
+                            if weight.rank() == 1 {
+                                weight.unsqueeze(0)
+                            } else {
+                                Ok(weight)
+                            }
+                        })
+                        .map(|weight| QLinear::from_tensor(weight, None))
+                } else {
+                    QLinear::from_qtensor(qt, None)
+                },
+            ),
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }

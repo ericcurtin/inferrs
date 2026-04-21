@@ -33,7 +33,7 @@ extern "C" {
         size_m: i32,
         size_n: i32,
         size_k: i32,
-        gguf_dtype: i32, // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5  (for weights)
+        gguf_dtype: i32, // Q8_0: 0, Q4K: 1, Q2K: 2, Q3K: 3, Q5K: 4, Q6K: 5, IQ2_XS: 6, IQ3_XXS: 7, IQ4_XS: 8
         stream: i64,
     );
 

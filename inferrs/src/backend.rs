@@ -17,6 +17,9 @@
 //!
 //! If a probe succeeds the matching `candle_core::Device` variant is returned.
 //! The caller (`resolve_device`) uses this to construct the actual device.
+//! On Linux and Windows x86_64, `resolve_device`'s `auto` mode still tries
+//! `Device::new_cuda(0)` after plugin probing so CUDA works without these
+//! `.so` files (they are optional packaging).
 //!
 //! ## Platform support matrix
 //!

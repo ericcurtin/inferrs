@@ -136,7 +136,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
     )?;
 
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
+    let arch = raw_config.detect_architecture(Some(model_id))?;
     tracing::info!("Detected architecture: {:?}", arch);
 
     let max_seq_len = if args.max_seq_len > 0 {
@@ -169,6 +169,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
             dtype,
             &device,
             args.turbo_quant.0,
+            args.moe_top_k,
             &model_files.config_path,
         );
 
@@ -184,6 +185,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         device.clone(),
         args.max_batch_size,
         args.max_tokens_per_step,
+        args.prefill_chunk_tokens,
     );
 
     engine = attach_paged_kv_if_requested(
@@ -1298,6 +1300,8 @@ pub struct Engine {
     max_batch_size: usize,
     #[allow(dead_code)]
     max_tokens_per_step: usize,
+    /// When > 0, split long prompt prefills into multiple forwards (VRAM).
+    prefill_chunk_tokens: usize,
     /// When `Some`, paged-attention is active.
     paged: Option<PagedState>,
     /// Pre-computed UTF-8 byte string for every token ID.
@@ -1330,6 +1334,7 @@ impl Engine {
         device: Device,
         max_batch_size: usize,
         max_tokens_per_step: usize,
+        prefill_chunk_tokens: usize,
     ) -> Self {
         let stop_token_ids = tokenizer.stop_token_ids.clone();
         Self {
@@ -1339,6 +1344,7 @@ impl Engine {
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step,
+            prefill_chunk_tokens,
             paged: None,
             // Defer the vocab scan to the first grammar-constrained request so
             // it does not add ~100 ms to every server startup.
@@ -1387,6 +1393,7 @@ impl Engine {
             stop_token_ids,
             max_batch_size,
             max_tokens_per_step: _,
+            prefill_chunk_tokens,
             paged,
             token_bytes: token_bytes_opt,
         } = self;
@@ -1430,14 +1437,13 @@ impl Engine {
                         }
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
-                        // If the prompt ends with a thinking delimiter (e.g. the
-                        // server injected <|think|> for think=true), the model
-                        // is already "inside" thinking and the first output token
-                        // will be reasoning content, not a delimiter.
-                        if let Some(&last) = seq.prompt_tokens.last() {
-                            if seq.think_filter.is_open_delimiter(last) {
-                                seq.think_filter.set_in_think(true);
-                            }
+                        // If the prompt ends with a thinking open delimiter (e.g.
+                        // <think>\n injected for enable_thinking=true), the model
+                        // is already inside a thinking block. Scan the last few tokens
+                        // since the delimiter may be followed by a newline token.
+                        let tail = seq.prompt_tokens.len().saturating_sub(4);
+                        if seq.prompt_tokens[tail..].iter().any(|&t| seq.think_filter.is_open_delimiter(t)) {
+                            seq.think_filter.set_in_think(true);
                         }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens, batch_size={})",
@@ -1467,10 +1473,9 @@ impl Engine {
                         }
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
-                        if let Some(&last) = seq.prompt_tokens.last() {
-                            if seq.think_filter.is_open_delimiter(last) {
-                                seq.think_filter.set_in_think(true);
-                            }
+                        let tail = seq.prompt_tokens.len().saturating_sub(4);
+                        if seq.prompt_tokens[tail..].iter().any(|&t| seq.think_filter.is_open_delimiter(t)) {
+                            seq.think_filter.set_in_think(true);
                         }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens)",
@@ -1669,6 +1674,7 @@ impl Engine {
                         &seq.prompt_tokens,
                         seq.block_table.as_mut(),
                         paged.as_mut(),
+                        prefill_chunk_tokens,
                     )
                 } else {
                     // Decode: generate the next token.
@@ -2077,8 +2083,8 @@ impl Engine {
         prompt_tokens: &[u32],
         block_table: Option<&mut BlockTable>,
         paged: Option<&mut PagedState>,
+        chunk_len: usize,
     ) -> Result<Tensor> {
-        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
         match (block_table, paged) {
             (Some(bt), Some(ps)) => {
                 // Hybrid prefill: run the standard (non-paged, contiguous) forward
@@ -2086,7 +2092,14 @@ impl Engine {
                 // paged store.  This avoids per-layer scatter/gather overhead during
                 // prefill, which was causing a 10-20x TTFT regression vs vllm/llama.
                 model.clear_kv_cache();
-                let logits = model.forward(&input_ids, 0)?;
+                let logits =
+                    Self::prefill_forward_chunked_concat(model, device, prompt_tokens, chunk_len)?;
+                if chunk_len > 0 && prompt_tokens.len() > chunk_len {
+                    tracing::debug!(
+                        "chunked hybrid prefill: {} prompt tokens, chunk_len={chunk_len}",
+                        prompt_tokens.len()
+                    );
+                }
 
                 // Allocate paged blocks for all prompt positions.
                 for pos in 0..prompt_tokens.len() {
@@ -2103,7 +2116,15 @@ impl Engine {
             }
             _ => {
                 model.clear_kv_cache();
-                model.forward(&input_ids, 0)
+                let logits =
+                    Self::prefill_forward_chunked_concat(model, device, prompt_tokens, chunk_len)?;
+                if chunk_len > 0 && prompt_tokens.len() > chunk_len {
+                    tracing::debug!(
+                        "chunked prefill: {} prompt tokens, chunk_len={chunk_len}",
+                        prompt_tokens.len()
+                    );
+                }
+                Ok(logits)
             }
         }
     }
@@ -2306,16 +2327,60 @@ impl Engine {
         Ok(())
     }
 
-    /// Run a prefill forward pass through the paged KV store.
-    fn paged_prefill(
+    /// Non-paged prefill in `chunk_len` token slices (0 = single forward over the full prompt).
+    fn prefill_forward_chunked_concat(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        prompt_tokens: &[u32],
+        chunk_len: usize,
+    ) -> Result<Tensor> {
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prefill: empty prompt");
+        }
+        if chunk_len == 0 {
+            let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
+            return model.forward(&input_ids, 0);
+        }
+        let mut offset = 0_usize;
+        let mut last_logits = None;
+        for chunk in prompt_tokens.chunks(chunk_len) {
+            let input_ids = Tensor::new(chunk, device)?.unsqueeze(0)?;
+            last_logits = Some(model.forward(&input_ids, offset)?);
+            offset += chunk.len();
+        }
+        last_logits.ok_or_else(|| anyhow::anyhow!("prefill: internal error (no logits)"))
+    }
+
+    /// Paged prefill in `chunk_len` token slices (0 = single forward over the full prompt).
+    fn prefill_forward_chunked_paged(
         model: &mut Box<dyn CausalLM>,
         device: &Device,
         prompt_tokens: &[u32],
         ps: &mut PagedState,
+        chunk_len: usize,
     ) -> Result<Tensor> {
-        Self::paged_alloc_range(ps, 0, prompt_tokens.len())?;
-        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
-        model.forward_paged(&input_ids, 0, &ps.block_table, &mut ps.kv_store)
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prefill: empty prompt");
+        }
+        if chunk_len == 0 {
+            Self::paged_alloc_range(ps, 0, prompt_tokens.len())?;
+            let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
+            return model.forward_paged(&input_ids, 0, &ps.block_table, &mut ps.kv_store);
+        }
+        let mut offset = 0_usize;
+        let mut last_logits = None;
+        for chunk in prompt_tokens.chunks(chunk_len) {
+            Self::paged_alloc_range(ps, offset, chunk.len())?;
+            let input_ids = Tensor::new(chunk, device)?.unsqueeze(0)?;
+            last_logits = Some(model.forward_paged(
+                &input_ids,
+                offset,
+                &ps.block_table,
+                &mut ps.kv_store,
+            )?);
+            offset += chunk.len();
+        }
+        last_logits.ok_or_else(|| anyhow::anyhow!("prefill: internal error (no logits)"))
     }
 
     /// Run a single decode step through the paged KV store.
@@ -2344,10 +2409,20 @@ impl Engine {
         self.model.clear_kv_cache();
         if let Some(ps) = &mut self.paged {
             ps.block_table.free_all(&mut ps.block_pool);
-            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)
+            Self::prefill_forward_chunked_paged(
+                &mut self.model,
+                &self.device,
+                prompt_tokens,
+                ps,
+                self.prefill_chunk_tokens,
+            )
         } else {
-            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
-            self.model.forward(&input_ids, 0)
+            Self::prefill_forward_chunked_concat(
+                &mut self.model,
+                &self.device,
+                prompt_tokens,
+                self.prefill_chunk_tokens,
+            )
         }
     }
 
