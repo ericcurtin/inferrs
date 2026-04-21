@@ -907,12 +907,13 @@ pub struct OllamaPullRequest {
 }
 
 impl OllamaPullRequest {
-    /// Return the client-requested model, preferring `name` over `model`.
+    /// Return the client-requested model, preferring `model` (canonical Ollama
+    /// field) over `name` (legacy alias).
     fn requested_model(&self) -> Option<&str> {
-        let preferred = if self.name.trim().is_empty() {
-            self.model.trim()
-        } else {
+        let preferred = if self.model.trim().is_empty() {
             self.name.trim()
+        } else {
+            self.model.trim()
         };
         if preferred.is_empty() {
             None
@@ -1305,6 +1306,7 @@ async fn run_active_pull(
 ) {
     let mut last_error: Option<String> = None;
     let mut emitted_error_line = false;
+    let mut abandoned = false;
 
     loop {
         tokio::select! {
@@ -1339,33 +1341,45 @@ async fn run_active_pull(
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                // If no subscribers remain, stop broadcasting.  The Go pull
-                // continues to completion in the background but we no longer
-                // buffer its output.
-                if tx.receiver_count() == 0 && waiters.load(Ordering::Relaxed) == 0 {
-                    line_rx.close();
-                    break;
+                // If no subscribers remain, stop broadcasting.  Hold the
+                // registry lock while checking so that `get_or_start` cannot
+                // hand out this `ActivePull` after the decision to abandon.
+                if tx.receiver_count() == 0 {
+                    let mut guard = registry.lock().await;
+                    // Re-check under the lock — a new client may have arrived
+                    // between the first check and acquiring the lock.
+                    if tx.receiver_count() == 0 && waiters.load(Ordering::Acquire) == 0 {
+                        guard.remove(&key);
+                        line_rx.close();
+                        abandoned = true;
+                        break;
+                    }
                 }
             }
         }
     }
 
-    let final_result = match last_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    };
+    // When abandoned, `done_tx` drops without sending a result.  Any late
+    // waiter that somehow obtained the `ActivePull` before the registry
+    // removal will see a channel-closed error rather than spurious success.
+    if !abandoned {
+        let final_result = match last_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        };
 
-    if let Err(ref message) = final_result {
-        if !emitted_error_line {
-            if let Ok(bytes) = serialize_pull_line(&OllamaPullStatus::error(message)) {
-                publish_pull_bytes(&tx, history.as_ref(), bytes).await;
+        if let Err(ref message) = final_result {
+            if !emitted_error_line {
+                if let Ok(bytes) = serialize_pull_line(&OllamaPullStatus::error(message)) {
+                    publish_pull_bytes(&tx, history.as_ref(), bytes).await;
+                }
             }
         }
-    }
 
-    let _ = done_tx.send(Some(final_result));
-    let mut guard = registry.lock().await;
-    guard.remove(&key);
+        let _ = done_tx.send(Some(final_result));
+        let mut guard = registry.lock().await;
+        guard.remove(&key);
+    }
 }
 
 /// Parse and re-encode one helper line before exposing it to HTTP clients.
@@ -1646,7 +1660,7 @@ async fn spawn_worker(
     let mut child = std::process::Command::new(&exe)
         .args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .map_err(|e| {
             (
@@ -5347,24 +5361,33 @@ mod tests {
     }
 
     #[test]
-    fn ollama_pull_request_prefers_name_field() {
-        // Prefer the legacy `name` field when both are present.
+    fn ollama_pull_request_prefers_model_field() {
+        // Prefer the canonical `model` field when both are present.
         let req = OllamaPullRequest {
             model: "gemma3".to_string(),
             name: "custom".to_string(),
             insecure: false,
             stream: None,
         };
+        assert_eq!(req.requested_model(), Some("gemma3"));
+
+        // Fall back to `name` when `model` is empty.
+        let req = OllamaPullRequest {
+            model: String::new(),
+            name: "custom".to_string(),
+            insecure: false,
+            stream: None,
+        };
         assert_eq!(req.requested_model(), Some("custom"));
 
-        // Fall back to `model` when `name` is empty.
+        // Return None when both are empty.
         let req = OllamaPullRequest {
-            model: "gemma3".to_string(),
+            model: String::new(),
             name: String::new(),
             insecure: false,
             stream: None,
         };
-        assert_eq!(req.requested_model(), Some("gemma3"));
+        assert_eq!(req.requested_model(), None);
     }
 
     #[test]
