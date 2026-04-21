@@ -23,9 +23,9 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
-use std::sync::Arc;
 
 use crate::models::gemma4::Gemma4Config;
+use crate::models::moe_utils::{split_expert_qtensor, MoeExpertWeights};
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 
 // ---------------------------------------------------------------------------
@@ -47,76 +47,6 @@ pub(super) fn rms_norm_no_scale(xs: &Tensor, eps: f64) -> Result<Tensor> {
     } else {
         normed.to_dtype(orig_dtype)
     }
-}
-
-/// Per-expert weight storage: either a Vec of per-expert QTensors (GGUF path)
-/// or a single fused dense tensor `[num_experts, rows, cols]` (safetensors path).
-#[derive(Debug, Clone)]
-enum MoeExpertWeights {
-    /// GGUF path: one `Arc<QTensor>` per expert, shape `[rows, cols]`, on the
-    /// target device (Metal/CUDA/CPU).  `QLinear::from_qtensor` wraps each one
-    /// directly so the Metal GEMV kernel fires without a BF16 intermediate.
-    Quantized(Vec<Arc<candle_core::quantized::QTensor>>),
-    /// Safetensors path: fused dense tensor `[num_experts, rows, cols]`.
-    Dense(Tensor),
-}
-
-impl MoeExpertWeights {
-    /// Return a `QLinear` for a single expert.
-    ///
-    /// On the GGUF path the per-expert `Arc<QTensor>` is stored on the target
-    /// device (Metal/CUDA/CPU), so `QLinear::forward` dispatches directly to the
-    /// Metal/CUDA quantized GEMV kernel (Q8_0, Q4K, …) — no BF16 intermediate.
-    /// On the safetensors path the dense weight slice is wrapped as `QMatMul::Tensor`.
-    fn expert_linear(&self, expert_idx: usize) -> Result<QLinear> {
-        match self {
-            Self::Quantized(qtensors) => QLinear::from_qtensor(qtensors[expert_idx].clone(), None),
-            Self::Dense(t) => Ok(QLinear::from_tensor(
-                t.narrow(0, expert_idx, 1)?.squeeze(0)?,
-                None,
-            )),
-        }
-    }
-}
-
-/// Split a fused `[num_experts, rows, cols]` QTensor into per-expert QTensors.
-///
-/// The fused QTensor's raw bytes are laid out in expert-major order; we slice
-/// off `bytes_per_expert` bytes for each expert and build a `QTensor` of shape
-/// `(rows, cols)`.  Both `rows × cols` must be a multiple of the quantization
-/// block size.
-fn split_expert_qtensor(
-    qt: Arc<candle_core::quantized::QTensor>,
-    num_experts: usize,
-    per_expert_shape: (usize, usize),
-    device: &Device,
-) -> Result<MoeExpertWeights> {
-    use candle_core::quantized::{QStorage, QTensor};
-    use std::borrow::Cow;
-
-    let raw = qt.data()?;
-    if raw.len() % num_experts != 0 {
-        candle_core::bail!(
-            "split_expert_qtensor: raw byte count {} is not divisible by num_experts {}",
-            raw.len(),
-            num_experts
-        );
-    }
-    let dtype_q = qt.dtype();
-    let bytes_per_expert = raw.len() / num_experts;
-
-    let mut experts = Vec::with_capacity(num_experts);
-    for e in 0..num_experts {
-        let start = e * bytes_per_expert;
-        let end = start + bytes_per_expert;
-        // Use Cow::Borrowed so the original bytes stay alive through `qt`
-        // while `from_data` → `as_t_slice` reads them via a raw pointer.
-        // Using Cow::Owned would free the allocation inside `as_t_slice`
-        // (before `.to_vec()` copies it out), which is use-after-free.
-        let storage = QStorage::from_data(Cow::Borrowed(&raw[start..end]), device, dtype_q)?;
-        experts.push(Arc::new(QTensor::new(storage, per_expert_shape)?));
-    }
-    Ok(MoeExpertWeights::Quantized(experts))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,97 +420,6 @@ mod tests {
         let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
         for (i, v) in vals.iter().enumerate() {
             assert!((v - 1.0).abs() < 1e-5, "element {i}: expected 1.0, got {v}");
-        }
-    }
-
-    // ── split_expert_qtensor ──────────────────────────────────────────────────
-
-    /// Build a Q8_0 QTensor whose raw bytes are filled with a known pattern,
-    /// split it into `num_experts` per-expert tensors, and verify each expert
-    /// gets exactly its own byte slice.
-    ///
-    /// Q8_0 block layout: 32 i8 values (32 bytes) + 1 f16 scale (2 bytes) = 34
-    /// bytes per block.  We use shape (num_experts * rows, block_size) so that:
-    ///   - each expert gets `rows` rows of `block_size` elements
-    ///   - total elements = num_experts * rows * block_size, all divisible by 32
-    #[test]
-    fn split_expert_qtensor_byte_layout() {
-        use candle_core::quantized::{GgmlDType, QTensor};
-
-        let num_experts = 4usize;
-        let rows_per_expert = 2usize; // 2 rows per expert
-        let cols = 64usize; // 64 cols (2 Q8_0 blocks of 32 per row)
-        let total_rows = num_experts * rows_per_expert;
-
-        // Build a dense F32 tensor with a recognisable per-expert pattern:
-        // expert e fills its rows with float value (e + 1) as f32.
-        let data: Vec<f32> = (0..num_experts)
-            .flat_map(|e| std::iter::repeat((e + 1) as f32).take(rows_per_expert * cols))
-            .collect();
-        let t = Tensor::from_vec(data, (total_rows, cols), &cpu()).unwrap();
-
-        // Quantize to Q8_0 to get a real QTensor.
-        let qt = std::sync::Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap());
-
-        // Split.
-        let weights =
-            split_expert_qtensor(qt, num_experts, (rows_per_expert, cols), &cpu()).unwrap();
-
-        let qtensors = match weights {
-            MoeExpertWeights::Quantized(v) => v,
-            MoeExpertWeights::Dense(_) => panic!("expected Quantized variant"),
-        };
-
-        assert_eq!(qtensors.len(), num_experts);
-
-        // Dequantize each expert and verify values are close to (e+1).
-        for (e, qt_e) in qtensors.iter().enumerate() {
-            assert_eq!(
-                qt_e.shape().dims(),
-                &[rows_per_expert, cols],
-                "expert {e} has wrong shape"
-            );
-            let dequant = qt_e.dequantize(&cpu()).unwrap();
-            let vals: Vec<f32> = dequant.flatten_all().unwrap().to_vec1().unwrap();
-            let expected = (e + 1) as f32;
-            for (i, v) in vals.iter().enumerate() {
-                assert!(
-                    (v - expected).abs() < 0.15, // Q8_0 max error ≈ 0.1
-                    "expert {e} element {i}: expected ~{expected}, got {v}"
-                );
-            }
-        }
-    }
-
-    // ── MoeExpertWeights::expert_linear (Dense path) ──────────────────────────
-
-    /// expert_linear on a Dense tensor must return the correct row slice.
-    /// We use a (4, 3, 2) tensor (4 experts, 3×2 weight each) and verify
-    /// expert 2 returns exactly the values from rows 6..9.
-    #[test]
-    fn moe_expert_weights_dense_slice_correctness() {
-        // Fill each expert e with float value (e as f32) so we can easily
-        // identify which slice we got.
-        let data: Vec<f32> = (0..4)
-            .flat_map(|e| std::iter::repeat(e as f32).take(3 * 2))
-            .collect();
-        let t = Tensor::from_vec(data, (4usize, 3usize, 2usize), &cpu()).unwrap();
-        let weights = MoeExpertWeights::Dense(t);
-
-        for e in 0..4usize {
-            let ql = weights.expert_linear(e).unwrap();
-            // Forward a ones input [1, 2] — result is sum of the row weights.
-            let input = Tensor::ones((1usize, 2usize), DType::F32, &cpu()).unwrap();
-            let out = ql.forward(&input).unwrap();
-            let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
-            // Each weight is (e as f32); input is all-ones; out = sum over cols = 2 * e.
-            let expected = 2.0 * e as f32;
-            for (i, v) in vals.iter().enumerate() {
-                assert!(
-                    (v - expected).abs() < 1e-4,
-                    "expert {e} output[{i}]: expected {expected}, got {v}"
-                );
-            }
         }
     }
 

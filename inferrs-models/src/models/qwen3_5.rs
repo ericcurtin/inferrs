@@ -20,6 +20,7 @@ use crate::models::attention_utils::{
 };
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
+use crate::models::qwen3_5_moe::Qwen3MoeSparseBlock;
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
@@ -65,6 +66,19 @@ pub struct Qwen35Config {
     pub turbo_quant_bits: Option<u8>,
     /// Number of MTP transformer blocks embedded in the model weights (0 = none).
     pub mtp_num_hidden_layers: usize,
+    // MoE fields — all None when the model is dense.
+    pub num_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    /// How often a layer uses sparse MoE instead of dense MLP (1 = every layer).
+    pub decoder_sparse_step: Option<usize>,
+    /// Layer indices forced to use a dense MLP even when MoE is enabled.
+    pub mlp_only_layers: Option<Vec<usize>>,
+    /// Normalize top-k routing probabilities to sum to 1 after selection.
+    pub norm_topk_prob: Option<bool>,
+    /// Hidden dim of the Qwen3.5 MoE shared-expert branch. None = no shared expert
+    /// (plain Qwen3 MoE behaviour).
+    pub shared_expert_intermediate_size: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -892,14 +906,14 @@ enum LayerAttn {
     Linear(Box<LinearAttn>),
 }
 
-struct QMlp {
+pub(super) struct QMlp {
     gate_proj: QLinear,
     up_proj: QLinear,
     down_proj: QLinear,
 }
 
 impl QMlp {
-    fn new(
+    pub(super) fn new(
         hidden_size: usize,
         intermediate_size: usize,
         vb: VarBuilder,
@@ -930,7 +944,7 @@ impl QMlp {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // On the quantized (GGUF) Metal/CPU path, pre-convert x to F32 once and share
         // the conversion across gate_proj and up_proj (saves 2 BF16→F32 dispatches/call).
         // CUDA (BF16 fast-path) and dense safetensors fall through to the standard path.
@@ -1046,19 +1060,27 @@ fn gqa_attention_no_expand(
         .map_err(Into::into)
 }
 
+enum MlpVariant {
+    Dense(QMlp),
+    Sparse(Qwen3MoeSparseBlock),
+}
+
 struct DecoderLayer {
     attn: LayerAttn,
-    mlp: QMlp,
+    mlp: MlpVariant,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
 
 impl DecoderLayer {
+    /// `layer_idx` is `Some(i)` for main model layers (used to decide Dense vs Sparse MoE)
+    /// and `None` for auxiliary layers like MTP that should always use a dense MLP.
     fn new(
         cfg: &Qwen35Config,
         vb: VarBuilder,
         qvb: Option<&QGgufVarBuilder>,
         is_full_attention: bool,
+        layer_idx: Option<usize>,
         tq_cfg: Option<&TurboQuantConfig>,
     ) -> Result<Self> {
         let attn = if is_full_attention {
@@ -1075,14 +1097,48 @@ impl DecoderLayer {
                 qvb.map(|q| q.pp("linear_attn")).as_ref(),
             )?))
         };
-        Ok(Self {
-            attn,
-            mlp: QMlp::new(
+
+        let use_moe = cfg.num_experts.is_some() && {
+            match layer_idx {
+                None => false, // MTP / auxiliary layers always use dense MLP
+                Some(idx) => {
+                    // `decoder_sparse_step` = N means "every N-th layer is MoE,
+                    // the rest are dense MLP". N=1 (default) means every layer
+                    // is MoE, matching the pure Qwen3.5 MoE reference. N=0 is
+                    // invalid (would mean "never sparse" but is never emitted
+                    // by HF configs); we normalize it to 1 to avoid a div-by-0.
+                    // The `(idx + 1) % step` offset matches HF's
+                    // `Qwen3MoeDecoderLayer.__init__`; for N > 1 this picks
+                    // layers N-1, 2N-1, … as sparse (disjoint from `idx % step`).
+                    let step = cfg.decoder_sparse_step.unwrap_or(1).max(1);
+                    let is_sparse_step = (idx + 1) % step == 0;
+                    let not_mlp_only = cfg
+                        .mlp_only_layers
+                        .as_ref()
+                        .is_none_or(|list| !list.contains(&idx));
+                    is_sparse_step && not_mlp_only
+                }
+            }
+        };
+
+        let mlp = if use_moe {
+            MlpVariant::Sparse(Qwen3MoeSparseBlock::new(
+                cfg,
+                vb.pp("mlp"),
+                qvb.map(|q| q.pp("mlp")).as_ref(),
+            )?)
+        } else {
+            MlpVariant::Dense(QMlp::new(
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 vb.pp("mlp"),
                 qvb.map(|q| q.pp("mlp")).as_ref(),
-            )?,
+            )?)
+        };
+
+        Ok(Self {
+            attn,
+            mlp,
             input_layernorm: rms_norm_with_offset(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
@@ -1114,7 +1170,10 @@ impl DecoderLayer {
         let x = (residual + attn_out)?;
         let residual = x.clone();
         let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
+        let mlp_out = match &self.mlp {
+            MlpVariant::Dense(m) => m.forward(&normed)?,
+            MlpVariant::Sparse(m) => m.forward(&normed)?,
+        };
         (residual + mlp_out).map_err(Into::into)
     }
 
@@ -1143,7 +1202,10 @@ impl DecoderLayer {
         let x = (residual + attn_out)?;
         let residual = x.clone();
         let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
+        let mlp_out = match &self.mlp {
+            MlpVariant::Dense(m) => m.forward(&normed)?,
+            MlpVariant::Sparse(m) => m.forward(&normed)?,
+        };
         (residual + mlp_out).map_err(Into::into)
     }
 
@@ -1273,7 +1335,7 @@ impl Qwen35Model {
                 .into_iter()
                 .enumerate()
                 .map(|(i, (vb, qvb, is_full))| {
-                    DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, tq_cfg.as_ref())
+                    DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, Some(i), tq_cfg.as_ref())
                         .with_context(|| format!("loading layer {i}"))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1285,8 +1347,15 @@ impl Qwen35Model {
                         .into_par_iter()
                         .enumerate()
                         .map(|(i, (vb, qvb, is_full))| {
-                            DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, tq_cfg.as_ref())
-                                .with_context(|| format!("loading layer {i}"))
+                            DecoderLayer::new(
+                                cfg,
+                                vb,
+                                qvb.as_ref(),
+                                is_full,
+                                Some(i),
+                                tq_cfg.as_ref(),
+                            )
+                            .with_context(|| format!("loading layer {i}"))
                         })
                         .collect::<Result<Vec<_>>>()
                 },
@@ -1528,7 +1597,8 @@ impl MtpModule {
             mtp_qvb.as_ref().map(|q| q.pp("fc")).as_ref(),
         )?;
 
-        // The MTP block is always a full-attention layer, under mtp.layers.0.*
+        // The MTP block is always a full-attention layer with dense MLP, under mtp.layers.0.*
+        // layer_idx=None forces the dense MLP path regardless of MoE config.
         let layer_vb = mtp_vb.pp("layers").pp("0");
         let layer_qvb = mtp_qvb.as_ref().map(|q| q.pp("layers").pp("0"));
         let block = DecoderLayer::new(
@@ -1536,6 +1606,7 @@ impl MtpModule {
             layer_vb,
             layer_qvb.as_ref(),
             true, // is_full_attention
+            None, // force dense MLP (MTP weights have no expert tensors)
             None, // no TurboQuant for MTP block
         )?;
 

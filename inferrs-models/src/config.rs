@@ -240,6 +240,15 @@ pub struct TextConfig {
     // Qwen3.5 MTP fields
     pub mtp_num_hidden_layers: Option<usize>,
 
+    // Qwen3.5 MoE fields (num_experts and moe_intermediate_size are shared with Gemma4 below)
+    pub num_experts_per_tok: Option<usize>,
+    pub decoder_sparse_step: Option<usize>,
+    pub mlp_only_layers: Option<Vec<usize>>,
+    pub norm_topk_prob: Option<bool>,
+    /// Qwen3.5 MoE shared-expert branch: hidden dim of the dense expert that
+    /// runs in parallel with the sparse experts. None = no shared expert.
+    pub shared_expert_intermediate_size: Option<usize>,
+
     // Gemma4-specific text_config fields
     pub global_head_dim: Option<usize>,
     pub sliding_window: Option<usize>,
@@ -330,7 +339,7 @@ impl RawConfig {
     pub fn detect_architecture(&self) -> Result<ModelArchitecture> {
         if let Some(archs) = &self.architectures {
             for arch in archs {
-                if arch.contains("Qwen3_5") {
+                if arch.contains("Qwen3_5") || arch.contains("Qwen3_5Moe") {
                     return Ok(ModelArchitecture::Qwen35);
                 }
                 if arch.contains("Qwen3") {
@@ -358,7 +367,7 @@ impl RawConfig {
             match model_type.as_str() {
                 "qwen2" | "qwen2_5" => return Ok(ModelArchitecture::Qwen2),
                 "qwen3" => return Ok(ModelArchitecture::Qwen3),
-                "qwen3_5" => return Ok(ModelArchitecture::Qwen35),
+                "qwen3_5" | "qwen3_5_moe" => return Ok(ModelArchitecture::Qwen35),
                 "gemma4" => return Ok(ModelArchitecture::Gemma4),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
                 "gemma2" => return Ok(ModelArchitecture::Gemma2),
@@ -683,6 +692,14 @@ impl RawConfig {
             device,
             turbo_quant_bits,
             mtp_num_hidden_layers: tc.and_then(|t| t.mtp_num_hidden_layers).unwrap_or(0),
+            // num_experts and moe_intermediate_size are stored in TextConfig shared fields.
+            num_experts: tc.and_then(|t| t.num_experts),
+            num_experts_per_tok: tc.and_then(|t| t.num_experts_per_tok),
+            moe_intermediate_size: tc.and_then(|t| t.moe_intermediate_size),
+            decoder_sparse_step: tc.and_then(|t| t.decoder_sparse_step),
+            mlp_only_layers: tc.and_then(|t| t.mlp_only_layers.clone()),
+            norm_topk_prob: tc.and_then(|t| t.norm_topk_prob),
+            shared_expert_intermediate_size: tc.and_then(|t| t.shared_expert_intermediate_size),
         }
     }
 

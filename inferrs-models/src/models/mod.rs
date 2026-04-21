@@ -6,10 +6,12 @@
 pub mod attention_utils;
 pub mod gemma4;
 mod gemma4_moe;
+mod moe_utils;
 pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_5_linear_attn_scan;
+mod qwen3_5_moe;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -928,6 +930,16 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "linear_attn.in_proj_b.weight" => "linear_attn_in_proj_b.weight",
         "linear_attn.out_proj.weight" => "linear_attn_out_proj.weight",
 
+        // ── Qwen3.5 MoE (sparse FFN layers) ──────────────────────────────
+        "mlp.gate.weight" => "ffn_gate_inp.weight",
+        "mlp.experts.gate_up_proj" => "ffn_gate_exps.weight",
+        "mlp.experts.down_proj" => "ffn_down_exps.weight",
+        // Qwen3.5 MoE shared expert (dense branch running in parallel).
+        "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
+        "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
+        "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
+        "mlp.shared_expert_gate.weight" => "ffn_gate_inp_shexp.weight",
+
         // Fallback: pass through the suffix unchanged so that `blk.{idx}.`
         // prefix is still applied.  This handles any tensors not explicitly
         // listed above without causing a lookup failure.
@@ -1013,6 +1025,15 @@ fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "proj.weight" => "per_layer_projection.weight",
         "post_norm.weight" => "post_per_layer_input_norm.weight",
         "layer_output_scale.weight" => "layer_scalar",
+        // ── Qwen3.5 MoE ──────────────────────────────────────────────────
+        "ffn_gate_inp.weight" => "mlp.gate.weight",
+        "ffn_gate_exps.weight" => "mlp.experts.gate_up_proj",
+        "ffn_down_exps.weight" => "mlp.experts.down_proj",
+        // Qwen3.5 MoE shared expert.
+        "ffn_gate_shexp.weight" => "mlp.shared_expert.gate_proj.weight",
+        "ffn_up_shexp.weight" => "mlp.shared_expert.up_proj.weight",
+        "ffn_down_shexp.weight" => "mlp.shared_expert.down_proj.weight",
+        "ffn_gate_inp_shexp.weight" => "mlp.shared_expert_gate.weight",
         // Passthrough for unknown suffixes
         other => return other.to_string(),
     };
