@@ -321,18 +321,44 @@ impl FullAttention {
         // device-agnostic helper that avoids materialising the expanded KV.
         // IMPORTANT: `candle_nn::ops::sdpa` has no CUDA impl (only cpu/metal
         // forwards), so the CUDA fallback must NOT go through `sdpa`.
-        let fast_out = if self.use_sdpa && t == 1 {
+        // ── Attention ────────────────────────────────────────────────────────
+        // Fast-path chain (all cases where `use_sdpa` is set):
+        //
+        // CUDA decode (t == 1):
+        //   `sdpa_cuda_flash` with do_causal=false →
+        //   `flash_attn_decode_bf16_d{64,128,256,512}`.
+        //
+        // CUDA prefill (t > 1, head_dim ∈ {128,256}):
+        //   `sdpa_cuda_flash` with do_causal=true →
+        //   `flash_attn_prefill_bf16_d{128,256}` (SM80+, RTX 30xx+).
+        //
+        // Metal decode (t == 1):
+        //   `sdpa` → vector kernel.
+        //
+        // Metal prefill (t > 8, head_dim ∈ {32,64,72,80,96,128,256}):
+        //   `sdpa_metal_prefill` → `steel_attention_*` (do_causal=true).
+        //   t ∈ [2,8] falls through: vector kernel lacks causal (review BUG 1).
+        //
+        // Fallback for all other cases (CPU, unsupported shape, t ∈ [2,8] Metal):
+        //   `gqa_attention_no_expand` with an explicit causal mask.
+        let fast_out = if self.use_sdpa {
             let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
             if let Some(out) =
-                candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, scale, 1.0_f32)
+                candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, t > 1, scale, 1.0_f32)
                     .map_err(anyhow::Error::from)?
             {
                 Some(out)
             } else if matches!(x.device(), candle_core::Device::Metal(_)) {
-                Some(
-                    candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
-                        .map_err(anyhow::Error::from)?,
-                )
+                if t == 1 {
+                    Some(
+                        candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
+                            .map_err(anyhow::Error::from)?,
+                    )
+                } else {
+                    // t > 8: steel prefill kernel (causal). t ∈ [2,8]: None → fallback.
+                    candle_nn::ops::sdpa_metal_prefill(&q, &k, &v, scale, 1.0_f32)
+                        .map_err(anyhow::Error::from)?
+                }
             } else {
                 None
             }
