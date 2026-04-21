@@ -344,22 +344,20 @@ impl RawConfig {
     pub fn detect_architecture(&self, hf_model_id: Option<&str>) -> Result<ModelArchitecture> {
         if let Some(repo) = hf_model_id {
             if hf_repo_suggests_qwen36(repo) {
-                let matches_upstream_qwen36_tags = matches!(
-                    self.model_type.as_deref(),
-                    Some("qwen3_6" | "qwen3_6_moe")
-                ) || matches!(
-                    self.text_config
-                        .as_ref()
-                        .and_then(|t| t.model_type.as_deref()),
-                    Some("qwen3_6_moe_text" | "qwen3_6_text" | "qwen3_6" | "qwen3_6_moe")
-                );
-                let matches_legacy_qwen35_shim = matches!(
-                    self.model_type.as_deref(),
-                    Some("qwen3_5_moe" | "qwen3_5")
-                ) || self.architectures.as_ref().is_some_and(|a| {
-                    a.iter()
-                        .any(|x| x.contains("Qwen3_5") && !x.contains("Qwen3_6"))
-                });
+                let matches_upstream_qwen36_tags =
+                    matches!(self.model_type.as_deref(), Some("qwen3_6" | "qwen3_6_moe"))
+                        || matches!(
+                            self.text_config
+                                .as_ref()
+                                .and_then(|t| t.model_type.as_deref()),
+                            Some("qwen3_6_moe_text" | "qwen3_6_text" | "qwen3_6" | "qwen3_6_moe")
+                        );
+                let matches_legacy_qwen35_shim =
+                    matches!(self.model_type.as_deref(), Some("qwen3_5_moe" | "qwen3_5"))
+                        || self.architectures.as_ref().is_some_and(|a| {
+                            a.iter()
+                                .any(|x| x.contains("Qwen3_5") && !x.contains("Qwen3_6"))
+                        });
                 if matches_upstream_qwen36_tags || matches_legacy_qwen35_shim {
                     return Ok(ModelArchitecture::Qwen36);
                 }
@@ -843,8 +841,7 @@ impl RawConfig {
                 // instead of an unbounded value so KV / request limits match HF.
                 // Qwen3.5/3.6 nest all model params under text_config.
                 // 131072 matches the published context window for both series.
-                 tc.and_then(|t| t.max_position_embeddings)
-                    .unwrap_or(131072)
+                tc.and_then(|t| t.max_position_embeddings).unwrap_or(131072)
             }
             ModelArchitecture::Gemma4 => {
                 // Gemma4 interleaves local sliding-window layers with global
@@ -1062,10 +1059,7 @@ mod tests {
     /// still say Qwen3.5 while the repo id carries the real series.
     #[test]
     fn detect_qwen36_when_hf_config_reuses_qwen3_5_tags() {
-        let cfg = config_with_arch(
-            &["Qwen3_5MoeForConditionalGeneration"],
-            "qwen3_5_moe",
-        );
+        let cfg = config_with_arch(&["Qwen3_5MoeForConditionalGeneration"], "qwen3_5_moe");
         assert_eq!(
             cfg.detect_architecture(Some("unsloth/Qwen3.6-35B-A3B-GGUF"))
                 .unwrap(),

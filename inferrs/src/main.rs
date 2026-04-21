@@ -12,9 +12,9 @@ mod rm;
 mod run;
 mod sampler;
 mod server;
-mod tool_calls;
 mod stop;
 mod tokenizer;
+mod tool_calls;
 mod util;
 
 use anyhow::Result;

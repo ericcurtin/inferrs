@@ -426,7 +426,11 @@ impl QGgufVarBuilder {
                     // 1-D weights (e.g. ffn_gate_inp_shexp stored as [in_features] in some
                     // GGUFs) must be unsqueezed to [1, in_features] so QMatMul can call .t().
                     let weight = qt.dequantize(&self.device)?;
-                    let weight = if weight.rank() == 1 { weight.unsqueeze(0)? } else { weight };
+                    let weight = if weight.rank() == 1 {
+                        weight.unsqueeze(0)?
+                    } else {
+                        weight
+                    };
                     Ok(QLinear::from_tensor(weight, None))
                 } else {
                     QLinear::from_qtensor(qt, None)

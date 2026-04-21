@@ -155,205 +155,213 @@ extern "C" __global__ void dequantize_block_iq4xs_f16(const void *__restrict__ v
 }
 
 // ---- fused GEMV: dst[row] = sum_k W[row,k] * y[k] (y = float) ----
+static __device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    return v;
+}
+
 static __device__ float iq2xs_row_dot(const block_iq2_xs *row_blocks, const float *yy, int nblk) {
-    float sum = 0;
+    float sum = 0.f;
+    const int tid = threadIdx.x;
+    const int il = tid / 8;
+    const int ibw = tid % 8;
     for (int ib = 0; ib < nblk; ++ib) {
         const block_iq2_xs *xi = &row_blocks[ib];
         const float *yb = yy + (int64_t)ib * QK_K;
-        for (int tid = 0; tid < 32; ++tid) {
-            const int il = tid / 8;
-            const int ibw = tid % 8;
-            const uint16_t *q2 = xi->qs + 4 * ibw;
-            const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
-            const float d =
-                __half2float(xi->d) * (0.5f + ((xi->scales[ibw] >> 4 * (il / 2)) & 0xf)) * 0.25f;
-            const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
-            const int base = 32 * ibw + 8 * il;
+        const uint16_t *q2 = xi->qs + 4 * ibw;
+        const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+        const float d =
+            __half2float(xi->d) * (0.5f + ((xi->scales[ibw] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+        const int base = 32 * ibw + 8 * il;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                float w = d * (float)grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
-                sum += w * yb[base + j];
-            }
+        for (int j = 0; j < 8; ++j) {
+            float w = d * (float)grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            sum += w * yb[base + j];
         }
     }
-    return sum;
+    return warp_reduce_sum(sum);
 }
 
 static __device__ float iq2xs_row_dot_bf16(const block_iq2_xs *row_blocks, const nv_bfloat16 *yy, int nblk) {
-    float sum = 0;
+    float sum = 0.f;
+    const int tid = threadIdx.x;
+    const int il = tid / 8;
+    const int ibw = tid % 8;
     for (int ib = 0; ib < nblk; ++ib) {
         const block_iq2_xs *xi = &row_blocks[ib];
         const nv_bfloat16 *yb = yy + (int64_t)ib * QK_K;
-        for (int tid = 0; tid < 32; ++tid) {
-            const int il = tid / 8;
-            const int ibw = tid % 8;
-            const uint16_t *q2 = xi->qs + 4 * ibw;
-            const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
-            const float d =
-                __half2float(xi->d) * (0.5f + ((xi->scales[ibw] >> 4 * (il / 2)) & 0xf)) * 0.25f;
-            const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
-            const int base = 32 * ibw + 8 * il;
+        const uint16_t *q2 = xi->qs + 4 * ibw;
+        const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+        const float d =
+            __half2float(xi->d) * (0.5f + ((xi->scales[ibw] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+        const int base = 32 * ibw + 8 * il;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                float w = d * (float)grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
-                sum += w * __bfloat162float(yb[base + j]);
-            }
+        for (int j = 0; j < 8; ++j) {
+            float w = d * (float)grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            sum += w * __bfloat162float(yb[base + j]);
         }
     }
-    return sum;
+    return warp_reduce_sum(sum);
 }
 
 static __device__ float iq3xxs_row_dot(const block_iq3_xxs *row_blocks, const float *yy, int nblk) {
-    float sum = 0;
+    float sum = 0.f;
+    const int tid = threadIdx.x;
+    const int il = tid / 8;
+    const int ibw = tid % 8;
     for (int ib = 0; ib < nblk; ++ib) {
         const block_iq3_xxs *xi = &row_blocks[ib];
         const float *yb = yy + (int64_t)ib * QK_K;
-        for (int tid = 0; tid < 32; ++tid) {
-            const int il = tid / 8;
-            const int ibw = tid % 8;
-            const uint8_t *q3 = xi->qs + 8 * ibw;
-            const uint16_t *gas = (const uint16_t *)(xi->qs + QK_K / 4) + 2 * ibw;
-            const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
-            const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
-            const uint32_t aux32 = gas[0] | (gas[1] << 16);
-            const float d = __half2float(xi->d) * (0.5f + (aux32 >> 28)) * 0.5f;
-            const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
-            const int base = 32 * ibw + 8 * il;
-            for (int j = 0; j < 4; ++j) {
-                float w0 = d * (float)grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
-                float w1 = d * (float)grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
-                sum += w0 * yb[base + j + 0];
-                sum += w1 * yb[base + j + 4];
-            }
+        const uint8_t *q3 = xi->qs + 8 * ibw;
+        const uint16_t *gas = (const uint16_t *)(xi->qs + QK_K / 4) + 2 * ibw;
+        const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
+        const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
+        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const float d = __half2float(xi->d) * (0.5f + (aux32 >> 28)) * 0.5f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+        const int base = 32 * ibw + 8 * il;
+        for (int j = 0; j < 4; ++j) {
+            float w0 = d * (float)grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+            float w1 = d * (float)grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+            sum += w0 * yb[base + j + 0];
+            sum += w1 * yb[base + j + 4];
         }
     }
-    return sum;
+    return warp_reduce_sum(sum);
 }
 
 static __device__ float iq3xxs_row_dot_bf16(const block_iq3_xxs *row_blocks, const nv_bfloat16 *yy, int nblk) {
-    float sum = 0;
+    float sum = 0.f;
+    const int tid = threadIdx.x;
+    const int il = tid / 8;
+    const int ibw = tid % 8;
     for (int ib = 0; ib < nblk; ++ib) {
         const block_iq3_xxs *xi = &row_blocks[ib];
         const nv_bfloat16 *yb = yy + (int64_t)ib * QK_K;
-        for (int tid = 0; tid < 32; ++tid) {
-            const int il = tid / 8;
-            const int ibw = tid % 8;
-            const uint8_t *q3 = xi->qs + 8 * ibw;
-            const uint16_t *gas = (const uint16_t *)(xi->qs + QK_K / 4) + 2 * ibw;
-            const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
-            const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
-            const uint32_t aux32 = gas[0] | (gas[1] << 16);
-            const float d = __half2float(xi->d) * (0.5f + (aux32 >> 28)) * 0.5f;
-            const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
-            const int base = 32 * ibw + 8 * il;
-            for (int j = 0; j < 4; ++j) {
-                float w0 = d * (float)grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
-                float w1 = d * (float)grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
-                sum += w0 * __bfloat162float(yb[base + j + 0]);
-                sum += w1 * __bfloat162float(yb[base + j + 4]);
-            }
+        const uint8_t *q3 = xi->qs + 8 * ibw;
+        const uint16_t *gas = (const uint16_t *)(xi->qs + QK_K / 4) + 2 * ibw;
+        const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
+        const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
+        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const float d = __half2float(xi->d) * (0.5f + (aux32 >> 28)) * 0.5f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+        const int base = 32 * ibw + 8 * il;
+        for (int j = 0; j < 4; ++j) {
+            float w0 = d * (float)grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+            float w1 = d * (float)grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+            sum += w0 * __bfloat162float(yb[base + j + 0]);
+            sum += w1 * __bfloat162float(yb[base + j + 4]);
         }
     }
-    return sum;
+    return warp_reduce_sum(sum);
 }
 
 static __device__ float iq4xs_row_dot(const block_iq4_xs *row_blocks, const float *yy, int nblk) {
-    float sum = 0;
+    float sum = 0.f;
+    const int tid = threadIdx.x;
+    const int il = tid / 8;
+    const int ibw = tid % 8;
     for (int ib = 0; ib < nblk; ++ib) {
         const block_iq4_xs *xi = &row_blocks[ib];
         const float *yb = yy + (int64_t)ib * QK_K;
-        for (int tid = 0; tid < 32; ++tid) {
-            const int il = tid / 8;
-            const int ibw = tid % 8;
-            const uint8_t *q4 = xi->qs + 16 * ibw + 4 * il;
-            const float d = __half2float(xi->d) *
-                ((((xi->scales_l[ibw / 2] >> 4 * (ibw % 2)) & 0xf) | (((xi->scales_h >> 2 * ibw) & 3) << 4)) - 32);
-            const int base = 32 * ibw + 4 * il;
-            for (int j = 0; j < 4; ++j) {
-                const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
-                const int8_t *v8 = (const int8_t *)&v;
-                sum += (d * (float)v8[0]) * yb[base + j + 0];
-                sum += (d * (float)v8[1]) * yb[base + j + 16];
-            }
+        const uint8_t *q4 = xi->qs + 16 * ibw + 4 * il;
+        const float d = __half2float(xi->d) *
+            ((((xi->scales_l[ibw / 2] >> 4 * (ibw % 2)) & 0xf) | (((xi->scales_h >> 2 * ibw) & 3) << 4)) - 32);
+        const int base = 32 * ibw + 4 * il;
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
+            const int8_t *v8 = (const int8_t *)&v;
+            sum += (d * (float)v8[0]) * yb[base + j + 0];
+            sum += (d * (float)v8[1]) * yb[base + j + 16];
         }
     }
-    return sum;
+    return warp_reduce_sum(sum);
 }
 
 static __device__ float iq4xs_row_dot_bf16(const block_iq4_xs *row_blocks, const nv_bfloat16 *yy, int nblk) {
-    float sum = 0;
+    float sum = 0.f;
+    const int tid = threadIdx.x;
+    const int il = tid / 8;
+    const int ibw = tid % 8;
     for (int ib = 0; ib < nblk; ++ib) {
         const block_iq4_xs *xi = &row_blocks[ib];
         const nv_bfloat16 *yb = yy + (int64_t)ib * QK_K;
-        for (int tid = 0; tid < 32; ++tid) {
-            const int il = tid / 8;
-            const int ibw = tid % 8;
-            const uint8_t *q4 = xi->qs + 16 * ibw + 4 * il;
-            const float d = __half2float(xi->d) *
-                ((((xi->scales_l[ibw / 2] >> 4 * (ibw % 2)) & 0xf) | (((xi->scales_h >> 2 * ibw) & 3) << 4)) - 32);
-            const int base = 32 * ibw + 4 * il;
-            for (int j = 0; j < 4; ++j) {
-                const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
-                const int8_t *v8 = (const int8_t *)&v;
-                sum += (d * (float)v8[0]) * __bfloat162float(yb[base + j + 0]);
-                sum += (d * (float)v8[1]) * __bfloat162float(yb[base + j + 16]);
-            }
+        const uint8_t *q4 = xi->qs + 16 * ibw + 4 * il;
+        const float d = __half2float(xi->d) *
+            ((((xi->scales_l[ibw / 2] >> 4 * (ibw % 2)) & 0xf) | (((xi->scales_h >> 2 * ibw) & 3) << 4)) - 32);
+        const int base = 32 * ibw + 4 * il;
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
+            const int8_t *v8 = (const int8_t *)&v;
+            sum += (d * (float)v8[0]) * __bfloat162float(yb[base + j + 0]);
+            sum += (d * (float)v8[1]) * __bfloat162float(yb[base + j + 16]);
         }
     }
-    return sum;
+    return warp_reduce_sum(sum);
 }
 
 // Launch layout matches candle `dequantize_mul_mat_vec`: one output row per (blockIdx.x, threadIdx.y).
 extern "C" __global__ void dequantize_mul_mat_vec_iq2xs_cuda(
     const void *__restrict__ vx, const float *__restrict__ yy, float *__restrict__ dst, int ncols, int nrows) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= nrows || threadIdx.x != 0) return;
+    if (row >= nrows) return;
     const int nblk = ncols / QK_K;
     const block_iq2_xs *row_blocks = (const block_iq2_xs *)vx + (size_t)row * (size_t)nblk;
-    dst[row] = iq2xs_row_dot(row_blocks, yy, nblk);
+    const float dot = iq2xs_row_dot(row_blocks, yy, nblk);
+    if (threadIdx.x == 0) dst[row] = dot;
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_iq2xs_bf16in_cuda(
     const void *__restrict__ vx, const nv_bfloat16 *__restrict__ yy, float *__restrict__ dst, int ncols, int nrows) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= nrows || threadIdx.x != 0) return;
+    if (row >= nrows) return;
     const int nblk = ncols / QK_K;
     const block_iq2_xs *row_blocks = (const block_iq2_xs *)vx + (size_t)row * (size_t)nblk;
-    dst[row] = iq2xs_row_dot_bf16(row_blocks, yy, nblk);
+    const float dot = iq2xs_row_dot_bf16(row_blocks, yy, nblk);
+    if (threadIdx.x == 0) dst[row] = dot;
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_iq3xxs_cuda(
     const void *__restrict__ vx, const float *__restrict__ yy, float *__restrict__ dst, int ncols, int nrows) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= nrows || threadIdx.x != 0) return;
+    if (row >= nrows) return;
     const int nblk = ncols / QK_K;
     const block_iq3_xxs *row_blocks = (const block_iq3_xxs *)vx + (size_t)row * (size_t)nblk;
-    dst[row] = iq3xxs_row_dot(row_blocks, yy, nblk);
+    const float dot = iq3xxs_row_dot(row_blocks, yy, nblk);
+    if (threadIdx.x == 0) dst[row] = dot;
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_iq3xxs_bf16in_cuda(
     const void *__restrict__ vx, const nv_bfloat16 *__restrict__ yy, float *__restrict__ dst, int ncols, int nrows) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= nrows || threadIdx.x != 0) return;
+    if (row >= nrows) return;
     const int nblk = ncols / QK_K;
     const block_iq3_xxs *row_blocks = (const block_iq3_xxs *)vx + (size_t)row * (size_t)nblk;
-    dst[row] = iq3xxs_row_dot_bf16(row_blocks, yy, nblk);
+    const float dot = iq3xxs_row_dot_bf16(row_blocks, yy, nblk);
+    if (threadIdx.x == 0) dst[row] = dot;
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_iq4xs_cuda(
     const void *__restrict__ vx, const float *__restrict__ yy, float *__restrict__ dst, int ncols, int nrows) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= nrows || threadIdx.x != 0) return;
+    if (row >= nrows) return;
     const int nblk = ncols / QK_K;
     const block_iq4_xs *row_blocks = (const block_iq4_xs *)vx + (size_t)row * (size_t)nblk;
-    dst[row] = iq4xs_row_dot(row_blocks, yy, nblk);
+    const float dot = iq4xs_row_dot(row_blocks, yy, nblk);
+    if (threadIdx.x == 0) dst[row] = dot;
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_iq4xs_bf16in_cuda(
     const void *__restrict__ vx, const nv_bfloat16 *__restrict__ yy, float *__restrict__ dst, int ncols, int nrows) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= nrows || threadIdx.x != 0) return;
+    if (row >= nrows) return;
     const int nblk = ncols / QK_K;
     const block_iq4_xs *row_blocks = (const block_iq4_xs *)vx + (size_t)row * (size_t)nblk;
-    dst[row] = iq4xs_row_dot_bf16(row_blocks, yy, nblk);
+    const float dot = iq4xs_row_dot_bf16(row_blocks, yy, nblk);
+    if (threadIdx.x == 0) dst[row] = dot;
 }

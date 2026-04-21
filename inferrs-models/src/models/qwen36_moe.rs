@@ -31,7 +31,10 @@ fn repack_moe_expert_first(
 ) -> Result<Arc<QTensor>> {
     let d = qt.shape().dims();
     if d.len() != 3 {
-        anyhow::bail!("Qwen3.6 MoE: expert tensor must be rank-3, got shape {:?}", d);
+        anyhow::bail!(
+            "Qwen3.6 MoE: expert tensor must be rank-3, got shape {:?}",
+            d
+        );
     }
     let device = qt.device();
     let already_ok = if is_down {
@@ -66,10 +69,7 @@ fn repack_moe_expert_first(
         );
     }
     let dtype = qt.dtype();
-    let dq = qt
-        .dequantize(&device)?
-        .permute((2, 1, 0))?
-        .contiguous()?;
+    let dq = qt.dequantize(&device)?.permute((2, 1, 0))?.contiguous()?;
     let out = QTensor::quantize(&dq, dtype)?;
     Ok(Arc::new(out))
 }
@@ -116,24 +116,27 @@ impl Qwen36MoeFfn {
 
         let (gate_exps, up_exps, down_exps) = if let Some(q) = qvb {
             let gate_exps = repack_moe_expert_first(
-                q.get_qtensor_named("gate_exps.weight")
-                    .ok_or_else(|| anyhow::anyhow!("Qwen3.6 MoE GGUF: missing mlp.gate_exps.weight"))?,
+                q.get_qtensor_named("gate_exps.weight").ok_or_else(|| {
+                    anyhow::anyhow!("Qwen3.6 MoE GGUF: missing mlp.gate_exps.weight")
+                })?,
                 hidden_size,
                 moe_intermediate_size,
                 num_experts,
                 false,
             )?;
             let up_exps = repack_moe_expert_first(
-                q.get_qtensor_named("up_exps.weight")
-                    .ok_or_else(|| anyhow::anyhow!("Qwen3.6 MoE GGUF: missing mlp.up_exps.weight"))?,
+                q.get_qtensor_named("up_exps.weight").ok_or_else(|| {
+                    anyhow::anyhow!("Qwen3.6 MoE GGUF: missing mlp.up_exps.weight")
+                })?,
                 hidden_size,
                 moe_intermediate_size,
                 num_experts,
                 false,
             )?;
             let down_exps = repack_moe_expert_first(
-                q.get_qtensor_named("down_exps.weight")
-                    .ok_or_else(|| anyhow::anyhow!("Qwen3.6 MoE GGUF: missing mlp.down_exps.weight"))?,
+                q.get_qtensor_named("down_exps.weight").ok_or_else(|| {
+                    anyhow::anyhow!("Qwen3.6 MoE GGUF: missing mlp.down_exps.weight")
+                })?,
                 hidden_size,
                 moe_intermediate_size,
                 num_experts,
@@ -149,22 +152,30 @@ impl Qwen36MoeFfn {
         let (sgi, sg, su, sd) = {
             let try_quad = || -> Result<_> {
                 let sgi = qlinear_b(
-                    hidden_size, 1, false,
+                    hidden_size,
+                    1,
+                    false,
                     vb.pp("gate_inp_shexp"),
                     qvb.map(|q| q.pp("gate_inp_shexp")).as_ref(),
                 )?;
                 let sg = qlinear_b(
-                    hidden_size, moe_intermediate_size, false,
+                    hidden_size,
+                    moe_intermediate_size,
+                    false,
                     vb.pp("gate_shexp"),
                     qvb.map(|q| q.pp("gate_shexp")).as_ref(),
                 )?;
                 let su = qlinear_b(
-                    hidden_size, moe_intermediate_size, false,
+                    hidden_size,
+                    moe_intermediate_size,
+                    false,
                     vb.pp("up_shexp"),
                     qvb.map(|q| q.pp("up_shexp")).as_ref(),
                 )?;
                 let sd = qlinear_b(
-                    moe_intermediate_size, hidden_size, false,
+                    moe_intermediate_size,
+                    hidden_size,
+                    false,
                     vb.pp("down_shexp"),
                     qvb.map(|q| q.pp("down_shexp")).as_ref(),
                 )?;
@@ -193,17 +204,17 @@ impl Qwen36MoeFfn {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, t, h) = x.dims3()?;
-        let flat = x.reshape((b * t, h))?;  // [seq_len, hidden]
+        let flat = x.reshape((b * t, h))?; // [seq_len, hidden]
         let seq_len = b * t;
 
         // ── Routing ──────────────────────────────────────────────────
-        let logits = flat.apply(&self.gate_inp)?;  // [seq_len, num_experts]
+        let logits = flat.apply(&self.gate_inp)?; // [seq_len, num_experts]
         let probs = candle_nn::ops::softmax_last_dim(&logits)?;
         let top_k_indices = probs
             .arg_sort_last_dim(false)?
             .narrow(D::Minus1, 0, self.top_k)?
-            .contiguous()?;  // [seq_len, top_k] (u32)
-        let top_k_weights_raw = probs.gather(&top_k_indices, D::Minus1)?;  // [seq_len, top_k]
+            .contiguous()?; // [seq_len, top_k] (u32)
+        let top_k_weights_raw = probs.gather(&top_k_indices, D::Minus1)?; // [seq_len, top_k]
         let top_k_weights = {
             let s = top_k_weights_raw.sum_keepdim(D::Minus1)?;
             top_k_weights_raw.broadcast_div(&s)?
@@ -216,16 +227,10 @@ impl Qwen36MoeFfn {
 
         let device = flat.device();
         match device {
-            Device::Cuda(_) => self.forward_cuda(
-                &flat, seq_len, h, b, t,
-                &flat_expert_ids,
-                &top_k_weights,
-            ),
-            _ => self.forward_cpu(
-                &flat, seq_len, h, b, t,
-                &flat_expert_ids,
-                &top_k_weights,
-            ),
+            Device::Cuda(_) => {
+                self.forward_cuda(&flat, seq_len, h, b, t, &flat_expert_ids, &top_k_weights)
+            }
+            _ => self.forward_cpu(&flat, seq_len, h, b, t, &flat_expert_ids, &top_k_weights),
         }
     }
 
@@ -237,20 +242,28 @@ impl Qwen36MoeFfn {
         h: usize,
         b: usize,
         t: usize,
-        flat_expert_ids: &Tensor,  // [seq_len * top_k] u32
-        top_k_weights: &Tensor,    // [seq_len, top_k] f32
+        flat_expert_ids: &Tensor, // [seq_len * top_k] u32
+        top_k_weights: &Tensor,   // [seq_len, top_k] f32
     ) -> Result<Tensor> {
         use candle_core::quantized::GgmlDType;
         use candle_nn::moe::moe_gemm_gguf;
 
         // Check if all three expert tensors have dtypes supported by moe_gemm_gguf.
         // If not, fall back to dequantize+CPU-style loop on CUDA.
-        let supported = |dtype: GgmlDType| matches!(
-            dtype,
-            GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q2K | GgmlDType::Q3K
-            | GgmlDType::Q5K | GgmlDType::Q6K
-            | GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS
-        );
+        let supported = |dtype: GgmlDType| {
+            matches!(
+                dtype,
+                GgmlDType::Q8_0
+                    | GgmlDType::Q4K
+                    | GgmlDType::Q2K
+                    | GgmlDType::Q3K
+                    | GgmlDType::Q5K
+                    | GgmlDType::Q6K
+                    | GgmlDType::IQ2XS
+                    | GgmlDType::IQ3XXS
+                    | GgmlDType::IQ4XS
+            )
+        };
         if !supported(self.gate_exps.dtype())
             || !supported(self.up_exps.dtype())
             || !supported(self.down_exps.dtype())
@@ -265,11 +278,7 @@ impl Qwen36MoeFfn {
         // sorted_token_ids = sequential [0..seq_len*top_k) for gate/up matmuls.
         // The kernel encodes: input_index = token_id / topk (access flat[tok]),
         // output row = token_id (unique per (tok, k) pair).
-        let sorted_token_ids = Tensor::arange(
-            0u32,
-            (seq_len * self.top_k) as u32,
-            flat.device(),
-        )?;
+        let sorted_token_ids = Tensor::arange(0u32, (seq_len * self.top_k) as u32, flat.device())?;
 
         // Ensure f32 input (moe_gemm_gguf decode path requires f32).
         let flat_f32 = flat.to_dtype(DType::F32)?;
@@ -305,21 +314,17 @@ impl Qwen36MoeFfn {
         // Down projection.
         // Each of the seq_len*top_k rows is an independent (token, expert-slot) with its own expert.
         // Use topk=1 so the kernel treats each row as a separate "token".
-        let flat_tok_ids = Tensor::arange(
-            0u32,
-            (seq_len * self.top_k) as u32,
-            flat.device(),
-        )?;
+        let flat_tok_ids = Tensor::arange(0u32, (seq_len * self.top_k) as u32, flat.device())?;
         let down_out = moe_gemm_gguf(
             &hidden,
             &self.down_exps,
             &None,
             &flat_tok_ids,
             flat_expert_ids,
-            1,     // topk=1: each row is its own "token"
+            1, // topk=1: each row is its own "token"
             false,
             DType::BF16,
-        )?;  // [seq_len * top_k, hidden]
+        )?; // [seq_len * top_k, hidden]
 
         // Weighted sum over top-k dimension.
         // down_out: [seq_len * top_k, h] → [seq_len, top_k, h]
@@ -327,13 +332,16 @@ impl Qwen36MoeFfn {
         let weights = top_k_weights
             .to_dtype(DType::F32)?
             .reshape((seq_len, self.top_k, 1))?;
-        let weighted = down_out.broadcast_mul(&weights)?;  // [seq_len, top_k, h]
-        let mut out = weighted.sum(1)?;                     // [seq_len, h]
+        let weighted = down_out.broadcast_mul(&weights)?; // [seq_len, top_k, h]
+        let mut out = weighted.sum(1)?; // [seq_len, h]
 
         // Optional shared expert
-        if let (Some(ref sgi), Some(ref sg), Some(ref su), Some(ref sd)) =
-            (&self.shared_gate_inp, &self.shared_gate, &self.shared_up, &self.shared_down)
-        {
+        if let (Some(ref sgi), Some(ref sg), Some(ref su), Some(ref sd)) = (
+            &self.shared_gate_inp,
+            &self.shared_gate,
+            &self.shared_up,
+            &self.shared_down,
+        ) {
             let flat_f32_orig = flat.to_dtype(DType::F32)?;
             let g = flat_f32_orig.apply(sg)?.silu()?;
             let u = flat_f32_orig.apply(su)?;
@@ -371,16 +379,14 @@ impl Qwen36MoeFfn {
         h: usize,
         b: usize,
         t: usize,
-        flat_expert_ids: &Tensor,  // [seq_len * top_k] u32
-        top_k_weights: &Tensor,    // [seq_len, top_k] f32
+        flat_expert_ids: &Tensor, // [seq_len * top_k] u32
+        top_k_weights: &Tensor,   // [seq_len, top_k] f32
     ) -> Result<Tensor> {
         let dtype = flat.dtype();
         let device = flat.device();
         let top_k = self.top_k;
 
-        let indices_vec = flat_expert_ids
-            .to_device(&Device::Cpu)?
-            .to_vec1::<u32>()?;
+        let indices_vec = flat_expert_ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
         let weights_vec = top_k_weights
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
@@ -388,9 +394,9 @@ impl Qwen36MoeFfn {
             .to_vec1::<f32>()?;
 
         // Dequantize fused expert tensors once (expensive but correct for CPU).
-        let gate_full = self.gate_exps.dequantize(device)?;  // [num_experts, moe_int, hidden]
-        let up_full   = self.up_exps.dequantize(device)?;
-        let down_full = self.down_exps.dequantize(device)?;  // [num_experts, hidden, moe_int]
+        let gate_full = self.gate_exps.dequantize(device)?; // [num_experts, moe_int, hidden]
+        let up_full = self.up_exps.dequantize(device)?;
+        let down_full = self.down_exps.dequantize(device)?; // [num_experts, hidden, moe_int]
 
         let mut sparse = Tensor::zeros((seq_len, h), dtype, device)?;
         let mut expert_tokens: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.num_experts];
@@ -403,20 +409,22 @@ impl Qwen36MoeFfn {
         }
 
         for (expert_idx, tokens) in expert_tokens.iter().enumerate() {
-            if tokens.is_empty() { continue; }
+            if tokens.is_empty() {
+                continue;
+            }
             let n = tokens.len();
             let (tok_pos, tok_weights): (Vec<u32>, Vec<f32>) =
                 tokens.iter().map(|&(t, w)| (t, w)).unzip();
             let idx_tensor = Tensor::from_vec(tok_pos, n, device)?;
             let cur = flat.index_select(&idx_tensor, 0)?;
 
-            let gate_w = gate_full.narrow(0, expert_idx, 1)?.squeeze(0)?;  // [moe_int, hidden]
-            let up_w   = up_full.narrow(0, expert_idx, 1)?.squeeze(0)?;
+            let gate_w = gate_full.narrow(0, expert_idx, 1)?.squeeze(0)?; // [moe_int, hidden]
+            let up_w = up_full.narrow(0, expert_idx, 1)?.squeeze(0)?;
             let gate_o = cur.matmul(&gate_w.t()?)?;
-            let up_o   = cur.matmul(&up_w.t()?)?;
+            let up_o = cur.matmul(&up_w.t()?)?;
             let hidden_act = (gate_o.silu()? * up_o)?;
 
-            let down_w = down_full.narrow(0, expert_idx, 1)?.squeeze(0)?;  // [hidden, moe_int]
+            let down_w = down_full.narrow(0, expert_idx, 1)?.squeeze(0)?; // [hidden, moe_int]
             let expert_out = hidden_act.matmul(&down_w.t()?)?;
 
             let w_tensor = Tensor::from_vec(tok_weights, n, device)?
@@ -427,9 +435,12 @@ impl Qwen36MoeFfn {
         }
 
         let mut out = sparse;
-        if let (Some(ref sgi), Some(ref sg), Some(ref su), Some(ref sd)) =
-            (&self.shared_gate_inp, &self.shared_gate, &self.shared_up, &self.shared_down)
-        {
+        if let (Some(ref sgi), Some(ref sg), Some(ref su), Some(ref sd)) = (
+            &self.shared_gate_inp,
+            &self.shared_gate,
+            &self.shared_up,
+            &self.shared_down,
+        ) {
             let g = flat.apply(sg)?.silu()?;
             let u = flat.apply(su)?;
             let h_act = (g * u)?;

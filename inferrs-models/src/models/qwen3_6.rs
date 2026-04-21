@@ -517,9 +517,7 @@ impl LinearAttn {
         } else if let Ok(w) = vb.get((kernel, conv_dim), "conv1d.weight") {
             w.to_dtype(DType::F32)?.transpose(0, 1)?.unsqueeze(1)?
         } else if let Ok(w) = vb.get((1, conv_dim, kernel), "conv1d.weight") {
-            w.to_dtype(DType::F32)?
-                .squeeze(0)?
-                .unsqueeze(1)?
+            w.to_dtype(DType::F32)?.squeeze(0)?.unsqueeze(1)?
         } else {
             anyhow::bail!(
                 "Qwen3.6 linear_attn conv1d.weight: unsupported shape (expected [{conv_dim},1,{kernel}] / [{conv_dim},{kernel}] / [{kernel},{conv_dim}])"
@@ -904,10 +902,7 @@ impl QMlp {
             let xs_f32 = x.to_dtype(DType::F32)?;
 
             match &self.gate_up {
-                QMlpGateUp::Split {
-                    gate_proj,
-                    up_proj,
-                } => {
+                QMlpGateUp::Split { gate_proj, up_proj } => {
                     // Fused double-GEMV (Q4K Metal) for single-token decode.
                     #[cfg(feature = "metal")]
                     if is_single_token {
@@ -943,10 +938,7 @@ impl QMlp {
             }
         } else {
             match &self.gate_up {
-                QMlpGateUp::Split {
-                    gate_proj,
-                    up_proj,
-                } => {
+                QMlpGateUp::Split { gate_proj, up_proj } => {
                     let gate = x.apply(gate_proj)?.silu()?;
                     let up = x.apply(up_proj)?;
                     let hidden = (gate * up)?;
@@ -1062,10 +1054,7 @@ struct DecoderLayer {
 /// Qwen3.6-A3B GGUFs are mostly MoE, but some layers use a dense SwiGLU stack
 /// (`ffn_gate` / `ffn_up` / `ffn_down`) instead of `ffn_gate_up_exps` /
 /// `ffn_gate_exps`+`ffn_up_exps`.  Only build `Qwen36MoeFfn` when those MoE tensors exist.
-fn qwen36_mlp_weights_are_moe(
-    mlp_qvb: Option<&QGgufVarBuilder>,
-    mlp_vb: &VarBuilder,
-) -> bool {
+fn qwen36_mlp_weights_are_moe(mlp_qvb: Option<&QGgufVarBuilder>, mlp_vb: &VarBuilder) -> bool {
     if let Some(q) = mlp_qvb {
         if q.has_qtensor_named("gate_up_exps.weight") {
             return true;
@@ -1608,8 +1597,8 @@ impl MtpModule {
             cfg,
             layer_vb,
             layer_qvb.as_ref(),
-            true, // is_full_attention
-            None, // no TurboQuant for MTP block
+            true,  // is_full_attention
+            None,  // no TurboQuant for MTP block
             false, // MTP block uses dense SwiGLU, not MoE
         )?;
 

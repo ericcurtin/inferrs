@@ -1442,7 +1442,10 @@ impl Engine {
                         // is already inside a thinking block. Scan the last few tokens
                         // since the delimiter may be followed by a newline token.
                         let tail = seq.prompt_tokens.len().saturating_sub(4);
-                        if seq.prompt_tokens[tail..].iter().any(|&t| seq.think_filter.is_open_delimiter(t)) {
+                        if seq.prompt_tokens[tail..]
+                            .iter()
+                            .any(|&t| seq.think_filter.is_open_delimiter(t))
+                        {
                             seq.think_filter.set_in_think(true);
                         }
                         tracing::debug!(
@@ -1474,7 +1477,10 @@ impl Engine {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         let tail = seq.prompt_tokens.len().saturating_sub(4);
-                        if seq.prompt_tokens[tail..].iter().any(|&t| seq.think_filter.is_open_delimiter(t)) {
+                        if seq.prompt_tokens[tail..]
+                            .iter()
+                            .any(|&t| seq.think_filter.is_open_delimiter(t))
+                        {
                             seq.think_filter.set_in_think(true);
                         }
                         tracing::debug!(
@@ -2372,12 +2378,8 @@ impl Engine {
         for chunk in prompt_tokens.chunks(chunk_len) {
             Self::paged_alloc_range(ps, offset, chunk.len())?;
             let input_ids = Tensor::new(chunk, device)?.unsqueeze(0)?;
-            last_logits = Some(model.forward_paged(
-                &input_ids,
-                offset,
-                &ps.block_table,
-                &mut ps.kv_store,
-            )?);
+            last_logits =
+                Some(model.forward_paged(&input_ids, offset, &ps.block_table, &mut ps.kv_store)?);
             offset += chunk.len();
         }
         last_logits.ok_or_else(|| anyhow::anyhow!("prefill: internal error (no logits)"))

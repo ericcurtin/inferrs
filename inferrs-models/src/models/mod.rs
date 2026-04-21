@@ -8,11 +8,11 @@ pub mod gemma4;
 mod gemma4_moe;
 pub mod quantized_linear;
 pub mod qwen3;
+pub(crate) mod qwen36_moe;
 pub mod qwen3_5;
 pub mod qwen3_5_linear_attn_scan;
 pub mod qwen3_6;
 pub mod qwen3_6_linear_attn_scan;
-pub(crate) mod qwen36_moe;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -1872,10 +1872,7 @@ mod tests {
                     "token_embd.weight",
                 ),
                 ("model.language_model.norm.weight", "output_norm.weight"),
-                (
-                    "model.language_model.lm_head.weight",
-                    "output.weight",
-                ),
+                ("model.language_model.lm_head.weight", "output.weight"),
                 // ── full-attention layer ───────────────────────────────────
                 (
                     "model.language_model.layers.0.self_attn.q_proj.weight",
@@ -1959,10 +1956,7 @@ mod tests {
         check(
             &ModelArchitecture::Qwen36,
             &[
-                (
-                    "model.language_model.lm_head.weight",
-                    "output.weight",
-                ),
+                ("model.language_model.lm_head.weight", "output.weight"),
                 (
                     "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
                     "blk.0.attn_qkv.weight",

@@ -1750,7 +1750,11 @@ async fn chat_completions(
         tracing::info!(
             "Request {}: tools provided — injecting as {} context",
             request_id,
-            if tokenizer.uses_native_tools() { "native" } else { "plain-text system" }
+            if tokenizer.uses_native_tools() {
+                "native"
+            } else {
+                "plain-text system"
+            }
         );
         if tokenizer.uses_native_tools() {
             // Native path: tools are passed directly to apply_chat_template; no
@@ -1896,9 +1900,11 @@ async fn chat_completions(
 
         (tokens, None, Some(image_ctx))
     } else {
-        let tokens = match tokenizer
-            .apply_chat_template_and_encode_with_tools(messages, req.tools.as_ref(), req.enable_thinking.unwrap_or(true))
-        {
+        let tokens = match tokenizer.apply_chat_template_and_encode_with_tools(
+            messages,
+            req.tools.as_ref(),
+            req.enable_thinking.unwrap_or(true),
+        ) {
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
         };
@@ -1981,7 +1987,13 @@ async fn chat_completions(
             return Err(server_error("Engine unavailable"));
         }
 
-        let stream = make_sse_stream(token_rx, request_id, model_id, created, tokenizer.uses_native_tools());
+        let stream = make_sse_stream(
+            token_rx,
+            request_id,
+            model_id,
+            created,
+            tokenizer.uses_native_tools(),
+        );
         Ok(Sse::new(stream).into_response())
     } else {
         // Non-streaming response
@@ -2191,7 +2203,33 @@ fn make_sse_stream(
             });
 
             if uses_native_tools {
-                // Accumulate content; hold all chunks until generation ends.
+                // reasoning_content streams through immediately — it is never part of the
+                // tool-call XML and must not be withheld from the client.
+                if reasoning_content.is_some() {
+                    let rc_chunk = ChatCompletionStreamResponse {
+                        id: request_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_id.clone(),
+                        choices: vec![ChatCompletionStreamChoice {
+                            index: 0,
+                            delta: DeltaMessage {
+                                role: None,
+                                content: None,
+                                reasoning_content,
+                                tool_calls: vec![],
+                            },
+                            finish_reason: None,
+                            logprobs: None,
+                        }],
+                    };
+                    if let Some(event) = to_sse_event(&rc_chunk, "reasoning chunk") {
+                        yield Ok(event);
+                    }
+                }
+
+                // Accumulate assistant content; hold until generation ends so the
+                // tool-call adapter can inspect the complete output.
                 if let Some(ref text) = content {
                     content_buf.push_str(text);
                 }
@@ -2204,7 +2242,30 @@ fn make_sse_stream(
                     );
 
                     if !outcome.tool_calls.is_empty() {
-                        // Emit a single delta with tool_calls; suppress buffered content.
+                        // Emit any text that preceded the first tool-call marker.
+                        if !outcome.content.is_empty() {
+                            let pre_chunk = ChatCompletionStreamResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk",
+                                created,
+                                model: model_id.clone(),
+                                choices: vec![ChatCompletionStreamChoice {
+                                    index: 0,
+                                    delta: DeltaMessage {
+                                        role: None,
+                                        content: Some(outcome.content),
+                                        reasoning_content: None,
+                                        tool_calls: vec![],
+                                    },
+                                    finish_reason: None,
+                                    logprobs: None,
+                                }],
+                            };
+                            if let Some(event) = to_sse_event(&pre_chunk, "pre-tool content chunk") {
+                                yield Ok(event);
+                            }
+                        }
+                        // Emit tool_calls delta — the raw XML content is suppressed.
                         let tc_chunk = ChatCompletionStreamResponse {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -2254,26 +2315,28 @@ fn make_sse_stream(
                         }
                     }
                 } else {
-                    // Mid-stream: buffer the chunk for potential flush.
-                    let chunk = ChatCompletionStreamResponse {
-                        id: request_id.clone(),
-                        object: "chat.completion.chunk",
-                        created,
-                        model: model_id.clone(),
-                        choices: vec![ChatCompletionStreamChoice {
-                            index: 0,
-                            delta: DeltaMessage {
-                                role: None,
-                                content,
-                                reasoning_content,
-                                tool_calls: vec![],
-                            },
-                            finish_reason: None,
-                            logprobs: chunk_logprobs,
-                        }],
-                    };
-                    if let Some(event) = to_sse_event(&chunk, "buffered chunk") {
-                        buffered_chunks.push(event);
+                    // Mid-stream: buffer only the content chunk for potential flush.
+                    if content.is_some() {
+                        let chunk = ChatCompletionStreamResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_id.clone(),
+                            choices: vec![ChatCompletionStreamChoice {
+                                index: 0,
+                                delta: DeltaMessage {
+                                    role: None,
+                                    content,
+                                    reasoning_content: None,
+                                    tool_calls: vec![],
+                                },
+                                finish_reason: None,
+                                logprobs: chunk_logprobs,
+                            }],
+                        };
+                        if let Some(event) = to_sse_event(&chunk, "buffered chunk") {
+                            buffered_chunks.push(event);
+                        }
                     }
                 }
             } else {

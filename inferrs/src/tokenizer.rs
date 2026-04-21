@@ -588,8 +588,7 @@ fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String
 
 /// Suffix after `<|im_start|>assistant\n` for Qwen3.5 when `enable_thinking=false` in upstream
 /// `tokenizer_config.json` Jinja (empty thinking block, then answer).
-const QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX: &str =
-    "<think>\n\n</think>\n\n";
+const QWEN35_THINKING_DISABLED_ASSISTANT_SUFFIX: &str = "<think>\n\n</think>\n\n";
 
 /// Qwen3.5 ChatML template with thinking disabled.
 ///
@@ -605,7 +604,11 @@ fn apply_qwen35(messages: &[ChatMessage]) -> String {
 /// tool-calling format so the model outputs well-formed `<tool_call>` XML.
 /// Without tools the output is identical to Qwen3.5 except that prior
 /// assistant turns have `<think>...</think>` stripped.
-fn apply_qwen36(messages: &[ChatMessage], tools: Option<&serde_json::Value>, enable_thinking: bool) -> Result<String> {
+fn apply_qwen36(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+    enable_thinking: bool,
+) -> Result<String> {
     let normalized = normalize_messages(messages, |role| match role {
         Role::System => "system",
         Role::User | Role::Tool | Role::Function => "user",
