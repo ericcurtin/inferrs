@@ -323,6 +323,9 @@ pub struct RawConfig {
     pub image_token_id: Option<u32>,
     pub boi_token_id: Option<u32>,
     pub eoi_token_id: Option<u32>,
+
+    #[serde(default)]
+    pub quantization_config: Option<crate::gptq::GptqConfig>,
 }
 
 /// Default epsilon for RMS normalization layers across all model families.

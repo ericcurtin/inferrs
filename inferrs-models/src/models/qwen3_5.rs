@@ -559,10 +559,13 @@ impl LinearAttn {
             qvb.map(|q| q.pp("in_proj_b")).as_ref(),
         )?;
 
-        // conv1d weight: [conv_dim, 1, kernel] -- depthwise
+        // conv1d weight: [conv_dim, 1, kernel] -- depthwise.
+        // External GGUFs (llama.cpp) store this as 2D [conv_dim, kernel] (the groups=1
+        // dimension is squeezed). Load unchecked and reshape so both shapes are accepted.
         let conv1d_weight = vb
-            .get((conv_dim, 1, kernel), "conv1d.weight")?
-            .to_dtype(DType::F32)?;
+            .get_unchecked("conv1d.weight")?
+            .to_dtype(DType::F32)?
+            .reshape((conv_dim, 1, kernel))?;
 
         // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
         // Load A_log and immediately compute its exp — it's a constant weight.

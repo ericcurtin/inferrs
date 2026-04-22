@@ -19,9 +19,11 @@ pub enum Id {
     Sort,
     Ternary,
     Unary,
+    IqDequant,
+    GptqInt4,
 }
 
-pub const ALL_IDS: [Id; 14] = [
+pub const ALL_IDS: [Id; 16] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -36,6 +38,8 @@ pub const ALL_IDS: [Id; 14] = [
     Id::Sort,
     Id::Ternary,
     Id::Unary,
+    Id::IqDequant,
+    Id::GptqInt4,
 ];
 
 pub struct Module {
@@ -87,5 +91,7 @@ mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);
 mdl!(TERNARY, Ternary);
 mdl!(UNARY, Unary);
+mdl!(IQ_DEQUANT, IqDequant);
+mdl!(GPTQ_INT4, GptqInt4);
 
 pub mod ffi;

@@ -904,11 +904,12 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         // ── Norms ────────────────────────────────────────────────────────
         "input_layernorm.weight" => "attn_norm.weight",
         "post_attention_layernorm.weight" => {
-            // Gemma2/3/4 use this as "post_attention_norm", everyone else as "ffn_norm"
+            // Gemma2/3/4 and Qwen3.5 use "post_attention_norm"; everyone else uses "ffn_norm"
             match arch {
                 ModelArchitecture::Gemma2
                 | ModelArchitecture::Gemma3
-                | ModelArchitecture::Gemma4 => "post_attention_norm.weight",
+                | ModelArchitecture::Gemma4
+                | ModelArchitecture::Qwen35 => "post_attention_norm.weight",
                 _ => "ffn_norm.weight",
             }
         }
@@ -924,11 +925,29 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "layer_scalar" => "layer_output_scale.weight",
 
         // ── Qwen3.5 linear attention tensors ─────────────────────────────
+        // Inferrs-internal GGUF (underscore format) for quantized projections:
         "linear_attn.in_proj_qkv.weight" => "linear_attn_in_proj_qkv.weight",
         "linear_attn.in_proj_z.weight" => "linear_attn_in_proj_z.weight",
         "linear_attn.in_proj_a.weight" => "linear_attn_in_proj_a.weight",
         "linear_attn.in_proj_b.weight" => "linear_attn_in_proj_b.weight",
         "linear_attn.out_proj.weight" => "linear_attn_out_proj.weight",
+        // External GGUF (llama.cpp) SSM F32 tensors — loaded via vb (not qvb):
+        "linear_attn.A_log" => match arch {
+            ModelArchitecture::Qwen35 => "ssm_a",
+            _ => return "linear_attn.A_log".to_string(),
+        },
+        "linear_attn.conv1d.weight" => match arch {
+            ModelArchitecture::Qwen35 => "ssm_conv1d.weight",
+            _ => return "linear_attn.conv1d.weight".to_string(),
+        },
+        "linear_attn.dt_bias" => match arch {
+            ModelArchitecture::Qwen35 => "ssm_dt.bias",
+            _ => return "linear_attn.dt_bias".to_string(),
+        },
+        "linear_attn.norm.weight" => match arch {
+            ModelArchitecture::Qwen35 => "ssm_norm.weight",
+            _ => return "linear_attn.norm.weight".to_string(),
+        },
 
         // ── Qwen3.5 MoE (sparse FFN layers) ──────────────────────────────
         "mlp.gate.weight" => "ffn_gate_inp.weight",
@@ -1001,7 +1020,18 @@ fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "attn_k.bias" => "self_attn.k_proj.bias",
         "attn_v.weight" => "self_attn.v_proj.weight",
         "attn_v.bias" => "self_attn.v_proj.bias",
-        "attn_qkv.weight" => "self_attn.qkv_proj.weight",
+        // In Qwen3.5 GGUF, attn_qkv appears in SSM (hybrid) layers and maps to
+        // linear_attn.in_proj_qkv. In other models (e.g. Phi3) it is a fused
+        // full-attention QKV → self_attn.qkv_proj.
+        "attn_qkv.weight" => match arch {
+            ModelArchitecture::Qwen35 => "linear_attn.in_proj_qkv.weight",
+            _ => "self_attn.qkv_proj.weight",
+        },
+        // Gating vector for the linear-attention value branch (Qwen3.5 SSM only).
+        "attn_gate.weight" => match arch {
+            ModelArchitecture::Qwen35 => "linear_attn.in_proj_z.weight",
+            _ => return "attn_gate.weight".to_string(),
+        },
         "attn_output.weight" => "self_attn.o_proj.weight",
         "attn_output.bias" => "self_attn.o_proj.bias",
         "attn_q_norm.weight" => "self_attn.q_norm.weight",
@@ -1025,6 +1055,16 @@ fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "proj.weight" => "per_layer_projection.weight",
         "post_norm.weight" => "post_per_layer_input_norm.weight",
         "layer_output_scale.weight" => "layer_scalar",
+        // ── Qwen3.5 SSM (linear attention / GatedDeltaNet) ───────────────
+        // These suffixes appear only in hybrid SSM blocks (blk.N where N is not
+        // a full-attention index). Full-attention blocks use attn_q/k/v instead.
+        "ssm_a" => "linear_attn.A_log",
+        "ssm_alpha.weight" => "linear_attn.in_proj_a.weight",
+        "ssm_beta.weight" => "linear_attn.in_proj_b.weight",
+        "ssm_conv1d.weight" => "linear_attn.conv1d.weight",
+        "ssm_dt.bias" => "linear_attn.dt_bias",
+        "ssm_norm.weight" => "linear_attn.norm.weight",
+        "ssm_out.weight" => "linear_attn.out_proj.weight",
         // ── Qwen3.5 MoE ──────────────────────────────────────────────────
         "ffn_gate_inp.weight" => "mlp.gate.weight",
         "ffn_gate_exps.weight" => "mlp.experts.gate_up_proj",
@@ -1077,9 +1117,23 @@ pub fn load_model(
         base_vb
     } else {
         let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
-        // SAFETY: the mmap lifetime is extended to 'static by the unsafe block.
-        // The VarBuilder (and the model built from it) keep the mmap alive.
-        unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? }
+        if raw_config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|q| q.bits == 4)
+        {
+            // GPTQ-Int4 safetensors: dequantize weights lazily via custom backend.
+            // Each projection is dequantized on-demand to avoid loading the full
+            // 54 GB BF16 expansion into CPU RAM simultaneously.
+            let cfg = raw_config.quantization_config.clone().unwrap();
+            // SAFETY: same mmap contract as from_mmaped_safetensors above.
+            let backend = unsafe { crate::gptq::GptqSafetensorsVb::new(&paths_ref, cfg)? };
+            VarBuilder::from_backend(Box::new(backend), dtype, device.clone())
+        } else {
+            // SAFETY: the mmap lifetime is extended to 'static by the unsafe block.
+            // The VarBuilder (and the model built from it) keep the mmap alive.
+            unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? }
+        }
     };
 
     // Detect external GGUF format for QGgufVarBuilder re-keying below.

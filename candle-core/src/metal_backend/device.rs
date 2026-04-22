@@ -254,11 +254,10 @@ impl MetalDevice {
         if ptr.is_null() || size == 0 {
             return self.new_buffer_with_data_untracked(data);
         }
-        let new_buffer = unsafe {
-            self.device
-                .new_buffer_with_bytes_no_copy(ptr, size, RESOURCE_OPTIONS)
-                .map_err(|e| MetalError::from(format!("{e:?}")))?
-        };
+        let new_buffer = self
+            .device
+            .new_buffer_with_bytes_no_copy(ptr, size, RESOURCE_OPTIONS)
+            .map_err(|e| MetalError::from(format!("{e:?}")))?;
         Ok(Arc::new(new_buffer))
     }
 
