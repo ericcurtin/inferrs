@@ -201,6 +201,29 @@ pub struct ServeArgs {
     #[arg(long, num_args(0..=1), default_value("Q4K"), default_missing_value("Q4K"),
           require_equals(true), value_name = "FORMAT")]
     pub quantize: Option<String>,
+
+    /// HuggingFace model ID for the speculative decoding draft model
+    /// (e.g. google/gemma-4-E2B-it). Must share the same vocabulary as the
+    /// target model. When set, speculative decoding is enabled automatically.
+    #[arg(long, value_name = "HF-ID")]
+    pub draft_model: Option<String>,
+
+    /// Number of tokens the draft model proposes per speculative decode step.
+    /// Higher values increase throughput when the draft model is accurate but
+    /// reduce it on mismatch. Default 5 mirrors llama.cpp's default.
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    pub draft_gamma: usize,
+
+    /// Weight data type for the draft model: f32, f16, bf16.
+    /// When omitted the draft model inherits the target model's `--dtype`.
+    #[arg(long, value_name = "DTYPE")]
+    pub draft_dtype: Option<String>,
+
+    /// Quantization scheme for the draft model (same format as `--quantize`).
+    /// When omitted the draft model inherits the target model's `--quantize` setting.
+    #[arg(long, num_args(0..=1), default_missing_value("Q4K"),
+          require_equals(true), value_name = "FORMAT")]
+    pub draft_quantize: Option<String>,
 }
 
 /// Disable per-tensor CUDA event tracking on a CUDA device.

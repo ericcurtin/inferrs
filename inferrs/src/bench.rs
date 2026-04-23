@@ -101,6 +101,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
         max_tokens,
     );
 
+    let use_spec = serve.draft_model.is_some();
+    let mut acceptance_samples: Vec<f64> = Vec::with_capacity(args.runs);
+
     for i in 0..total_runs {
         let is_warmup = i < args.warmup;
         let label = if is_warmup {
@@ -110,7 +113,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         };
 
         let wall_start = std::time::Instant::now();
-        let (result, prefill_ms, decode_ms) =
+        let (result, prefill_ms, decode_ms, acceptance_rate) =
             engine.bench_generate("bench", &prompt_tokens, &sampling_params)?;
         let e2e_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -127,6 +130,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
             e2e_ms_samples.push(e2e_ms);
             prompt_tok_samples.push(n_prompt);
             output_tok_samples.push(n_output);
+            if let Some(ar) = acceptance_rate {
+                acceptance_samples.push(ar);
+            }
 
             let ttft_ms = prefill_ms;
             let decode_tps = if decode_ms > 0.0 {
@@ -139,9 +145,12 @@ pub fn run(args: BenchArgs) -> Result<()> {
             } else {
                 0.0
             };
+            let spec_str = acceptance_rate
+                .map(|ar| format!("  accept={:.0}%", ar * 100.0))
+                .unwrap_or_default();
 
             println!(
-                "  [{label}] TTFT={ttft_ms:.1}ms  decode={decode_tps:.1}tok/s  prefill={prefill_tps:.1}tok/s  output_tokens={n_output}",
+                "  [{label}] TTFT={ttft_ms:.1}ms  decode={decode_tps:.1}tok/s  prefill={prefill_tps:.1}tok/s  output_tokens={n_output}{spec_str}",
             );
         }
     }
@@ -211,6 +220,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
     println!("  End-to-end latency (avg): {mean_e2e_ms:.1} ms");
     println!("  End-to-end p50          : {p50:.1} ms");
     println!("  End-to-end p90          : {p90:.1} ms");
+    if use_spec && !acceptance_samples.is_empty() {
+        let mean_accept = acceptance_samples.iter().sum::<f64>() / acceptance_samples.len() as f64;
+        println!("  Draft acceptance rate   : {:.1}%", mean_accept * 100.0);
+        if mean_accept < 0.20 {
+            println!(
+                "  ⚠ Low acceptance — consider a better-matched draft model or reducing --draft-gamma"
+            );
+        }
+    }
 
     Ok(())
 }

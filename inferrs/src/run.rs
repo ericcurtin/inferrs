@@ -134,6 +134,28 @@ pub struct RunArgs {
           value_name = "FORMAT")]
     pub quantize: Option<String>,
 
+    // ── Speculative decoding ──────────────────────────────────────────────────
+    /// HuggingFace model ID for a speculative-decoding draft model.
+    /// Must share the same vocabulary as the target model.
+    /// Example: `--draft-model bartowski/google_gemma-4-E2B-it-GGUF`
+    #[arg(long, value_name = "HF-ID")]
+    pub draft_model: Option<String>,
+
+    /// Number of tokens the draft model proposes per step (default: 5).
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    pub draft_gamma: usize,
+
+    /// Weight data type for the draft model: f32, f16, bf16.
+    /// Inherits `--dtype` when omitted.
+    #[arg(long, value_name = "DTYPE")]
+    pub draft_dtype: Option<String>,
+
+    /// Quantization scheme for the draft model (same format as `--quantize`).
+    /// Plain `--draft-quantize` defaults to Q4K.
+    #[arg(long, num_args(0..=1), require_equals(true), default_missing_value("Q4K"),
+          value_name = "FORMAT")]
+    pub draft_quantize: Option<String>,
+
     // ── Media attachments (non-interactive / single-turn only) ────────────────
     /// Path to a WAV audio file to attach to the prompt (Gemma 4 audio models).
     #[arg(long)]
@@ -569,6 +591,18 @@ async fn warm_up_model(client: &Client, base_url: &str, args: &RunArgs) -> Resul
     }
     if let Some(ref ts) = args.tokenizer_source {
         options.insert("tokenizer_source".into(), ts.clone().into());
+    }
+    if let Some(ref dm) = args.draft_model {
+        options.insert("draft_model".into(), dm.clone().into());
+    }
+    if args.draft_gamma != 5 {
+        options.insert("draft_gamma".into(), args.draft_gamma.into());
+    }
+    if let Some(ref dd) = args.draft_dtype {
+        options.insert("draft_dtype".into(), dd.clone().into());
+    }
+    if let Some(ref dq) = args.draft_quantize {
+        options.insert("draft_quantize".into(), dq.clone().into());
     }
 
     let mut body = serde_json::json!({

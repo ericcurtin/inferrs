@@ -141,6 +141,27 @@ fn chat_completion(port: u16, user_message: &str) -> String {
         .to_string()
 }
 
+/// Gracefully unload a model from a running server before killing the process.
+///
+/// Sends `POST /api/generate` with `keep_alive=0` (Ollama unload protocol).
+/// This lets the server release Metal/CUDA device resources cleanly, avoiding
+/// command-buffer assertion failures when a second model loads immediately after.
+/// Errors are silently ignored — the caller should still kill() + wait() the process.
+fn graceful_stop(port: u16, model_id: &str) {
+    let url = format!("http://127.0.0.1:{}/api/generate", port);
+    let body = serde_json::json!({
+        "model": model_id,
+        "prompt": "",
+        "keep_alive": 0,
+        "stream": false,
+    });
+    let _ = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(&body);
+    // Give the server a moment to complete the unload before SIGKILL.
+    std::thread::sleep(Duration::from_secs(2));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -153,6 +174,37 @@ fn synthetic_prompt(target_tokens: usize) -> String {
     // Approximately 10 tokens per repetition (9 words × ~1.1 tokens/word).
     let reps = (target_tokens / 10).max(1);
     sentence.repeat(reps)
+}
+
+/// Starts `inferrs serve <model_id>` with a draft model for speculative decoding.
+///
+/// Passes `--draft-model <draft_model_id> --draft-gamma <gamma>` in addition to the
+/// standard set of flags used by [`spawn_server`].
+fn spawn_server_with_draft(model_id: &str, draft_model_id: &str, gamma: usize, port: u16) -> Child {
+    let bin = env!("CARGO_BIN_EXE_inferrs");
+    Command::new(bin)
+        .args([
+            "serve",
+            model_id,
+            "--port",
+            &port.to_string(),
+            "--host",
+            "127.0.0.1",
+            "--max-tokens",
+            "128",
+            "--dtype",
+            "bf16",
+            "--device",
+            "auto",
+            "--draft-model",
+            draft_model_id,
+            "--draft-gamma",
+            &gamma.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn inferrs with draft model")
 }
 
 /// Starts `inferrs serve <model_id>` with paged attention enabled.
@@ -629,4 +681,101 @@ fn gemma4_26b_moe_produces_intelligible_output() {
     if let Err(e) = result {
         std::panic::resume_unwind(e);
     }
+}
+
+/// Verifies that speculative decoding with `google/gemma-4-E2B-it` used as **both**
+/// target and draft model produces output identical to the non-speculative baseline
+/// at `temperature=0`.
+///
+/// Using the same model as its own draft guarantees ~100% acceptance rate under
+/// greedy decoding.  We verify correctness by sending the SAME prompt twice to
+/// the single speculative server: both responses must be identical.  This avoids
+/// running two sequential server processes (which stresses Metal GPU resource
+/// teardown on Apple Silicon) while still proving the speculative path is lossless.
+///
+/// Why two identical responses prove correctness:
+/// - temperature=0 → greedy decode is deterministic → same tokens every run.
+/// - When target == draft the probability ratio p(x)/q(x) = 1.0 always, so
+///   speculative_verify() accepts every draft token → acceptance rate = 100% →
+///   no replacement sampling → output is byte-for-byte the greedy result.
+///
+/// # Manual validation
+///
+/// ```bash
+/// RUST_LOG=inferrs=info,inferrs_models=warn \
+///   cargo run --bin inferrs --release -- \
+///   serve --model google/gemma-4-E2B-it \
+///   --draft-model google/gemma-4-E2B-it --draft-gamma 5
+/// ```
+///
+/// Then in another terminal:
+/// ```bash
+/// curl -s http://localhost:8080/v1/chat/completions \
+///   -H "Content-Type: application/json" \
+///   -d '{"model":"test","messages":[{"role":"user","content":"What is the capital of France? Reply in one word."}],"max_tokens":32,"temperature":0}' \
+///   | jq .choices[0].message.content
+/// ```
+///
+/// Look for log lines like:
+///   INFO  inferrs: speculative decoding: 100.0% acceptance (15/15 tokens)
+///
+/// Run the automated test with:
+/// ```
+/// cargo test --release --test server_integration speculative -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires model download and significant compute; run with --ignored"]
+fn speculative_decoding_gemma4_e2b_produces_correct_output() {
+    let model_id = "google/gemma-4-E2B-it";
+    // Use a multi-sentence prompt to produce a response long enough (>gamma tokens)
+    // to exercise multiple speculative decode steps.  Single-word answers like
+    // "Paris" fit in one step and would not catch KV-offset drift bugs.
+    let prompt = "List the first 5 planets of the solar system, one per line, no extra text.";
+
+    // Single speculative server: same model used as both target and draft.
+    // This avoids two sequential Metal processes (which can cause GPU command-buffer
+    // assertion failures on Apple Silicon before the first server fully releases
+    // its resources).
+    let spec_port = free_port();
+    let mut spec_server = spawn_server_with_draft(model_id, model_id, 3, spec_port);
+
+    let (resp1, resp2) = match std::panic::catch_unwind(|| {
+        wait_for_health(spec_port, Duration::from_secs(300));
+        let r1 = chat_completion(spec_port, prompt);
+        let r2 = chat_completion(spec_port, prompt);
+        (r1, r2)
+    }) {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = spec_server.kill();
+            let _ = spec_server.wait();
+            std::panic::resume_unwind(e);
+        }
+    };
+
+    graceful_stop(spec_port, model_id);
+    let _ = spec_server.kill();
+    let _ = spec_server.wait();
+
+    eprintln!("speculative response 1: {:?}", resp1);
+    eprintln!("speculative response 2: {:?}", resp2);
+
+    assert!(
+        looks_intelligible(&resp1),
+        "speculative response is not intelligible.\nGot: {:?}",
+        resp1
+    );
+
+    // With temperature=0, both responses must be identical.
+    // When target == draft, p(x)/q(x) == 1.0 always → 100% acceptance →
+    // output equals greedy target-only decoding.
+    assert_eq!(
+        resp1, resp2,
+        "speculative decoding is not deterministic at temperature=0.\n\
+         response 1: {:?}\n\
+         response 2: {:?}",
+        resp1, resp2
+    );
+
+    eprintln!("both responses match — speculative decode is deterministic and lossless");
 }

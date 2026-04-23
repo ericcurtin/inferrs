@@ -148,10 +148,63 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
     }
 
-    // Load model weights and tokenizer in parallel: both are I/O + CPU bound
-    // and independent of each other.  On a 256K-token vocabulary the tokenizer
-    // parse takes ~300 ms; running it concurrently with the ~840 ms weight load
-    // hides it almost entirely.
+    // Resolve draft model files before entering the thread scope so that any
+    // network / disk errors surface early (and cleanly via `?`).
+    //
+    // The draft config is loaded here too: we need the vocab size before the
+    // scope finishes so we can validate it against the target's vocab size.
+    let draft_info: Option<(crate::hub::ModelFiles, RawConfig, ModelArchitecture, DType)> =
+        if let Some(draft_id) = args.draft_model.as_deref() {
+            // Resolve dtype: use --draft-dtype if set, otherwise fall back to
+            // the target model dtype (already normalised for CPU above).
+            let draft_dtype = if let Some(ref s) = args.draft_dtype {
+                match s.as_str() {
+                    "f32" => candle_core::DType::F32,
+                    "f16" => candle_core::DType::F16,
+                    "bf16" => candle_core::DType::BF16,
+                    other => anyhow::bail!("Unknown draft-dtype: {other}"),
+                }
+            } else {
+                dtype // inherit target model dtype
+            };
+
+            // Resolve quantize: use --draft-quantize if set, otherwise fall back
+            // to the target model quant_dtype.
+            let draft_quant_dtype: Option<candle_core::quantized::GgmlDType> =
+                match args.draft_quantize.as_deref() {
+                    Some(s) if matches!(s.to_lowercase().as_str(), "none" | "false") => None,
+                    Some(s) => Some(crate::quantize::parse_format(s)?),
+                    None => quant_dtype, // inherit target model quant setting
+                };
+
+            tracing::info!("Downloading draft model: {draft_id}");
+            let draft_files = crate::hub::download_and_maybe_quantize(
+                draft_id,
+                &args.revision,
+                None, // no --gguf-file override for draft model
+                None, // no --tokenizer-source override for draft model
+                draft_quant_dtype,
+            )?;
+
+            let draft_raw_config = RawConfig::from_file(&draft_files.config_path)?;
+            let draft_arch = draft_raw_config.detect_architecture()?;
+            tracing::info!("Draft model architecture: {:?}", draft_arch);
+
+            Some((draft_files, draft_raw_config, draft_arch, draft_dtype))
+        } else {
+            None
+        };
+
+    // Load target model weights and tokenizer in parallel: both are I/O + CPU
+    // bound and independent of each other.  On a 256K-token vocabulary the
+    // tokenizer parse takes ~300 ms; running it concurrently with the weight
+    // load hides it almost entirely.
+    //
+    // IMPORTANT: the draft model is loaded SEQUENTIALLY after the target model,
+    // not in a third parallel thread.  Metal (Apple Silicon) does not allow two
+    // threads to encode Metal commands on the same device simultaneously — doing
+    // so triggers a command-buffer assertion in the Metal driver.  Loading the
+    // draft model after the target model has fully finished avoids this.
     let (model, tokenizer) = std::thread::scope(|s| {
         let tok_handle = s.spawn(|| {
             Tokenizer::from_file_with_arch(
@@ -175,8 +228,54 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         let tok_result = tok_handle
             .join()
             .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))?;
+
         Ok::<_, anyhow::Error>((model_result?, Arc::new(tok_result?)))
     })?;
+
+    // Load draft model sequentially (after target model) so both models never
+    // encode Metal commands simultaneously on the same device.
+    let draft_model_opt: Option<Box<dyn CausalLM>> =
+        if let Some((draft_files, draft_raw_config, draft_arch, draft_dtype)) = &draft_info {
+            Some(inferrs_models::models::load_model(
+                draft_raw_config,
+                draft_arch,
+                &draft_files.weight_paths,
+                draft_files.gguf_path.as_deref(),
+                *draft_dtype,
+                &device,
+                args.turbo_quant.0,
+                &draft_files.config_path,
+            )?)
+        } else {
+            None
+        };
+
+    // Validate that the draft and target models share the same vocabulary.
+    // Mismatched vocabularies make the acceptance step undefined.
+    if let Some((_, draft_raw_config, _, _)) = &draft_info {
+        let target_vocab = raw_config.effective_vocab_size();
+        let draft_vocab = draft_raw_config.effective_vocab_size();
+        match (target_vocab, draft_vocab) {
+            (Some(tv), Some(dv)) if tv != dv => {
+                let draft_id = args.draft_model.as_deref().unwrap_or("<unknown>");
+                let target_id = args.model.as_deref().unwrap_or("<unknown>");
+                anyhow::bail!(
+                    "Draft model vocabulary size ({dv}) does not match target model \
+                     vocabulary size ({tv}). Speculative decoding requires the draft \
+                     and target models to share the same vocabulary. \
+                     (target: {target_id}, draft: {draft_id})"
+                );
+            }
+            (None, _) | (_, None) => {
+                tracing::warn!(
+                    "Could not validate vocabulary compatibility (vocab_size missing \
+                     from one or both configs). Ensure the draft and target models \
+                     share the same vocabulary."
+                );
+            }
+            _ => {}
+        }
+    }
 
     let mut engine = Engine::new(
         model,
@@ -185,6 +284,15 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         args.max_batch_size,
         args.max_tokens_per_step,
     );
+
+    // Attach draft model if one was loaded.
+    if let Some(draft_model) = draft_model_opt {
+        engine = engine.with_draft_model(draft_model, args.draft_gamma);
+        tracing::info!(
+            "Speculative decoding enabled (gamma={} draft tokens per step)",
+            args.draft_gamma
+        );
+    }
 
     engine = attach_paged_kv_if_requested(
         engine,
@@ -632,6 +740,11 @@ struct ActiveSequence {
     token_logprobs: Vec<crate::sampler::TokenLogprob>,
     /// JSON grammar FSM for structured output.  `None` = free generation.
     grammar_fsm: Option<crate::grammar::JsonFsm>,
+    /// Per-sequence speculative decode stats.  Accumulated while this sequence
+    /// is active; logged at sequence completion if non-zero.
+    spec_accepted: u64,
+    /// Total draft tokens proposed for this sequence (gamma * number of steps).
+    spec_steps: u64,
 }
 
 impl ActiveSequence {
@@ -679,6 +792,8 @@ impl ActiveSequence {
                     max_stop_string_len,
                     token_logprobs: Vec::new(),
                     grammar_fsm,
+                    spec_accepted: 0,
+                    spec_steps: 0,
                 }
             }
             EngineRequest::GenerateStream {
@@ -721,6 +836,8 @@ impl ActiveSequence {
                     max_stop_string_len,
                     token_logprobs: Vec::new(),
                     grammar_fsm,
+                    spec_accepted: 0,
+                    spec_steps: 0,
                 }
             }
             EngineRequest::Embed { .. } => {
@@ -1306,6 +1423,11 @@ pub struct Engine {
     /// Stays `None` when the tokenizer vocab size exceeds 512K tokens to
     /// avoid excessive memory use.
     token_bytes: Option<Vec<Vec<u8>>>,
+    /// Draft model for speculative decoding.  `None` when `--draft-model` was
+    /// not specified.
+    pub(crate) draft_model: Option<Box<dyn CausalLM>>,
+    /// Number of draft tokens proposed per speculative decode step.
+    pub(crate) draft_gamma: usize,
 }
 
 /// Shared state for paged-attention mode.
@@ -1343,7 +1465,20 @@ impl Engine {
             // Defer the vocab scan to the first grammar-constrained request so
             // it does not add ~100 ms to every server startup.
             token_bytes: None,
+            draft_model: None,
+            draft_gamma: 5,
         }
+    }
+
+    /// Attach a speculative-decoding draft model to this engine.
+    ///
+    /// Called by [`load_engine`] after vocab validation when `--draft-model`
+    /// is specified.  `gamma` is the number of tokens the draft model proposes
+    /// per step (default 5, mirrors llama.cpp).
+    pub fn with_draft_model(mut self, draft_model: Box<dyn CausalLM>, gamma: usize) -> Self {
+        self.draft_model = Some(draft_model);
+        self.draft_gamma = gamma;
+        self
     }
 
     /// Attach a paged KV store to this engine, enabling paged-attention mode.
@@ -1389,6 +1524,8 @@ impl Engine {
             max_tokens_per_step: _,
             paged,
             token_bytes: token_bytes_opt,
+            draft_model: mut draft_model_opt,
+            draft_gamma,
         } = self;
         // Lazily-populated cache of per-token byte strings for grammar masking.
         // Populated on the first grammar-constrained request so startup is not
@@ -1515,6 +1652,182 @@ impl Engine {
                             continue;
                         }
                     }
+                }
+
+                // ── Draft-model speculative decode path ──────────────────
+                // Active only when a draft model is loaded, for single-sequence
+                // batches without grammar constraints or logprobs, using the
+                // internal concat-KV cache (not paged).  Takes priority over MTP.
+                let use_draft = seq.prefilled
+                    && active_count == 1
+                    && seq.grammar_fsm.is_none()
+                    && !seq.sampling_params.logprobs
+                    && paged.is_none()
+                    && draft_model_opt.is_some();
+
+                if use_draft {
+                    let last_token = match seq.output_tokens.last() {
+                        Some(&t) => t,
+                        None => {
+                            seq.finish_error(
+                                anyhow::anyhow!(
+                                    "internal error: speculative decode before prefill"
+                                ),
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            continue;
+                        }
+                    };
+                    let seqlen_offset = seq.prompt_tokens.len() + seq.output_tokens.len() - 1;
+                    model.hint_decode_token(last_token);
+                    model.hint_sampling_temperature(seq.sampling_params.temperature);
+
+                    let draft = draft_model_opt.as_mut().unwrap();
+                    let spec_tokens = match Self::cb_speculative_decode_step(
+                        &mut model,
+                        draft,
+                        &device,
+                        last_token,
+                        seqlen_offset,
+                        draft_gamma,
+                        &seq.sampling_params,
+                        &seq.all_tokens,
+                    ) {
+                        Ok(toks) => toks,
+                        Err(e) => {
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                            continue;
+                        }
+                    };
+
+                    let n_accepted = spec_tokens.len();
+
+                    // Emit each accepted token through the normal output pipeline.
+                    for token_id in spec_tokens {
+                        seq.output_tokens.push(token_id);
+                        seq.all_tokens.push(token_id);
+
+                        let decoded_text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+
+                        if seq.max_stop_string_len > 0 {
+                            update_decoded_suffix(
+                                &mut seq.decoded_suffix,
+                                &decoded_text,
+                                seq.max_stop_string_len * 2,
+                            );
+                        }
+
+                        let finish_reason = check_stop(
+                            token_id,
+                            seq.output_tokens.len(),
+                            &seq.sampling_params,
+                            &stop_token_ids,
+                            &seq.decoded_suffix,
+                        );
+
+                        let is_last = finish_reason.is_some();
+                        let (total_ns, prompt_eval_ns, eval_ns) = if is_last {
+                            let t = seq.timing_ns();
+                            (Some(t.0), Some(t.1), Some(t.2))
+                        } else {
+                            (None, None, None)
+                        };
+
+                        let kind = seq.think_filter.classify(token_id);
+                        match kind {
+                            TokenKind::Reasoning => seq.reasoning_tokens.push(token_id),
+                            TokenKind::Content => seq.content_tokens.push(token_id),
+                            TokenKind::Delimiter => {}
+                        }
+
+                        let client_gone = match kind {
+                            TokenKind::Delimiter => {
+                                if is_last {
+                                    let _ = seq.sink.send_token(StreamToken {
+                                        token_id,
+                                        text: String::new(),
+                                        reasoning_content: String::new(),
+                                        finish_reason: finish_reason.clone(),
+                                        total_duration_ns: total_ns,
+                                        prompt_eval_duration_ns: prompt_eval_ns,
+                                        eval_duration_ns: eval_ns,
+                                        logprob: None,
+                                    });
+                                }
+                                false
+                            }
+                            TokenKind::Reasoning => !seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: String::new(),
+                                reasoning_content: decoded_text.clone(),
+                                finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
+                                logprob: None,
+                            }),
+                            TokenKind::Content => !seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: decoded_text,
+                                reasoning_content: String::new(),
+                                finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
+                                logprob: None,
+                            }),
+                        };
+
+                        if is_last || client_gone {
+                            if !seq.prefilled {
+                                seq.prefilled = true;
+                                seq.prefill_end = Some(Instant::now());
+                            }
+                            let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
+                            seq.finish_ok(
+                                &reason,
+                                &tokenizer,
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            break;
+                        }
+                    }
+
+                    // vec len minus bonus/replacement = accepted draft tokens.
+                    let n_accepted_draft = (n_accepted as u64)
+                        .saturating_sub(1)
+                        .min(draft_gamma as u64);
+                    tracing::debug!(
+                        "speculative: accepted {}/{} draft tokens",
+                        n_accepted_draft,
+                        draft_gamma,
+                    );
+                    seq.spec_accepted += n_accepted_draft;
+                    seq.spec_steps += draft_gamma as u64;
+
+                    if seq.finished && seq.spec_steps > 0 {
+                        let pct = seq.spec_accepted as f64 / seq.spec_steps as f64 * 100.0;
+                        tracing::info!(
+                            "speculative decoding: {:.1}% acceptance ({}/{} tokens)",
+                            pct,
+                            seq.spec_accepted,
+                            seq.spec_steps,
+                        );
+                        if pct < 20.0 {
+                            tracing::warn!(
+                                "speculative decoding acceptance rate {:.1}% is below \
+                                 20% — consider reducing --draft-gamma or using a \
+                                 better-matched draft model",
+                                pct,
+                            );
+                        }
+                    }
+
+                    if !seq.prefilled {
+                        seq.prefilled = true;
+                        seq.prefill_end = Some(Instant::now());
+                    }
+                    continue; // skip MTP and single-token paths below
                 }
 
                 // ── MTP speculative decode path ───────────────────────────
@@ -2249,6 +2562,131 @@ impl Engine {
         Ok(accepted)
     }
 
+    /// Run a speculative decode step using an external draft model.
+    ///
+    /// Returns `Ok(tokens)` where `tokens` contains 1..=gamma+1 accepted token ids
+    /// in sequence order.  The draft model proposes `gamma` tokens autoregressively;
+    /// the target model verifies each one sequentially.  On the first rejection the
+    /// draft KV cache is rolled back and a replacement token is returned.  On full
+    /// acceptance a bonus token is sampled from the last target logits.
+    ///
+    /// Verification follows Algorithm 1 from Chen et al. 2302.01318.
+    #[allow(clippy::too_many_arguments)]
+    fn cb_speculative_decode_step(
+        target: &mut Box<dyn CausalLM>,
+        draft: &mut Box<dyn CausalLM>,
+        device: &Device,
+        last_token: u32,
+        seqlen_offset: usize,
+        gamma: usize,
+        params: &sampler::SamplingParams,
+        previous_tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        // 1. Draft phase: run draft autoregressively for `gamma` steps.
+        let mut draft_tokens: Vec<(u32, Vec<f32>)> = Vec::with_capacity(gamma);
+        let mut draft_offset = seqlen_offset;
+        let mut draft_input = last_token;
+
+        for _ in 0..gamma {
+            draft.hint_decode_token(draft_input);
+            draft.hint_sampling_temperature(params.temperature);
+            let input_ids = Tensor::new(&[draft_input], device)?.unsqueeze(0)?;
+            let logits = draft.forward(&input_ids, draft_offset)?;
+
+            // Temperature-scaled softmax probs passed to speculative_verify() as q(x).
+            let logits_vec: Vec<f32> = logits
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(candle_core::DType::F32)?
+                .to_vec1()?;
+            let probs = if params.temperature <= 0.0 {
+                // Greedy: one-hot on argmax.
+                let best = logits_vec
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let mut v = vec![0.0f32; logits_vec.len()];
+                v[best] = 1.0;
+                v
+            } else if (params.temperature - 1.0).abs() < 1e-6 {
+                sampler::softmax_vec(&logits_vec)
+            } else {
+                let inv_t = (1.0 / params.temperature) as f32;
+                let scaled: Vec<f32> = logits_vec.iter().map(|&l| l * inv_t).collect();
+                sampler::softmax_vec(&scaled)
+            };
+
+            let (tok, _) = sampler::sample_token(&logits, params, previous_tokens)?;
+            draft_tokens.push((tok, probs));
+
+            draft_offset += 1;
+            draft_input = tok;
+        }
+
+        // 2. Verify phase: target runs last_token then verifies each draft token.
+        target.hint_decode_token(last_token);
+        target.hint_sampling_temperature(params.temperature);
+        let anchor_ids = Tensor::new(&[last_token], device)?.unsqueeze(0)?;
+        let anchor_logits = target.forward(&anchor_ids, seqlen_offset)?;
+        let mut cur_logits: Vec<f32> = anchor_logits
+            .squeeze(0)?
+            .squeeze(0)?
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec1()?;
+
+        let step_base = previous_tokens.len() as u64;
+        let mut accepted: Vec<u32> = Vec::with_capacity(gamma + 1);
+        let mut target_offset = seqlen_offset + 1;
+
+        for (draft_idx, (draft_tok, draft_probs)) in draft_tokens.iter().enumerate() {
+            let (verdict, _) = sampler::speculative_verify(
+                &cur_logits,
+                draft_probs,
+                *draft_tok,
+                params.temperature,
+                params.seed,
+                step_base + draft_idx as u64,
+            )?;
+
+            match verdict {
+                sampler::SpecVerdict::Accept => {
+                    accepted.push(*draft_tok);
+                    let tok_ids = Tensor::new(&[*draft_tok], device)?.unsqueeze(0)?;
+                    let logits = target.forward(&tok_ids, target_offset)?;
+                    cur_logits = logits
+                        .squeeze(0)?
+                        .squeeze(0)?
+                        .to_dtype(candle_core::DType::F32)?
+                        .to_vec1()?;
+                    target_offset += 1;
+                }
+                sampler::SpecVerdict::Reject(replacement) => {
+                    // Rollback draft KV to seqlen_offset + draft_idx + 1.
+                    // After full draft phase KV = seqlen_offset + gamma;
+                    // rollback = gamma - draft_idx - 1.
+                    let rollback = gamma - draft_idx - 1;
+                    draft.truncate_kv_cache(rollback);
+                    accepted.push(replacement);
+                    return Ok(accepted);
+                }
+            }
+        }
+
+        // All gamma tokens accepted. Sync draft KV (one position behind target)
+        // then sample bonus token from last target logits.
+        let sync_ids = Tensor::new(&[draft_input], device)?.unsqueeze(0)?;
+        draft.hint_decode_token(draft_input);
+        draft.forward(&sync_ids, draft_offset)?;
+
+        let bonus_logits = Tensor::from_vec(cur_logits.clone(), (1, 1, cur_logits.len()), device)?;
+        let (bonus, _) = sampler::sample_token(&bonus_logits, params, previous_tokens)?;
+        accepted.push(bonus);
+
+        Ok(accepted)
+    }
+
     /// Run the engine loop using only stdlib channels — no Tokio runtime required.
     /// Used by `inferrs run` so that blocking sends/recvs work on a plain OS thread.
     #[allow(dead_code)]
@@ -2340,8 +2778,16 @@ impl Engine {
 
     /// Run the prefill forward pass (paged or concat-KV) and return the logits.
     /// Resets the KV cache and (if paged) the block table before running.
+    ///
+    /// Also clears the draft model's KV cache (when present) so that both
+    /// caches are always reset together at sequence boundaries.
     fn run_prefill(&mut self, prompt_tokens: &[u32]) -> Result<Tensor> {
         self.model.clear_kv_cache();
+        if let Some(dm) = &mut self.draft_model {
+            dm.clear_kv_cache();
+            let draft_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            dm.forward(&draft_ids, 0)?;
+        }
         if let Some(ps) = &mut self.paged {
             ps.block_table.free_all(&mut ps.block_pool);
             Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)
@@ -2550,22 +2996,21 @@ impl Engine {
 
     /// Run a single generation and return the result plus timing breakdown.
     ///
-    /// Returns `(result, prefill_ms, decode_ms)` where:
-    /// - `prefill_ms` is the wall time for the prefill forward pass
-    /// - `decode_ms`  is the wall time for all decode steps combined
+    /// When a draft model is loaded, uses speculative decoding automatically.
+    ///
+    /// Returns `(result, prefill_ms, decode_ms, acceptance_rate)`.
+    /// `acceptance_rate` is `Some(f64)` when spec-decode was used, else `None`.
     pub fn bench_generate(
         &mut self,
         _request_id: &str,
         prompt_tokens: &[u32],
         sampling_params: &SamplingParams,
-    ) -> Result<(GenerationResult, f64, f64)> {
+    ) -> Result<(GenerationResult, f64, f64, Option<f64>)> {
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
         let prefill_start = Instant::now();
-
         let logits = self.run_prefill(prompt_tokens)?;
-
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         let (mut token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
@@ -2574,23 +3019,58 @@ impl Engine {
 
         let decode_start = Instant::now();
         let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+        let mut spec_accepted: u64 = 0;
+        let mut spec_steps: u64 = 0;
 
         while finish_reason.is_none() {
-            let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits =
-                self.run_decode_step(token_id, seqlen_offset, sampling_params.temperature)?;
-            (token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
-            output_tokens.push(token_id);
-            all_tokens.push(token_id);
-            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+            if let Some(draft) = self.draft_model.as_mut() {
+                // Speculative decode path.
+                let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
+                let gamma = self.draft_gamma;
+                let spec_tokens = Self::cb_speculative_decode_step(
+                    &mut self.model,
+                    draft,
+                    &self.device,
+                    token_id,
+                    seqlen_offset,
+                    gamma,
+                    sampling_params,
+                    &all_tokens,
+                )?;
+                let n = spec_tokens.len() as u64;
+                spec_accepted += n.saturating_sub(1).min(gamma as u64);
+                spec_steps += gamma as u64;
+                for tok in spec_tokens {
+                    output_tokens.push(tok);
+                    all_tokens.push(tok);
+                    finish_reason = self.check_stop(tok, output_tokens.len(), sampling_params, "");
+                    if finish_reason.is_some() {
+                        break;
+                    }
+                }
+                token_id = *output_tokens.last().unwrap();
+            } else {
+                // Standard single-token decode path.
+                let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
+                let logits =
+                    self.run_decode_step(token_id, seqlen_offset, sampling_params.temperature)?;
+                (token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+                output_tokens.push(token_id);
+                all_tokens.push(token_id);
+                finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+            }
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-
         self.free_paged_blocks();
 
         let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
         let output_text = self.tokenizer.decode(&output_tokens, true)?;
+        let acceptance_rate = if spec_steps > 0 {
+            Some(spec_accepted as f64 / spec_steps as f64)
+        } else {
+            None
+        };
 
         Ok((
             GenerationResult {
@@ -2607,6 +3087,7 @@ impl Engine {
             },
             prefill_ms,
             decode_ms,
+            acceptance_rate,
         ))
     }
 

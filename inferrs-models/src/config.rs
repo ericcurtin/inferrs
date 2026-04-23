@@ -339,6 +339,17 @@ impl RawConfig {
         Ok(config)
     }
 
+    /// Return the vocabulary size from the config, checking the nested
+    /// `text_config` first (Gemma4, Qwen3.5) and then the top-level field.
+    /// Returns `None` when neither is present; callers that need a hard value
+    /// should use a model-specific default.
+    pub fn effective_vocab_size(&self) -> Option<usize> {
+        self.text_config
+            .as_ref()
+            .and_then(|tc| tc.vocab_size)
+            .or(self.vocab_size)
+    }
+
     pub fn detect_architecture(&self) -> Result<ModelArchitecture> {
         if let Some(archs) = &self.architectures {
             for arch in archs {
