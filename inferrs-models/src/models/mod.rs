@@ -829,17 +829,9 @@ impl Qwen35NormFixBackend {
             return Ok(tensor);
         }
         let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
         if max_v >= 0.0 {
-            tracing::debug!(
-                "Qwen35 ssm_a appears to be HF `log(A)` (min={min_v:.3}, max={max_v:.3}); no transform"
-            );
             return Ok(tensor);
         }
-        tracing::info!(
-            "Qwen35 ssm_a detected as llama.cpp `-A` (min={min_v:.3}, max={max_v:.3}); \
-             transforming to `A_log = log(-ssm_a)`"
-        );
         // A_log = log(-ssm_a). Both ops preserve dtype.
         tensor.neg()?.log()
     }
@@ -927,14 +919,8 @@ fn var_builder_from_gguf(
     let boxed: Box<dyn candle_nn::var_builder::SimpleBackend + 'static> = if is_external_gguf
         && matches!(arch, ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3)
     {
-        tracing::info!(
-            "{arch:?}: applying GemmaNormFixBackend to correct RMSNorm scale for external GGUF"
-        );
         Box::new(GemmaNormFixBackend { inner: backend })
     } else if is_external_gguf && matches!(arch, ModelArchitecture::Qwen35) {
-        tracing::info!(
-            "Qwen35: applying Qwen35NormFixBackend to correct RMSNorm scale for external GGUF"
-        );
         Box::new(Qwen35NormFixBackend { inner: backend })
     } else {
         Box::new(backend)
@@ -1395,12 +1381,6 @@ pub fn load_model(
             // SSM key/value correlation stays correct.  No-op for symmetric
             // models (ratio=1) since the permutation is identity.
             if is_external_gguf && config.linear_num_value_heads > config.linear_num_key_heads {
-                tracing::info!(
-                    "Qwen3.5: external GGUF detected with asymmetric SSM heads \
-                     ({} key / {} value); switching GQA expansion to GGUF head order",
-                    config.linear_num_key_heads,
-                    config.linear_num_value_heads,
-                );
                 config.gguf_external_head_order = true;
             }
             tracing::info!(
