@@ -2550,30 +2550,51 @@ impl Engine {
 
     /// Run a single generation and return the result plus timing breakdown.
     ///
-    /// Returns `(result, prefill_ms, decode_ms)` where:
-    /// - `prefill_ms` is the wall time for the prefill forward pass
-    /// - `decode_ms`  is the wall time for all decode steps combined
+    /// Returns `(result, prefill_ms, decode_ms, ttft_ms)` where:
+    /// - `prefill_ms` is the GPU-synchronized wall time for the prefill forward pass
+    /// - `decode_ms`  is the wall time for all N output tokens (first token included)
+    /// - `ttft_ms`    is the wall time from request start to first token available
     pub fn bench_generate(
         &mut self,
         _request_id: &str,
         prompt_tokens: &[u32],
         sampling_params: &SamplingParams,
-    ) -> Result<(GenerationResult, f64, f64)> {
+    ) -> Result<(GenerationResult, f64, f64, f64)> {
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
 
         let prefill_start = Instant::now();
 
         let logits = self.run_prefill(prompt_tokens)?;
-
+        // Synchronize so prefill_ms reflects actual GPU computation, not just
+        // kernel-dispatch latency (GPU ops are async without an explicit sync).
+        self.device.synchronize()?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
+        // Time all output tokens in decode_ms — including the first token sampled
+        // from prefill logits — to match llama.cpp's n_eval / n_p_eval convention.
+        let max_stop_len = sampling_params
+            .stop_strings
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        let mut decoded_suffix = String::new();
+
+        let decode_start = Instant::now();
         let (mut token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
         all_tokens.push(token_id);
+        let ttft_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-        let decode_start = Instant::now();
-        let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+        let decoded_text = self.tokenizer.decode(&[token_id], true).unwrap_or_default();
+        update_decoded_suffix(&mut decoded_suffix, &decoded_text, max_stop_len * 2);
+        let mut finish_reason = self.check_stop(
+            token_id,
+            output_tokens.len(),
+            sampling_params,
+            &decoded_suffix,
+        );
 
         while finish_reason.is_none() {
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
@@ -2582,9 +2603,17 @@ impl Engine {
             (token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
             all_tokens.push(token_id);
-            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
+            let decoded_text = self.tokenizer.decode(&[token_id], true).unwrap_or_default();
+            update_decoded_suffix(&mut decoded_suffix, &decoded_text, max_stop_len * 2);
+            finish_reason = self.check_stop(
+                token_id,
+                output_tokens.len(),
+                sampling_params,
+                &decoded_suffix,
+            );
         }
 
+        self.device.synchronize()?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         self.free_paged_blocks();
@@ -2607,6 +2636,7 @@ impl Engine {
             },
             prefill_ms,
             decode_ms,
+            ttft_ms,
         ))
     }
 
@@ -2617,14 +2647,16 @@ impl Engine {
         params: &SamplingParams,
         decoded_suffix: &str,
     ) -> Option<String> {
-        if self.stop_token_ids.contains(&token_id)
-            || params.extra_stop_token_ids.contains(&token_id)
-        {
-            return Some("stop".to_string());
-        }
-        for stop in &params.stop_strings {
-            if !stop.is_empty() && decoded_suffix.ends_with(stop.as_str()) {
+        if !params.bypass_stop_tokens {
+            if self.stop_token_ids.contains(&token_id)
+                || params.extra_stop_token_ids.contains(&token_id)
+            {
                 return Some("stop".to_string());
+            }
+            for stop in &params.stop_strings {
+                if !stop.is_empty() && decoded_suffix.ends_with(stop.as_str()) {
+                    return Some("stop".to_string());
+                }
             }
         }
         if num_output_tokens >= params.max_tokens {

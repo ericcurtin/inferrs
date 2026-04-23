@@ -3634,6 +3634,7 @@ fn build_sampling_params_with_grammar(
         extra_stop_token_ids,
         stop_strings,
         grammar_mode,
+        bypass_stop_tokens: false,
     }
 }
 
