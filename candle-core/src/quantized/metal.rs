@@ -109,6 +109,18 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::IQ2XS => {
+                let vec: Vec<crate::quantized::BlockIq2Xs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIq2Xs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ3XXS => {
+                let vec: Vec<crate::quantized::BlockIq3Xxs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIq3Xxs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ4XS => {
+                let vec: Vec<crate::quantized::BlockIq4Xs> = read_to_vec(&buffer, block_len);
+                crate::quantized::BlockIq4Xs::to_float(&vec, &mut out);
+            }
         }
 
         let buffer = self.device.new_buffer_with_data(&out)?;
@@ -618,6 +630,9 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::F16,
+            GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS => {
+                panic!("IQ quant types have no Metal kernel; route through CPU dequant before dispatch")
+            }
         }
     }
 }

@@ -456,6 +456,23 @@ pub fn download_and_maybe_quantize(
         return Ok(files);
     }
 
+    // Pre-quantized safetensors (e.g. GPTQ-Int4) expose packed Int4 tensors
+    // (`qweight`/`qzeros`/`scales`/`g_idx`) that the GGUF quantizer cannot
+    // read as FP weights — and the downstream loader already dequantizes them
+    // lazily via `GptqSafetensorsVb`.  Detect them via the top-level
+    // `quantization_config` key in `config.json` and keep the raw safetensors.
+    if let Ok(bytes) = std::fs::read(&files.config_path) {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if matches!(json.get("quantization_config"), Some(v) if !v.is_null()) {
+                tracing::info!(
+                    "Model is pre-quantized (quantization_config present in config.json); \
+                     skipping --quantize"
+                );
+                return Ok(files);
+            }
+        }
+    }
+
     let gguf = crate::quantize::gguf_path(&files.weight_paths, dtype);
 
     // Re-quantize if the GGUF doesn't exist OR any base shard is newer than it.

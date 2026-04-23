@@ -100,6 +100,9 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::IQ2XS => metal::load_quantized(d, as_t_slice::<BlockIq2Xs>(data)),
+                GgmlDType::IQ3XXS => metal::load_quantized(d, as_t_slice::<BlockIq3Xxs>(data)),
+                GgmlDType::IQ4XS => metal::load_quantized(d, as_t_slice::<BlockIq4Xs>(data)),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -117,6 +120,9 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::IQ2XS => cuda::load_quantized(d, as_t_slice::<BlockIq2Xs>(data)),
+                GgmlDType::IQ3XXS => cuda::load_quantized(d, as_t_slice::<BlockIq3Xxs>(data)),
+                GgmlDType::IQ4XS => cuda::load_quantized(d, as_t_slice::<BlockIq4Xs>(data)),
             },
         }
     }
@@ -267,6 +273,9 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    IQ2XS,
+    IQ3XXS,
+    IQ4XS,
 }
 
 impl GgmlDType {
@@ -287,6 +296,9 @@ impl GgmlDType {
             14 => Self::Q6K,
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            23 => Self::IQ4XS,
             30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
@@ -310,6 +322,9 @@ impl GgmlDType {
             Self::Q6K => 14,
             Self::Q8K => 15,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ4XS => 23,
             Self::BF16 => 30,
         }
     }
@@ -331,6 +346,9 @@ impl GgmlDType {
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::IQ2XS => Box::new(vec![BlockIq2Xs::zeros(); elem_count / BlockIq2Xs::BLCK_SIZE]),
+            Self::IQ3XXS => Box::new(vec![BlockIq3Xxs::zeros(); elem_count / BlockIq3Xxs::BLCK_SIZE]),
+            Self::IQ4XS => Box::new(vec![BlockIq4Xs::zeros(); elem_count / BlockIq4Xs::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -351,6 +369,9 @@ impl GgmlDType {
             Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
+            Self::IQ2XS => Box::new(as_t_slice::<BlockIq2Xs>(data).to_vec()),
+            Self::IQ3XXS => Box::new(as_t_slice::<BlockIq3Xxs>(data).to_vec()),
+            Self::IQ4XS => Box::new(as_t_slice::<BlockIq4Xs>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
         }
     }
@@ -374,6 +395,9 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::IQ2XS => std::mem::size_of::<BlockIq2Xs>(),
+            Self::IQ3XXS => std::mem::size_of::<BlockIq3Xxs>(),
+            Self::IQ4XS => std::mem::size_of::<BlockIq4Xs>(),
         }
     }
 
@@ -389,6 +413,7 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::IQ2XS | Self::IQ3XXS | Self::IQ4XS => k_quants::QK_K,
         }
     }
 }

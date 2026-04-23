@@ -6,6 +6,7 @@
 //! `candle-core` feature sets.
 
 pub mod config;
+pub mod gptq;
 pub mod kv_cache;
 pub mod models;
 pub mod multimodal_plugin;

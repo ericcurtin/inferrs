@@ -107,31 +107,36 @@ fn dequantize_f32(
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     let nb = elem_count.div_ceil(256);
-    let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
-        GgmlDType::Q4_0 => ("dequantize_block_q4_0_f32", false, 32, nb),
-        GgmlDType::Q4_1 => ("dequantize_block_q4_1_f32", false, 32, nb),
+    let (kernel_name, is_k, block_dim, num_blocks, module): (&str, bool, usize, usize, &candle_kernels::Module) = match dtype {
+        GgmlDType::Q4_0 => ("dequantize_block_q4_0_f32", false, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q4_1 => ("dequantize_block_q4_1_f32", false, 32, nb, &candle_kernels::QUANTIZED),
         GgmlDType::Q5_0 => (
             "dequantize_block_q5_0_f32",
             false,
             CUDA_DEQUANTIZE_BLOCK_SIZE,
             ceil_div(elem_count, 2 * CUDA_DEQUANTIZE_BLOCK_SIZE),
+            &candle_kernels::QUANTIZED,
         ),
         GgmlDType::Q5_1 => (
             "dequantize_block_q5_1_f32",
             false,
             CUDA_DEQUANTIZE_BLOCK_SIZE,
             ceil_div(elem_count, 2 * CUDA_DEQUANTIZE_BLOCK_SIZE),
+            &candle_kernels::QUANTIZED,
         ),
-        GgmlDType::Q8_0 => ("dequantize_block_q8_0_f32", false, 32, nb),
-        GgmlDType::Q2K => ("dequantize_block_q2_K_f32", true, 64, nb),
-        GgmlDType::Q3K => ("dequantize_block_q3_K_f32", true, 64, nb),
-        GgmlDType::Q4K => ("dequantize_block_q4_K_f32", true, 32, nb),
-        GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb),
-        GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb),
-        GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb),
+        GgmlDType::Q8_0 => ("dequantize_block_q8_0_f32", false, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q2K => ("dequantize_block_q2_K_f32", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q3K => ("dequantize_block_q3_K_f32", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q4K => ("dequantize_block_q4_K_f32", true, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::IQ2XS => ("dequantize_block_iq2xs_f32", true, 32, nb, &candle_kernels::IQ_DEQUANT),
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3xxs_f32", true, 32, nb, &candle_kernels::IQ_DEQUANT),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4xs_f32", true, 32, nb, &candle_kernels::IQ_DEQUANT),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
-    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let func = dev.get_or_load_func(kernel_name, module)?;
     let dst = unsafe { dev.alloc::<f32>(elem_count)? };
     // See e.g.
     // https://github.com/ggerganov/llama.cpp/blob/cbbd1efa06f8c09f9dff58ff9d9af509cc4c152b/ggml-cuda.cu#L7270
@@ -167,31 +172,36 @@ fn dequantize_f16(
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     let nb = elem_count.div_ceil(256);
-    let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
-        GgmlDType::Q4_0 => ("dequantize_block_q4_0_f16", false, 32, nb),
-        GgmlDType::Q4_1 => ("dequantize_block_q4_1_f16", false, 32, nb),
+    let (kernel_name, is_k, block_dim, num_blocks, module): (&str, bool, usize, usize, &candle_kernels::Module) = match dtype {
+        GgmlDType::Q4_0 => ("dequantize_block_q4_0_f16", false, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q4_1 => ("dequantize_block_q4_1_f16", false, 32, nb, &candle_kernels::QUANTIZED),
         GgmlDType::Q5_0 => (
             "dequantize_block_q5_0_f16",
             false,
             CUDA_DEQUANTIZE_BLOCK_SIZE,
             ceil_div(elem_count, 2 * CUDA_DEQUANTIZE_BLOCK_SIZE),
+            &candle_kernels::QUANTIZED,
         ),
         GgmlDType::Q5_1 => (
             "dequantize_block_q5_1_f16",
             false,
             CUDA_DEQUANTIZE_BLOCK_SIZE,
             ceil_div(elem_count, 2 * CUDA_DEQUANTIZE_BLOCK_SIZE),
+            &candle_kernels::QUANTIZED,
         ),
-        GgmlDType::Q8_0 => ("dequantize_block_q8_0_f16", false, 32, nb),
-        GgmlDType::Q2K => ("dequantize_block_q2_K_f16", true, 64, nb),
-        GgmlDType::Q3K => ("dequantize_block_q3_K_f16", true, 64, nb),
-        GgmlDType::Q4K => ("dequantize_block_q4_K_f16", true, 32, nb),
-        GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb),
-        GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb),
-        GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb),
+        GgmlDType::Q8_0 => ("dequantize_block_q8_0_f16", false, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q2K => ("dequantize_block_q2_K_f16", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q3K => ("dequantize_block_q3_K_f16", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q4K => ("dequantize_block_q4_K_f16", true, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb, &candle_kernels::QUANTIZED),
+        GgmlDType::IQ2XS => ("dequantize_block_iq2xs_f16", true, 32, nb, &candle_kernels::IQ_DEQUANT),
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3xxs_f16", true, 32, nb, &candle_kernels::IQ_DEQUANT),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4xs_f16", true, 32, nb, &candle_kernels::IQ_DEQUANT),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
-    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let func = dev.get_or_load_func(kernel_name, module)?;
     let dst = unsafe { dev.alloc::<f16>(elem_count)? };
     // See e.g.
     // https://github.com/ggerganov/llama.cpp/blob/cbbd1efa06f8c09f9dff58ff9d9af509cc4c152b/ggml-cuda.cu#L7270
@@ -235,20 +245,31 @@ fn dequantize_mul_mat_vec(
     if y.len() != ncols {
         crate::bail!("unexpected y size {}, ncols {ncols} {nrows}", y.len())
     }
-    let kernel_name = match dtype {
-        GgmlDType::Q4_0 => "dequantize_mul_mat_vec_q4_0_cuda",
-        GgmlDType::Q4_1 => "dequantize_mul_mat_vec_q4_1_cuda",
-        GgmlDType::Q5_0 => "dequantize_mul_mat_vec_q5_0_cuda",
-        GgmlDType::Q5_1 => "dequantize_mul_mat_vec_q5_1_cuda",
-        GgmlDType::Q8_0 => "dequantize_mul_mat_vec_q8_0_cuda",
-        GgmlDType::Q2K => "dequantize_mul_mat_vec_q2_k",
-        GgmlDType::Q3K => "dequantize_mul_mat_vec_q3_k",
-        GgmlDType::Q4K => "dequantize_mul_mat_vec_q4_k",
-        GgmlDType::Q5K => "dequantize_mul_mat_vec_q5_k",
-        GgmlDType::Q6K => "dequantize_mul_mat_vec_q6_k",
+    if matches!(dtype, GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS)
+        && ncols % dtype.block_size() != 0
+    {
+        crate::bail!(
+            "IQ GEMV requires ncols to be a multiple of {} (got {ncols})",
+            dtype.block_size()
+        )
+    }
+    let (kernel_name, module): (&str, &candle_kernels::Module) = match dtype {
+        GgmlDType::Q4_0 => ("dequantize_mul_mat_vec_q4_0_cuda", &candle_kernels::QUANTIZED),
+        GgmlDType::Q4_1 => ("dequantize_mul_mat_vec_q4_1_cuda", &candle_kernels::QUANTIZED),
+        GgmlDType::Q5_0 => ("dequantize_mul_mat_vec_q5_0_cuda", &candle_kernels::QUANTIZED),
+        GgmlDType::Q5_1 => ("dequantize_mul_mat_vec_q5_1_cuda", &candle_kernels::QUANTIZED),
+        GgmlDType::Q8_0 => ("dequantize_mul_mat_vec_q8_0_cuda", &candle_kernels::QUANTIZED),
+        GgmlDType::Q2K => ("dequantize_mul_mat_vec_q2_k", &candle_kernels::QUANTIZED),
+        GgmlDType::Q3K => ("dequantize_mul_mat_vec_q3_k", &candle_kernels::QUANTIZED),
+        GgmlDType::Q4K => ("dequantize_mul_mat_vec_q4_k", &candle_kernels::QUANTIZED),
+        GgmlDType::Q5K => ("dequantize_mul_mat_vec_q5_k", &candle_kernels::QUANTIZED),
+        GgmlDType::Q6K => ("dequantize_mul_mat_vec_q6_k", &candle_kernels::QUANTIZED),
+        GgmlDType::IQ2XS => ("dequantize_mul_mat_vec_iq2xs_cuda", &candle_kernels::IQ_DEQUANT),
+        GgmlDType::IQ3XXS => ("dequantize_mul_mat_vec_iq3xxs_cuda", &candle_kernels::IQ_DEQUANT),
+        GgmlDType::IQ4XS => ("dequantize_mul_mat_vec_iq4xs_cuda", &candle_kernels::IQ_DEQUANT),
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
-    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let func = dev.get_or_load_func(kernel_name, module)?;
     let dst = unsafe { dev.alloc::<f32>(nrows)? };
     let block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
     let cfg = cudarc::driver::LaunchConfig {
@@ -260,6 +281,44 @@ fn dequantize_mul_mat_vec(
     let mut builder = func.builder();
     builder.arg(&data.inner);
     builder.arg(y);
+    builder.arg(&dst);
+    barg!(builder, ncols as i32, nrows as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+// IQ types have direct BF16-input GEMV kernels that bypass Q8_1 quantization.
+fn dequantize_mul_mat_vec_bf16in(
+    data: &PaddedCudaSlice,
+    y_bf16: &CudaView<half::bf16>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if ncols % dtype.block_size() != 0 {
+        crate::bail!(
+            "IQ BF16 GEMV requires ncols to be a multiple of {} (got {ncols})",
+            dtype.block_size()
+        )
+    }
+    let kernel_name = match dtype {
+        GgmlDType::IQ2XS => "dequantize_mul_mat_vec_iq2xs_bf16in_cuda",
+        GgmlDType::IQ3XXS => "dequantize_mul_mat_vec_iq3xxs_bf16in_cuda",
+        GgmlDType::IQ4XS => "dequantize_mul_mat_vec_iq4xs_bf16in_cuda",
+        _ => crate::bail!("unsupported dtype for IQ bf16in GEMV {dtype:?}"),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::IQ_DEQUANT)?;
+    let dst = unsafe { dev.alloc::<f32>(nrows)? };
+    let block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (block_num_y as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, GGML_CUDA_MMV_Y as u32, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&data.inner);
+    builder.arg(y_bf16);
     builder.arg(&dst);
     barg!(builder, ncols as i32, nrows as i32);
     unsafe { builder.launch(cfg) }.w()?;
@@ -349,6 +408,11 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
         GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+        // IQ types have no Q8_1 GEMV kernels; dequantize_matmul_vec routes them
+        // via the BF16/F32 early-returns before reaching this function.
+        GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS => {
+            crate::bail!("IQ types ({dtype:?}) do not support the Q8_1 GEMV path; use BF16 activations")
+        }
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let kernel_name = format!("{kernel_name}{b_size}");
@@ -541,6 +605,10 @@ fn mul_mat_vec_via_q8_1_bf16out(
         GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_bf16out1",
         GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_bf16out1",
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_bf16out1",
+        // IQ types bypass this via the bf16in direct GEMV early-return in dequantize_matmul_vec.
+        GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS => {
+            crate::bail!("IQ types ({dtype:?}) do not support the Q8_1 BF16-out GEMV path")
+        }
         _ => crate::bail!("unsupported dtype for bf16out GEMV {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -618,6 +686,10 @@ fn mul_mat_via_q8_1(
         GgmlDType::Q4K => ("mul_mat_q4_K", 64, 128),
         GgmlDType::Q5K => ("mul_mat_q5_K", 64, 128),
         GgmlDType::Q6K => ("mul_mat_q6_K", 64, 64),
+        // IQ types use the cuBLAS dequant-F16+GEMM path via dequantize_matmul, not this kernel.
+        GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS => {
+            crate::bail!("IQ types ({dtype:?}) do not support the Q8_1 batched GEMM path; use dequantize_matmul")
+        }
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -811,6 +883,9 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -838,6 +913,9 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::IQ2XS => deq::<crate::quantized::BlockIq2Xs>(&buffer, block_len, &mut out),
+            GgmlDType::IQ3XXS => deq::<crate::quantized::BlockIq3Xxs>(&buffer, block_len, &mut out),
+            GgmlDType::IQ4XS => deq::<crate::quantized::BlockIq4Xs>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -1010,6 +1088,38 @@ impl QCudaStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
         }
 
+        // IQ types: no Q8_1 GEMV kernels exist.
+        // b_size == 1: direct BF16-input GEMV kernel (fastest path).
+        // b_size  > 1: route to cuBLAS via dequantize_matmul (dequant-F16 + GEMM).
+        if matches!(
+            self.dtype,
+            GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS
+        ) && rhs.dtype() == crate::DType::BF16
+            && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if b_size == 1 {
+                let rhs_bf16 = rhs.as_cuda_slice::<half::bf16>()?;
+                let rhs_bf16 = match rhs_l.contiguous_offsets() {
+                    Some((o1, o2)) => rhs_bf16.slice(o1..o2),
+                    None => Err(crate::Error::RequiresContiguous { op: "dmmv-iq-bf16" }.bt())?,
+                };
+                let mut out_shape = rhs_l.shape().dims().to_vec();
+                out_shape.pop();
+                out_shape.push(nrows);
+                let out = dequantize_mul_mat_vec_bf16in(
+                    &self.data,
+                    &rhs_bf16,
+                    self.dtype,
+                    ncols,
+                    nrows,
+                    self.device(),
+                )?;
+                return Ok((out, out_shape.into()));
+            } else {
+                return self.dequantize_matmul(self_shape, rhs, rhs_l);
+            }
+        }
+
         // BF16 fast path: for single-vector decode (b_size == 1), use a fused
         // BF16→Q8_1 + GEMV→BF16 path that produces BF16 output directly.
         // This replaces the old 3-kernel chain (BF16→Q8_1 + GEMV→F32 + F32→BF16)
@@ -1097,6 +1207,35 @@ impl QCudaStorage {
             return Ok((out_f32, out_shape.into()));
         }
 
+        // IQ types have no Q8_1 GEMV kernels; for F32 input use the direct GEMV
+        // (b_size==1) or cuBLAS dequant path (b_size>1).
+        if matches!(
+            self.dtype,
+            GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS
+        ) {
+            return if b_size == 1 {
+                let rhs_f32 = rhs.as_cuda_slice::<f32>()?;
+                let rhs_f32 = match rhs_l.contiguous_offsets() {
+                    Some((o1, o2)) => rhs_f32.slice(o1..o2),
+                    None => Err(crate::Error::RequiresContiguous { op: "dmmv-iq-f32" }.bt())?,
+                };
+                let out = dequantize_mul_mat_vec(
+                    &self.data,
+                    &rhs_f32,
+                    self.dtype,
+                    ncols,
+                    nrows,
+                    self.device(),
+                )?;
+                let mut out_shape = rhs_l.shape().dims().to_vec();
+                out_shape.pop();
+                out_shape.push(nrows);
+                Ok((out, out_shape.into()))
+            } else {
+                self.dequantize_matmul(self_shape, rhs, rhs_l)
+            };
+        }
+
         // Standard F32 path
         let rhs = rhs.as_cuda_slice::<f32>()?;
         let rhs = match rhs_l.contiguous_offsets() {
@@ -1144,7 +1283,12 @@ impl QCudaStorage {
             let data_f32 = self.dequantize(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
-        } else if matches!(storage.dtype(), crate::DType::BF16 | crate::DType::F16)
+        } else if (matches!(storage.dtype(), crate::DType::BF16 | crate::DType::F16)
+            || (matches!(storage.dtype(), crate::DType::F32)
+                && matches!(
+                    self.dtype,
+                    GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS
+                )))
             && matches!(
                 self.dtype,
                 GgmlDType::Q4_0
@@ -1158,6 +1302,9 @@ impl QCudaStorage {
                     | GgmlDType::Q5K
                     | GgmlDType::Q6K
                     | GgmlDType::Q8K
+                    | GgmlDType::IQ2XS
+                    | GgmlDType::IQ3XXS
+                    | GgmlDType::IQ4XS
             )
         {
             // F16 cuBLAS GEMM fast path: dequantize weights to F16 on-device, then
@@ -1169,6 +1316,10 @@ impl QCudaStorage {
             //      PCIe transfer; its overhead is negligible relative to the GEMM.
             //   3. We avoid the BF16→F32 conversion kernel that the Q8_1 path needs.
             //
+            // F32 input (IQ types only): IQ types have no Q8_1 GEMM kernels; the
+            // F32→F16 cast of the small activation tensor is cheaper than dequanting
+            // weights to F32 + running a slower F32 GEMM.
+            //
             // The F16 weight buffer is temporary (not cached) — at 31B model scale
             // each projection is ~100 MB but is freed immediately after the GEMM,
             // so peak extra VRAM is one projection weight at a time (amortised).
@@ -1179,7 +1330,7 @@ impl QCudaStorage {
             // Build layout: contiguous [n, k], then transpose to [k, n].
             let w_layout = crate::Layout::contiguous(crate::Shape::from((n, k)));
             let w_t_layout = w_layout.transpose(0, 1)?;
-            // Convert activation to F16 if it is BF16.
+            // Convert activation to F16 if it is BF16 or F32.
             let (act_f16_cow, act_layout_cow);
             let (act_f16, act_layout) = if in_dtype == crate::DType::F16 {
                 (storage, layout)

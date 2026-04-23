@@ -323,6 +323,9 @@ pub struct RawConfig {
     pub image_token_id: Option<u32>,
     pub boi_token_id: Option<u32>,
     pub eoi_token_id: Option<u32>,
+
+    #[serde(default)]
+    pub quantization_config: Option<crate::gptq::GptqConfig>,
 }
 
 /// Default epsilon for RMS normalization layers across all model families.
@@ -700,6 +703,9 @@ impl RawConfig {
             mlp_only_layers: tc.and_then(|t| t.mlp_only_layers.clone()),
             norm_topk_prob: tc.and_then(|t| t.norm_topk_prob),
             shared_expert_intermediate_size: tc.and_then(|t| t.shared_expert_intermediate_size),
+            // Defaults to HF convention; flipped by `load_model` when an
+            // external (llama.cpp) GGUF is detected.
+            gguf_external_head_order: false,
         }
     }
 

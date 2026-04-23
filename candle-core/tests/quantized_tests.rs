@@ -1036,6 +1036,12 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+
+        // IQ types are GPU-only (no from_float, no CPU vec_dot) and do not
+        // participate in the ggml reference matmul tests.
+        GgmlDType::IQ2XS | GgmlDType::IQ3XXS | GgmlDType::IQ4XS => {
+            bail!("ggml reference matmul error is not defined for {dtype:?} (GPU-only type)")
+        }
     };
     Ok(err)
 }
@@ -1398,5 +1404,288 @@ fn quantized_matmul_q8k() -> Result<()> {
     assert_eq!(dst, [1.266, 1.504, -0.204, 1.7]);
 
     ggml_matmul_error_test::<BlockQ8K>()?;
+    Ok(())
+}
+
+// ---- IQ4_XS correctness tests --------------------------------------------
+//
+// The CPU `to_float` and the CUDA kernels historically shared the same nibble
+// layout bug, so comparing CPU↔CUDA alone cannot prove correctness. Test A
+// (reference-formula unit test, in `candle-core/src/quantized/k_quants.rs`)
+// validates CPU against the ggml formula. The tests below validate that the
+// CUDA dequant and GEMV paths agree with the (now-correct) CPU path.
+
+/// Build a raw byte buffer of IQ4_XS blocks. The struct layout is
+/// `#[repr(C)] { d: f16, scales_h: u16, scales_l: [u8; 4], qs: [u8; 128] }` —
+/// total 136 bytes per block. We pack bytes directly so the test does not
+/// need access to the private fields of `BlockIq4Xs`.
+fn build_iq4xs_bytes(nblocks: usize, mut seed: u32) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 136;
+    let mut buf = vec![0u8; nblocks * BLOCK_SIZE];
+    // xorshift for determinism without needing rand crate plumbing here
+    let next = |s: &mut u32| -> u32 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *s = x;
+        x
+    };
+    for b in 0..nblocks {
+        let off = b * BLOCK_SIZE;
+        // d in a reasonable range so scales stay non-zero
+        let d_f32 = 0.01 + (next(&mut seed) as f32 / u32::MAX as f32) * 0.1;
+        let d_f16 = half::f16::from_f32(d_f32);
+        buf[off..off + 2].copy_from_slice(&d_f16.to_le_bytes());
+        // scales_h: each 2-bit group must be non-trivial but avoid overflow.
+        // Keep ls = (scale_l | (scale_h << 4)) - 32 in [-32, 31].
+        let scales_h = (next(&mut seed) & 0xFFFF) as u16;
+        buf[off + 2..off + 4].copy_from_slice(&scales_h.to_le_bytes());
+        for k in 0..4 {
+            buf[off + 4 + k] = (next(&mut seed) & 0xFF) as u8;
+        }
+        for k in 0..128 {
+            buf[off + 8 + k] = (next(&mut seed) & 0xFF) as u8;
+        }
+    }
+    buf
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn iq4xs_cuda_dequant_parity() -> Result<()> {
+    use std::borrow::Cow;
+    let cuda = Device::new_cuda(0)?;
+    let cpu = &Device::Cpu;
+
+    // 4 rows × 512 cols = 4 × 2 blocks per row (8 blocks total per nrow, per-row).
+    // Actually layout is [nrows, ncols] with ncols = 512 = 2 * QK_K, and
+    // IQ4_XS stores one row of weights as contiguous blocks, so nblocks =
+    // nrows * (ncols / QK_K).
+    let nrows = 4usize;
+    let ncols = 512usize;
+    let nblk_total = nrows * (ncols / 256);
+
+    let bytes = build_iq4xs_bytes(nblk_total, 0xCAFE_0001);
+
+    let q_cpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), cpu, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+    let q_gpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), &cuda, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+
+    let deq_cpu = q_cpu.dequantize(cpu)?;
+    let deq_gpu = q_gpu.dequantize(&cuda)?.to_device(cpu)?;
+
+    let a = deq_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let b = deq_gpu.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(a.len(), b.len());
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let diff = (x - y).abs();
+        let tol = 1e-5 * x.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "iq4_xs dequant divergence at {i}: cpu={x} cuda={y} diff={diff}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn iq4xs_cuda_gemv_parity_f32() -> Result<()> {
+    use std::borrow::Cow;
+    let cuda = Device::new_cuda(0)?;
+    let cpu = &Device::Cpu;
+
+    let nrows = 8usize;
+    let ncols = 512usize;
+    let nblk_total = nrows * (ncols / 256);
+    let bytes = build_iq4xs_bytes(nblk_total, 0xCAFE_0002);
+
+    let q_cpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), cpu, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+    let q_gpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), &cuda, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+
+    // Activation vector (1 × ncols).
+    let mut rng = StdRng::seed_from_u64(0x1234_5678);
+    let act: Vec<f32> = (0..ncols).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+    let act_cpu = Tensor::from_vec(act.clone(), (1, ncols), cpu)?;
+    let act_gpu = Tensor::from_vec(act, (1, ncols), &cuda)?;
+
+    // Reference: dequant (CPU) → matmul on CPU.
+    let deq = q_cpu.dequantize(cpu)?; // [nrows, ncols]
+    let expected = act_cpu.matmul(&deq.t()?)?; // [1, nrows]
+
+    // Under test: QMatMul::forward on CUDA (exercises the GEMV kernel for b_size=1).
+    let mm = quantized::QMatMul::from_qtensor(q_gpu)?;
+    let got = mm.forward(&act_gpu)?.to_device(cpu)?;
+
+    let e = expected.flatten_all()?.to_vec1::<f32>()?;
+    let g = got.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(e.len(), g.len());
+    for (i, (x, y)) in e.iter().zip(g.iter()).enumerate() {
+        let diff = (x - y).abs();
+        let tol = 1e-3 * x.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "iq4_xs f32 GEMV divergence at row {i}: ref={x} cuda={y} diff={diff}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn iq4xs_cuda_gemv_parity_bf16() -> Result<()> {
+    use std::borrow::Cow;
+    let cuda = Device::new_cuda(0)?;
+    let cpu = &Device::Cpu;
+
+    let nrows = 8usize;
+    let ncols = 512usize;
+    let nblk_total = nrows * (ncols / 256);
+    let bytes = build_iq4xs_bytes(nblk_total, 0xCAFE_0003);
+
+    let q_cpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), cpu, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+    let q_gpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), &cuda, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+
+    let mut rng = StdRng::seed_from_u64(0x9ABC_DEF0);
+    let act: Vec<f32> = (0..ncols).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+    let act_cpu = Tensor::from_vec(act.clone(), (1, ncols), cpu)?;
+    let act_bf16 = Tensor::from_vec(act, (1, ncols), &cuda)?.to_dtype(DType::BF16)?;
+
+    let deq = q_cpu.dequantize(cpu)?;
+    let expected = act_cpu.matmul(&deq.t()?)?;
+
+    let mm = quantized::QMatMul::from_qtensor(q_gpu)?;
+    let got = mm.forward(&act_bf16)?.to_dtype(DType::F32)?.to_device(cpu)?;
+
+    let e = expected.flatten_all()?.to_vec1::<f32>()?;
+    let g = got.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(e.len(), g.len());
+    for (i, (x, y)) in e.iter().zip(g.iter()).enumerate() {
+        let diff = (x - y).abs();
+        // BF16 activation loses ~3 decimal digits of precision; tolerance is looser.
+        let tol = 5e-2 * x.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "iq4_xs bf16 GEMV divergence at row {i}: ref={x} cuda={y} diff={diff}"
+        );
+    }
+    Ok(())
+}
+
+// Test D — parity of the F16 dequant path (used by the prefill cuBLAS GEMM
+// fast path in `dequantize_matmul` at cuda.rs:1328).
+#[cfg(feature = "cuda")]
+#[test]
+fn iq4xs_cuda_dequant_f16_parity() -> Result<()> {
+    use std::borrow::Cow;
+    let cuda = Device::new_cuda(0)?;
+    let cpu = &Device::Cpu;
+
+    let nrows = 4usize;
+    let ncols = 512usize;
+    let nblk_total = nrows * (ncols / 256);
+    let bytes = build_iq4xs_bytes(nblk_total, 0xCAFE_0004);
+
+    let q_cpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), cpu, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+    let q_gpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), &cuda, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+
+    // CPU reference: dequantize to F32 then cast to F16 for comparison.
+    let ref_f32 = q_cpu.dequantize(cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let got_f16 = q_gpu
+        .dequantize_f16(&cuda)?
+        .to_dtype(DType::F32)?
+        .to_device(cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert_eq!(ref_f32.len(), got_f16.len());
+    for (i, (x, y)) in ref_f32.iter().zip(got_f16.iter()).enumerate() {
+        let diff = (x - y).abs();
+        // F16 rounding only: tolerance dominated by 2^-10 relative.
+        let tol = 1e-3 * x.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "iq4_xs f16 dequant divergence at {i}: cpu_f32={x} cuda_f16→f32={y} diff={diff}"
+        );
+    }
+    Ok(())
+}
+
+// Test E — parity of the prefill path (b_size > 1) which routes through
+// `dequantize_matmul` → F16 cuBLAS GEMM at cuda.rs:1342.
+#[cfg(feature = "cuda")]
+#[test]
+fn iq4xs_cuda_prefill_parity_bf16() -> Result<()> {
+    use std::borrow::Cow;
+    let cuda = Device::new_cuda(0)?;
+    let cpu = &Device::Cpu;
+
+    let nrows = 8usize;
+    let ncols = 512usize;
+    let nblk_total = nrows * (ncols / 256);
+    let bytes = build_iq4xs_bytes(nblk_total, 0xCAFE_0005);
+
+    let q_cpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), cpu, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+    let q_gpu = quantized::QTensor::new(
+        quantized::QStorage::from_data(Cow::Borrowed(&bytes), &cuda, GgmlDType::IQ4XS)?,
+        (nrows, ncols),
+    )?;
+
+    // Activation: (1, m=8, ncols) so b_size=8>1 triggers the prefill cuBLAS path.
+    let m = 8usize;
+    let mut rng = StdRng::seed_from_u64(0xBEEF_1234);
+    let act: Vec<f32> = (0..m * ncols)
+        .map(|_| rng.random_range(-1.0f32..1.0))
+        .collect();
+    let act_cpu = Tensor::from_vec(act.clone(), (m, ncols), cpu)?;
+    let act_gpu_bf16 = Tensor::from_vec(act, (m, ncols), &cuda)?.to_dtype(DType::BF16)?;
+
+    let deq = q_cpu.dequantize(cpu)?; // [nrows, ncols]
+    let expected = act_cpu.matmul(&deq.t()?)?; // [m, nrows]
+
+    let mm = quantized::QMatMul::from_qtensor(q_gpu)?;
+    let got = mm
+        .forward(&act_gpu_bf16)?
+        .to_dtype(DType::F32)?
+        .to_device(cpu)?;
+
+    assert_eq!(got.dims(), &[m, nrows]);
+    let e = expected.flatten_all()?.to_vec1::<f32>()?;
+    let g = got.flatten_all()?.to_vec1::<f32>()?;
+    for (i, (x, y)) in e.iter().zip(g.iter()).enumerate() {
+        let diff = (x - y).abs();
+        // Combined BF16→F16 activation cast + F16 GEMM accumulation loss.
+        let tol = 1e-1 * x.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "iq4_xs prefill divergence at {i}: ref={x} cuda={y} diff={diff}"
+        );
+    }
     Ok(())
 }

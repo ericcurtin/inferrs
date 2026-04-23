@@ -7,6 +7,9 @@ fn main() {
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
     println!("cargo::rerun-if-changed=src/flash_attn_prefill.cu");
+    println!("cargo::rerun-if-changed=src/iq_dequant.cu");
+    println!("cargo::rerun-if-changed=src/ggml_iq_tables_device.inc");
+    println!("cargo::rerun-if-changed=src/gptq_int4.cu");
 
     // Build for PTX
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
