@@ -79,6 +79,46 @@ impl TensorInfo {
             device,
         )
     }
+
+    /// Zero-copy variant of [`Self::read`]: `data` is a slice covering the full
+    /// GGUF file (typically a memory-mapped region). The tensor is built directly
+    /// from `&data[tensor_data_offset + self.offset ..]`, skipping the
+    /// `Vec<u8>` allocation and the syscall that `read` would otherwise perform.
+    pub fn read_from_slice(
+        &self,
+        data: &[u8],
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let start_u64 = tensor_data_offset
+            .checked_add(self.offset)
+            .ok_or_else(|| crate::Error::Msg("gguf tensor offset overflow".into()))?;
+        let end_u64 = start_u64
+            .checked_add(size_in_bytes as u64)
+            .ok_or_else(|| crate::Error::Msg("gguf tensor slice overflow".into()))?;
+        if end_u64 > data.len() as u64 {
+            crate::bail!(
+                "gguf tensor slice out of bounds: need {end_u64} bytes, have {}",
+                data.len()
+            );
+        }
+        let start = start_u64 as usize;
+        let end = end_u64 as usize;
+        super::ggml_file::qtensor_from_ggml(
+            self.ggml_dtype,
+            &data[start..end],
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -478,6 +518,21 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    /// Zero-copy variant of [`Self::tensor`]: loads a tensor directly from a
+    /// slice covering the full GGUF file (typically a memory-mapped region).
+    pub fn tensor_from_slice(
+        &self,
+        data: &[u8],
+        name: &str,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_from_slice(data, self.tensor_data_offset, device)
     }
 }
 

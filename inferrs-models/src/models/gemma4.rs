@@ -67,13 +67,14 @@ const PLI_EMBED_CACHE_SIZE: usize = 1024;
 enum PliEmbeddingTable {
     /// GGUF-file-backed on-demand row lookup (zero CPU RAM for the table).
     ///
-    /// Rows are read directly from the GGUF file as needed, with results
-    /// cached by token ID (via the model-level `pli_embed_cache`).  This
+    /// Rows are read directly from the memory-mapped GGUF file as needed, with
+    /// results cached by token ID (via the model-level `pli_embed_cache`). This
     /// keeps the PLI embedding table out of CPU RAM entirely, reducing peak
     /// RSS by ~1.9 GB compared to the `Quantized` variant.
     GgufFile {
-        /// GGUF file, shared among all model components.
-        file: Arc<std::sync::Mutex<std::fs::File>>,
+        /// Memory-mapped GGUF file, kept alive for the lifetime of all row
+        /// lookups. Mmap is `Sync`, so no lock is needed on the hot path.
+        mmap: Arc<memmap2::Mmap>,
         /// Absolute file offset where tensor data starts.
         tensor_offset: u64,
         #[allow(dead_code)]
@@ -108,8 +109,16 @@ impl PliEmbeddingTable {
     fn from_gguf_file(gguf_path: &std::path::Path) -> candle_core::Result<Option<Self>> {
         use candle_core::quantized::gguf_file;
 
-        let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
-        let content = gguf_file::Content::read(&mut file)?;
+        let file = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
+        // SAFETY: mmap stays alive inside `Arc<Mmap>` for the lifetime of
+        // every row lookup; see `QGgufVarBuilder::from_gguf` for the same
+        // assumption.
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .map(&file)
+                .map_err(candle_core::Error::from)?
+        };
+        let content = gguf_file::Content::read(&mut std::io::Cursor::new(mmap.as_ref()))?;
 
         // Find the PLI embedding tensor — check both HF and llama.cpp naming.
         let tensor_name = if content
@@ -146,7 +155,7 @@ impl PliEmbeddingTable {
         let tensor_offset = content.tensor_data_offset + info.offset;
 
         Ok(Some(PliEmbeddingTable::GgufFile {
-            file: Arc::new(std::sync::Mutex::new(file)),
+            mmap: Arc::new(mmap),
             tensor_offset,
             vocab_size,
             embed_dim,
@@ -186,11 +195,10 @@ impl PliEmbeddingTable {
     ) -> candle_core::Result<candle_core::Tensor> {
         use candle_core::quantized::{GgmlDType, QStorage, QTensor};
         use std::borrow::Cow;
-        use std::io::{Read, Seek, SeekFrom};
 
         match self {
             PliEmbeddingTable::GgufFile {
-                file,
+                mmap,
                 tensor_offset,
                 row_bytes,
                 dtype_q,
@@ -198,13 +206,27 @@ impl PliEmbeddingTable {
             } => {
                 let n = token_ids.len();
                 let mut row_data: Vec<u8> = vec![0u8; n * row_bytes];
-                let mut f = file.lock().expect("GGUF file lock poisoned");
+                let data = mmap.as_ref();
                 for (i, &tok) in token_ids.iter().enumerate() {
-                    let file_pos = tensor_offset + tok as u64 * *row_bytes as u64;
-                    f.seek(SeekFrom::Start(file_pos))
-                        .map_err(candle_core::Error::from)?;
-                    f.read_exact(&mut row_data[i * row_bytes..(i + 1) * row_bytes])
-                        .map_err(candle_core::Error::from)?;
+                    let row_offset =
+                        (tok as u64).checked_mul(*row_bytes as u64).ok_or_else(|| {
+                            candle_core::Error::Msg("PLI row offset overflow".to_string())
+                        })?;
+                    let start_u64 = (*tensor_offset).checked_add(row_offset).ok_or_else(|| {
+                        candle_core::Error::Msg("PLI row start offset overflow".to_string())
+                    })?;
+                    let end_u64 = start_u64.checked_add(*row_bytes as u64).ok_or_else(|| {
+                        candle_core::Error::Msg("PLI row end offset overflow".to_string())
+                    })?;
+                    if end_u64 > data.len() as u64 {
+                        candle_core::bail!(
+                            "PLI row out of bounds: tok={tok}, need {end_u64} bytes, mmap {}",
+                            data.len()
+                        );
+                    }
+                    let start = start_u64 as usize;
+                    let end = end_u64 as usize;
+                    row_data[i * row_bytes..(i + 1) * row_bytes].copy_from_slice(&data[start..end]);
                 }
                 // For non-quantized dtypes (BF16, F16, F32), `QStorage::from_data`
                 // reinterprets the `Vec<u8>` as typed values via raw pointer cast.

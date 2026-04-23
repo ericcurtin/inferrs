@@ -10,7 +10,6 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{embedding, Embedding, Init, RmsNorm, VarBuilder};
-use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
@@ -1313,10 +1312,12 @@ impl Qwen35Model {
             }
         });
 
-        // Pre-extract per-layer VarBuilders (sequential, trivial cost) then
-        // construct all layers + lm_head in parallel via rayon::join.
-        // VarBuilder is Send (Arc<TensorData<Box<dyn SimpleBackend>>> where
-        // SimpleBackend: Send + Sync). QGgufVarBuilder is Send (Arc<Mutex<>>).
+        // Pre-extract per-layer VarBuilders and build layers + lm_head
+        // sequentially. Both safetensors and GGUF paths are now mmap-backed
+        // (zero syscalls / zero heap alloc per tensor), so the previous
+        // rayon::join parallelism is no longer load-bound — and removing it
+        // eliminates the Metal command-encoder thread-safety SIGSEGV that
+        // forced a conditional branch.
         let layer_specs: Vec<_> = cfg
             .layer_types
             .iter()
@@ -1329,16 +1330,6 @@ impl Qwen35Model {
             .collect();
 
         let norm_vb = lm_vb.pp("norm");
-
-        // Build layers and lm_head.
-        // Metal's command encoder is not thread-safe: concurrent rayon threads
-        // calling dequantize → wait_until_completed on the shared encoder corrupts
-        // the heap and causes a SIGSEGV.  On Metal, both closures run sequentially;
-        // on CPU/CUDA, rayon::join parallelizes them.
-        let on_metal = matches!(
-            embed_tokens.embeddings().device(),
-            candle_core::Device::Metal(_)
-        );
 
         // Resolve the lm_head weight.
         //
@@ -1428,39 +1419,15 @@ impl Qwen35Model {
             QLinear::from_tensor(dense, None)
         };
 
-        let (layers_result, lm_head) = if on_metal {
-            let layers: Vec<_> = layer_specs
-                .into_iter()
-                .enumerate()
-                .map(|(i, (vb, qvb, is_full))| {
-                    DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, Some(i), tq_cfg.as_ref())
-                        .with_context(|| format!("loading layer {i}"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (Ok(layers), build_lm_head())
-        } else {
-            rayon::join(
-                || -> Result<Vec<DecoderLayer>> {
-                    layer_specs
-                        .into_par_iter()
-                        .enumerate()
-                        .map(|(i, (vb, qvb, is_full))| {
-                            DecoderLayer::new(
-                                cfg,
-                                vb,
-                                qvb.as_ref(),
-                                is_full,
-                                Some(i),
-                                tq_cfg.as_ref(),
-                            )
-                            .with_context(|| format!("loading layer {i}"))
-                        })
-                        .collect::<Result<Vec<_>>>()
-                },
-                build_lm_head,
-            )
-        };
-        let layers = layers_result?;
+        let layers: Vec<DecoderLayer> = layer_specs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (vb, qvb, is_full))| {
+                DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, Some(i), tq_cfg.as_ref())
+                    .with_context(|| format!("loading layer {i}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lm_head = build_lm_head();
 
         let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, norm_vb, 1.0)?;
 

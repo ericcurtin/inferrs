@@ -639,11 +639,12 @@ impl CausalLM for Qwen35ModelWrapper {
 /// spike and slow startup of the previous eager approach (loading all 2 000+
 /// tensors including multi-gigabyte embedding tables upfront).
 ///
-/// The GGUF file is kept open for the lifetime of the backend; a `Mutex`
-/// around the `BufReader` satisfies the `Sync` requirement of `SimpleBackend`.
+/// The GGUF file is memory-mapped once at construction and kept alive via
+/// `Arc<Mmap>` for the lifetime of the backend. Mmap is immutable and `Sync`,
+/// so no lock is required on the hot path.
 struct GgufBackend {
     content: candle_core::quantized::gguf_file::Content,
-    reader: std::sync::Mutex<std::io::BufReader<std::fs::File>>,
+    mmap: std::sync::Arc<memmap2::Mmap>,
     device: Device,
 }
 
@@ -656,7 +657,6 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
         dtype: DType,
         dev: &Device,
     ) -> candle_core::Result<Tensor> {
-        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
         // Use `dev` (the VarBuilder's device) for loading the quantized tensor
         // so that if the caller requests CPU placement (e.g. for the enormous
         // embed_tokens_per_layer table) the data never touches GPU memory.
@@ -667,7 +667,7 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
         };
         let qt = self
             .content
-            .tensor(&mut *reader, name, load_dev)
+            .tensor_from_slice(self.mmap.as_ref(), name, load_dev)
             .map_err(|e| {
                 candle_core::Error::CannotFindTensor {
                     path: format!("{name}: {e}"),
@@ -688,7 +688,6 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
-        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
         let load_dev = if matches!(dev, Device::Cpu) {
             dev
         } else {
@@ -696,7 +695,7 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
         };
         let qt = self
             .content
-            .tensor(&mut *reader, name, load_dev)
+            .tensor_from_slice(self.mmap.as_ref(), name, load_dev)
             .map_err(|e| {
                 candle_core::Error::CannotFindTensor {
                     path: format!("{name}: {e}"),
@@ -892,9 +891,16 @@ fn var_builder_from_gguf(
 
     let file = std::fs::File::open(gguf_path)
         .with_context(|| format!("Cannot open GGUF {}", gguf_path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
+    // SAFETY: kept alive for the lifetime of the backend via `Arc<Mmap>`.
+    // External mutation of the mapped file would be unsound; same assumption
+    // as `VarBuilder::from_mmaped_safetensors`.
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .map(&file)
+            .with_context(|| format!("Cannot mmap GGUF {}", gguf_path.display()))?
+    };
 
-    let content = gguf_file::Content::read(&mut reader)
+    let content = gguf_file::Content::read(&mut std::io::Cursor::new(mmap.as_ref()))
         .with_context(|| format!("Failed to parse GGUF header in {}", gguf_path.display()))?;
 
     tracing::info!(
@@ -912,7 +918,7 @@ fn var_builder_from_gguf(
 
     let backend = GgufBackend {
         content,
-        reader: std::sync::Mutex::new(reader),
+        mmap: std::sync::Arc::new(mmap),
         device: device.clone(),
     };
 

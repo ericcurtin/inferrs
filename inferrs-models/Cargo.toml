@@ -29,6 +29,7 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 half = { version = "2.5", features = ["num-traits"] }
 libloading = "0.8"
+memmap2 = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
