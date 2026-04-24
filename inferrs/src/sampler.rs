@@ -67,6 +67,10 @@ pub struct SamplingParams {
     pub top_logprobs: u8,
     /// Structured output grammar mode.
     pub grammar_mode: GrammarMode,
+    /// When true, stop tokens and stop strings are ignored so generation runs
+    /// until `max_tokens` is reached.  Used by `inferrs bench` to ensure every
+    /// run produces exactly `max_tokens` output tokens for consistent metrics.
+    pub bypass_stop_tokens: bool,
 }
 
 /// Structured output constraint mode.
@@ -102,6 +106,7 @@ impl Default for SamplingParams {
             logprobs: false,
             top_logprobs: 0,
             grammar_mode: GrammarMode::None,
+            bypass_stop_tokens: false,
         }
     }
 }

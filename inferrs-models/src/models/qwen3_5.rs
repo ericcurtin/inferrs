@@ -549,94 +549,14 @@ struct LinearAttn {
     head_v_dim: usize,     // = linear_value_head_dim
     key_dim: usize,        // = n_key_heads   * head_k_dim
     value_dim: usize,      // = n_value_heads * head_v_dim
+    // When true, all value-head-indexed tensors are in GGUF tiled order
+    // (llama.cpp reshape(n_key,ratio).T.flatten()). GQA expansion in forward
+    // uses unsqueeze(2) instead of unsqueeze(3) to match.
+    gguf_external_head_order: bool,
     // Recurrent state: [b, n_value_heads, head_k_dim, head_v_dim], F32
     recurrent_state: Option<Tensor>,
     // Conv state: [b, conv_dim, kernel-1], used for causal padding across calls
     conv_state: Option<Tensor>,
-}
-
-/// Inverse of llama.cpp's `reshape(n_key, ratio).T.flatten()` value-head
-/// permutation applied along the first dim of `t`.
-///
-/// Given a tensor whose leading dim enumerates `n_value_heads` in llama.cpp
-/// order — `[v_{2k}, v_{2k+1}]` groups stored as `[first-of-group..., second-of-group...]`
-/// — returns a new tensor in HF natural order where consecutive positions
-/// correspond to consecutive value-heads.  No-op when `ratio == 1`.
-///
-/// Used to undo the llama.cpp convention for the per-value-head tensors
-/// `ssm_a` (1-D), `ssm_dt.bias` (1-D), `ssm_alpha.weight` / `ssm_beta.weight`
-/// (2-D) so that downstream SSM code sees a single consistent ordering.
-fn unpermute_value_heads(
-    t: Tensor,
-    n_key_heads: usize,
-    n_value_heads: usize,
-    ratio: usize,
-) -> Result<Tensor> {
-    if ratio <= 1 {
-        return Ok(t);
-    }
-    let rest_dims: Vec<usize> = t.dims().iter().skip(1).copied().collect();
-    let mut from_shape = vec![ratio, n_key_heads];
-    from_shape.extend_from_slice(&rest_dims);
-    let mut to_shape = vec![n_value_heads];
-    to_shape.extend_from_slice(&rest_dims);
-    Ok(t.reshape(from_shape)?
-        .transpose(0, 1)?
-        .contiguous()?
-        .reshape(to_shape)?)
-}
-
-/// Inverse of llama.cpp's value-head permutation applied to the *v-portion*
-/// of a packed tensor along `dim` — used for tensors where only a contiguous
-/// slice corresponds to value heads (qkv, conv1d, out_proj value cols).
-///
-/// `dim` is permuted between `start` and `start + n_value_heads * head_v_dim`;
-/// everything outside that range is untouched.  Each head contributes a
-/// contiguous chunk of `head_v_dim` elements along `dim`, so we temporarily
-/// reshape the v-slice to `(n_value_heads, head_v_dim, …rest)`, run
-/// `unpermute_value_heads`, and concatenate the unchanged Q/K prefix back.
-fn unpermute_v_portion(
-    t: &Tensor,
-    dim: usize,
-    start: usize,
-    n_key_heads: usize,
-    n_value_heads: usize,
-    ratio: usize,
-    head_v_dim: usize,
-) -> Result<Tensor> {
-    if ratio <= 1 {
-        return Ok(t.clone());
-    }
-    let value_dim = n_value_heads * head_v_dim;
-    let head_chunk = t.narrow(dim, start, value_dim)?;
-    // Introduce the (n_value, head_v_dim) factorisation on `dim` so that
-    // `unpermute_value_heads` can swap the head axis.
-    let mut split_shape = t.dims().to_vec();
-    split_shape[dim] = n_value_heads;
-    split_shape.insert(dim + 1, head_v_dim);
-    let reshaped = head_chunk.reshape(split_shape)?;
-    // The helper permutes the *leading* dim, so move the head axis to front.
-    let permuted = if dim == 0 {
-        unpermute_value_heads(reshaped, n_key_heads, n_value_heads, ratio)?
-    } else {
-        let mut perm: Vec<usize> = (0..reshaped.rank()).collect();
-        perm[0] = dim;
-        perm[dim] = 0;
-        let moved = reshaped.permute(perm.clone())?.contiguous()?;
-        let unpermuted = unpermute_value_heads(moved, n_key_heads, n_value_heads, ratio)?;
-        unpermuted.permute(perm)?.contiguous()?
-    };
-    // Collapse (n_value, head_v_dim) back into value_dim.
-    let mut flat_shape = t.dims().to_vec();
-    flat_shape[dim] = value_dim;
-    let v_flat = permuted.reshape(flat_shape)?;
-    // Concatenate the untouched Q/K prefix (if any) with the unpermuted V.
-    if start == 0 {
-        Ok(v_flat)
-    } else {
-        let head = t.narrow(dim, 0, start)?;
-        Tensor::cat(&[&head, &v_flat], dim).map_err(Into::into)
-    }
 }
 
 impl LinearAttn {
@@ -652,182 +572,48 @@ impl LinearAttn {
         let hidden = cfg.hidden_size;
         let kernel = cfg.linear_conv_kernel_dim;
 
-        // ── llama.cpp external-GGUF asymmetric-SSM head permutation ─────────
-        //
-        // For asymmetric Qwen3.5 models (n_value_heads > n_key_heads),
-        // llama.cpp's convert_hf_to_gguf.py applies a value-head permutation
-        // `reshape(n_key, ratio).T.flatten()` to **every** tensor whose layout
-        // is indexed by value-heads (the whole `_LinearAttentionVReorderBase`
-        // family).  The complete list, verified against convert_hf_to_gguf.py:
-        //
-        //   1. `ssm_a`                  — 1D [n_value_heads]
-        //   2. `ssm_dt.bias`            — 1D [n_value_heads]
-        //   3. `ssm_alpha.weight`       — rows [n_value_heads, hidden]
-        //   4. `ssm_beta.weight`        — rows [n_value_heads, hidden]
-        //   5. `attn_qkv.weight`        — V rows only (last value_dim of
-        //                                  [conv_dim, hidden]); Q/K untouched
-        //   6. `attn_gate.weight`       — rows [value_dim, hidden]
-        //                                  (i.e. `in_proj_z`, row-permuted in
-        //                                  chunks of head_v_dim)
-        //   7. `ssm_conv1d.weight`      — V channels only (last value_dim of
-        //                                  [conv_dim, kernel]); QK untouched
-        //   8. `ssm_out.weight`         — cols [hidden, value_dim]
-        //
-        // Leaving even *one* of these eight in GGUF order while unpermuting
-        // the others produces mixed-order garbage (`silu(z) * norm(out)` in
-        // particular pairs wrong heads if z is the outlier).  We must
-        // therefore flip all eight atomically.
-        //
-        // For quantized weights we dequantize once, undo the permutation, and
-        // wrap the dense tensor in a `QLinear::Tensor` — the Q4_K / IQ4_XS
-        // block layout can't represent the permuted-then-reordered storage
-        // directly.  Extra VRAM is ~100 MB per SSM layer on a 4B model,
-        // ~200 MB on a 9B — acceptable for correctness.  Symmetric models
-        // (`ratio == 1`) skip the entire branch since the permutation is the
-        // identity.
-        let needs_head_unpermute = cfg.gguf_external_head_order && kv_group_ratio > 1;
-        let qvb_ref = if needs_head_unpermute {
-            Some(qvb.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "external-GGUF asymmetric SSM requires QGgufVarBuilder but none was provided"
-                )
-            })?)
-        } else {
-            None
-        };
-        let dev = vb.device().clone();
+        // All 8 value-head-indexed tensors are loaded in their native storage
+        // order (HF or GGUF tiled).  When gguf_external_head_order is true the
+        // GQA expansion in forward() uses unsqueeze(2) instead of unsqueeze(3)
+        // so q/k tile in the same order as the stored v/z/state tensors.
+        // No dequantization or permutation at load time — zero extra VRAM.
+        let in_proj_a = qlinear_b(
+            hidden,
+            n_value_heads,
+            false,
+            vb.pp("in_proj_a"),
+            qvb.map(|q| q.pp("in_proj_a")).as_ref(),
+        )?;
+        let in_proj_b = qlinear_b(
+            hidden,
+            n_value_heads,
+            false,
+            vb.pp("in_proj_b"),
+            qvb.map(|q| q.pp("in_proj_b")).as_ref(),
+        )?;
+        let in_proj_qkv = qlinear_b(
+            hidden,
+            conv_dim,
+            false,
+            vb.pp("in_proj_qkv"),
+            qvb.map(|q| q.pp("in_proj_qkv")).as_ref(),
+        )?;
+        let in_proj_z = qlinear_b(
+            hidden,
+            value_dim,
+            false,
+            vb.pp("in_proj_z"),
+            qvb.map(|q| q.pp("in_proj_z")).as_ref(),
+        )?;
 
-        // Load a quantized weight via `qvb`, dequantize to F32, apply an
-        // arbitrary transformation (row/col unpermute), and return as a dense
-        // `QLinear::Tensor` wrapper.
-        let load_dense_transformed = |pp: &str,
-                                      transform: &dyn Fn(Tensor) -> Result<Tensor>|
-         -> Result<QLinear> {
-            let qt = qvb_ref
-                .expect("needs_head_unpermute implies qvb_ref is Some")
-                .pp(pp)
-                .get_qtensor()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("external-GGUF asymmetric SSM: `{pp}.weight` not found in qvb")
-                })?;
-            let dense = qt
-                .dequantize(&dev)
-                .with_context(|| format!("dequantize `{pp}.weight`"))?
-                .to_dtype(DType::F32)?;
-            let w = transform(dense).with_context(|| format!("transform `{pp}.weight`"))?;
-            Ok(QLinear::from_tensor(w, None))
-        };
-
-        // (3, 4) in_proj_a / in_proj_b: whole-row per-value-head permutation.
-        let (in_proj_a, in_proj_b) = if needs_head_unpermute {
-            let unperm = |t: Tensor| -> Result<Tensor> {
-                unpermute_value_heads(t, n_key_heads, n_value_heads, kv_group_ratio)
-            };
-            (
-                load_dense_transformed("in_proj_a", &unperm)?,
-                load_dense_transformed("in_proj_b", &unperm)?,
-            )
-        } else {
-            (
-                qlinear_b(
-                    hidden,
-                    n_value_heads,
-                    false,
-                    vb.pp("in_proj_a"),
-                    qvb.map(|q| q.pp("in_proj_a")).as_ref(),
-                )?,
-                qlinear_b(
-                    hidden,
-                    n_value_heads,
-                    false,
-                    vb.pp("in_proj_b"),
-                    qvb.map(|q| q.pp("in_proj_b")).as_ref(),
-                )?,
-            )
-        };
-
-        // (5) in_proj_qkv: only the last value_dim rows (V) are head-permuted
-        // in chunks of head_v_dim.  Q/K rows pass through unchanged.
-        let in_proj_qkv = if needs_head_unpermute {
-            load_dense_transformed("in_proj_qkv", &|t| {
-                unpermute_v_portion(
-                    &t,
-                    0,
-                    2 * key_dim,
-                    n_key_heads,
-                    n_value_heads,
-                    kv_group_ratio,
-                    head_v_dim,
-                )
-            })?
-        } else {
-            qlinear_b(
-                hidden,
-                conv_dim,
-                false,
-                vb.pp("in_proj_qkv"),
-                qvb.map(|q| q.pp("in_proj_qkv")).as_ref(),
-            )?
-        };
-
-        // (6) in_proj_z (= attn_gate): rows [value_dim, hidden] — permuted in
-        // chunks of head_v_dim (see convert_hf_to_gguf.py, `.in_proj_z.`
-        // branch: `_reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k,
-        // head_v_dim)`).  Missing this fix breaks the SSM gate `silu(z) *
-        // norm(out_flat)` because z ends up in GGUF order while the rest of
-        // the SSM path is in HF order.
-        let in_proj_z = if needs_head_unpermute {
-            load_dense_transformed("in_proj_z", &|t| {
-                unpermute_v_portion(
-                    &t,
-                    0,
-                    0,
-                    n_key_heads,
-                    n_value_heads,
-                    kv_group_ratio,
-                    head_v_dim,
-                )
-            })?
-        } else {
-            qlinear_b(
-                hidden,
-                value_dim,
-                false,
-                vb.pp("in_proj_z"),
-                qvb.map(|q| q.pp("in_proj_z")).as_ref(),
-            )?
-        };
-
-        // (7) conv1d weight: [conv_dim, 1, kernel] depthwise.  External GGUFs
-        // store it as 2D [conv_dim, kernel] (groups=1 squeezed); only the last
-        // value_dim channels (the V portion) are head-permuted.
         let conv1d_weight_raw = vb.get_unchecked("conv1d.weight")?.to_dtype(DType::F32)?;
         let conv1d_weight_2d = if conv1d_weight_raw.rank() == 3 {
             conv1d_weight_raw.reshape((conv_dim, kernel))?
         } else {
             conv1d_weight_raw
         };
-        let conv1d_weight_2d = if needs_head_unpermute {
-            unpermute_v_portion(
-                &conv1d_weight_2d,
-                0,
-                2 * key_dim,
-                n_key_heads,
-                n_value_heads,
-                kv_group_ratio,
-                head_v_dim,
-            )?
-        } else {
-            conv1d_weight_2d
-        };
         let conv1d_weight = conv1d_weight_2d.reshape((conv_dim, 1, kernel))?;
 
-        // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
-        // Both A_log and dt_bias are per-value-head; in an external asymmetric
-        // llama.cpp GGUF they arrive row-permuted (see `unpermute_value_heads`
-        // for the full rationale) and must be brought back to HF natural order
-        // so the rest of the SSM path (v from `attn_qkv`, `ssm_out`, the GQA
-        // expansion) stays consistent.
         let a_log = vb
             .get_with_hints(n_value_heads, "A_log", candle_nn::Init::Const(0.0))?
             .to_dtype(DType::F32)?;
@@ -835,58 +621,26 @@ impl LinearAttn {
         let norm_weight = vb
             .get_with_hints(head_v_dim, "norm.weight", candle_nn::Init::Const(1.0))?
             .to_dtype(DType::F32)?;
-        let a_log = if needs_head_unpermute {
-            unpermute_value_heads(a_log, n_key_heads, n_value_heads, kv_group_ratio)?
-        } else {
-            a_log
-        };
-        let dt_bias = if needs_head_unpermute {
-            unpermute_value_heads(dt_bias, n_key_heads, n_value_heads, kv_group_ratio)?
-        } else {
-            dt_bias
-        };
 
-        // Precompute `a_exp = A_log.exp()` — it's a constant weight, saves one
-        // dispatch per SSM layer per decode token.
+        // Precompute `a_exp = A_log.exp()` — constant weight, saves one dispatch
+        // per SSM layer per decode token.
         let a_exp = a_log.exp()?;
 
-        // (7) out_proj: [hidden, value_dim] — value-head permutation applied
-        // on the *input* dimension (cols).  llama.cpp uses `apply_col_perm()`
-        // here rather than a row permutation.  Unpermute the cols to match
-        // the HF-ordered state that downstream code feeds into out_proj.
-        let out_proj = if needs_head_unpermute {
-            load_dense_transformed("out_proj", &|t| {
-                unpermute_v_portion(
-                    &t,
-                    1,
-                    0,
-                    n_key_heads,
-                    n_value_heads,
-                    kv_group_ratio,
-                    head_v_dim,
-                )
-            })?
-        } else {
-            qlinear_b(
-                value_dim,
-                hidden,
-                false,
-                vb.pp("out_proj"),
-                qvb.map(|q| q.pp("out_proj")).as_ref(),
-            )?
-        };
+        let out_proj = qlinear_b(
+            value_dim,
+            hidden,
+            false,
+            vb.pp("out_proj"),
+            qvb.map(|q| q.pp("out_proj")).as_ref(),
+        )?;
 
-        // Precompute alpha = (1/sqrt(head_k_dim)) * ones[head_k_dim] and the
-        // rescaled eps for the L2-norm-via-rms_norm substitution. See `l2norm`
-        // below for the arithmetic identity that links candle-nn
-        // `rms_norm(x, alpha, eps)` to `x · rsqrt(sum(x²) + cfg.rms_norm_eps)`.
+        // Precompute alpha and eps for the L2-norm-via-rms_norm substitution.
         let l2norm_alpha =
             Tensor::full(1.0f32 / (head_k_dim as f32).sqrt(), head_k_dim, vb.device())?;
         let l2norm_eps_rms = (cfg.rms_norm_eps as f32) / head_k_dim as f32;
 
-        // If both in_proj_a and in_proj_b are dense (non-quantized), concatenate their
-        // weight matrices once at load time so forward can issue a single matmul.
-        // Saves 1 dispatch per SSM layer per decode token.
+        // If both in_proj_a and in_proj_b are dense (non-quantized), concatenate
+        // their weight matrices once at load time — saves 1 dispatch per SSM layer.
         let in_proj_ab_weight = match (in_proj_a.dense_weight(), in_proj_b.dense_weight()) {
             (Some(wa), Some(wb)) => Tensor::cat(&[wa, wb], 0)
                 .and_then(|t| t.to_dtype(DType::F32))
@@ -914,6 +668,7 @@ impl LinearAttn {
             head_v_dim,
             key_dim,
             value_dim,
+            gguf_external_head_order: cfg.gguf_external_head_order,
             recurrent_state: None,
             conv_state: None,
         })
@@ -1022,21 +777,38 @@ impl LinearAttn {
         let q = q.affine(scale, 0.0)?;
 
         // ── Repeat q and k to n_value_heads (GQA-style expansion) ────────────
-        // Each key head serves `kv_group_ratio` value heads. Expand after L2norm
-        // so that each value-head slot gets the same normalized key vector.
+        // Each key head serves `kv_group_ratio` value heads.  The unsqueeze axis
+        // depends on the storage order of the value-head-indexed tensors:
+        //
+        //   HF grouped  — v[p] pairs with k[p / ratio]:  unsqueeze(3) so q/k
+        //                 expand as  [n_key, ratio] → [n_key×ratio = n_val].
+        //   GGUF tiled  — v[p] pairs with k[p % n_key]:  unsqueeze(2) so q/k
+        //                 expand as  [ratio, n_key] → [ratio×n_key = n_val].
         let (q, k) = if self.kv_group_ratio > 1 {
             let ratio = self.kv_group_ratio;
-            // [b, t, n_key_heads, head_k_dim] -> [b, t, n_key_heads, ratio, head_k_dim]
-            //                                  -> [b, t, n_value_heads, head_k_dim]
-            let q = q
-                .unsqueeze(3)?
-                .expand((b, t, self.n_key_heads, ratio, self.head_k_dim))?
-                .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
-            let k = k
-                .unsqueeze(3)?
-                .expand((b, t, self.n_key_heads, ratio, self.head_k_dim))?
-                .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
-            (q, k)
+            if self.gguf_external_head_order {
+                // GGUF tiled: value head at position p pairs with key head p % n_key
+                let q = q
+                    .unsqueeze(2)?
+                    .expand((b, t, ratio, self.n_key_heads, self.head_k_dim))?
+                    .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
+                let k = k
+                    .unsqueeze(2)?
+                    .expand((b, t, ratio, self.n_key_heads, self.head_k_dim))?
+                    .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
+                (q, k)
+            } else {
+                // HF grouped: value head at position p pairs with key head p / ratio
+                let q = q
+                    .unsqueeze(3)?
+                    .expand((b, t, self.n_key_heads, ratio, self.head_k_dim))?
+                    .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
+                let k = k
+                    .unsqueeze(3)?
+                    .expand((b, t, self.n_key_heads, ratio, self.head_k_dim))?
+                    .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
+                (q, k)
+            }
         } else {
             (q, k)
         };

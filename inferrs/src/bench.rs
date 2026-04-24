@@ -4,9 +4,9 @@
 //! local inference engine and reports throughput and latency statistics.
 //!
 //! Metrics reported per run:
-//!   - Prefill throughput  (prompt tokens / prefill wall-time)
-//!   - Decode  throughput  (output tokens / decode  wall-time)
-//!   - Time to first token (TTFT)   — prefill wall-time
+//!   - Prefill throughput  (prompt tokens / GPU-synchronized prefill wall-time)
+//!   - Decode  throughput  (output tokens / decode wall-time for all N tokens)
+//!   - Time to first token (TTFT)   — prefill + first sample wall-time
 //!   - Mean per-token latency       — decode wall-time / output tokens
 //!   - End-to-end latency           — total wall-time for the request
 
@@ -82,14 +82,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
         top_p: serve.top_p,
         top_k: serve.top_k,
         max_tokens,
+        // Suppress stop tokens so every run generates exactly max_tokens.
+        // Without this, early EOS produces variable n_output and skews throughput.
+        bypass_stop_tokens: true,
         ..SamplingParams::default()
     };
 
     let total_runs = args.warmup + args.runs;
     let mut prefill_ms_samples: Vec<f64> = Vec::with_capacity(args.runs);
     let mut decode_ms_samples: Vec<f64> = Vec::with_capacity(args.runs);
+    let mut ttft_ms_samples: Vec<f64> = Vec::with_capacity(args.runs);
     let mut e2e_ms_samples: Vec<f64> = Vec::with_capacity(args.runs);
-    let mut prompt_tok_samples: Vec<usize> = Vec::with_capacity(args.runs);
+    let mut prefill_tps_samples: Vec<f64> = Vec::with_capacity(args.runs);
+    let mut decode_tps_samples: Vec<f64> = Vec::with_capacity(args.runs);
     let mut output_tok_samples: Vec<usize> = Vec::with_capacity(args.runs);
 
     println!(
@@ -110,7 +115,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         };
 
         let wall_start = std::time::Instant::now();
-        let (result, prefill_ms, decode_ms) =
+        let (result, prefill_ms, decode_ms, ttft_ms) =
             engine.bench_generate("bench", &prompt_tokens, &sampling_params)?;
         let e2e_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -122,26 +127,27 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 "  [{label}] prefill={prefill_ms:.1}ms  decode={decode_ms:.1}ms  output_tokens={n_output}",
             );
         } else {
-            prefill_ms_samples.push(prefill_ms);
-            decode_ms_samples.push(decode_ms);
-            e2e_ms_samples.push(e2e_ms);
-            prompt_tok_samples.push(n_prompt);
-            output_tok_samples.push(n_output);
-
-            let ttft_ms = prefill_ms;
-            let decode_tps = if decode_ms > 0.0 {
-                n_output as f64 / (decode_ms / 1000.0)
-            } else {
-                0.0
-            };
             let prefill_tps = if prefill_ms > 0.0 {
                 n_prompt as f64 / (prefill_ms / 1000.0)
             } else {
                 0.0
             };
+            let decode_tps = if decode_ms > 0.0 {
+                n_output as f64 / (decode_ms / 1000.0)
+            } else {
+                0.0
+            };
+
+            prefill_ms_samples.push(prefill_ms);
+            decode_ms_samples.push(decode_ms);
+            ttft_ms_samples.push(ttft_ms);
+            e2e_ms_samples.push(e2e_ms);
+            prefill_tps_samples.push(prefill_tps);
+            decode_tps_samples.push(decode_tps);
+            output_tok_samples.push(n_output);
 
             println!(
-                "  [{label}] TTFT={ttft_ms:.1}ms  decode={decode_tps:.1}tok/s  prefill={prefill_tps:.1}tok/s  output_tokens={n_output}",
+                "  [{label}] TTFT={ttft_ms:.1}ms  prefill={prefill_tps:.1}tok/s  decode={decode_tps:.1}tok/s  output_tokens={n_output}",
             );
         }
     }
@@ -155,12 +161,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     let mean_prefill_ms = prefill_ms_samples.iter().sum::<f64>() / n;
     let mean_decode_ms = decode_ms_samples.iter().sum::<f64>() / n;
+    let mean_ttft_ms = ttft_ms_samples.iter().sum::<f64>() / n;
     let mean_e2e_ms = e2e_ms_samples.iter().sum::<f64>() / n;
-    let mean_prompt_toks = prompt_tok_samples.iter().sum::<usize>() as f64 / n;
     let mean_output_toks = output_tok_samples.iter().sum::<usize>() as f64 / n;
 
-    let mean_prefill_tps = mean_prompt_toks / (mean_prefill_ms / 1000.0);
-    let mean_decode_tps = mean_output_toks / (mean_decode_ms / 1000.0);
+    // Use mean-of-rates (not rate-of-means) so each run is equally weighted.
+    let mean_prefill_tps = prefill_tps_samples.iter().sum::<f64>() / n;
+    let mean_decode_tps = decode_tps_samples.iter().sum::<f64>() / n;
+
+    let std_prefill_tps = stddev(&prefill_tps_samples);
+    let std_decode_tps = stddev(&decode_tps_samples);
+
     let mean_per_token_ms = if mean_output_toks > 0.0 {
         mean_decode_ms / mean_output_toks
     } else {
@@ -176,6 +187,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // ── KV cache memory estimate ─────────────────────────────────────────────
     let kv_mem_str = {
         let (num_kv_heads, head_dim, num_layers) = raw_config.kv_cache_params(&arch);
+        let actual_seq_len = args.prompt_len + max_tokens;
         // bytes consumed per token across all layers (K + V combined)
         let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant.0 {
             // PolarQuant: (head_dim-1) packed angle indices + one f32 root norm per token
@@ -187,12 +199,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             let bytes_per_element = dtype.size_in_bytes();
             head_dim * 2 * num_kv_heads * num_layers * bytes_per_element
         };
-        let effective_seq_len = if max_seq_len == usize::MAX {
-            args.prompt_len + max_tokens
-        } else {
-            max_seq_len
-        };
-        let total_bytes = bytes_per_token * effective_seq_len;
+        let total_bytes = bytes_per_token * actual_seq_len;
         format_bytes(total_bytes as u64)
     };
 
@@ -201,18 +208,35 @@ pub fn run(args: BenchArgs) -> Result<()> {
         "── Results ({} runs) ──────────────────────────────────────────",
         args.runs
     );
-    println!("  Prompt tokens (avg)     : {mean_prompt_toks:.0}");
     println!("  Output tokens (avg)     : {mean_output_toks:.0}");
-    println!("  KV cache memory         : {kv_mem_str}");
-    println!("  Prefill throughput      : {mean_prefill_tps:.1} tok/s");
-    println!("  Decode  throughput      : {mean_decode_tps:.1} tok/s");
-    println!("  Time to first token     : {mean_prefill_ms:.1} ms");
+    println!("  KV cache memory (est.)  : {kv_mem_str}");
+    println!("  Prefill throughput      : {mean_prefill_tps:.1} tok/s  (σ={std_prefill_tps:.1})");
+    println!("  Decode  throughput      : {mean_decode_tps:.1} tok/s  (σ={std_decode_tps:.1})");
+    println!(
+        "  Time to first token     : {mean_ttft_ms:.1} ms  (prefill: {mean_prefill_ms:.1} ms)"
+    );
     println!("  Per-token latency (avg) : {mean_per_token_ms:.2} ms/tok");
     println!("  End-to-end latency (avg): {mean_e2e_ms:.1} ms");
     println!("  End-to-end p50          : {p50:.1} ms");
     println!("  End-to-end p90          : {p90:.1} ms");
 
     Ok(())
+}
+
+fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f64>() / xs.len() as f64
+}
+
+fn stddev(xs: &[f64]) -> f64 {
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let m = mean(xs);
+    let variance = xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (xs.len() - 1) as f64;
+    variance.sqrt()
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {

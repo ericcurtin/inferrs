@@ -121,15 +121,24 @@ pub fn dequant_gptq_from_bytes(
     // safetensors guarantees ≥8-byte alignment for all tensor data, which
     // satisfies i32 (4 B) and bf16 (2 B). Assert in debug to catch regressions.
     let qweight = unsafe {
-        debug_assert_eq!(qweight_bytes.as_ptr() as usize % std::mem::align_of::<i32>(), 0);
+        debug_assert_eq!(
+            qweight_bytes.as_ptr() as usize % std::mem::align_of::<i32>(),
+            0
+        );
         std::slice::from_raw_parts(qweight_bytes.as_ptr() as *const i32, in_dim / 8 * out_dim)
     };
     let qzeros = unsafe {
-        debug_assert_eq!(qzeros_bytes.as_ptr() as usize % std::mem::align_of::<i32>(), 0);
+        debug_assert_eq!(
+            qzeros_bytes.as_ptr() as usize % std::mem::align_of::<i32>(),
+            0
+        );
         std::slice::from_raw_parts(qzeros_bytes.as_ptr() as *const i32, n_groups * out_dim / 8)
     };
     let scales = unsafe {
-        debug_assert_eq!(scales_bytes.as_ptr() as usize % std::mem::align_of::<bf16>(), 0);
+        debug_assert_eq!(
+            scales_bytes.as_ptr() as usize % std::mem::align_of::<bf16>(),
+            0
+        );
         std::slice::from_raw_parts(scales_bytes.as_ptr() as *const bf16, n_groups * out_dim)
     };
 
