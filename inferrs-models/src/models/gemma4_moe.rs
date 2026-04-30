@@ -151,8 +151,11 @@ impl Gemma4MoeExperts {
     ) -> Result<Self> {
         let device = vb.device();
         let (gate_up_proj, down_proj) = if let Some(q) = qvb {
-            // GGUF path: load fused QTensors and split per-expert onto target device.
-            let gate_up_proj = match q.get_qtensor_named("gate_up_proj") {
+            // GGUF path: load fused QTensors on CPU, then split per-expert
+            // onto the target device.  Using _cpu avoids caching the large
+            // fused tensor (~430 MB each) on CUDA, which would double the
+            // expert VRAM footprint and OOM on 24 GB cards.
+            let gate_up_proj = match q.get_qtensor_named_cpu("gate_up_proj") {
                 Some(qt) => split_expert_qtensor(
                     qt,
                     cfg.num_experts,
@@ -174,7 +177,7 @@ impl Gemma4MoeExperts {
                     )
                 }
             };
-            let down_proj = match q.get_qtensor_named("down_proj") {
+            let down_proj = match q.get_qtensor_named_cpu("down_proj") {
                 Some(qt) => split_expert_qtensor(
                     qt,
                     cfg.num_experts,
