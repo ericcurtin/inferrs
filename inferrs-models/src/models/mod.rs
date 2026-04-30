@@ -710,14 +710,17 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
     }
 }
 
-/// A [`candle_nn::var_builder::SimpleBackend`] that wraps [`GgufBackend`] and
-/// subtracts 1.0 from any tensor whose name ends in `"norm.weight"`.
+/// A [`candle_nn::var_builder::SimpleBackend`] wrapper for Gemma GGUF files.
 ///
-/// llama.cpp/GGUF stores the actual RMSNorm scale value directly, but
-/// candle-transformers (following HuggingFace convention) expects the stored
-/// weight `w` to be applied as `1 + w`.  So llama.cpp stores `s`, HF stores
-/// `s - 1.0`.  This wrapper corrects the mismatch for Gemma2 and Gemma3
-/// external GGUFs.
+/// llama.cpp/GGUF stores the actual RMSNorm scale value `s` directly.
+/// HuggingFace Gemma models store `w = s − 1` and apply `x * (1 + w)` in the
+/// forward pass.  candle's [`RmsNorm`], however, simply applies `x * weight`
+/// without the `1 +` offset — so the GGUF value `s` is exactly what candle
+/// needs; no conversion is required.
+///
+/// This wrapper is kept as a pass-through for Gemma architectures so that
+/// future Gemma-specific GGUF fixups can be added without touching the
+/// dispatch logic.
 struct GemmaNormFixBackend {
     inner: GgufBackend,
 }
@@ -731,21 +734,11 @@ impl candle_nn::var_builder::SimpleBackend for GemmaNormFixBackend {
         dtype: DType,
         dev: &Device,
     ) -> candle_core::Result<Tensor> {
-        let tensor = self.inner.get(s, name, h, dtype, dev)?;
-        if name.ends_with("norm.weight") {
-            tensor - 1.0f64
-        } else {
-            Ok(tensor)
-        }
+        self.inner.get(s, name, h, dtype, dev)
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
-        let tensor = self.inner.get_unchecked(name, dtype, dev)?;
-        if name.ends_with("norm.weight") {
-            tensor - 1.0f64
-        } else {
-            Ok(tensor)
-        }
+        self.inner.get_unchecked(name, dtype, dev)
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
@@ -877,10 +870,11 @@ impl candle_nn::var_builder::SimpleBackend for Qwen35NormFixBackend {
 /// fast and peak memory is bounded by the model's actual weight usage rather
 /// than the full file size.
 ///
-/// When `arch` is `Gemma2` or `Gemma3` and the file is an external GGUF
-/// (detected by the presence of `token_embd.weight`), the backend is wrapped
-/// in [`GemmaNormFixBackend`] to subtract 1.0 from all `*norm.weight` tensors,
-/// correcting the RMSNorm scale convention difference between llama.cpp and HF.
+/// When `arch` is `Gemma2`, `Gemma3`, or `Gemma4` and the file is an
+/// external GGUF (detected by the presence of `token_embd.weight`), the
+/// backend is wrapped in [`GemmaNormFixBackend`] (currently a pass-through)
+/// so that future Gemma-specific fixups can be added without changing the
+/// dispatch.
 fn var_builder_from_gguf(
     gguf_path: &Path,
     dtype: DType,
@@ -923,7 +917,7 @@ fn var_builder_from_gguf(
     };
 
     let boxed: Box<dyn candle_nn::var_builder::SimpleBackend + 'static> = if is_external_gguf
-        && matches!(arch, ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3)
+        && matches!(arch, ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4)
     {
         Box::new(GemmaNormFixBackend { inner: backend })
     } else if is_external_gguf && matches!(arch, ModelArchitecture::Qwen35) {
@@ -1072,10 +1066,21 @@ fn gguf_rename_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
             _ => return "linear_attn.norm.weight".to_string(),
         },
 
-        // ── Qwen3.5 MoE (sparse FFN layers) ──────────────────────────────
-        "mlp.gate.weight" => "ffn_gate_inp.weight",
-        "mlp.experts.gate_up_proj" => "ffn_gate_exps.weight",
-        "mlp.experts.down_proj" => "ffn_down_exps.weight",
+        // ── MoE (sparse FFN layers) ────────────────────────────────────────
+        // Gemma4 and Qwen3.5 share the same GGUF tensor names for MoE but
+        // use different HuggingFace paths.
+        "mlp.gate.weight" => "ffn_gate_inp.weight",           // Qwen3.5 router
+        "router.proj.weight" => "ffn_gate_inp.weight",        // Gemma4 router proj
+        "router.scale" => "ffn_gate_inp.scale",               // Gemma4 router scale
+        "router.per_expert_scale" => "ffn_down_exps.scale",   // Gemma4 per-expert scale
+        "mlp.experts.gate_up_proj" => "ffn_gate_exps.weight", // Qwen3.5 experts
+        "mlp.experts.down_proj" => "ffn_down_exps.weight",    // Qwen3.5 experts
+        "experts.gate_up_proj" => "ffn_gate_up_exps.weight",  // Gemma4 experts
+        "experts.down_proj" => "ffn_down_exps.weight",        // Gemma4 experts
+        // Gemma4 MoE-specific norms (not present in Qwen3.5)
+        "post_feedforward_layernorm_1.weight" => "post_ffw_norm_1.weight",
+        "pre_feedforward_layernorm_2.weight" => "pre_ffw_norm_2.weight",
+        "post_feedforward_layernorm_2.weight" => "post_ffw_norm_2.weight",
         // Qwen3.5 MoE shared expert (dense branch running in parallel).
         "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
         "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
@@ -1188,10 +1193,25 @@ fn gguf_reverse_layer_suffix(suffix: &str, arch: &ModelArchitecture) -> String {
         "ssm_dt.bias" => "linear_attn.dt_bias",
         "ssm_norm.weight" => "linear_attn.norm.weight",
         "ssm_out.weight" => "linear_attn.out_proj.weight",
-        // ── Qwen3.5 MoE ──────────────────────────────────────────────────
-        "ffn_gate_inp.weight" => "mlp.gate.weight",
-        "ffn_gate_exps.weight" => "mlp.experts.gate_up_proj",
-        "ffn_down_exps.weight" => "mlp.experts.down_proj",
+        // ── MoE (sparse FFN layers) ────────────────────────────────────────
+        // Gemma4 and Qwen3.5 share some GGUF tensor names but map to
+        // different HF paths.
+        "ffn_gate_inp.weight" => match arch {
+            ModelArchitecture::Gemma4 => "router.proj.weight",
+            _ => "mlp.gate.weight",
+        },
+        "ffn_gate_inp.scale" => "router.scale",                   // Gemma4 only
+        "ffn_gate_up_exps.weight" => "experts.gate_up_proj",       // Gemma4 experts (fused gate+up)
+        "ffn_gate_exps.weight" => "mlp.experts.gate_up_proj",     // Qwen3.5 experts
+        "ffn_down_exps.weight" => match arch {
+            ModelArchitecture::Gemma4 => "experts.down_proj",
+            _ => "mlp.experts.down_proj",
+        },
+        "ffn_down_exps.scale" => "router.per_expert_scale",       // Gemma4 per-expert scale
+        // Gemma4 MoE-specific norms
+        "post_ffw_norm_1.weight" => "post_feedforward_layernorm_1.weight",
+        "pre_ffw_norm_2.weight" => "pre_feedforward_layernorm_2.weight",
+        "post_ffw_norm_2.weight" => "post_feedforward_layernorm_2.weight",
         // Qwen3.5 MoE shared expert.
         "ffn_gate_shexp.weight" => "mlp.shared_expert.gate_proj.weight",
         "ffn_up_shexp.weight" => "mlp.shared_expert.up_proj.weight",

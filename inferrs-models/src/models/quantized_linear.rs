@@ -410,6 +410,33 @@ impl QGgufVarBuilder {
         self.load_qtensor(&name).ok().flatten()
     }
 
+    /// Like [`get_qtensor_named`] but loads the tensor on **CPU** and does NOT
+    /// cache it.
+    ///
+    /// Designed for fused expert tensors that are immediately split into
+    /// per-expert QTensors (which are uploaded to the target device individually).
+    /// Loading on CPU avoids a double-allocation: without this, the fused tensor
+    /// would be uploaded to CUDA (and cached), then downloaded back to CPU for
+    /// splitting, then each split re-uploaded — tripling peak VRAM.
+    pub fn get_qtensor_named_cpu(
+        &self,
+        suffix: &str,
+    ) -> Option<Arc<candle_core::quantized::QTensor>> {
+        let name = self.full_name(suffix);
+        let gguf_name: std::borrow::Cow<str> = if let Some(g) = self.name_remap.get(&name) {
+            std::borrow::Cow::Borrowed(g.as_str())
+        } else {
+            std::borrow::Cow::Borrowed(&name)
+        };
+        if !self.content.tensor_infos.contains_key(gguf_name.as_ref()) {
+            return None;
+        }
+        self.content
+            .tensor_from_slice(self.mmap.as_ref(), gguf_name.as_ref(), &candle_core::Device::Cpu)
+            .ok()
+            .map(Arc::new)
+    }
+
     /// Build a bias-free `QLinear` from the "weight" tensor at the current path.
     ///
     /// Errors if the tensor is absent from the GGUF file.

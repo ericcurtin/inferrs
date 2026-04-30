@@ -324,8 +324,27 @@ pub struct RawConfig {
     pub boi_token_id: Option<u32>,
     pub eoi_token_id: Option<u32>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_quantization_config")]
     pub quantization_config: Option<crate::gptq::GptqConfig>,
+}
+
+/// Try to parse `quantization_config` as GPTQ; silently return `None` for
+/// unknown formats (AWQ, compressed-tensors, bitsandbytes, etc.) so the
+/// overall config parse doesn't fail.
+fn deserialize_quantization_config<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::gptq::GptqConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match v {
+        None => Ok(None),
+        Some(val) => match serde_json::from_value::<crate::gptq::GptqConfig>(val) {
+            Ok(cfg) => Ok(Some(cfg)),
+            Err(_) => Ok(None),
+        },
+    }
 }
 
 /// Default epsilon for RMS normalization layers across all model families.
@@ -906,6 +925,7 @@ mod tests {
             image_token_id: None,
             boi_token_id: None,
             eoi_token_id: None,
+            quantization_config: None,
         }
     }
 

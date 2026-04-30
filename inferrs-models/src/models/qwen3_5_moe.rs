@@ -147,7 +147,7 @@ impl Qwen3MoeExperts {
         let dtype = cfg.dtype;
 
         let (gate_up_proj, down_proj) = if let Some(q) = qvb {
-            let gate_up_proj = match q.get_qtensor_named("gate_up_proj") {
+            let gate_up_proj = match q.get_qtensor_named_cpu("gate_up_proj") {
                 Some(qt) => split_expert_qtensor(
                     qt,
                     num_experts,
@@ -162,7 +162,7 @@ impl Qwen3MoeExperts {
                     .to_dtype(dtype)?,
                 ),
             };
-            let down_proj = match q.get_qtensor_named("down_proj") {
+            let down_proj = match q.get_qtensor_named_cpu("down_proj") {
                 Some(qt) => split_expert_qtensor(
                     qt,
                     num_experts,
