@@ -32,6 +32,11 @@
 //! its own prerequisite (`mlx_lm.server` on `PATH`, and Apple Silicon
 //! macOS, the only platform that binary even runs on) isn't met.
 //!
+//! [`backend_metrics_follows_llmman_metrics`] is the other non-integration
+//! test here, proving `LLMMAN_METRICS` reaches the backend `llama-server`.
+//! It is the one test that starts a daemon of its own, since that flag is
+//! read once at daemon startup.
+//!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
 //! see `daemon::server`/`daemon::bind_addr`), so these tests can't
@@ -1052,6 +1057,133 @@ fn dead_daemon_setup(label: &str) -> (PathBuf, u16, std::ffi::OsString) {
 /// tolerated the same way a timeout or a missing "pong" already are.
 fn openclaw_pull_registry_flake(stderr: &str) -> bool {
     stderr.contains("pull failed: copy image") || stderr.contains("FailoverError")
+}
+
+/// An `llmman serve` started by [`backend_metrics_follows_llmman_metrics`]
+/// on its own port, since `LLMMAN_METRICS` is read once at daemon startup
+/// and the shared daemon's environment belongs to whoever started it.
+/// Killed as a process tree on drop so its llama-server child goes too.
+struct IsolatedDaemon {
+    port: u16,
+    child: std::process::Child,
+}
+
+impl Drop for IsolatedDaemon {
+    fn drop(&mut self) {
+        kill_process_tree(&mut self.child);
+    }
+}
+
+/// Starts an isolated `llmman serve` with `LLMMAN_METRICS=1` and waits up
+/// to 60s for it to answer `/api/version`. Its stderr is inherited, so a
+/// daemon that fails to start explains itself in the test output.
+fn start_isolated_daemon() -> IsolatedDaemon {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind probe listener")
+        .local_addr()
+        .expect("probe listener addr")
+        .port();
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("serve")
+        // Shared with the `llmman run` below, which would otherwise
+        // auto-start its own daemon on the default port.
+        .env("LLMMAN_HOST", format!("127.0.0.1:{port}"))
+        .env("LLMMAN_METRICS", "1")
+        // llama-server's own spelling of --metrics, cleared so the 200
+        // below can only come from the flag.
+        .env_remove("LLAMA_ARG_ENDPOINT_METRICS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // Own process group, so kill_process_tree takes the llama-server
+    // child down with the daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut daemon = IsolatedDaemon {
+        port,
+        child: cmd.spawn().expect("spawn llmman serve"),
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build reqwest client");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if client
+            .get(format!("http://127.0.0.1:{port}/api/version"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return daemon;
+        }
+        if let Ok(Some(status)) = daemon.child.try_wait() {
+            panic!("llmman serve exited during startup: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("llmman serve on port {port} never answered /api/version");
+}
+
+/// Proves `LLMMAN_METRICS` reaches the backend llama-server llmman spawns:
+/// with the flag set, the port `/api/ps` reports for the loaded model
+/// answers `/metrics` with 200. The disabled direction, and the env var
+/// that is an alternative input to the same flag, are unit-tested in
+/// `cmd::serve` and `container`, since this job only runs on push.
+#[test]
+fn backend_metrics_follows_llmman_metrics() {
+    eprintln!("[test] backend_metrics_follows_llmman_metrics: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] backend_metrics_follows_llmman_metrics: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+
+    let daemon = start_isolated_daemon();
+    let mut run = Command::new(llmman_bin());
+    run.args([
+        "run",
+        MODEL,
+        "--think",
+        "false",
+        "--num-predict",
+        "1",
+        PROMPT,
+    ])
+    .env("LLMMAN_HOST", format!("127.0.0.1:{}", daemon.port));
+    let output = spawn_with_timeout(run, TIMEOUT, "llmman run (backend metrics)");
+    assert!(
+        output.status.success(),
+        "llmman run {MODEL} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build reqwest client");
+    let ps: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/api/ps", daemon.port))
+        .send()
+        .expect("GET /api/ps")
+        .json()
+        .expect("/api/ps JSON");
+    let backend_port = ps["models"][0]["port"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no backend port in /api/ps: {ps}"));
+    let resp = client
+        .get(format!("http://127.0.0.1:{backend_port}/metrics"))
+        .send()
+        .expect("GET backend /metrics");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "--metrics did not reach the llama-server llmman spawned"
+    );
+    assert!(resp.text().unwrap_or_default().contains("llamacpp:"));
 }
 
 /// A tiny (135M-parameter, 8-bit-quantized) real safetensors model
