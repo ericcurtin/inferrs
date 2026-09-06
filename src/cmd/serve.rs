@@ -1839,7 +1839,7 @@ async fn spawn_llama_server(
     if let Some(t) = kv_cache_type {
         cmd.args(["--cache-type-k", t, "--cache-type-v", t]);
     }
-    // See context_shift_from_env's doc comment.
+    // See supports_context_shift's doc comment.
     cmd.arg(if context_shift {
         "--context-shift"
     } else {
