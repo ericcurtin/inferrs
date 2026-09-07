@@ -340,11 +340,9 @@ async fn download_layer(
     let url = format!("{endpoint}{owner}/{repo}/resolve/{commit}/{}", file.path);
     let label = format!("Pulling {}", basename(&file.path));
 
-    // Single attempt: this is a cheap metadata probe, so a bad or
-    // nonexistent host must fail fast rather than run the retry backoff.
-    // Failure is tolerated anyway (falls back to a plain, un-Xet'd GET
+    // Failure is tolerated (falls back to a plain, un-Xet'd GET
     // self-hashed after download).
-    let meta = super::client::once(&format!("HEAD {}", file.path), || {
+    let meta = super::client::probe(&format!("HEAD {}", file.path), || {
         download::head_metadata(head_client, url.clone(), token)
     })
     .await
