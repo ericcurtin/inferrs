@@ -1099,7 +1099,7 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     // A recognized wrapper or venv identifies the code that will actually
     // run. Its local env file lives there, even if TALOS_PREFIX names a
     // different installation. Only unknown shims need the explicit hint.
-    let config_prefix = talos.cwd.clone().or_else(talos_prefix_override);
+    let config_prefix = talos.config_prefix.clone().or_else(talos_prefix_override);
     let secrets_env_absolute = absolute_env_path("TALOS_SECRETS_ENV")?;
     let env_file = talos_env_file(
         config_prefix.as_deref(),
@@ -1132,9 +1132,9 @@ fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let base_url = format!("{}/v1", daemon::server());
     let (bin, args) = talos_exec_argv(&talos, extra_args);
     let mut extra_env: Vec<(&str, &str)> = vec![(TALOS_BASE_URL_KEY, base_url.as_str())];
-    // Pin both paths before changing cwd so the child sees the same
-    // locations used for configuration. Recognized wrappers take precedence
-    // over a stale prefix override, just as they do in command resolution.
+    // Pin both paths so the child sees the same locations used for
+    // configuration. Recognized wrappers take precedence over a stale prefix
+    // override, just as they do in command resolution.
     let secrets_env_owned = secrets_env_absolute
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
@@ -1188,16 +1188,17 @@ fn expand_and_absolutize(raw: &str, home: Option<&std::path::Path>) -> std::io::
     std::path::absolute(expanded)
 }
 
-/// How Talos is run: the command line, and the directory it has to be
-/// run from. The installer does not install the package into the venv;
-/// `-m talos` finds it on the current directory, which is why its own
-/// instructions read `cd ~/talos && .venv/bin/python -m talos …` — so
-/// the venv form carries the prefix as its working directory, and a
-/// recognized installer wrapper carries its resolved prefix too. Unknown
-/// shims inherit the caller's directory.
+/// How Talos is run: the command line, its installation prefix when known,
+/// and an optional required working directory. The installer does not install
+/// the package into the venv; `-m talos` finds it on the current directory,
+/// which is why its own instructions read
+/// `cd ~/talos && .venv/bin/python -m talos …`. The venv fallback therefore
+/// runs from the prefix. The official wrapper sets `PYTHONPATH` itself and,
+/// like unknown shims, deliberately inherits the caller's directory.
 #[derive(Debug, PartialEq)]
 struct TalosCommand {
     argv: Vec<String>,
+    config_prefix: Option<PathBuf>,
     cwd: Option<PathBuf>,
 }
 
@@ -1253,19 +1254,10 @@ fn talos_command_in(
     prefix: Option<&std::path::Path>,
 ) -> Option<TalosCommand> {
     if let Some(path) = lookup("talos") {
-        let cwd = talos_wrapper_prefix(&path);
-        // A PATH entry may itself be relative. Recognized wrappers change
-        // into their install prefix before exec, so preserve the executable's
-        // caller-relative meaning by making it absolute first. Unknown shims
-        // keep the caller's cwd and therefore need no normalization.
-        let path = if cwd.is_some() {
-            std::path::absolute(&path).unwrap_or(path)
-        } else {
-            path
-        };
         return Some(TalosCommand {
-            cwd,
             argv: vec![path.to_string_lossy().into_owned()],
+            config_prefix: talos_wrapper_prefix(&path),
+            cwd: None,
         });
     }
     let prefix = prefix?;
@@ -1277,6 +1269,7 @@ fn talos_command_in(
                 "-m".to_string(),
                 "talos".to_string(),
             ],
+            config_prefix: Some(prefix.to_path_buf()),
             cwd: Some(prefix.to_path_buf()),
         });
     }
@@ -2413,6 +2406,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         let shim = PathBuf::from("/opt/somewhere/bin/talos");
         let shim_only = Some(TalosCommand {
             argv: vec![shim.to_string_lossy().into_owned()],
+            config_prefix: None,
             cwd: None,
         });
         assert_eq!(
@@ -2437,6 +2431,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
                     "-m".to_string(),
                     "talos".to_string(),
                 ],
+                config_prefix: Some(prefix.clone()),
                 cwd: Some(prefix.clone()),
             })
         );
@@ -2445,11 +2440,12 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
 
     /// The exact layout Talos's own installer leaves since 0.18.0:
     /// `<prefix>/bin/talos` symlinked onto PATH. `talos_command_in`
-    /// resolves that back to `<prefix>` as `cwd` — a fresh, standard
-    /// install must not fall into the "unknown shim" case, which is
-    /// this test's real regression coverage: without the fix, a plain
-    /// `talos` on PATH from the official installer produced `cwd: None`
-    /// and `launch_talos` could never find its own env file.
+    /// resolves that back to `<prefix>` for config discovery — a fresh,
+    /// standard install must not fall into the "unknown shim" case, which is
+    /// this test's real regression coverage: without prefix discovery, a
+    /// plain `talos` on PATH from the official installer could never find its
+    /// own env file. The wrapper itself sets `PYTHONPATH` and must keep the
+    /// caller's cwd for relative Talos settings.
     #[cfg(unix)]
     #[test]
     fn talos_command_resolves_the_installers_own_wrapper_to_its_prefix() {
@@ -2467,17 +2463,19 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             talos_command_in(|_| Some(on_path.clone()), None),
             Some(TalosCommand {
                 argv: vec![on_path.to_string_lossy().into_owned()],
-                cwd: Some(prefix.canonicalize().unwrap()),
+                config_prefix: Some(prefix.canonicalize().unwrap()),
+                cwd: None,
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A relative PATH entry is resolved in llmman's cwd. Once the wrapper
-    /// changes cwd to its install prefix, argv[0] must no longer be relative.
+    /// A relative PATH entry is resolved in llmman's cwd. The official wrapper
+    /// must inherit that cwd, both so the relative executable still resolves
+    /// and so relative Talos settings retain their caller-relative meaning.
     #[cfg(unix)]
     #[test]
-    fn talos_command_absolutizes_a_recognized_wrapper_from_a_relative_path_entry() {
+    fn talos_command_preserves_cwd_for_a_recognized_relative_wrapper() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2500,11 +2498,9 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert_eq!(
             talos_command_in(|_| Some(on_path.clone()), None),
             Some(TalosCommand {
-                argv: vec![std::path::absolute(&on_path)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()],
-                cwd: Some(prefix.canonicalize().unwrap()),
+                argv: vec![on_path.to_string_lossy().into_owned()],
+                config_prefix: Some(prefix.canonicalize().unwrap()),
+                cwd: None,
             })
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2765,6 +2761,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
                 "-m".to_string(),
                 "talos".to_string(),
             ],
+            config_prefix: Some(PathBuf::from("/x")),
             cwd: Some(PathBuf::from("/x")),
         };
         let none: Vec<String> = vec![];
@@ -2790,6 +2787,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         );
         let shim = TalosCommand {
             argv: vec!["/usr/local/bin/talos".to_string()],
+            config_prefix: None,
             cwd: None,
         };
         let extra = vec!["--verbose".to_string()];
