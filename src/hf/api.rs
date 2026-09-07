@@ -252,6 +252,112 @@ pub fn select_gguf(files: &[HfFile], tag: &str) -> Result<Vec<HfFile>> {
     gguf_shards(&models, smallest)
 }
 
+// ---------------------------------------------------------------------------
+// Latent diffusion repositories (mirrors llama.cpp common/download.cpp)
+// ---------------------------------------------------------------------------
+
+fn is_weights_file(lower: &str) -> bool {
+    lower.ends_with(".gguf") || lower.ends_with(".safetensors")
+}
+
+/// True when the repo ships a diffusion model: a transformer GGUF next to
+/// VAE / text projection sidecars (e.g. `unsloth/LTX-2.3-GGUF`).
+pub fn is_diffusion_repo(files: &[HfFile]) -> bool {
+    files.iter().any(|f| {
+        let name = basename_lower(&f.path);
+        f.kind == "file"
+            && is_weights_file(&name)
+            && (name.contains("video_vae")
+                || name.contains("_vae.")
+                || name.contains("embeddings_connectors"))
+    })
+}
+
+fn basename_lower(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_lowercase()
+}
+
+/// Like [`select_gguf`], but when no quant is requested prefers the fast
+/// `distilled` variant that diffusion repos ship next to the `dev` one.
+pub fn select_diffusion_gguf(files: &[HfFile], tag: &str) -> Result<Vec<HfFile>> {
+    // sidecars may be GGUFs too
+    let files: Vec<HfFile> = files
+        .iter()
+        .filter(|f| !is_diffusion_sidecar(&basename_lower(&f.path)))
+        .cloned()
+        .collect();
+    if tag.is_empty() || tag == "latest" {
+        // one file per transformer: a split cannot be served
+        let models: Vec<&HfFile> = files
+            .iter()
+            .filter(|f| {
+                f.kind == "file" && is_model_gguf(&f.path) && parse_gguf_shard(&f.path).is_none()
+            })
+            .collect();
+        for pref in QUANT_PREFERENCE {
+            let matching: Vec<&&HfFile> = models
+                .iter()
+                .filter(|f| f.path.to_uppercase().contains(pref))
+                .collect();
+            if let Some(f) = matching
+                .iter()
+                .find(|f| f.path.to_lowercase().contains("distilled"))
+                .or(matching.first())
+            {
+                return Ok(vec![(**f).clone()]);
+            }
+        }
+    }
+    select_gguf(&files, tag)
+}
+
+fn is_diffusion_sidecar(name: &str) -> bool {
+    ["vae", "connector", "text_encoder", "embeddings"]
+        .iter()
+        .any(|k| name.contains(k))
+}
+
+/// The sidecar whose file name contains `keyword` and shares the longest
+/// prefix with the chosen transformer's file name — so the `distilled`
+/// VAE goes with the `distilled` transformer.
+pub fn select_diffusion_sidecar(
+    files: &[HfFile],
+    model_path: &str,
+    keyword: &str,
+) -> Option<HfFile> {
+    let model_name = basename_lower(model_path);
+    let mut best: Option<(usize, &HfFile)> = None;
+    for f in files.iter().filter(|f| f.kind == "file") {
+        let name = basename_lower(&f.path);
+        if !is_weights_file(&name) || !name.contains(keyword) {
+            continue;
+        }
+        let common = name
+            .bytes()
+            .zip(model_name.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if best.is_none_or(|(c, _)| common > c) {
+            best = Some((common, f));
+        }
+    }
+    best.map(|(_, f)| f.clone())
+}
+
+/// The text encoder repository a diffusion model family is trained with.
+/// LTX-2.x uses Gemma 3 12B; LTX-2.5 needs a fine-tuned Gemma 4 that
+/// ships with the model, so there is no generic default for it.
+pub fn diffusion_default_text_encoder(model_path: &str) -> Option<&'static str> {
+    let name = basename_lower(model_path);
+    if name.contains("ltx-2.5") || name.contains("ltx-2-5") {
+        return None;
+    }
+    if name.contains("ltx-2") || name.contains("ltx2") {
+        return Some("ggml-org/gemma-3-12b-it-GGUF:Q4_K_M");
+    }
+    None
+}
+
 const MMPROJ_PREFERENCE: &[&str] = &["F16", "BF16", "F32"];
 
 /// Returns the repo's multimodal projector file, if it has one.
@@ -489,5 +595,77 @@ mod tests {
             safetensors_media_type("chat_template.jinja"),
             oci::MEDIA_TYPE_MODEL_WEIGHT_CONFIG_RAW
         );
+    }
+
+    fn ltx_repo() -> Vec<HfFile> {
+        vec![
+            file("README.md", 10),
+            file("ltx-2.3-22b-dev-Q4_K_M.gguf", 14),
+            file("ltx-2.3-22b-dev-Q8_0.gguf", 22),
+            file("distilled/ltx-2.3-22b-distilled-Q4_K_M.gguf", 14),
+            file("distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf", 14),
+            file("vae/ltx-2.3-22b-dev_video_vae.safetensors", 1),
+            file("vae/ltx-2.3-22b-distilled_video_vae.safetensors", 1),
+            file("vae/ltx-2.3-22b-dev_audio_vae.safetensors", 1),
+            file("vae/ltx-2.3-22b-distilled_audio_vae.safetensors", 1),
+            file(
+                "text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+                2,
+            ),
+            file(
+                "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+                2,
+            ),
+        ]
+    }
+
+    #[test]
+    fn diffusion_repo_is_detected_by_its_sidecars() {
+        assert!(is_diffusion_repo(&ltx_repo()));
+        assert!(!is_diffusion_repo(&[
+            file("model-Q4_K_M.gguf", 1),
+            file("mmproj-F16.gguf", 1)
+        ]));
+    }
+
+    #[test]
+    fn diffusion_gguf_prefers_distilled_without_a_tag() {
+        let picked = select_diffusion_gguf(&ltx_repo(), "").unwrap();
+        assert_eq!(picked.len(), 1);
+        assert!(picked[0].path.contains("distilled"), "{}", picked[0].path);
+        assert!(picked[0].path.contains("Q4_K_M"));
+        // an explicit tag still wins
+        let dev = select_diffusion_gguf(&ltx_repo(), "dev-Q8_0").unwrap();
+        assert_eq!(dev[0].path, "ltx-2.3-22b-dev-Q8_0.gguf");
+    }
+
+    #[test]
+    fn diffusion_sidecars_follow_the_transformer_variant() {
+        let files = ltx_repo();
+        let model = "distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf";
+        let vae = select_diffusion_sidecar(&files, model, "video_vae").unwrap();
+        assert_eq!(vae.path, "vae/ltx-2.3-22b-distilled_video_vae.safetensors");
+        let conn = select_diffusion_sidecar(&files, model, "embeddings_connectors").unwrap();
+        assert_eq!(
+            conn.path,
+            "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors"
+        );
+        let dev_vae =
+            select_diffusion_sidecar(&files, "ltx-2.3-22b-dev-Q8_0.gguf", "audio_vae").unwrap();
+        assert_eq!(dev_vae.path, "vae/ltx-2.3-22b-dev_audio_vae.safetensors");
+        assert!(select_diffusion_sidecar(&files, model, "nothing").is_none());
+    }
+
+    #[test]
+    fn ltx2_defaults_to_gemma3_text_encoder() {
+        assert_eq!(
+            diffusion_default_text_encoder("distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf"),
+            Some("ggml-org/gemma-3-12b-it-GGUF:Q4_K_M")
+        );
+        assert_eq!(
+            diffusion_default_text_encoder("ltx-2.5-22b-dev-Q8_0.gguf"),
+            None
+        );
+        assert_eq!(diffusion_default_text_encoder("flux-dev-Q8_0.gguf"), None);
     }
 }

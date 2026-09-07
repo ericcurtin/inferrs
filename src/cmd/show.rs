@@ -68,15 +68,15 @@ pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
                 None
             }
         },
-        ModelPath::SafeTensors(_) => None,
+        ModelPath::SafeTensors(_) | ModelPath::Diffusion(_) => None,
     };
     let safetensors_config = match &resolved {
         ModelPath::SafeTensors(dir) => read_json_file(&dir.join("config.json")),
-        ModelPath::Gguf(..) => None,
+        ModelPath::Gguf(..) | ModelPath::Diffusion(_) => None,
     };
     let tokenizer_config = match &resolved {
         ModelPath::SafeTensors(dir) => read_json_file(&dir.join("tokenizer_config.json")),
-        ModelPath::Gguf(..) => None,
+        ModelPath::Gguf(..) | ModelPath::Diffusion(_) => None,
     };
 
     // Any single-focus flag suppresses the full summary and prints just

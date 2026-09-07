@@ -1012,6 +1012,13 @@ impl ShowResponse {
             .iter()
             .any(|c| c == crate::modelpack::CAPABILITY_VISION || c == "audio")
     }
+
+    /// An image generation model (see `crate::imagegen`).
+    pub fn image(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_IMAGE)
+    }
 }
 
 /// Ollama's `client.Show`: a read-only `/api/show` lookup. `Ok(None)` is
