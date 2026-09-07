@@ -30,7 +30,7 @@ pub enum ModelPath {
     /// [`is_mmproj_layer`]) needed for vision/audio support.
     Gguf(PathBuf, Option<PathBuf>),
     /// A safetensors directory — serve with vllm, or (Apple Silicon
-    /// macOS) `mlx_lm.server` — see `cmd::serve::use_mlx_for_safetensors`.
+    /// macOS) `mlx_lm.server` — see `cmd::serve::backend::use_mlx_for_safetensors`.
     SafeTensors(PathBuf),
     /// A latent diffusion model (image / video / audio generation) —
     /// served in-process by `crate::mediagen` from the transformer GGUF
