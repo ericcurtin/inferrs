@@ -215,7 +215,7 @@ impl Context {
             .to_lowercase()
             .contains("distilled");
 
-        let mut be = Backend::new(api, p.use_gpu, p.n_threads, 24 * 1024)?;
+        let mut be = Backend::new(api, p.use_gpu, p.n_threads, 64 * 1024)?;
         let buft = be.weight_buft();
         let t0 = Instant::now();
         let dit = Weights::load(api, &p.model, buft, &LoadOpts::default())?;
@@ -399,6 +399,17 @@ impl Context {
     pub fn generate(
         &mut self,
         p: &GenParams,
+        progress: impl FnMut(i32, i32) -> bool,
+    ) -> Result<Output> {
+        let out = self.generate_inner(p, progress);
+        // frees the compute buffers; recreates the GPU backend after a failure
+        self.be.release_compute()?;
+        out
+    }
+
+    fn generate_inner(
+        &mut self,
+        p: &GenParams,
         mut progress: impl FnMut(i32, i32) -> bool,
     ) -> Result<Output> {
         if !self.has_video_vae {
@@ -446,6 +457,8 @@ impl Context {
         } else {
             None
         };
+        // free its buffers for the transformer and the VAE
+        self.text.release_context();
 
         let mut lat = VideoLatent {
             n_frames: (n_frames - 1) / hp.vae_scale_t + 1,
@@ -536,7 +549,7 @@ impl Context {
         };
         {
             let t0 = Instant::now();
-            let dec = ltx::vae::decode(&self.ltx, &self.be, &lat);
+            let dec = ltx::vae::decode(&self.ltx, &mut self.be, &lat);
             self.be.release_compute()?;
             let (of, oh, ow, rgb) = dec?;
             eprintln!(
@@ -554,9 +567,7 @@ impl Context {
         }
         if gen_audio {
             let t0 = Instant::now();
-            let dec = ltx::audio::decode(&self.ltx, &self.be, &alat);
-            self.be.release_compute()?;
-            match dec {
+            match ltx::audio::decode(&self.ltx, &self.be, &alat) {
                 Err(e) => eprintln!(
                     "[llmman] mediagen: audio decoding failed ({e}), returning video only"
                 ),

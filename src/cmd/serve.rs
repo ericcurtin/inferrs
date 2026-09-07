@@ -8240,6 +8240,9 @@ pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
     "LLAMA_ARG_N_GPU_LAYERS",
 ];
 
+/// `crate::mediagen`'s debugging knobs, forwarded to the backend it spawns.
+pub const MEDIAGEN_ENV_PASSTHROUGH_VARS: &[&str] = &["MEDIAGEN_DUMP", "MEDIAGEN_VAE_TILE"];
+
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
 /// `pinned_version` explicitly asks for a specific llama.cpp release, in
@@ -8590,6 +8593,7 @@ async fn spawn_mediagen_backend(
     for var in GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(LLAMA_CPP_ENV_PASSTHROUGH_VARS)
+        .chain(MEDIAGEN_ENV_PASSTHROUGH_VARS)
     {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);

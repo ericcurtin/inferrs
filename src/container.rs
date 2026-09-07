@@ -418,6 +418,7 @@ fn run_args(backend: GpuBackend, port: u16) -> Vec<String> {
     for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
         .iter()
         .chain(crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS)
+        .chain(crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS)
     {
         if let Ok(val) = std::env::var(var) {
             args.push("-e".into());

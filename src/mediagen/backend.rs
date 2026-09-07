@@ -1,5 +1,6 @@
 //! Backend, scheduler and graph building on top of [`ffi::Api`].
 
+use std::cell::Cell;
 use std::ffi::{c_int, CString};
 use std::ptr;
 
@@ -12,10 +13,15 @@ pub struct Backend {
     pub api: &'static Api,
     pub gpu: GgmlBackend,
     pub cpu: GgmlBackend,
-    ptrs: Vec<GgmlBackend>,
-    bufts: Vec<GgmlBackendBuft>,
+    /// Buffer type the weights live on: the GPU's when there is one.
+    weight_buft: GgmlBackendBuft,
     sched: GgmlBackendSched,
     max_nodes: usize,
+    /// Empty graph run after every real one: Metal reports a failed
+    /// command buffer (usually out of memory) only on the next compute.
+    probe: Option<(Ctx, *mut ffi::GgmlCgraph)>,
+    /// The GPU failed and must be recreated by [`Backend::release_compute`].
+    gpu_failed: Cell<bool>,
 }
 
 unsafe impl Send for Backend {}
@@ -33,38 +39,36 @@ impl Backend {
             if cpu.is_null() {
                 return Err(anyhow!("failed to initialize the CPU backend"));
             }
-            let mut gpu = ptr::null_mut();
-            if use_gpu {
-                gpu =
-                    (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_GPU, ptr::null());
-                if gpu.is_null() {
-                    gpu = (api.ggml_backend_init_by_type)(
-                        ffi::GGML_BACKEND_DEVICE_TYPE_IGPU,
-                        ptr::null(),
-                    );
-                }
-            }
-            let mut ptrs = Vec::new();
-            let mut bufts = Vec::new();
-            if !gpu.is_null() {
+            let gpu = if use_gpu {
+                init_gpu(api)
+            } else {
+                ptr::null_mut()
+            };
+            let mut probe = None;
+            let weight_buft = if !gpu.is_null() {
                 let name = std::ffi::CStr::from_ptr((api.ggml_backend_name)(gpu)).to_string_lossy();
                 eprintln!("[llmman] mediagen: using {name} backend");
-                ptrs.push(gpu);
-                bufts.push((api.ggml_backend_get_default_buffer_type)(gpu));
+                let ctx = Ctx::new(api, (api.ggml_graph_overhead_custom)(1, false) + 1024, true)?;
+                let gf = (api.ggml_new_graph_custom)(ctx.raw, 1, false);
+                if gf.is_null() {
+                    return Err(anyhow!("ggml_new_graph_custom failed"));
+                }
+                probe = Some((ctx, gf));
+                (api.ggml_backend_get_default_buffer_type)(gpu)
             } else {
                 eprintln!("[llmman] mediagen: using CPU backend");
-            }
-            ptrs.push(cpu);
-            bufts.push((api.ggml_backend_get_default_buffer_type)(cpu));
+                (api.ggml_backend_get_default_buffer_type)(cpu)
+            };
             api.set_n_threads(cpu, n_threads);
             let mut be = Backend {
                 api,
                 gpu,
                 cpu,
-                ptrs,
-                bufts,
+                weight_buft,
                 sched: ptr::null_mut(),
                 max_nodes,
+                probe,
+                gpu_failed: Cell::new(false),
             };
             be.release_compute()?;
             Ok(be)
@@ -73,19 +77,59 @@ impl Backend {
 
     /// Buffer type the weights are allocated on.
     pub fn weight_buft(&self) -> GgmlBackendBuft {
-        self.bufts[0]
+        self.weight_buft
     }
 
-    /// Recreates the scheduler, freeing its compute buffers.
+    /// Nodes plus leafs the scheduler can take in one graph.
+    pub fn max_nodes(&self) -> usize {
+        self.max_nodes
+    }
+
+    /// Free and total GPU memory in bytes as the backend reports it (Metal:
+    /// the process's working set); `None` without a GPU.
+    pub fn gpu_memory(&self) -> Option<(usize, usize)> {
+        if self.gpu.is_null() {
+            return None;
+        }
+        let (mut free, mut total) = (0usize, 0usize);
+        unsafe {
+            let dev = (self.api.ggml_backend_get_device)(self.gpu);
+            (self.api.ggml_backend_dev_memory)(dev, &mut free, &mut total);
+        }
+        Some((free, total))
+    }
+
+    /// Recreates the scheduler, freeing its compute buffers, and the GPU
+    /// backend if it is in an error state.
     pub fn release_compute(&mut self) -> Result<()> {
         unsafe {
             if !self.sched.is_null() {
                 (self.api.ggml_backend_sched_free)(self.sched);
+                self.sched = ptr::null_mut();
             }
+            if self.gpu_failed.replace(false) && !self.gpu.is_null() {
+                (self.api.ggml_backend_free)(self.gpu);
+                self.gpu = init_gpu(self.api);
+                if self.gpu.is_null() {
+                    return Err(anyhow!(
+                        "failed to recreate the GPU backend after a failure"
+                    ));
+                }
+                eprintln!("[llmman] mediagen: recreated the GPU backend after a failure");
+            }
+            let mut ptrs = Vec::new();
+            if !self.gpu.is_null() {
+                ptrs.push(self.gpu);
+            }
+            ptrs.push(self.cpu);
+            let mut bufts: Vec<GgmlBackendBuft> = ptrs
+                .iter()
+                .map(|&b| (self.api.ggml_backend_get_default_buffer_type)(b))
+                .collect();
             self.sched = (self.api.ggml_backend_sched_new)(
-                self.ptrs.as_mut_ptr(),
-                self.bufts.as_mut_ptr(),
-                self.ptrs.len() as c_int,
+                ptrs.as_mut_ptr(),
+                bufts.as_mut_ptr(),
+                ptrs.len() as c_int,
                 self.max_nodes,
                 false,
                 true,
@@ -96,6 +140,34 @@ impl Backend {
         }
         Ok(())
     }
+
+    /// Asks the GPU whether its last compute actually succeeded.
+    fn check_gpu(&self) -> Result<()> {
+        let Some((_, gf)) = &self.probe else {
+            return Ok(());
+        };
+        if self.gpu.is_null() {
+            return Ok(());
+        }
+        let status = unsafe { (self.api.ggml_backend_graph_compute)(self.gpu, *gf) };
+        if status != ffi::GGML_STATUS_SUCCESS {
+            self.gpu_failed.set(true);
+            return Err(anyhow!(
+                "the GPU failed to compute the graph (out of memory?), status {status}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn init_gpu(api: &Api) -> GgmlBackend {
+    unsafe {
+        let gpu = (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_GPU, ptr::null());
+        if !gpu.is_null() {
+            return gpu;
+        }
+        (api.ggml_backend_init_by_type)(ffi::GGML_BACKEND_DEVICE_TYPE_IGPU, ptr::null())
+    }
 }
 
 impl Drop for Backend {
@@ -104,6 +176,7 @@ impl Drop for Backend {
             if !self.sched.is_null() {
                 (self.api.ggml_backend_sched_free)(self.sched);
             }
+            self.probe = None;
             if !self.gpu.is_null() {
                 (self.api.ggml_backend_free)(self.gpu);
             }
@@ -268,6 +341,28 @@ impl Graph {
         }
     }
 
+    /// Compute buffer bytes this graph needs, planned by a CPU graph
+    /// allocator: nothing is allocated on the GPU, and the host memory is
+    /// only reserved, not touched.
+    pub fn measure(&self, be: &Backend) -> Result<usize> {
+        let api = self.ctx.api;
+        unsafe {
+            let buft = (api.ggml_backend_get_default_buffer_type)(be.cpu);
+            let galloc = (api.ggml_gallocr_new)(buft);
+            if galloc.is_null() {
+                return Err(anyhow!("ggml_gallocr_new failed"));
+            }
+            let ok = (api.ggml_gallocr_reserve)(galloc, self.gf);
+            let size = if ok {
+                (api.ggml_gallocr_get_buffer_size)(galloc, 0)
+            } else {
+                usize::MAX
+            };
+            (api.ggml_gallocr_free)(galloc);
+            Ok(size)
+        }
+    }
+
     pub fn compute(&self, be: &Backend) -> Result<()> {
         let api = self.ctx.api;
         unsafe {
@@ -283,10 +378,11 @@ impl Graph {
             }
             let status = (api.ggml_backend_sched_graph_compute)(be.sched, self.gf);
             if status != ffi::GGML_STATUS_SUCCESS {
+                be.gpu_failed.set(!be.gpu.is_null());
                 return Err(anyhow!("graph compute failed with status {status}"));
             }
         }
-        Ok(())
+        be.check_gpu()
     }
 
     pub fn output_f32(&self, t: Tensor) -> Vec<f32> {
