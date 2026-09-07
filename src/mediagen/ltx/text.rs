@@ -38,12 +38,16 @@ impl Capture {
     }
 }
 
-/// The text model, its context and the ggml API it was loaded with.
+/// The text model, its context and the ggml API it was loaded with. The
+/// context (gigabytes of KV cache and compute buffers) is created on demand
+/// and released with [`TextEncoder::release_context`] between prompts.
 pub struct TextEncoder {
     api: &'static Api,
     model: *mut LlamaModel,
     ctx: *mut ffi::LlamaContextT,
     n_ctx: u32,
+    n_threads: i32,
+    flash: bool,
     capture: *mut Capture,
 }
 
@@ -135,8 +139,22 @@ impl TextEncoder {
                 model,
                 ctx: ptr::null_mut(),
                 n_ctx,
+                n_threads,
+                flash,
                 capture: ptr::null_mut(),
             });
+            enc.ensure_context()?;
+            Ok(enc)
+        }
+    }
+
+    /// Creates the llama context if there is none.
+    fn ensure_context(&mut self) -> Result<()> {
+        if !self.ctx.is_null() {
+            return Ok(());
+        }
+        let api = self.api;
+        unsafe {
             let mut cp = (api.llama_context_default_params)();
             {
                 let p = cp.view_mut::<LlamaContextParams>();
@@ -151,30 +169,39 @@ impl TextEncoder {
                 {
                     bail!("llama_context_params layout does not match this libllama");
                 }
-                p.n_ctx = n_ctx;
-                p.n_batch = n_ctx;
-                p.n_ubatch = n_ctx;
+                p.n_ctx = self.n_ctx;
+                p.n_batch = self.n_ctx;
+                p.n_ubatch = self.n_ctx;
                 p.n_seq_max = 1;
-                p.n_threads = n_threads;
-                p.n_threads_batch = n_threads;
+                p.n_threads = self.n_threads;
+                p.n_threads_batch = self.n_threads;
                 // embeddings mode, every token an output: final norm on all tokens, no lm_head
                 p.embeddings = true;
                 p.pooling_type = ffi::LLAMA_POOLING_TYPE_NONE;
                 p.no_perf = true;
-                p.flash_attn_type = if flash {
+                p.flash_attn_type = if self.flash {
                     ffi::LLAMA_FLASH_ATTN_TYPE_AUTO
                 } else {
                     ffi::LLAMA_FLASH_ATTN_TYPE_DISABLED
                 };
                 p.cb_eval = Some(cb_eval);
-                p.cb_eval_user_data = &*enc as *const TextEncoder as *mut c_void;
+                // stable: the encoder is boxed
+                p.cb_eval_user_data = self as *const TextEncoder as *mut c_void;
             }
-            let ctx = (api.llama_init_from_model)(model, cp);
+            let ctx = (api.llama_init_from_model)(self.model, cp);
             if ctx.is_null() {
                 bail!("failed to create the text encoder context");
             }
-            enc.ctx = ctx;
-            Ok(enc)
+            self.ctx = ctx;
+        }
+        Ok(())
+    }
+
+    /// Frees the context; the next `encode` or `enhance` recreates it.
+    pub fn release_context(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { (self.api.llama_free)(self.ctx) };
+            self.ctx = ptr::null_mut();
         }
     }
 
@@ -220,6 +247,7 @@ impl TextEncoder {
     /// Runs the model and returns the packed, per-token RMS-normalized hidden
     /// states `out[t * (H * L) + h * L + l]`, with `(n_tokens, n_hidden, n_states)`.
     pub fn encode(&mut self, prompt: &str, max_tokens: i64) -> Result<(Vec<f32>, i64, i64, i64)> {
+        self.ensure_context()?;
         let mut tokens = self.tokenize(prompt.trim(), true, false)?;
         if tokens.is_empty() {
             bail!("empty prompt");
@@ -299,6 +327,7 @@ impl TextEncoder {
 
     /// Expands a short prompt into a detailed caption with the text model.
     pub fn enhance(&mut self, prompt: &str, seed: u32, max_new_tokens: usize) -> Result<String> {
+        self.ensure_context()?;
         let api = self.api;
         let user = CString::new(format!("user prompt: {prompt}"))?;
         let system = CString::new(T2V_SYSTEM_PROMPT)?;
