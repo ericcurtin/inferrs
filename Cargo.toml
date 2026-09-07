@@ -45,6 +45,7 @@ base64     = "0.22"
 regex      = "1"
 anyhow     = "1"
 walkdir    = "2"
+dunce      = "1"
 chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 tar        = "0.4"

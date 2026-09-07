@@ -40,9 +40,7 @@ pub fn run(args: &BuildArgs) -> anyhow::Result<()> {
         })
         .collect();
 
-    let context_dir = args
-        .context_dir
-        .canonicalize()
+    let context_dir = dunce::canonicalize(&args.context_dir)
         .with_context(|| format!("context dir: {}", args.context_dir.display()))?;
 
     let desc = store.build(&context_dir, &tag, &labels)?;

@@ -754,7 +754,7 @@ pub fn check_signing_key(path: &str) -> anyhow::Result<PathBuf> {
         bail!("signing key {path} is not a file");
     }
     std::fs::File::open(path).with_context(|| format!("cannot read signing key {path}"))?;
-    std::fs::canonicalize(path).with_context(|| format!("resolve signing key {path}"))
+    dunce::canonicalize(path).with_context(|| format!("resolve signing key {path}"))
 }
 
 /// Every distinct trusted key the policy names, for `llmman verify` to

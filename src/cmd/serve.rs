@@ -8856,7 +8856,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         // deleted, exactly the situation /api/version exists to expose.
         exe: std::env::current_exe()
             .ok()
-            .map(|p| p.canonicalize().unwrap_or(p)),
+            .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
         ctx_size,
