@@ -1,10 +1,13 @@
-//! Runs `llama-server` inside a container (Linux only, via `--ociman
-//! docker|podman`) instead of as a local process, auto-selecting the
-//! matching `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for
-//! whatever GPU acceleration the host actually has — see
+//! Runs `llama-server` (or, for a safetensors model, `vllm serve`) inside
+//! a container (Linux only, via `--ociman docker|podman`) instead of as a
+//! local process, auto-selecting the matching
+//! `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for whatever GPU
+//! acceleration the host actually has — see
 //! <https://github.com/ggml-org/llama.cpp/blob/master/docs/docker.md> for
 //! the full image list and their `docker run` flags, which
-//! [`GpuBackend::engine_args`] mirrors for the subset detected here.
+//! [`GpuBackend::engine_args`] mirrors for the subset detected here. The
+//! same host probe picks the vLLM image (`vllm/vllm-openai`, `rocm/vllm`
+//! or `vllm/vllm-openai-cpu`, per architecture) — see [`VllmBackend`].
 //!
 //! This is the same problem ggml's own dynamic backend loading
 //! (`GGML_BACKEND_DL=ON`, `ggml_backend_load_all` in
@@ -157,6 +160,129 @@ fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
     }
 }
 
+/// The architectures vLLM publishes images for. Its Docker Hub tags spell
+/// the architecture out (unlike llama.cpp's multi-arch manifests), so the
+/// host architecture is part of the image choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostArch {
+    X86_64,
+    Aarch64,
+}
+
+impl HostArch {
+    /// From `std::env::consts::ARCH`; `None` for anything without an image.
+    fn parse(arch: &str) -> Option<HostArch> {
+        match arch {
+            "x86_64" => Some(HostArch::X86_64),
+            "aarch64" => Some(HostArch::Aarch64),
+            _ => None,
+        }
+    }
+
+    fn detect() -> Result<HostArch> {
+        HostArch::parse(std::env::consts::ARCH).with_context(|| {
+            format!(
+                "vLLM publishes no container image for {} hosts (only x86_64 and aarch64)",
+                std::env::consts::ARCH
+            )
+        })
+    }
+}
+
+/// The vLLM image family for a host — derived from [`GpuBackend`] so both
+/// engines share the one [`crate::hostgpu::detect`] probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VllmBackend {
+    /// `vllm/vllm-openai`'s `-cu129` tags, for a CUDA 12 driver.
+    Cuda12,
+    /// `vllm/vllm-openai`'s default (CUDA 13) tags.
+    Cuda13,
+    /// `rocm/vllm`: amd64 only upstream.
+    Rocm,
+    /// `vllm/vllm-openai-cpu`: also what a Vulkan-only host gets, since
+    /// vLLM has no Vulkan backend.
+    Cpu,
+}
+
+impl VllmBackend {
+    fn from_gpu(backend: GpuBackend) -> VllmBackend {
+        match backend {
+            GpuBackend::Cuda12 => VllmBackend::Cuda12,
+            GpuBackend::Cuda13 => VllmBackend::Cuda13,
+            GpuBackend::Rocm => VllmBackend::Rocm,
+            GpuBackend::Cpu | GpuBackend::Vulkan => VllmBackend::Cpu,
+        }
+    }
+
+    /// This host's backend and architecture, from the shared GPU probe.
+    fn detect() -> Result<(VllmBackend, HostArch)> {
+        Ok((VllmBackend::from_gpu(detect_backend()), HostArch::detect()?))
+    }
+
+    /// The `docker.io/`-qualified image (so podman doesn't prompt for a
+    /// registry). `version` replaces the floating `latest`: `<version>-<arch>`
+    /// (`-cu129` for CUDA 12) for the `vllm/` images, the whole tag for
+    /// `rocm/vllm` (whose `rocmX.Y_..._vllm_Z` tags carry no arch suffix).
+    /// Arch spellings are Docker Hub's: the GPU image says `aarch64`, the
+    /// CPU image `arm64`.
+    fn image_ref(self, arch: HostArch, version: Option<&str>) -> Result<String> {
+        let v = version.unwrap_or("latest");
+        let (repo, suffix) = match (self, arch) {
+            (VllmBackend::Rocm, HostArch::X86_64) => return Ok(format!("docker.io/rocm/vllm:{v}")),
+            (VllmBackend::Rocm, HostArch::Aarch64) => anyhow::bail!(
+                "an AMD GPU was detected, but rocm/vllm publishes no aarch64 image \
+                 (set LLMMAN_LLM_LIBRARY=cpu to run vllm/vllm-openai-cpu instead)"
+            ),
+            (VllmBackend::Cuda12, HostArch::X86_64) => ("vllm-openai", "x86_64-cu129"),
+            (VllmBackend::Cuda12, HostArch::Aarch64) => ("vllm-openai", "aarch64-cu129"),
+            (VllmBackend::Cuda13, HostArch::X86_64) => ("vllm-openai", "x86_64"),
+            (VllmBackend::Cuda13, HostArch::Aarch64) => ("vllm-openai", "aarch64"),
+            (VllmBackend::Cpu, HostArch::X86_64) => ("vllm-openai-cpu", "x86_64"),
+            (VllmBackend::Cpu, HostArch::Aarch64) => ("vllm-openai-cpu", "arm64"),
+        };
+        Ok(format!("docker.io/vllm/{repo}:{v}-{suffix}"))
+    }
+
+    /// GPU passthrough plus what vLLM's deployment docs ask for: `--ipc=host`
+    /// (its workers share tensors over `/dev/shm`) and, for the CPU image,
+    /// `SYS_NICE` and an unconfined seccomp profile for NUMA thread binding.
+    fn engine_args(self) -> Vec<String> {
+        let mut args = match self {
+            VllmBackend::Cuda12 | VllmBackend::Cuda13 => GpuBackend::Cuda12.engine_args(),
+            VllmBackend::Rocm => GpuBackend::Rocm.engine_args(),
+            VllmBackend::Cpu => vec![
+                "--security-opt".into(),
+                "seccomp=unconfined".into(),
+                "--cap-add".into(),
+                "SYS_NICE".into(),
+            ],
+        };
+        args.push("--ipc=host".into());
+        args
+    }
+}
+
+/// Which engine's image a container run is for; cmd::serve knows this from
+/// the model's format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerEngine {
+    /// `ghcr.io/ggml-org/llama.cpp` (GGUF and diffusion models).
+    LlamaServer,
+    /// `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` (safetensors).
+    Vllm,
+}
+
+/// The image [`spawn`] / [`spawn_vllm`] would run here for `engine`.
+fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
+    match engine {
+        ContainerEngine::LlamaServer => Ok(detect_backend().image_ref(version)),
+        ContainerEngine::Vllm => {
+            let (backend, arch) = VllmBackend::detect()?;
+            backend.image_ref(arch, version)
+        }
+    }
+}
+
 /// Runs `llama-server` inside a container: `docker run --rm --init -t`
 /// (or `podman run` with the same flags), auto-selecting the image for
 /// whatever [`detect_backend`] found. Returns the running child process
@@ -182,10 +308,11 @@ fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
 /// stdin isn't a real terminal — the common case, since `llmman serve`
 /// itself is normally daemonized with stdin closed (see daemon.rs).
 ///
-/// Pulls the image [`spawn`] would run for the current host's detected GPU
-/// backend, with the pull's own progress output (a real `docker pull`/
+/// Pulls the image [`spawn`] or [`spawn_vllm`] would run for `engine` on
+/// this host, with the pull's own progress output (a real `docker pull`/
 /// `podman pull` progress bar — not something llmman re-implements)
-/// inherited directly to this process's stdout/stderr.
+/// inherited directly to this process's stdout/stderr. `version` is the
+/// engine's pin (`--llama-cpp-version` / `--vllm-version`), if any.
 ///
 /// `spawn`'s underlying `docker run`/`podman run` would pull an image that
 /// isn't already cached locally on its own, but silently and without any
@@ -197,9 +324,12 @@ fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
 /// first prompt to whoever's waiting on it) should call this — in the
 /// foreground, before `serve` is even started — rather than relying on
 /// `spawn`'s own implicit pull.
-pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> Result<()> {
-    let backend = detect_backend();
-    let image = backend.image_ref(llama_cpp_version);
+pub fn pull_image(
+    ociman: ContainerManager,
+    engine: ContainerEngine,
+    version: Option<&str>,
+) -> Result<()> {
+    let image = image_for(engine, version)?;
     eprintln!("[llmman] {}: pulling {image}...", ociman.binary());
     let status = std::process::Command::new(ociman.binary())
         .args(["pull", &image])
@@ -326,21 +456,20 @@ pub fn spawn(
         .file_name()
         .and_then(|n| n.to_str())
         .context("model path has no valid UTF-8 filename")?;
-    let model_dir_str = model_dir
-        .to_str()
-        .context("model directory is not valid UTF-8")?;
+    let model_dir = mount_source(model_dir)?;
 
-    let mut args = run_args(backend, port);
+    let mut args = run_args(
+        backend.engine_args(),
+        port,
+        crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
+    );
     args.push("-v".into());
-    args.push(format!("{model_dir_str}:/models:ro"));
+    args.push(format!("{model_dir}:/models:ro"));
     let mmproj_file = mmproj_path
         .map(|p| -> Result<&str> {
             let dir = p.parent().context("mmproj path has no parent directory")?;
-            let dir_str = dir
-                .to_str()
-                .context("mmproj directory is not valid UTF-8")?;
             args.push("-v".into());
-            args.push(format!("{dir_str}:/mmproj:ro"));
+            args.push(format!("{}:/mmproj:ro", mount_source(dir)?));
             p.file_name()
                 .and_then(|n| n.to_str())
                 .context("mmproj path has no valid UTF-8 filename")
@@ -403,9 +532,12 @@ pub fn spawn(
 }
 
 /// The `run` prefix every container here starts with: attached with an
-/// init, the port published, the GPU passed through, and the GPU / llama.cpp
-/// env vars forwarded (`docker run` does not inherit the environment).
-fn run_args(backend: GpuBackend, port: u16) -> Vec<String> {
+/// init, the port published, the GPU passed through (`engine_args`), and
+/// the GPU-visibility env vars plus the engine's own `passthrough_vars`
+/// forwarded (`docker run` does not inherit the environment). `-e NAME`
+/// without a value: the engine copies it from our environment, so a
+/// secret (`VLLM_API_KEY`) never appears in argv or the debug log.
+fn run_args(engine_args: Vec<String>, port: u16, passthrough_vars: &[&str]) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
@@ -414,17 +546,82 @@ fn run_args(backend: GpuBackend, port: u16) -> Vec<String> {
         "-p".into(),
         format!("127.0.0.1:{port}:{port}"),
     ];
-    args.extend(backend.engine_args());
+    args.extend(engine_args);
     for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
         .iter()
-        .chain(crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS)
-        .chain(crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS)
+        .chain(passthrough_vars)
     {
-        if let Ok(val) = std::env::var(var) {
+        if std::env::var_os(var).is_some() {
             args.push("-e".into());
-            args.push(format!("{var}={val}"));
+            args.push(var.to_string());
         }
     }
+    args
+}
+
+/// The vLLM counterpart of [`spawn`]: `vllm serve` on a safetensors
+/// directory (mounted at `/models`) in the image [`VllmBackend`] picks.
+/// `serve_args` builds the argv after `vllm` from the in-container model
+/// dir and bind address, so it's `cmd::serve::vllm_serve_args` unchanged.
+/// `--entrypoint vllm` is explicit because `rocm/vllm`'s default is a
+/// shell. Every `VLLM_*` env var is forwarded, as a local child would
+/// inherit them.
+pub fn spawn_vllm(
+    ociman: ContainerManager,
+    model_dir: &Path,
+    vllm_version: Option<&str>,
+    port: u16,
+    serve_args: impl FnOnce(&str, &str) -> Vec<String>,
+) -> Result<tokio::process::Child> {
+    let (backend, arch) = VllmBackend::detect()?;
+    let image = backend.image_ref(arch, vllm_version)?;
+    eprintln!(
+        "[llmman] {}: detected {:?} on {:?}, using image {:?}",
+        ociman.binary(),
+        backend,
+        arch,
+        image
+    );
+    let model_dir = mount_source(model_dir)?;
+    let vllm_vars: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| k.starts_with("VLLM_"))
+        .collect();
+    let vllm_vars: Vec<&str> = vllm_vars.iter().map(String::as_str).collect();
+    let args = vllm_run_args(backend, image, &model_dir, port, &vllm_vars, serve_args);
+    run(ociman, args)
+}
+
+/// A bind-mount source: absolute (a relative `-v` source is a named
+/// volume to the engine, and `LLMMAN_MODELS` may be relative) and UTF-8.
+fn mount_source(dir: &Path) -> Result<String> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolving {}", dir.display()))?;
+    dir.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{} is not valid UTF-8", dir.display()))
+}
+
+/// [`spawn_vllm`]'s argv, split out so the ordering (`-v`/`--entrypoint`
+/// before the image, `serve ...` after) is testable without an engine.
+fn vllm_run_args(
+    backend: VllmBackend,
+    image: String,
+    model_dir: &str,
+    port: u16,
+    passthrough_vars: &[&str],
+    serve_args: impl FnOnce(&str, &str) -> Vec<String>,
+) -> Vec<String> {
+    let mut args = run_args(backend.engine_args(), port, passthrough_vars);
+    args.extend([
+        "-v".into(),
+        format!("{model_dir}:/models:ro"),
+        "--entrypoint".into(),
+        "vllm".into(),
+        image,
+    ]);
+    args.extend(serve_args("/models", "0.0.0.0"));
     args
 }
 
@@ -471,7 +668,12 @@ pub fn spawn_mediagen(
             .with_context(|| format!("{} is not valid UTF-8", p.display()))
     };
     let (exe, store, cache) = (utf8(&exe)?, utf8(store_path)?, utf8(cache_path)?);
-    let mut args = run_args(backend, port);
+    let passthrough = [
+        crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS,
+        crate::cmd::serve::MEDIAGEN_ENV_PASSTHROUGH_VARS,
+    ]
+    .concat();
+    let mut args = run_args(backend.engine_args(), port, &passthrough);
     args.extend([
         "-v".into(),
         format!("{exe}:/usr/local/bin/llmman:ro"),
@@ -644,6 +846,204 @@ mod tests {
     fn container_manager_binary_names() {
         assert_eq!(ContainerManager::Docker.binary(), "docker");
         assert_eq!(ContainerManager::Podman.binary(), "podman");
+    }
+
+    #[test]
+    fn host_arch_parses_only_the_two_architectures_vllm_ships() {
+        assert_eq!(HostArch::parse("x86_64"), Some(HostArch::X86_64));
+        assert_eq!(HostArch::parse("aarch64"), Some(HostArch::Aarch64));
+        assert_eq!(HostArch::parse("s390x"), None);
+        assert_eq!(HostArch::parse("riscv64"), None);
+        assert_eq!(HostArch::parse(""), None);
+    }
+
+    #[test]
+    fn cuda_12_hosts_get_the_cu129_vllm_image() {
+        assert_eq!(
+            VllmBackend::from_gpu(GpuBackend::Cuda12),
+            VllmBackend::Cuda12
+        );
+        assert_eq!(
+            VllmBackend::from_gpu(GpuBackend::Cuda13),
+            VllmBackend::Cuda13
+        );
+        assert_eq!(
+            VllmBackend::Cuda12
+                .image_ref(HostArch::X86_64, None)
+                .unwrap(),
+            "docker.io/vllm/vllm-openai:latest-x86_64-cu129"
+        );
+        assert_eq!(
+            VllmBackend::Cuda12
+                .image_ref(HostArch::Aarch64, Some("v0.28.0"))
+                .unwrap(),
+            "docker.io/vllm/vllm-openai:v0.28.0-aarch64-cu129"
+        );
+    }
+
+    #[test]
+    fn vulkan_host_runs_the_vllm_cpu_image() {
+        assert_eq!(VllmBackend::from_gpu(GpuBackend::Vulkan), VllmBackend::Cpu);
+        assert_eq!(VllmBackend::from_gpu(GpuBackend::Cpu), VllmBackend::Cpu);
+        assert_eq!(VllmBackend::from_gpu(GpuBackend::Rocm), VllmBackend::Rocm);
+    }
+
+    #[test]
+    fn vllm_image_refs_match_docker_hub_tag_spellings() {
+        assert_eq!(
+            VllmBackend::Cuda13
+                .image_ref(HostArch::X86_64, None)
+                .unwrap(),
+            "docker.io/vllm/vllm-openai:latest-x86_64"
+        );
+        assert_eq!(
+            VllmBackend::Cuda13
+                .image_ref(HostArch::Aarch64, None)
+                .unwrap(),
+            "docker.io/vllm/vllm-openai:latest-aarch64"
+        );
+        assert_eq!(
+            VllmBackend::Rocm.image_ref(HostArch::X86_64, None).unwrap(),
+            "docker.io/rocm/vllm:latest"
+        );
+        assert_eq!(
+            VllmBackend::Cpu.image_ref(HostArch::X86_64, None).unwrap(),
+            "docker.io/vllm/vllm-openai-cpu:latest-x86_64"
+        );
+        assert_eq!(
+            VllmBackend::Cpu.image_ref(HostArch::Aarch64, None).unwrap(),
+            "docker.io/vllm/vllm-openai-cpu:latest-arm64"
+        );
+    }
+
+    #[test]
+    fn vllm_image_ref_pins_to_the_given_version() {
+        assert_eq!(
+            VllmBackend::Cuda13
+                .image_ref(HostArch::X86_64, Some("v0.11.0"))
+                .unwrap(),
+            "docker.io/vllm/vllm-openai:v0.11.0-x86_64"
+        );
+        assert_eq!(
+            VllmBackend::Cuda13
+                .image_ref(HostArch::Aarch64, Some("v0.11.0"))
+                .unwrap(),
+            "docker.io/vllm/vllm-openai:v0.11.0-aarch64"
+        );
+        assert_eq!(
+            VllmBackend::Cpu
+                .image_ref(HostArch::Aarch64, Some("v0.11.0"))
+                .unwrap(),
+            "docker.io/vllm/vllm-openai-cpu:v0.11.0-arm64"
+        );
+        // rocm/vllm's tags carry no arch suffix: the pin is the whole tag.
+        assert_eq!(
+            VllmBackend::Rocm
+                .image_ref(
+                    HostArch::X86_64,
+                    Some("rocm7.14.1_cdna_ubuntu24.04_py3.14_pytorch_2.11_vllm_0.23.0")
+                )
+                .unwrap(),
+            "docker.io/rocm/vllm:rocm7.14.1_cdna_ubuntu24.04_py3.14_pytorch_2.11_vllm_0.23.0"
+        );
+    }
+
+    #[test]
+    fn rocm_vllm_has_no_aarch64_image() {
+        let err = VllmBackend::Rocm
+            .image_ref(HostArch::Aarch64, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rocm/vllm"), "{err}");
+        assert!(err.contains("LLMMAN_LLM_LIBRARY=cpu"), "{err}");
+    }
+
+    #[test]
+    fn vllm_engine_args_add_ipc_host_on_top_of_gpu_passthrough() {
+        assert_eq!(
+            VllmBackend::Cuda13.engine_args(),
+            vec!["--gpus", "all", "--ipc=host"]
+        );
+        let rocm = VllmBackend::Rocm.engine_args();
+        assert!(
+            rocm.starts_with(&GpuBackend::Rocm.engine_args()),
+            "{rocm:?}"
+        );
+        assert_eq!(rocm.last().map(String::as_str), Some("--ipc=host"));
+    }
+
+    #[test]
+    fn vllm_cpu_engine_args_grant_what_its_numa_thread_binding_needs() {
+        assert_eq!(
+            VllmBackend::Cpu.engine_args(),
+            vec![
+                "--security-opt",
+                "seccomp=unconfined",
+                "--cap-add",
+                "SYS_NICE",
+                "--ipc=host"
+            ]
+        );
+    }
+
+    #[test]
+    fn vllm_run_args_put_the_mount_and_entrypoint_before_the_image_and_serve_after() {
+        let args = vllm_run_args(
+            VllmBackend::Cuda13,
+            "docker.io/vllm/vllm-openai:latest-x86_64".into(),
+            "/cache/abc/model",
+            8000,
+            &[],
+            |dir, host| {
+                vec![
+                    "serve".into(),
+                    dir.into(),
+                    "--host".into(),
+                    host.into(),
+                    "--served-model-name".into(),
+                    "m".into(),
+                ]
+            },
+        );
+        let image = args
+            .iter()
+            .position(|a| a == "docker.io/vllm/vllm-openai:latest-x86_64")
+            .expect("image present");
+        let before = &args[..image];
+        assert!(before.contains(&"--gpus".to_string()), "{before:?}");
+        assert!(before.contains(&"--ipc=host".to_string()), "{before:?}");
+        assert!(
+            before.contains(&"/cache/abc/model:/models:ro".to_string()),
+            "{before:?}"
+        );
+        assert_eq!(&before[before.len() - 2..], &["--entrypoint", "vllm"]);
+        assert_eq!(
+            &args[image + 1..],
+            &[
+                "serve",
+                "/models",
+                "--host",
+                "0.0.0.0",
+                "--served-model-name",
+                "m"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_forward_only_the_requested_passthrough_vars() {
+        const VAR: &str = "LLMMAN_TEST_RUN_ARGS_PASSTHROUGH";
+        std::env::set_var(VAR, "1");
+        let args = run_args(vec![], 8080, &[]);
+        assert_eq!(
+            &args[..6],
+            &["run", "--rm", "--init", "-t", "-p", "127.0.0.1:8080:8080"]
+        );
+        assert!(!args.contains(&VAR.to_string()), "{args:?}");
+        let args = run_args(vec![], 8080, &[VAR]);
+        assert!(args.windows(2).any(|w| w == ["-e", VAR]), "{args:?}");
+        // The value stays out of argv (it may be a secret).
+        assert!(!args.iter().any(|a| a.starts_with(&format!("{VAR}="))));
     }
 
     /// Exercises real end-to-end backend detection (via

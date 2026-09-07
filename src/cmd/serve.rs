@@ -90,11 +90,13 @@ pub struct ServeArgs {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Run llama-server in a container (docker or podman) instead of as a
-    /// local process — Linux only. Auto-selects the matching
-    /// ghcr.io/ggml-org/llama.cpp:server-<backend> image for whatever GPU
-    /// acceleration the host has (see crate::container); no local
-    /// llama-server binary is required on PATH when this is set.
+    /// Run the inference engine in a container (docker or podman) instead
+    /// of as a local process — Linux only. GGUF: llama-server from the
+    /// ghcr.io/ggml-org/llama.cpp:server-<backend> image; safetensors:
+    /// `vllm serve` from the vllm/vllm-openai (NVIDIA), rocm/vllm (AMD) or
+    /// vllm/vllm-openai-cpu image for the host's architecture. Both use
+    /// the same GPU probe (see crate::container); neither binary is
+    /// required on PATH.
     #[arg(long, value_name = "docker|podman")]
     pub ociman: Option<crate::container::ContainerManager>,
 
@@ -112,12 +114,23 @@ pub struct ServeArgs {
     #[arg(long, value_name = "TAG")]
     pub llama_cpp_version: Option<String>,
 
-    /// Proactively pull the ghcr.io/ggml-org/llama.cpp image `--ociman`
-    /// would run, as its own explicit foreground step, then exit — this
-    /// process does not go on to bind the listener or serve — with the
-    /// pull's own progress (a real `docker pull`/`podman pull` progress
-    /// bar) inherited directly to this process's stdout/stderr — only
-    /// meaningful together with --ociman, ignored otherwise.
+    /// With --ociman, pin the vLLM image tag for safetensors models (e.g.
+    /// `v0.28.0`) instead of the floating `latest`. The architecture
+    /// suffix (`-x86_64`/`-aarch64`, `-arm64` for the CPU image) is added
+    /// automatically for the vllm/ images — pick a release that image
+    /// actually publishes; for rocm/vllm the value is the whole tag.
+    #[arg(long, value_name = "TAG", requires = "ociman")]
+    pub vllm_version: Option<String>,
+
+    /// Proactively pull the image `--ociman` would run, as its own
+    /// explicit foreground step, then exit — this process does not go on
+    /// to bind the listener or serve — with the pull's own progress (a
+    /// real `docker pull`/`podman pull` progress bar) inherited directly
+    /// to this process's stdout/stderr — only meaningful together with
+    /// --ociman, ignored otherwise. Given a safetensors MODEL, this is the
+    /// vLLM image (see --vllm-version); given a GGUF MODEL or none, the
+    /// ghcr.io/ggml-org/llama.cpp one (see --llama-cpp-version). MODEL
+    /// must already be pulled.
     ///
     /// `--ociman`'s underlying `docker run`/`podman run` pulls an image
     /// that isn't already cached on its own, but silently: `serve` is
@@ -207,6 +220,8 @@ struct Inner {
     exe: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
+    // --vllm-version; only meaningful with --ociman.
+    vllm_version: Option<String>,
     // See context_length_from_env's doc comment — forwarded to
     // backends that expose a context-size flag.
     ctx_size: Option<u32>,
@@ -318,11 +333,9 @@ struct RunningModel {
 impl RunningModel {
     fn processor(&self) -> String {
         match &self.process {
-            ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server (local)".into(),
-            ModelProcess::Local(Engine::Vllm, _, _) => "vllm (local)".into(),
-            ModelProcess::Local(Engine::Mlx, _, _) => "mlx (local)".into(),
-            ModelProcess::Container(ociman, _) => {
-                format!("llama-server (container/{})", ociman.binary())
+            ModelProcess::Local(engine, _, _) => format!("{} (local)", engine.label()),
+            ModelProcess::Container(ociman, engine, _) => {
+                format!("{} (container/{})", engine.label(), ociman.binary())
             }
         }
     }
@@ -330,7 +343,7 @@ impl RunningModel {
     fn pid(&self) -> Option<u32> {
         match &self.process {
             ModelProcess::Local(_, child, _) => child.id(),
-            ModelProcess::Container(_, child) => child.id(),
+            ModelProcess::Container(_, _, child) => child.id(),
         }
     }
 
@@ -338,18 +351,18 @@ impl RunningModel {
     /// [`RunningModel::processor`]: that is prose for `/api/ps`, and its
     /// container form carries the runtime binary, which would put
     /// `docker` and `podman` in a label for the same engine. A container
-    /// runs llama-server (see `container::spawn`), so it reports as one.
+    /// reports as whichever engine it runs (llama-server via
+    /// `container::spawn`, vllm via `container::spawn_vllm`).
     fn engine_label(&self) -> &'static str {
         match &self.process {
-            ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server",
-            ModelProcess::Local(Engine::Vllm, _, _) => "vllm",
-            ModelProcess::Local(Engine::Mlx, _, _) => "mlx",
-            ModelProcess::Container(_, _) => "llama-server",
+            ModelProcess::Local(engine, _, _) | ModelProcess::Container(_, engine, _) => {
+                engine.label()
+            }
         }
     }
 }
 
-/// Which local engine a [`ModelProcess::Local`] is running — see
+/// Which engine a [`ModelProcess`] is running — see
 /// [`RunningModel::processor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
@@ -365,12 +378,24 @@ enum Engine {
     Mlx,
 }
 
+impl Engine {
+    /// The engine's name as `llmman ps` and the `llmman_model_up`
+    /// metric's `engine` label spell it.
+    fn label(self) -> &'static str {
+        match self {
+            Engine::LlamaServer => "llama-server",
+            Engine::Vllm => "vllm",
+            Engine::Mlx => "mlx",
+        }
+    }
+}
+
 /// A running inference backend: either a local `llama-server`/`vllm`/
 /// `mlx_lm.server` process (killed via `Child::kill_on_drop`, except
 /// `Engine::Vllm` — see this Drop impl) or an attached `docker run`/
-/// `podman run` process, gracefully stopped via SIGTERM on drop since
-/// `kill_on_drop`'s SIGKILL can't be forwarded to (and so doesn't stop)
-/// the container.
+/// `podman run` process running `Engine::LlamaServer` or `Engine::Vllm`,
+/// gracefully stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL
+/// can't be forwarded to (and so doesn't stop) the container.
 enum ModelProcess {
     // `Option<u32>` is the pid captured right after spawn, not
     // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
@@ -384,13 +409,19 @@ enum ModelProcess {
         tokio::process::Child,
         #[cfg_attr(not(unix), allow(dead_code))] Option<u32>,
     ),
-    Container(crate::container::ContainerManager, tokio::process::Child),
+    Container(
+        crate::container::ContainerManager,
+        Engine,
+        tokio::process::Child,
+    ),
 }
 
 impl Drop for ModelProcess {
     fn drop(&mut self) {
         match self {
-            ModelProcess::Container(_, child) => {
+            // Either engine: `--init` forwards the SIGTERM, and a vllm
+            // worker tree dies with its container.
+            ModelProcess::Container(_, _, child) => {
                 if let Some(pid) = child.id() {
                     crate::container::stop(pid);
                 }
@@ -446,7 +477,7 @@ impl ModelProcess {
     fn is_alive(&mut self) -> bool {
         let child = match self {
             ModelProcess::Local(_, child, _) => child,
-            ModelProcess::Container(_, child) => child,
+            ModelProcess::Container(_, _, child) => child,
         };
         matches!(child.try_wait(), Ok(None))
     }
@@ -460,7 +491,7 @@ impl ModelProcess {
     /// safety net — see that loop's own comment).
     async fn stop_and_wait(&mut self) {
         match self {
-            ModelProcess::Container(_, child) => {
+            ModelProcess::Container(_, _, child) => {
                 if let Some(pid) = child.id() {
                     crate::container::stop(pid);
                 }
@@ -478,7 +509,7 @@ impl ModelProcess {
         // beyond confirming the process is actually gone.
         let child = match self {
             ModelProcess::Local(_, child, _) => child,
-            ModelProcess::Container(_, child) => child,
+            ModelProcess::Container(_, _, child) => child,
         };
         let _ = child.kill().await;
     }
@@ -1927,9 +1958,12 @@ fn vllm_max_model_len(ctx_size: Option<u32>, ctx_size_explicit: bool) -> Option<
     ctx_size.filter(|n| ctx_size_explicit && *n > 0)
 }
 
-/// argv after the `vllm` binary, kept separate so context forwarding is testable.
+/// argv after the `vllm` binary, shared with `container::spawn_vllm`
+/// (which passes its `/models` mount and `0.0.0.0`) and kept separate so
+/// context forwarding is testable.
 fn vllm_serve_args(
     model_dir: &str,
+    host: &str,
     port: u16,
     model_name: &str,
     max_model_len: Option<u32>,
@@ -1940,7 +1974,7 @@ fn vllm_serve_args(
         "--port".into(),
         port.to_string(),
         "--host".into(),
-        "127.0.0.1".into(),
+        host.into(),
         // Register the model under the same name used in API requests so
         // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
         "--served-model-name".into(),
@@ -1963,6 +1997,7 @@ async fn spawn_vllm_server(
     let mut cmd = tokio::process::Command::new(&vllm);
     cmd.args(vllm_serve_args(
         model_dir.to_str().context("non-UTF-8 model path")?,
+        "127.0.0.1",
         port,
         model_name,
         max_model_len,
@@ -2068,8 +2103,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Polls `process`'s `/health` endpoint until ready, bailing out early
 /// if `process` itself exits first (so a crash-on-startup doesn't hang
-/// the caller for the whole deadline). `stderr_tail`, when given
-/// (llama-server only), includes the crash reason in the error.
+/// the caller for the whole deadline). `stderr_tail`, when given (every
+/// piped child — see `ensure_model`), includes the crash reason in the
+/// error.
 async fn wait_for_ready(
     client: &Client,
     port: u16,
@@ -3674,9 +3710,12 @@ async fn ensure_model(
             // full precedence chain this `.or` implements.
             threads: request_threads.or(state.0.threads),
         };
-        // Only llama-server children (local or containerized) capture a
-        // stderr tail — every OOM retry below only fires for those.
+        // Every piped child gets an output tail for crash reasons; only
+        // llama-server ones join the OOM retry loop below, whose
+        // fallbacks are llama-server flags.
         let mut stderr_tail: Option<OutputTail> = None;
+        let mut oom_retryable = false;
+        let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
         process = match (&model_path, state.0.ociman) {
             // container::spawn ignores llama_opts.threads; see that
             // field's doc comment.
@@ -3689,13 +3728,15 @@ async fn ensure_model(
                     llama_opts,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
-                ModelProcess::Container(ociman, child)
+                oom_retryable = true;
+                ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
             (ModelPath::Gguf(path, mmproj), None) => {
                 let bin = local_llama_server_bin(state).await?;
                 let (child, tail) =
                     spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
                 stderr_tail = Some(tail);
+                oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
             // diffusion models run in this binary (see mediagen_backend)
@@ -3709,20 +3750,36 @@ async fn ensure_model(
                     port,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
-                ModelProcess::Container(ociman, child)
+                oom_retryable = true;
+                ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
             (ModelPath::Diffusion(_), None) => {
                 let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
                 stderr_tail = Some(tail);
+                oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
-            (ModelPath::SafeTensors(_dir), _) if use_mlx_for_safetensors() => {
+            // --ociman is Linux-only and mlx Metal-only, so this never
+            // competes with the mlx arm.
+            (ModelPath::SafeTensors(dir), Some(ociman)) => {
+                let mut child = crate::container::spawn_vllm(
+                    ociman,
+                    dir,
+                    state.0.vllm_version.as_deref(),
+                    port,
+                    |model_dir, host| {
+                        vllm_serve_args(model_dir, host, port, model_ref, max_model_len)
+                    },
+                )?;
+                stderr_tail = Some(tail_child_output(&mut child));
+                ModelProcess::Container(ociman, Engine::Vllm, child)
+            }
+            (ModelPath::SafeTensors(_dir), None) if use_mlx_for_safetensors() => {
                 let child = spawn_mlx_server(port).await?;
                 let pid = child.id();
                 ModelProcess::Local(Engine::Mlx, child, pid)
             }
-            (ModelPath::SafeTensors(dir), _) => {
-                let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+            (ModelPath::SafeTensors(dir), None) => {
                 let child = spawn_vllm_server(dir, port, model_ref, max_model_len).await?;
                 let pid = child.id();
                 ModelProcess::Local(Engine::Vllm, child, pid)
@@ -3732,8 +3789,7 @@ async fn ensure_model(
         match wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await {
             Ok(()) => break,
             Err(e) => {
-                let looks_oom = stderr_tail.is_some() // llama-server only
-                    && looks_like_oom(&e.to_string());
+                let looks_oom = oom_retryable && looks_like_oom(&e.to_string());
                 if !looks_oom {
                     return Err(e.into());
                 }
@@ -8737,6 +8793,32 @@ fn metrics_router(enabled: bool) -> Router<AppState> {
         .layer(middleware::from_fn(track_metrics))
 }
 
+/// Which image `--pull-oci` warms up: the one `ensure_model` would run
+/// for `model` (read off its stored manifest), or llama-server's when no
+/// model is named — pulling both would cost a GGUF-only host the vLLM
+/// image's several GB for nothing.
+fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::ContainerEngine> {
+    // Same guard as the pre-load below: a pair warms its local half, a
+    // provider-routed reference has no local weights.
+    let model = model
+        .map(crate::hybrid::local_half)
+        .filter(|m| !crate::providers::is_remote_ref(m));
+    let Some(model) = model else {
+        return Ok(crate::container::ContainerEngine::LlamaServer);
+    };
+    let model_ref = crate::shortnames::resolve_ollama_api(model)?;
+    let store_path = default_store()?;
+    let format = crate::modelpack::stored_format(&store_path, &model_ref).with_context(|| {
+        format!("--pull-oci: pull {model_ref} first to learn which image it needs")
+    })?;
+    Ok(match format {
+        crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
+        crate::modelpack::ModelFormat::Gguf | crate::modelpack::ModelFormat::Diffusion => {
+            crate::container::ContainerEngine::LlamaServer
+        }
+    })
+}
+
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     if _args.ociman.is_some() && !cfg!(target_os = "linux") {
         anyhow::bail!("--ociman is only supported on Linux");
@@ -8751,7 +8833,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // listener and serving forever.
     if _args.pull_oci {
         let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
-        crate::container::pull_image(ociman, _args.llama_cpp_version.as_deref())?;
+        let engine = pull_oci_engine(_args.model.as_deref())?;
+        let version = match engine {
+            crate::container::ContainerEngine::Vllm => _args.vllm_version.as_deref(),
+            crate::container::ContainerEngine::LlamaServer => _args.llama_cpp_version.as_deref(),
+        };
+        crate::container::pull_image(ociman, engine, version)?;
         return Ok(());
     }
     // Same idea as --pull-oci above, but for the local (non-container)
@@ -8870,6 +8957,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .map(|p| p.canonicalize().unwrap_or(p)),
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
+        vllm_version: _args.vllm_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
         hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
@@ -11210,6 +11298,7 @@ mod tests {
             exe: None,
             ociman: None,
             llama_cpp_version: None,
+            vllm_version: None,
             ctx_size: None,
             ctx_size_explicit: false,
             hybrid_local_bytes: None,
@@ -12705,7 +12794,13 @@ mod tests {
             (Some(4096), Some("4096")),
             (None, None),
         ] {
-            let args = vllm_serve_args("/models/qwen", 8000, "qwen3.5:0.8b", max_model_len);
+            let args = vllm_serve_args(
+                "/models/qwen",
+                "127.0.0.1",
+                8000,
+                "qwen3.5:0.8b",
+                max_model_len,
+            );
             let pos = args.iter().position(|arg| arg == "--max-model-len");
 
             match expected {
@@ -12716,6 +12811,27 @@ mod tests {
                 None => assert!(pos.is_none()),
             }
         }
+    }
+
+    /// Local and container `vllm serve` argv differ only in dir and host.
+    #[test]
+    fn vllm_serve_args_differ_between_local_and_container_only_in_dir_and_host() {
+        let local = vllm_serve_args("/cache/abc/model", "127.0.0.1", 8000, "m", Some(4096));
+        let container = vllm_serve_args("/models", "0.0.0.0", 8000, "m", Some(4096));
+        assert_eq!(local[0], "serve");
+        assert_eq!(local[1], "/cache/abc/model");
+        assert_eq!(container[1], "/models");
+        let host = |args: &[String]| {
+            let i = args.iter().position(|a| a == "--host").unwrap();
+            args[i + 1].clone()
+        };
+        assert_eq!(host(&local), "127.0.0.1");
+        assert_eq!(host(&container), "0.0.0.0");
+        let rest = |args: &[String]| {
+            let i = args.iter().position(|a| a == "--host").unwrap();
+            [&args[2..i], &args[i + 2..]].concat()
+        };
+        assert_eq!(rest(&local), rest(&container));
     }
 
     /// `/api/embed` takes a string or an array of strings, and nothing
@@ -14238,7 +14354,7 @@ mod tests {
             let mut dead =
                 running_model_fixture(Some(Duration::from_secs(1)), Duration::from_secs(10), 0);
             match &mut dead.process {
-                ModelProcess::Local(_, child, _) | ModelProcess::Container(_, child) => {
+                ModelProcess::Local(_, child, _) | ModelProcess::Container(_, _, child) => {
                     child.kill().await.expect("kill the placeholder process")
                 }
             }

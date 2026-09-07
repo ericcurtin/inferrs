@@ -1,9 +1,10 @@
 //! Cross-platform detection of the GPU/accelerator, if any, available on
 //! the local host — used by [`crate::llama_release`] to pick which
 //! prebuilt `llama-server` release asset to download for this machine,
-//! and by [`crate::container`] to pick which
-//! `ghcr.io/ggml-org/llama.cpp` container image to run instead (`--ociman`)
-//! — both share this one probe rather than detecting the host twice.
+//! and by [`crate::container`] to pick which `ghcr.io/ggml-org/llama.cpp`
+//! (or, for a safetensors model, vLLM) container image to run instead
+//! (`--ociman`) — all share this one probe rather than detecting the host
+//! twice.
 //!
 //! Detection calls the real vendor APIs — the CUDA Driver API, the HIP
 //! runtime API, and the Vulkan API — the same libraries and entry points
