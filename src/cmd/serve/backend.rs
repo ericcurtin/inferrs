@@ -416,7 +416,7 @@ fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
 /// Loading instead happens on the *first real request* — every caller
 /// sends this model's actual absolute directory path (not its
 /// human-readable reference) as that request's own `"model"` field, via
-/// [`backend_wire_model`] — which goes through `ModelProvider.load`'s
+/// [`backend_wire_model`](super::backend_wire_model) — which goes through `ModelProvider.load`'s
 /// own `try`/`except` in the request-handling path instead, and so does
 /// report a real error back to that request on a bad model directory.
 pub(super) async fn spawn_mlx_server(port: u16) -> anyhow::Result<tokio::process::Child> {
