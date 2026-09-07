@@ -113,7 +113,7 @@ fn is_mmproj_layer(l: &crate::storage::oci::Descriptor) -> bool {
 // + --override-kv builder that let --ctx-size force a context above a
 // model's own trained length) were tried and removed: llama-server's own
 // capping of --ctx-size back down to a model's trained context — see
-// cmd::serve::context_length_from_env's doc comment — is deliberate, not
+// cmd::serve::config::context_length_from_env's doc comment — is deliberate, not
 // a bug to work around. Defeating that safety net via --override-kv
 // produces a real NaN/incoherent-output risk for out-of-distribution
 // RoPE positions that llama-server's own warning exists to prevent, for

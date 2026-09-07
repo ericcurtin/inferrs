@@ -211,34 +211,34 @@ pub struct LlamaOptions<'a> {
     pub port: u16,
 
     /// `--ctx-size`. `None` leaves it unset, falling back to the model's
-    /// own `n_ctx_train` — see `cmd::serve::context_length_from_env`'s
+    /// own `n_ctx_train` — see `cmd::serve::config::context_length_from_env`'s
     /// doc comment for what this does and doesn't guarantee.
     pub ctx_size: Option<u32>,
 
     /// `--flash-attn <mode>`. `None` falls back to llama-server's own
-    /// `auto` — see `cmd::serve::flash_attention_from_env`.
+    /// `auto` — see `cmd::serve::config::flash_attention_from_env`.
     pub flash_attention: Option<&'a str>,
 
     /// `--cache-type-k`/`--cache-type-v <type>` (both set together).
     /// `None` falls back to llama-server's own `f16` — see
-    /// `cmd::serve::kv_cache_type_from_env`.
+    /// `cmd::serve::config::kv_cache_type_from_env`.
     pub kv_cache_type: Option<&'a str>,
 
     /// `--context-shift` when true, `--no-context-shift` when false —
     /// always passed explicitly, never left to the default. See
-    /// `cmd::serve::context_shift_from_env`.
+    /// `cmd::serve::config::supports_context_shift`.
     pub context_shift: bool,
 
     /// `--split-mode <mode>`. `None` falls back to llama-server's own
-    /// `layer` — see `cmd::serve::sched_spread_from_env`.
+    /// `layer` — see `cmd::serve::config::sched_spread_from_env`.
     pub split_mode: Option<&'a str>,
 
     /// `--parallel <n>`. `None` falls back to llama-server's own single
-    /// slot — see `cmd::serve::num_parallel_from_env`.
+    /// slot — see `cmd::serve::config::num_parallel_from_env`.
     pub num_parallel: Option<u32>,
 
     /// `--embeddings`: an embedding model (see
-    /// `cmd::serve::embedding_model_ctx`) gets 501 on `/v1/embeddings`
+    /// `cmd::serve::config::embedding_model_ctx`) gets 501 on `/v1/embeddings`
     /// without it.
     pub embeddings: bool,
 
@@ -251,7 +251,7 @@ pub struct LlamaOptions<'a> {
     /// set, else the derived host-limit value, which is `Some` only
     /// when a CPU limit (cgroup quota or affinity) binds; see
     /// `cmd::serve::ensure_model`'s `request_threads` parameter and
-    /// `cmd::serve::threads_from_env_or_host`. Deliberately ignored by
+    /// `cmd::serve::config::threads_from_env_or_host`. Deliberately ignored by
     /// [`spawn`], whichever source it came from: the derived value
     /// describes the daemon's cgroup, which says nothing about the
     /// limits of the fresh container llama-server runs in, and a
