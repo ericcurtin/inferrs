@@ -8558,8 +8558,15 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32)),
         flash_attn: flash_attention_from_env().as_deref() != Some("off"),
     };
-    let ctx =
-        tokio::task::spawn_blocking(move || crate::mediagen::Context::init(api, &params)).await??;
+    let ctx = tokio::task::spawn_blocking(move || crate::mediagen::Context::init(api, &params))
+        .await?
+        .with_context(|| {
+            format!(
+                "loading the model with the llama.cpp libraries in {} (an old build? \
+                 remove it from PATH or pass --llama-cpp-version to use a release)",
+                lib_dir.display()
+            )
+        })?;
     let router = crate::mediagen::server::router(
         ctx,
         model_ref.to_string(),

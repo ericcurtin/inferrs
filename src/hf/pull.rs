@@ -94,57 +94,25 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                 );
             }
             if diffusion {
-                // The transformer needs its VAE(s), text projection and
-                // the text encoder it was trained with — see llama.cpp's
-                // common_download_get_hf_plan for the same resolution.
-                let model_path = &shards[0].path;
-                let sidecars = [
-                    (
-                        "vae",
-                        api::select_diffusion_sidecar(&files, model_path, "video_vae").or_else(
-                            || {
-                                api::select_diffusion_sidecar(&files, model_path, "_vae.")
-                                    .filter(|f| !f.path.to_lowercase().contains("audio_vae"))
-                            },
-                        ),
-                    ),
-                    (
-                        "audio_vae",
-                        api::select_diffusion_sidecar(&files, model_path, "audio_vae"),
-                    ),
-                    (
-                        "text_proj",
-                        api::select_diffusion_sidecar(&files, model_path, "embeddings_connectors"),
-                    ),
-                ];
-                for (role, file) in sidecars {
-                    let Some(file) = file else { continue };
-                    let mut d = download_layer(
+                let plan = api::diffusion_plan(&files, &shards[0].path);
+                meta.diffusion_outputs = plan.outputs;
+                for (role, file) in &plan.sidecars {
+                    let d = download_layer(
                         &dl_client,
                         &head_client,
                         &endpoint,
                         &owner,
                         &repo,
                         &commit,
-                        &file,
+                        file,
                         token.as_deref(),
                         layout_dir,
                         progress_key,
                     )
                     .await?;
-                    d.media_type = api::safetensors_media_type(&file.path).to_string();
-                    d.annotations = Some(BTreeMap::from([
-                        (oci::ANNOTATION_FILEPATH.to_string(), basename(&file.path)),
-                        (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
-                    ]));
-                    layers.push(d);
-                    match role {
-                        "vae" => meta.diffusion_outputs.extend(["image", "video"]),
-                        "audio_vae" => meta.diffusion_outputs.push("audio"),
-                        _ => {}
-                    }
+                    layers.push(api::sidecar_layer(d, file, role));
                 }
-                if let Some(te_ref) = api::diffusion_default_text_encoder(model_path) {
+                if let Some(te_ref) = plan.text_encoder {
                     let mut d = pull_text_encoder(
                         &api_client,
                         &dl_client,

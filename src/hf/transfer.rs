@@ -124,7 +124,16 @@ mod docker {
         .context("HF file list")?;
 
         let mut changed = false;
-        let (layers, filepath_annotation) = match api::select_gguf(&files, &tag) {
+        let diffusion = api::is_diffusion_repo(&files);
+        let selected = if diffusion {
+            api::select_diffusion_gguf(&files, &tag)
+        } else {
+            api::select_gguf(&files, &tag)
+        };
+        let (layers, filepath_annotation) = match selected {
+            Ok(shards) if diffusion && shards.len() != 1 => {
+                anyhow::bail!("{owner}/{repo}: split diffusion transformers are not supported");
+            }
             Ok(shards) => {
                 meta.format = "gguf".to_string();
                 let filepath_annotation = if shards.len() == 1 {
@@ -150,7 +159,40 @@ mod docker {
                         .await?,
                     );
                 }
-                if let Some(mmproj) = api::select_mmproj(&files) {
+                if diffusion {
+                    let plan = api::diffusion_plan(&files, &shards[0].path);
+                    meta.diffusion_outputs = plan.outputs;
+                    for (role, file) in &plan.sidecars {
+                        let d = transfer_layer(
+                            &dl_client,
+                            &head_client,
+                            &endpoint,
+                            &owner,
+                            &repo,
+                            &commit,
+                            file,
+                            token.as_deref(),
+                            &session,
+                            &mut changed,
+                        )
+                        .await?;
+                        layers.push(api::sidecar_layer(d, file, role));
+                    }
+                    if let Some(te_ref) = plan.text_encoder {
+                        let d = transfer_text_encoder(
+                            &api_client,
+                            &dl_client,
+                            &head_client,
+                            &host,
+                            te_ref,
+                            token.as_deref(),
+                            &session,
+                            &mut changed,
+                        )
+                        .await?;
+                        layers.push(d);
+                    }
+                } else if let Some(mmproj) = api::select_mmproj(&files) {
                     layers.push(
                         transfer_layer(
                             &dl_client,
@@ -237,6 +279,54 @@ mod docker {
 
     fn basename(path: &str) -> String {
         path.rsplit('/').next().unwrap_or(path).to_string()
+    }
+
+    /// The text encoder GGUF from its own repository, as a `text_encoder` layer.
+    #[allow(clippy::too_many_arguments)]
+    async fn transfer_text_encoder(
+        api_client: &reqwest::Client,
+        dl_client: &reqwest::Client,
+        head_client: &reqwest::Client,
+        host: &str,
+        reference: &str,
+        token: Option<&str>,
+        session: &crate::ffi::PushSession,
+        changed: &mut bool,
+    ) -> Result<Descriptor> {
+        let (_, owner, repo, tag) = api::parse_hf_ref(&format!("{host}/{reference}"))?;
+        let endpoint = super::super::hf_endpoint(host);
+        let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
+            .await
+            .with_context(|| format!("HF model info for text encoder {reference}"))?;
+        let commit = info.commit().to_string();
+        let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
+            .await
+            .with_context(|| format!("HF file list for text encoder {reference}"))?;
+        let shards = api::select_gguf(&files, &tag)?;
+        if shards.len() != 1 {
+            anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
+        }
+        let mut d = transfer_layer(
+            dl_client,
+            head_client,
+            &endpoint,
+            &owner,
+            &repo,
+            &commit,
+            &shards[0],
+            token,
+            session,
+            changed,
+        )
+        .await?;
+        d.annotations = Some(std::collections::BTreeMap::from([
+            (
+                oci::ANNOTATION_FILEPATH.to_string(),
+                basename(&shards[0].path),
+            ),
+            (oci::ANNOTATION_ROLE.to_string(), "text_encoder".to_string()),
+        ]));
+        Ok(d)
     }
 
     /// Fetches one file and streams it directly into a registry push,
