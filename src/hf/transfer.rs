@@ -347,9 +347,7 @@ mod docker {
         let url = format!("{endpoint}{owner}/{repo}/resolve/{commit}/{}", file.path);
         let label = format!("Transferring {}", basename(&file.path));
 
-        // Single attempt: this is a cheap metadata probe, so a bad or
-        // nonexistent host must fail fast rather than run the retry backoff.
-        let meta = super::super::client::once(&format!("HEAD {}", file.path), || {
+        let meta = super::super::client::probe(&format!("HEAD {}", file.path), || {
             download::head_metadata(head_client, url.clone(), token)
         })
         .await
@@ -536,9 +534,9 @@ mod docker {
     /// times, honoring `Retry-After`/exponential backoff between tries.
     /// It is its own loop rather than a shared helper because `attempt`
     /// needs the attempt number to seed the backoff (see
-    /// `download::should_retry`); the metadata path's `client::once` runs
-    /// a single attempt and the blob-download loop lives in `download.rs`,
-    /// so there is no shared retry helper to call here.
+    /// `download::should_retry`); the metadata path's `client::probe`
+    /// retries only a 429 and the blob-download loop lives in
+    /// `download.rs`, so there is no shared retry helper to call here.
     async fn retry_push<F, Fut>(label: &str, mut attempt: F) -> Result<bool>
     where
         F: FnMut(u32) -> Fut,

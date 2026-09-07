@@ -116,21 +116,35 @@ fn rand_unit() -> f64 {
     (nanos % 1_000_000) as f64 / 1_000_000.0
 }
 
-/// Runs `attempt` exactly once, with no retry loop or backoff. The cheap
-/// metadata requests (the model-info GET and the HEAD size/etag probes)
-/// use this so a bad or nonexistent host fails immediately rather than
-/// running a full backoff budget. The HF client attaches its bearer token
-/// up front (no 401 auth handshake to retry), and the per-request timeout
-/// reqwest already applies still bounds a slow-but-resolvable host. A 4xx
-/// surfaces as-is.
-pub async fn once<T, F, Fut>(label: &str, attempt: F) -> Result<T>
+/// Runs a cheap metadata request (the model-info GET, the HEAD size/etag
+/// probes): no backoff, so a bad or nonexistent host fails immediately,
+/// except on a 429, which is retried honoring `Retry-After` — a transfer
+/// of hundreds of shards issues hundreds of these and the rate limit is
+/// the one transient error they do hit.
+pub async fn probe<T, F, Fut>(label: &str, mut attempt: F) -> Result<T>
 where
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    attempt().await.inspect_err(|e| {
-        eprintln!("[llmman] {label} error: {e:#}");
-    })
+    for i in 1..=MAX_ATTEMPTS {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                eprintln!("[llmman] {label} error: {e:#}");
+                let throttled = e
+                    .chain()
+                    .find_map(|e| e.downcast_ref::<HttpStatusError>())
+                    .is_some_and(|e| e.status == 429);
+                if !throttled || i == MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                let delay = retry_after_of(&e).unwrap_or_else(|| retry_delay(i));
+                eprintln!("[llmman] {label}: rate limited, retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!()
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +291,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn probe_retries_only_a_429() {
+        let calls = std::cell::Cell::new(0);
+        let err = |status: u16| -> anyhow::Error {
+            HttpStatusError::new("GET x", status, &headers_with_retry_after("0")).into()
+        };
+        let ok: Result<u32> = probe("t", || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    Err(err(429))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 3);
+
+        calls.set(0);
+        let res: Result<u32> = probe("t", || {
+            calls.set(calls.get() + 1);
+            async { Err(err(503)) }
+        })
+        .await;
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1, "a non-429 is not retried");
+    }
+
     #[test]
     fn is_permanent_sees_through_context_wrapping() {
         let err = anyhow::Error::new(HttpStatusError::new("GET x", 404, &HeaderMap::new()))
@@ -285,9 +329,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn once_runs_the_attempt_a_single_time_on_failure() {
+    async fn probe_runs_the_attempt_a_single_time_on_failure() {
         let attempts = AtomicU32::new(0);
-        let result: Result<()> = once("test", || {
+        let result: Result<()> = probe("test", || {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err(anyhow!("boom")) }
         })
