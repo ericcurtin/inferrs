@@ -15,7 +15,7 @@ use super::api::{self, HfFile};
 use super::download::{self, FetchRequest};
 use super::oci::{self, Descriptor, ModelMeta};
 use super::progress;
-use crate::xet_fetch::XetFileRef;
+use crate::xet_fetch::{self, XetFileRef};
 
 /// Pulls `reference` (already stripped of any `hf://`/`huggingface://`
 /// scheme prefix) into `layout_dir`. `progress_key` is the exact,
@@ -381,18 +381,19 @@ async fn download_layer(
     })
     .await
     .unwrap_or_default();
+    // One size for both the progress total and the Xet download, so the
+    // bytes download_to_path credits can never exceed what was added.
+    let size = if meta.size > 0 { meta.size } else { file.size };
     let xet = meta.xet_hash.map(|hash| XetFileRef {
         endpoint: endpoint.to_string(),
         repo_type: "models".to_string(),
         owner_repo: format!("{owner}/{repo}"),
         revision: commit.to_string(),
         hash,
-        size: meta.size.max(file.size) as u64,
+        size: size as u64,
         sha256: meta.digest.clone(),
         hf_token: token.map(str::to_string),
     });
-
-    let size = if meta.size > 0 { meta.size } else { file.size };
     progress::add_total(progress_key, size);
 
     // The blob store is content-addressed and HF's X-Linked-Etag is the
@@ -457,28 +458,45 @@ async fn download_layer(
             // (Progress reporting isn't undone on a retry — a retried
             // file's bar may briefly look ahead of itself; a cosmetic
             // wrinkle only, not worth this migration's added complexity.)
-            let f = std::fs::File::create(&tmp_path)?;
-            let mut writer = HashingProgressWriter {
-                file: f,
-                hasher: Sha256::new(),
-                progress_key,
-            };
-            let result = download::fetch_once(client, &req, &mut writer)
-                .await
-                .and_then(|_| {
-                    writer.file.flush()?;
-                    let got = format!("sha256:{:x}", writer.hasher.finalize());
-                    // meta.digest (from X-Linked-Etag) is a trusted claim
-                    // about the content ahead of downloading it — worth
-                    // checking the bytes we actually got still match, in
-                    // case of transient corruption, same as a failed fetch.
-                    match &meta.digest {
-                        Some(want) if format!("sha256:{want}") != got => {
-                            anyhow::bail!("digest mismatch: expected sha256:{want}, got {got}")
-                        }
-                        _ => Ok(got),
+            let got = match &req.xet {
+                // Xet: hf-xet owns the file so progress tracks the wire
+                // (see xet_fetch::download_to_path); hash it afterwards.
+                Some(xet) => {
+                    match xet_fetch::download_to_path(xet, &tmp_path, |n| {
+                        progress::add_completed(progress_key, n as i64)
+                    })
+                    .await
+                    .with_context(|| label.clone())
+                    {
+                        Ok(()) => sha256_of_file(&tmp_path).await,
+                        Err(e) => Err(e),
                     }
-                });
+                }
+                None => {
+                    let f = std::fs::File::create(&tmp_path)?;
+                    let mut writer = HashingProgressWriter {
+                        file: f,
+                        hasher: Sha256::new(),
+                        progress_key,
+                    };
+                    download::fetch_once(client, &req, &mut writer)
+                        .await
+                        .and_then(|_| {
+                            writer.file.flush()?;
+                            Ok(format!("sha256:{:x}", writer.hasher.finalize()))
+                        })
+                }
+            };
+            // meta.digest (from X-Linked-Etag) is a trusted claim about
+            // the content ahead of downloading it — worth checking the
+            // bytes we actually got still match, in case of transient
+            // corruption, same as a failed fetch.
+            let result = got.and_then(|got| match &meta.digest {
+                Some(want) if format!("sha256:{want}") != got => {
+                    anyhow::bail!("digest mismatch: expected sha256:{want}, got {got}")
+                }
+                _ => Ok(got),
+            });
             match result {
                 Ok(digest) => break 'attempts digest,
                 Err(e) => {
@@ -530,6 +548,31 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// `sha256:<hex>` of `path`'s content, for the one download path
+/// (`xet_fetch::download_to_path`) that bypasses [`HashingProgressWriter`].
+/// Off the async runtime: a full read of a possibly hundreds-of-GB file.
+async fn sha256_of_file(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&path)
+            .with_context(|| format!("open {} for hashing", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    })
+    .await
+    .context("sha256 hashing task panicked")?
 }
 
 /// Writes to a local file while hashing every byte and reporting it to

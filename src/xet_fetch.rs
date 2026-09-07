@@ -23,9 +23,17 @@
 //! `xet-client`/`xet-data`/`xet-runtime` separately.
 
 use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use xet::xet_session::{header, HeaderMap, XetFileInfo, XetSessionBuilder};
+use xet::xet_session::{
+    header, HeaderMap, XetFileDownloadGroup, XetFileInfo, XetSession, XetSessionBuilder,
+};
+
+/// How often [`download_to_path`] samples hf-xet's network-byte counter.
+/// Matches the daemon's own poll cadence (`cmd::serve::stream_ffi_progress`).
+const PROGRESS_POLL: Duration = Duration::from_millis(200);
 
 /// Identifies and authenticates one Xet-backed HuggingFace file — just
 /// the fields the Go shim's own header-parsing already extracts
@@ -69,6 +77,36 @@ impl XetFileRef {
             self.revision
         )
     }
+
+    /// Auth headers for the CAS token fetch/refresh (never sent to CAS
+    /// itself). Empty for an anonymous request.
+    fn refresh_headers(&self) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = &self.hf_token {
+            let value = format!("Bearer {token}")
+                .parse()
+                .context("build Authorization header")?;
+            headers.insert(header::AUTHORIZATION, value);
+        }
+        Ok(headers)
+    }
+
+    /// hf-xet's own description of the file to reconstruct.
+    fn file_info(&self) -> XetFileInfo {
+        match &self.sha256 {
+            Some(sha256) => {
+                XetFileInfo::new_with_sha256(self.hash.clone(), self.size, sha256.clone())
+            }
+            None => XetFileInfo::new(self.hash.clone(), self.size),
+        }
+    }
+}
+
+/// A session on the ambient tokio runtime.
+fn new_session() -> Result<XetSession> {
+    XetSessionBuilder::new()
+        .build()
+        .context("create xet session")
 }
 
 /// Streams `file`'s reconstructed content to `w`, chunk by chunk, with no
@@ -76,34 +114,24 @@ impl XetFileRef {
 /// multi-hundred-GB file. `with_token_refresh_url` handles both the
 /// initial CAS token fetch and any later refresh a long-running stream
 /// needs, so this needs no upfront token round trip of its own.
+///
+/// Chunks arrive in file order while hf-xet fetches many ~64 MiB terms
+/// in parallel, so `w` sees long pauses then bursts. Fine for a pipe; a
+/// caller writing to a local file should prefer [`download_to_path`],
+/// whose progress tracks the wire instead.
 pub async fn stream_to_writer(file: &XetFileRef, w: &mut impl Write) -> Result<()> {
-    let session = XetSessionBuilder::new()
-        .build()
-        .context("create xet session")?;
-
-    let mut headers = HeaderMap::new();
-    if let Some(token) = &file.hf_token {
-        let value = format!("Bearer {token}")
-            .parse()
-            .context("build Authorization header")?;
-        headers.insert(header::AUTHORIZATION, value);
-    }
+    let session = new_session()?;
 
     let group = session
         .new_download_stream_group()
         .context("create xet download stream group")?
-        .with_token_refresh_url(file.refresh_route(), headers)
+        .with_token_refresh_url(file.refresh_route(), file.refresh_headers()?)
         .build()
         .await
         .context("authenticate xet download")?;
 
-    let xet_file_info = match &file.sha256 {
-        Some(sha256) => XetFileInfo::new_with_sha256(file.hash.clone(), file.size, sha256.clone()),
-        None => XetFileInfo::new(file.hash.clone(), file.size),
-    };
-
     let mut stream = group
-        .download_stream(xet_file_info, None)
+        .download_stream(file.file_info(), None)
         .await
         .context("start xet download stream")?;
 
@@ -112,6 +140,103 @@ pub async fn stream_to_writer(file: &XetFileRef, w: &mut impl Write) -> Result<(
     }
 
     Ok(())
+}
+
+/// Downloads `file` to `dest` (created or truncated), reporting progress
+/// as bytes received from CAS rather than bytes written — via hf-xet's
+/// file-download API, the only one exposing its network-side counter.
+///
+/// `on_progress(delta)` deltas sum to exactly `file.size` on `Ok`: wire
+/// bytes are capped at the file size (chunks are compressed on the wire)
+/// and any shortfall is reported once the download completes.
+///
+/// Unlike [`stream_to_writer`] this hashes nothing; verify `dest` after.
+pub async fn download_to_path(
+    file: &XetFileRef,
+    dest: &Path,
+    mut on_progress: impl FnMut(u64),
+) -> Result<()> {
+    let session = new_session()?;
+
+    let group = session
+        .new_file_download_group()
+        .context("create xet file download group")?
+        .with_token_refresh_url(file.refresh_route(), file.refresh_headers()?)
+        .build()
+        .await
+        .context("authenticate xet download")?;
+    // hf-xet's download runs detached from this future; make sure
+    // dropping it (a sibling in a buffer_unordered failing, say) stops
+    // the transfer rather than leaving it writing to `dest`.
+    let guard = AbortOnDrop(Some(group.clone()));
+
+    // hf-xet resolves a relative `dest` against the process cwd, which
+    // for a daemon is arbitrary.
+    let dest = std::path::absolute(dest).context("absolute path of download destination")?;
+    group
+        .download_file_to_path(file.file_info(), dest)
+        .await
+        .context("start xet download")?;
+
+    // `finish` consumes the group; poll a clone (lock-free) while it runs.
+    let poller = group.clone();
+    report_while(
+        async { group.finish().await.context("xet download").map(|_| ()) },
+        file.size,
+        || poller.progress().total_transfer_bytes_completed,
+        &mut on_progress,
+    )
+    .await?;
+    guard.disarm();
+    Ok(())
+}
+
+/// Drives `on_progress` from `wire_bytes()` every [`PROGRESS_POLL`] until
+/// `finish` resolves, then tops up so the deltas sum to exactly `size`.
+async fn report_while(
+    finish: impl std::future::Future<Output = Result<()>>,
+    size: u64,
+    mut wire_bytes: impl FnMut() -> u64,
+    mut on_progress: impl FnMut(u64),
+) -> Result<()> {
+    let mut finish = std::pin::pin!(finish);
+    let mut reported: u64 = 0;
+    loop {
+        tokio::select! {
+            result = &mut finish => {
+                result?;
+                break;
+            }
+            _ = tokio::time::sleep(PROGRESS_POLL) => {
+                let wire = wire_bytes().min(size);
+                if wire > reported {
+                    on_progress(wire - reported);
+                    reported = wire;
+                }
+            }
+        }
+    }
+    if reported < size {
+        on_progress(size - reported);
+    }
+    Ok(())
+}
+
+/// Aborts an in-flight download group unless disarmed first.
+struct AbortOnDrop(Option<XetFileDownloadGroup>);
+
+impl AbortOnDrop {
+    fn disarm(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            let _ = group.abort();
+        }
+    }
 }
 
 /// Strips the surrounding quotes an `ETag`/`X-Linked-Etag` value
@@ -169,6 +294,58 @@ mod tests {
         assert_eq!(strip_etag_quotes("unquoted"), "unquoted");
     }
 
+    /// Progress must be reported *while* the download runs, not just as
+    /// one top-up at the end; the wire count is capped at the file size.
+    /// Paused tokio time makes the poll cadence deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn report_while_emits_deltas_during_the_download_and_caps_at_size() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let wire = Rc::new(Cell::new(0u64));
+        let deltas = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let finish = {
+            let wire = wire.clone();
+            async move {
+                // Bytes arrive across ~5 polls; the wire count then
+                // overshoots the file size (compressed-chunk bookkeeping).
+                for step in [100u64, 200, 300, 400, 550] {
+                    tokio::time::sleep(PROGRESS_POLL).await;
+                    wire.set(step);
+                }
+                tokio::time::sleep(PROGRESS_POLL).await;
+                Ok(())
+            }
+        };
+        report_while(finish, 500, || wire.get(), |n| deltas.borrow_mut().push(n))
+            .await
+            .expect("report_while");
+
+        let deltas = deltas.borrow();
+        assert!(
+            deltas.len() >= 3,
+            "expected several in-flight updates, got {deltas:?}"
+        );
+        assert_eq!(deltas.iter().sum::<u64>(), 500, "deltas must sum to size");
+        assert!(deltas.iter().all(|&d| d > 0), "no zero deltas: {deltas:?}");
+    }
+
+    /// A failing download must not be topped up to look complete.
+    #[tokio::test(start_paused = true)]
+    async fn report_while_propagates_the_error_without_a_top_up() {
+        let mut reported = 0u64;
+        let err = report_while(
+            async { anyhow::bail!("boom") },
+            500,
+            || 0,
+            |n| reported += n,
+        )
+        .await
+        .expect_err("must fail");
+        assert!(err.to_string().contains("boom"));
+        assert_eq!(reported, 0);
+    }
+
     /// Real streaming download of a small (~450KB), genuinely Xet-backed
     /// file — hf-internal-testing/tiny-random-gpt2's model.safetensors.
     /// Needs real network access (same convention as hf.rs's Go-side
@@ -201,6 +378,50 @@ mod tests {
         let got_sha256 = hex::encode(hasher.finalize());
         assert_eq!(
             got_sha256, "8111d5afb0715dbf5a31396d31432cb56370ba23f6650a035ea0fc8a20b4e500",
+            "downloaded content doesn't match the expected sha256"
+        );
+    }
+
+    /// Same file via the to-path API: content must match, and progress
+    /// deltas must sum to exactly the file size.
+    #[tokio::test]
+    async fn download_to_path_downloads_a_real_small_xet_backed_file_and_reports_its_size() {
+        let file = XetFileRef {
+            endpoint: crate::hf::endpoint(),
+            repo_type: "models".to_string(),
+            owner_repo: "hf-internal-testing/tiny-random-gpt2".to_string(),
+            revision: "71034c5d8bde858ff824298bdedc65515b97d2b9".to_string(),
+            hash: "f8accece953fd366d4ce30597b97acc1ccedc3c785187a5ef6ecb4a8e1755122".to_string(),
+            size: 453_864,
+            sha256: Some(
+                "8111d5afb0715dbf5a31396d31432cb56370ba23f6650a035ea0fc8a20b4e500".to_string(),
+            ),
+            hf_token: crate::hf::token(),
+        };
+
+        let dest = std::env::temp_dir().join(format!(
+            "llmman-xet-download-to-path-{}.safetensors",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dest);
+        let mut reported = 0u64;
+        download_to_path(&file, &dest, |n| reported += n)
+            .await
+            .expect("download_to_path");
+        assert_eq!(
+            reported, 453_864,
+            "progress deltas must sum to the file size"
+        );
+
+        let data = std::fs::read(&dest).expect("read downloaded file");
+        let _ = std::fs::remove_file(&dest);
+        assert_eq!(data.len(), 453_864);
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&data);
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            "8111d5afb0715dbf5a31396d31432cb56370ba23f6650a035ea0fc8a20b4e500",
             "downloaded content doesn't match the expected sha256"
         );
     }
