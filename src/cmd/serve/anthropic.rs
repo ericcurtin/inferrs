@@ -40,6 +40,13 @@ const THINKING_BUDGETS: [(&str, u32); 5] = [
     ("max", 32768),
 ];
 
+/// The levels every provider's `reasoning_effort` takes: Gemini's
+/// compatibility endpoint and OpenAI's o1 have no `minimal`, OpenAI no
+/// `max`.
+pub(super) fn portable_efforts() -> &'static [(&'static str, u32)] {
+    &THINKING_BUDGETS[1..4]
+}
+
 /// The smallest budget the API accepts.
 const MIN_THINKING_BUDGET: u32 = 1024;
 
@@ -387,7 +394,7 @@ fn unanswered_call(messages: &[Value], name: Option<&str>) -> Option<String> {
 /// The API accepts ids matching `[a-zA-Z0-9_-]+` only. A rewritten id
 /// gets a hash of the original appended, so `call:1` and `call.1` stay
 /// distinct; the same mapping applies to calls and results.
-fn sanitize_id(id: &str) -> String {
+pub(super) fn sanitize_id(id: &str) -> String {
     use std::hash::{Hash, Hasher};
     let out: String = id
         .chars()
@@ -1968,5 +1975,11 @@ mod tests {
         assert_eq!(conv.line("event: message_start"), "");
         assert_eq!(conv.line(""), "");
         assert_eq!(conv.line(": comment"), "");
+    }
+
+    #[test]
+    fn portable_efforts_are_low_medium_high() {
+        let levels: Vec<&str> = portable_efforts().iter().map(|(l, _)| *l).collect();
+        assert_eq!(levels, ["low", "medium", "high"]);
     }
 }

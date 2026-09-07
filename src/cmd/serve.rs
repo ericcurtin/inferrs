@@ -35,6 +35,7 @@ use crate::webui;
 mod aggregation;
 mod anthropic;
 mod config;
+mod messages;
 mod responses;
 
 pub use config::DEFAULT_CTX_SIZE;
@@ -912,61 +913,6 @@ struct OAIEmbeddingsUsage {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic API types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct AnthropicRequest {
-    model: String,
-    messages: Vec<AnthropicMessage>,
-    max_tokens: Option<u32>,
-    #[serde(default)]
-    stream: bool,
-    // Anthropic's real API accepts `system` as either a plain string or an
-    // array of content blocks (the same shape as message content) — real
-    // Claude Code always sends the array form, carrying its system prompt
-    // as one or more {"type":"text","text":"..."} blocks, so a bare
-    // Option<String> here 422s on every real request.
-    system: Option<AnthropicContent>,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicMessage {
-    role: String,
-    content: AnthropicContent,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum AnthropicContent {
-    Text(String),
-    Blocks(Vec<AnthropicBlock>),
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicBlock {
-    #[serde(rename = "type")]
-    type_: String,
-    text: Option<String>,
-}
-
-impl AnthropicContent {
-    fn as_text(&self) -> String {
-        match self {
-            AnthropicContent::Text(s) => s.clone(),
-            AnthropicContent::Blocks(blocks) => blocks
-                .iter()
-                .filter(|b| b.type_ == "text")
-                .filter_map(|b| b.text.as_deref())
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // OpenAI types (internal proxy use)
 // ---------------------------------------------------------------------------
 
@@ -1612,7 +1558,7 @@ fn parse_keep_alive_str(s: &str) -> Option<Option<Duration>> {
 /// own runner refcounting (llm/server.go) at a coarser granularity.
 ///
 /// Must be moved into (captured by) whatever `Stream`/`Body` backs the
-/// actual HTTP response — see `stream_ollama`, `stream_anthropic`, and
+/// actual HTTP response — see `stream_ollama`, `anthropic_messages_to`, and
 /// `proxy` — so it isn't dropped until the response has actually finished
 /// being sent, not merely until the handler function that built it
 /// returns.
@@ -4162,7 +4108,7 @@ async fn relay_rewriting_model(
 }
 
 /// The streaming (`stream: true`) case: like `stream_ollama`/
-/// `stream_anthropic`, uses `bytes_to_lines` so a `data: {...}` SSE line
+/// `anthropic_messages_to`, uses `bytes_to_lines` so a `data: {...}` SSE line
 /// split across two TCP reads is never parsed as JSON prematurely — but
 /// unlike those two (which convert into a completely different wire
 /// format, ndjson/Anthropic SSE, and so don't need to preserve the
@@ -4647,9 +4593,8 @@ fn relay_chat_upstream(upstream: ChatUpstream, activity: ActivityGuard) -> Respo
 /// body, converting a non-2xx status into an AppError carrying the
 /// backend's error body.
 /// The *only* function that actually sends an `OAIChatRequest` to
-/// llama-server — every caller (`collect_completion`, `stream_ollama`,
-/// `stream_anthropic`, and `handle_anthropic_messages`'s non-streaming
-/// branch) goes through this one function, which is what lets
+/// llama-server — every caller (`collect_completion` and `stream_ollama`)
+/// goes through this one function, which is what lets
 /// `apply_default_repeat_penalty_typed` above resolve `repeat_penalty`
 /// exactly once instead of at every construction site.
 async fn post_chat(
@@ -4664,6 +4609,12 @@ async fn post_chat(
     }
     // Typed callers build their own chunks and never read the model.
     let upstream = send_chat_completion(client, target, &*oai_req, &oai_req.model).await?;
+    chat_body(target, upstream).await
+}
+
+/// A successful chat completion's still-streaming body, or the backend's
+/// refusal as the client's error.
+async fn chat_body(target: &Target, upstream: ChatUpstream) -> Result<ChatBody, AppError> {
     if !upstream.status.is_success() {
         let status = upstream.status;
         let body = upstream.text().await;
@@ -5186,99 +5137,6 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
     Ok(Response::builder()
         .header("content-type", "application/x-ndjson")
         .body(Body::from_stream(stream))
-        .unwrap())
-}
-
-// ---------------------------------------------------------------------------
-// Streaming conversion: OpenAI SSE → Anthropic SSE
-// ---------------------------------------------------------------------------
-
-async fn stream_anthropic(
-    client: Client,
-    target: Target,
-    mut oai_req: OAIChatRequest,
-    model: String,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
-    let resp = post_chat(&client, &target, &mut oai_req).await?;
-
-    let msg_id = gen_id();
-    let preamble = {
-        let start = serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model,
-                "stop_reason": null,
-                "usage": { "input_tokens": 0, "output_tokens": 0 }
-            }
-        });
-        let block_start = serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": { "type": "text", "text": "" }
-        });
-        format!(
-            "event: message_start\ndata: {start}\n\nevent: content_block_start\ndata: {block_start}\n\n"
-        )
-    };
-
-    let preamble_stream =
-        futures::stream::once(futures::future::ready(Ok::<_, std::convert::Infallible>(
-            Bytes::from(preamble),
-        )));
-
-    let sse_stream = bytes_to_lines(resp).map(move |line| {
-        let out = if let Some(payload) = line.strip_prefix("data: ") {
-            if payload == "[DONE]" {
-                let msg_delta = serde_json::json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                    "usage": { "output_tokens": 0 }
-                });
-                let msg_stop = serde_json::json!({ "type": "message_stop" });
-                format!(
-                    "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
-                     event: message_delta\ndata: {msg_delta}\n\n\
-                     event: message_stop\ndata: {msg_stop}\n\n"
-                )
-            } else if let Ok(chunk) = serde_json::from_str::<OAIChunk>(payload) {
-                let content = chunk.choices.first()
-                    .and_then(|c| c.delta.content.as_deref())
-                    .unwrap_or("")
-                    .to_string();
-                if content.is_empty() {
-                    String::new()
-                } else {
-                    let delta = serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": { "type": "text_delta", "text": content }
-                    });
-                    format!("event: content_block_delta\ndata: {delta}\n\n")
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-        Ok::<_, std::convert::Infallible>(Bytes::from(out))
-    });
-    // Moved into the tail of the chained stream so it lives until the
-    // whole SSE response has been sent — see ActivityGuard's doc comment.
-    let sse_stream = sse_stream.chain(futures::stream::once(async move {
-        let _activity = activity;
-        Ok::<_, std::convert::Infallible>(Bytes::new())
-    }));
-
-    Ok(Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(preamble_stream.chain(sse_stream)))
         .unwrap())
 }
 
@@ -7694,6 +7552,73 @@ const RESPONSES_ROUTE: &str = "/v1/responses";
 /// models) is retried as a chat completion; any other failure is the
 /// provider's own answer about the caller's key or request, relayed
 /// untouched. The retry happens before any body has been relayed.
+/// A converter of one upstream SSE stream into another, line by line:
+/// `responses::StreamConverter` and `messages::StreamConverter`.
+trait SseConverter: Send + 'static {
+    fn line(&mut self, line: &str) -> String;
+    fn finish(&mut self) -> String;
+    fn failed(&self) -> bool;
+    fn fold(&mut self, lines: Vec<String>) -> serde_json::Value;
+}
+
+macro_rules! sse_converter {
+    ($($t:ty),*) => {$(
+        impl SseConverter for $t {
+            fn line(&mut self, line: &str) -> String {
+                Self::line(self, line)
+            }
+            fn finish(&mut self) -> String {
+                Self::finish(self)
+            }
+            fn failed(&self) -> bool {
+                Self::failed(self)
+            }
+            fn fold(&mut self, lines: Vec<String>) -> serde_json::Value {
+                Self::fold(self, lines)
+            }
+        }
+    )*};
+}
+sse_converter!(responses::StreamConverter, messages::StreamConverter);
+
+/// `body` translated by `converter`: streamed as SSE, with a trailing
+/// `None` so the converter can close a stream ended without `[DONE]`, or
+/// folded into one JSON object (502 when the converter failed).
+async fn convert_upstream(
+    body: ChatBody,
+    activity: ActivityGuard,
+    mut converter: impl SseConverter,
+    streaming: bool,
+) -> Response {
+    if !streaming {
+        let lines: Vec<String> = bytes_to_lines(body).collect().await;
+        drop(activity);
+        let response = converter.fold(lines);
+        let status = if converter.failed() {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::OK
+        };
+        return (status, Json(response)).into_response();
+    }
+    let sse_stream = bytes_to_lines(body)
+        .map(Some)
+        .chain(futures::stream::once(futures::future::ready(None)))
+        .map(move |line| {
+            let _activity = &activity;
+            let out = match line {
+                Some(line) => converter.line(&line),
+                None => converter.finish(),
+            };
+            Ok::<_, std::convert::Infallible>(Bytes::from(out))
+        });
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(sse_stream))
+        .unwrap()
+}
+
 async fn remote_responses(
     client: &Client,
     target: &Target,
@@ -7752,37 +7677,8 @@ async fn remote_responses(
         ));
     }
 
-    let mut converter = responses::StreamConverter::new(&canonical_model, &req);
-    if !streaming {
-        let lines: Vec<String> = bytes_to_lines(upstream.body).collect().await;
-        drop(activity);
-        let response = converter.fold(lines);
-        let status = if converter.failed() {
-            StatusCode::BAD_GATEWAY
-        } else {
-            StatusCode::OK
-        };
-        return Ok((status, Json(response)).into_response());
-    }
-
-    // A trailing `None` lets the converter close a stream the provider
-    // ended without `[DONE]`.
-    let sse_stream = bytes_to_lines(upstream.body)
-        .map(Some)
-        .chain(futures::stream::once(futures::future::ready(None)))
-        .map(move |line| {
-            let _activity = &activity;
-            let out = match line {
-                Some(line) => converter.line(&line),
-                None => converter.finish(),
-            };
-            Ok::<_, std::convert::Infallible>(Bytes::from(out))
-        });
-    Ok(Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(sse_stream))
-        .unwrap())
+    let converter = responses::StreamConverter::new(&canonical_model, &req);
+    Ok(convert_upstream(upstream.body, activity, converter, streaming).await)
 }
 
 async fn handle_openai_responses_input_tokens(
@@ -7959,8 +7855,7 @@ fn consolidate_responses_instructions(req: &mut serde_json::Value) {
 /// Extracts the plain text of a Responses-API `input` message item —
 /// `content` is either a bare string or an array of blocks (each with a
 /// `"text"` field, e.g. `{"type":"input_text","text":"..."}`), the same
-/// two shapes Anthropic's own message content takes (see
-/// `AnthropicContent::as_text` above).
+/// two shapes Anthropic's own message content takes.
 fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
     match item.get("content")? {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -7977,45 +7872,10 @@ fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
 
 // -- Anthropic /v1/messages --------------------------------------------------
 
-/// Merges every system-role turn in an Anthropic request into a single
-/// leading system message, then appends every other message in order.
-///
-/// Real Claude Code doesn't confine system content to the top-level
-/// `system` field: it also injects background reminders (available
-/// agents/skills, etc.) as ordinary entries with `"role": "system"`
-/// scattered later in `messages`, which the real Anthropic API accepts in
-/// any position. llama.cpp's chat templates (Qwen's included) are far
-/// stricter and raise "System message must be at the beginning" the
-/// moment a `system` role appears anywhere but index 0 — which every
-/// sufficiently long real Claude Code session eventually triggers.
-/// Concatenating them here keeps every request llama.cpp-template-safe
-/// regardless of where the client put its system-role content.
-fn build_anthropic_messages(req: &AnthropicRequest) -> Vec<OAIMessage> {
-    let mut system_text = String::new();
-    if let Some(sys) = &req.system {
-        system_text.push_str(&sys.as_text());
-    }
-    let mut messages: Vec<OAIMessage> = Vec::new();
-    for m in &req.messages {
-        if m.role == "system" {
-            if !system_text.is_empty() {
-                system_text.push_str("\n\n");
-            }
-            system_text.push_str(&m.content.as_text());
-            continue;
-        }
-        messages.push(OAIMessage::text(m.role.clone(), m.content.as_text()));
-    }
-    if !system_text.is_empty() {
-        messages.insert(0, OAIMessage::text("system", system_text));
-    }
-    messages
-}
-
 /// The Anthropic Messages surface. The body is kept raw until the target
 /// is known: a [`Wire::Anthropic`] provider gets it relayed as sent (see
-/// [`relay_anthropic_messages`]); anything else gets the
-/// [`AnthropicRequest`] subset translated into a chat completion.
+/// [`relay_anthropic_messages`]); anything else gets it translated into
+/// a chat completion and the reply back (see [`messages`]).
 async fn handle_anthropic_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8072,61 +7932,19 @@ async fn anthropic_messages_to(
         .await;
     }
 
-    let req: AnthropicRequest = serde_json::from_value(raw.clone()).map_err(|e| {
-        AppError(
-            anyhow!("parse Anthropic request: {e}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
-    let req = &req;
-    let messages = build_anthropic_messages(req);
-
-    let mut oai = OAIChatRequest {
-        model: wire_model,
-        messages,
-        stream: req.stream,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        max_tokens: req.max_tokens,
-        // No repeat_penalty concept to read an override from: post_chat
-        // resolves DEFAULT_REPEAT_PENALTY itself (see
-        // apply_default_repeat_penalty_typed). Nor a `think` override.
-        ..Default::default()
-    };
-
-    if req.stream {
-        stream_anthropic(
-            state.0.client.clone(),
-            target,
-            oai,
-            req.model.clone(),
-            activity,
-        )
-        .await
-    } else {
-        // Goes through post_chat like every other typed request (see its
-        // own doc comment) rather than posting directly, so this branch
-        // also gets repeat_penalty defaulted instead of needing its own
-        // copy of that logic.
-        let resp = post_chat(&state.0.client, &target, &mut oai).await?;
-        let body: serde_json::Value = serde_json::from_slice(&collect_body(resp).await)
-            .context("parse llama-server response")?;
-        let content = body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        Ok(Json(serde_json::json!({
-            "id": format!("msg_{}", gen_id()),
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "text", "text": content }],
-            "model": req.model,
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-            "usage": { "input_tokens": 0, "output_tokens": 0 }
-        }))
-        .into_response())
+    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
+    let bad_request = |e| AppError(e, StatusCode::BAD_REQUEST);
+    let streaming = messages::streaming(raw).map_err(bad_request)?;
+    let (mut chat_req, tool_names) =
+        messages::from_messages_request(raw, &wire_model).map_err(bad_request)?;
+    if repeat_penalty_applies(&target) {
+        apply_default_repeat_penalty(&mut chat_req);
     }
+    let upstream = send_chat_completion(&state.0.client, &target, &chat_req, &wire_model).await?;
+    let body = chat_body(&target, upstream).await?;
+
+    let converter = messages::StreamConverter::new(&client_model, tool_names);
+    Ok(convert_upstream(body, activity, converter, streaming).await)
 }
 
 /// Headers a `/v1/messages` caller sets for the provider: opt-in
@@ -8136,8 +7954,8 @@ const ANTHROPIC_PASSTHROUGH_HEADERS: [&str; 2] = ["anthropic-beta", "anthropic-v
 
 /// `/v1/messages` to a provider that speaks it: relayed as sent, with
 /// only `model` rewritten out and back. Claude Code's cache breakpoints,
-/// thinking, betas and tools, which the typed [`AnthropicRequest`]
-/// translation drops for llama-server, reach a provider intact.
+/// thinking and betas, which the [`messages`] translation has no
+/// chat-completion form for, reach a provider intact.
 async fn relay_anthropic_messages(
     client: &Client,
     target: &Target,
@@ -13018,55 +12836,6 @@ mod tests {
         }
     }
 
-    /// Regression test for the Claude Code bug described on
-    /// `build_anthropic_messages`'s own doc comment: a `system`-role
-    /// message anywhere in `messages` (not just the top-level `system`
-    /// field) must be folded into one message at index 0, never left in
-    /// place, or llama.cpp's chat templates raise "System message must be
-    /// at the beginning" on the second one.
-    #[test]
-    fn build_anthropic_messages_merges_system_role_messages_anywhere_in_the_conversation() {
-        let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
-            "model": "docker.io/ai/qwen3.5:0.8b",
-            "system": [{"type": "text", "text": "leading system prompt"}],
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
-                {"role": "system", "content": "a mid-conversation reminder"},
-                {"role": "user", "content": "bye"}
-            ]
-        }))
-        .unwrap();
-
-        let messages = build_anthropic_messages(&req);
-
-        assert_eq!(
-            messages,
-            vec![
-                OAIMessage::text(
-                    "system",
-                    "leading system prompt\n\na mid-conversation reminder"
-                ),
-                OAIMessage::text("user", "hi"),
-                OAIMessage::text("assistant", "hello"),
-                OAIMessage::text("user", "bye"),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_anthropic_messages_with_no_system_content_has_no_leading_system_message() {
-        let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
-            "model": "docker.io/ai/qwen3.5:0.8b",
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .unwrap();
-
-        let messages = build_anthropic_messages(&req);
-
-        assert_eq!(messages, vec![OAIMessage::text("user", "hi")]);
-    }
-
     /// Regression test for the Codex tool-type bug described on
     /// `filter_non_function_tools`'s own doc comment.
     #[test]
@@ -13673,51 +13442,6 @@ mod tests {
                 "data: tail".to_string(),
             ]
         );
-    }
-
-    /// Ported from ollama's middleware/anthropic_test.go
-    /// (TestAnthropicMessagesMiddleware's plain-string `system` case):
-    /// Anthropic's `system` field is accepted as either a bare string or
-    /// an array of content blocks, and both forms end up as the single
-    /// leading system message.
-    #[test]
-    fn build_anthropic_messages_accepts_a_plain_string_system_field() {
-        let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
-            "model": "docker.io/ai/qwen3.5:0.8b",
-            "system": "you are a helpful assistant",
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .unwrap();
-
-        let messages = build_anthropic_messages(&req);
-
-        assert_eq!(
-            messages,
-            vec![
-                OAIMessage::text("system", "you are a helpful assistant"),
-                OAIMessage::text("user", "hi"),
-            ]
-        );
-    }
-
-    /// Ported from ollama's middleware/anthropic_test.go content-block
-    /// conversion cases: block-array content joins its text blocks in
-    /// order and ignores non-text block types entirely.
-    #[test]
-    fn anthropic_content_as_text_joins_text_blocks_and_ignores_other_types() {
-        let plain: AnthropicContent = serde_json::from_value(serde_json::json!("plain")).unwrap();
-        assert_eq!(plain.as_text(), "plain");
-
-        let blocks: AnthropicContent = serde_json::from_value(serde_json::json!([
-            {"type": "text", "text": "a"},
-            {"type": "image", "source": {"type": "base64", "data": "zzzz"}},
-            {"type": "text", "text": "b"}
-        ]))
-        .unwrap();
-        assert_eq!(blocks.as_text(), "ab");
-
-        let empty: AnthropicContent = serde_json::from_value(serde_json::json!([])).unwrap();
-        assert_eq!(empty.as_text(), "");
     }
 
     /// Ported from ollama's openai/responses_test.go polymorphic-input

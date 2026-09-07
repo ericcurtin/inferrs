@@ -85,6 +85,24 @@ bridged through chat completions: nothing is stored to resolve it against.
 audio support (an `--mmproj` projector, supplied when the model image
 carries one). Bodies up to 200 MiB are accepted.
 
+## Anthropic API notes
+
+`/v1/messages` implements the Anthropic Messages API (the dialect
+[Claude Code](https://github.com/anthropics/claude-code) requires). For
+a local model or a provider on the `openai` wire the daemon translates
+it to a chat completion and the reply back: system-role turns fold into
+one leading system message, `tool_use`/`tool_result` become
+`tool_calls`/`role: "tool"`, tools and `tool_choice` become functions
+(names over 64 characters shortened and restored), `thinking` becomes
+`reasoning_effort` and llama-server's `chat_template_kwargs`,
+`output_format` becomes `response_format`. Text,
+reasoning (as `thinking`) and tool input stream back as they arrive,
+with the real `stop_reason` and usage. Anthropic's server tools, cache
+breakpoints and `anthropic-beta` headers have no chat-completion form
+and are dropped; a `tool_choice` naming a server tool is a 400. A
+provider on the `anthropic` wire gets the request relayed as sent (see
+[wire formats](providers.md#wire-formats)).
+
 ## llmman's own API
 
 `/llmman/...` is llmman's own API, not a compatibility surface: no
