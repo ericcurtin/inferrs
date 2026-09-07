@@ -1064,14 +1064,14 @@ const TALOS_BASE_URL_KEY: &str = "TALOS_BASE_URL_OLLAMA";
 /// stdout), which is what the e2e test drives — `chat` counts a terminal
 /// as attended only when stdin and stdout both are one.
 ///
-/// Two things this leaves to Talos on purpose. The terminal has to be in
-/// its allowlist (`cli:<uid>` in `TALOS_ALLOWED_PRINCIPALS`, a policy
-/// key llmman does not touch); a fresh install refuses with the exact
-/// line to add. And a model picked with `/model` inside a session
-/// persists in Talos's event log and outranks its env file on the next
-/// start — Talos reports the model it runs, and `/model` in the session
-/// changes it. Neither is llmman's to override: both are the kernel
-/// deciding who may talk to it and with what.
+/// Two things this leaves to Talos on purpose. Authorization remains
+/// Talos's policy: an explicit `TALOS_ALLOWED_PRINCIPALS` allowlist is
+/// exhaustive, while a fresh CLI-only install supplies `cli:<uid>` for
+/// the current caller itself. And a model picked with `/model` inside a
+/// session persists in Talos's event log and outranks its env file on the
+/// next start — Talos reports the model it runs, and `/model` in the
+/// session changes it. Neither is llmman's to override: both are the
+/// kernel deciding who may talk to it and with what.
 ///
 /// `--model` is required: with none, Talos would start on whatever its
 /// env file or shipped default names, which is not what the caller asked
@@ -1253,8 +1253,18 @@ fn talos_command_in(
     prefix: Option<&std::path::Path>,
 ) -> Option<TalosCommand> {
     if let Some(path) = lookup("talos") {
+        let cwd = talos_wrapper_prefix(&path);
+        // A PATH entry may itself be relative. Recognized wrappers change
+        // into their install prefix before exec, so preserve the executable's
+        // caller-relative meaning by making it absolute first. Unknown shims
+        // keep the caller's cwd and therefore need no normalization.
+        let path = if cwd.is_some() {
+            std::path::absolute(&path).unwrap_or(path)
+        } else {
+            path
+        };
         return Some(TalosCommand {
-            cwd: talos_wrapper_prefix(&path),
+            cwd,
             argv: vec![path.to_string_lossy().into_owned()],
         });
     }
@@ -1406,6 +1416,14 @@ fn write_talos_env(path: &std::path::Path, pairs: &[(&str, &str)]) -> anyhow::Re
     {
         use std::io::Write;
         let mut file = open.open(&tmp)?;
+        // `OpenOptionsExt::mode` is still filtered by umask. Set the
+        // credential-bearing file explicitly after creation so even an
+        // unusually restrictive process umask cannot leave it unreadable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
@@ -2455,6 +2473,43 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A relative PATH entry is resolved in llmman's cwd. Once the wrapper
+    /// changes cwd to its install prefix, argv[0] must no longer be relative.
+    #[cfg(unix)]
+    #[test]
+    fn talos_command_absolutizes_a_recognized_wrapper_from_a_relative_path_entry() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from(format!(
+            ".llmman-launch-test-talos-relative-wrapper-{}-{nonce}",
+            std::process::id()
+        ));
+        let prefix = dir.join("prefix");
+        let wrapper = prefix.join("bin").join("talos");
+        let python = prefix.join(".venv").join("bin").join("python");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "").unwrap();
+        std::fs::write(&python, "").unwrap();
+        let on_path = dir.join("path").join("talos");
+        std::fs::create_dir_all(on_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(std::path::absolute(&wrapper).unwrap(), &on_path).unwrap();
+
+        assert_eq!(
+            talos_command_in(|_| Some(on_path.clone()), None),
+            Some(TalosCommand {
+                argv: vec![std::path::absolute(&on_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()],
+                cwd: Some(prefix.canonicalize().unwrap()),
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Three ways a `talos` on PATH can fail to match the installer's own
     /// shape — each has to fall back to "unknown shim", not a wrong guess.
     #[test]
@@ -2592,6 +2647,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     /// Writing keeps everything the operator put there, replaces the
     /// key's first line, drops its duplicates, appends what is missing —
     /// and lands with mode 600, as Talos's own writer does.
+    #[cfg(unix)]
     #[test]
     fn write_talos_env_replaces_in_place_and_keeps_the_rest() {
         let dir = scratch_dir("talos-env-write");
@@ -2665,6 +2721,36 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             std::fs::read_to_string(&padded).unwrap(),
             "TALOS_MODEL=qwen3.5\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Exercise the post-open chmod in a child process so the deliberately
+    /// restrictive umask cannot perturb unrelated tests in this process.
+    #[cfg(unix)]
+    #[test]
+    fn write_talos_env_forces_mode_after_open_under_restrictive_umask() {
+        const CHILD: &str = "LLMMAN_TEST_TALOS_RESTRICTIVE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("write_talos_env_forces_mode_after_open_under_restrictive_umask")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "restrictive-umask child failed: {status}");
+            return;
+        }
+
+        let dir = scratch_dir("talos-env-write-umask");
+        let path = dir.join("talos.env");
+        let old_umask = unsafe { libc::umask(0o777) };
+        write_talos_env(&path, &[("TALOS_MODEL", "m")]).unwrap();
+        unsafe {
+            libc::umask(old_umask);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

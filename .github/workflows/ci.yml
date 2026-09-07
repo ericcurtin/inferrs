@@ -977,9 +977,12 @@ jobs:
           rm -f "$tarball"
           python3 -m venv "$HOME/talos/.venv"
           "$HOME/talos/.venv/bin/python" -m pip install --quiet --require-hashes -r "$HOME/talos/requirements.lock"
-          # The installer's own first-run file: the template with an empty
-          # allowlist, mode 600 — the e2e grants its own terminal separately.
-          cp "$HOME/talos/.env.example" "$HOME/talos/talos.env"
+          # The installer's own first-run file: its template carries an
+          # illustrative Telegram principal, so the installer clears that
+          # placeholder before the first CLI run. Mirror that transformation;
+          # the e2e grants its own terminal separately.
+          sed 's/^TALOS_ALLOWED_PRINCIPALS=.*/TALOS_ALLOWED_PRINCIPALS=/' \
+            "$HOME/talos/.env.example" > "$HOME/talos/talos.env"
           chmod 600 "$HOME/talos/talos.env"
           (cd "$HOME/talos" && .venv/bin/python -c "import talos; print('talos', talos.__version__)")
 
