@@ -317,6 +317,61 @@ fn is_diffusion_sidecar(name: &str) -> bool {
         .any(|k| name.contains(k))
 }
 
+/// Everything a diffusion transformer needs next to it.
+pub struct DiffusionPlan {
+    /// `(role, file)` from the same repo: `vae`, `audio_vae`, `text_proj`.
+    pub sidecars: Vec<(&'static str, HfFile)>,
+    /// The `image` / `video` / `audio` capabilities the sidecars enable.
+    pub outputs: Vec<&'static str>,
+    /// `owner/repo:quant` of the text encoder the family was trained with.
+    pub text_encoder: Option<&'static str>,
+}
+
+/// See llama.cpp's `common_download_get_hf_plan` for the same resolution.
+pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
+    let pick = |k| select_diffusion_sidecar(files, model_path, k);
+    let candidates = [
+        (
+            "vae",
+            pick("video_vae")
+                .or_else(|| pick("_vae.").filter(|f| !f.path.to_lowercase().contains("audio_vae"))),
+        ),
+        ("audio_vae", pick("audio_vae")),
+        ("text_proj", pick("embeddings_connectors")),
+    ];
+    let mut plan = DiffusionPlan {
+        sidecars: Vec::new(),
+        outputs: Vec::new(),
+        text_encoder: diffusion_default_text_encoder(model_path),
+    };
+    for (role, file) in candidates {
+        let Some(file) = file else { continue };
+        match role {
+            "vae" => plan.outputs.extend(["image", "video"]),
+            "audio_vae" => plan.outputs.push("audio"),
+            _ => {}
+        }
+        plan.sidecars.push((role, file));
+    }
+    plan
+}
+
+/// Media type and annotations of a sidecar layer.
+pub fn sidecar_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::Descriptor {
+    d.media_type = safetensors_media_type(&file.path).to_string();
+    let name = file
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&file.path)
+        .to_string();
+    d.annotations = Some(BTreeMap::from([
+        (oci::ANNOTATION_FILEPATH.to_string(), name),
+        (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
+    ]));
+    d
+}
+
 /// The sidecar whose file name contains `keyword` and shares the longest
 /// prefix with the chosen transformer's file name — so the `distilled`
 /// VAE goes with the `distilled` transformer.
