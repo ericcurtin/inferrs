@@ -1,0 +1,23 @@
+services:
+  llmman:
+    build:
+      context: .
+      args:
+        LLMMAN_VERSION: ${LLMMAN_VERSION:-0.1.336}
+    cpus: ${LLMMAN_CPUS:-4}
+    restart: unless-stopped
+    volumes:
+      - llmman-data:/var/lib/llmman
+
+  gateway:
+    image: caddy:2-alpine
+    depends_on:
+      - llmman
+    ports:
+      - "${LLMMAN_PORT:-8080}:80"
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  llmman-data:
