@@ -215,9 +215,9 @@ pub(super) fn effective_num_parallel(
 /// Matches Ollama's own default for `OLLAMA_MAX_QUEUE`.
 const DEFAULT_MAX_QUEUE: usize = 512;
 
-/// Maximum number of requests [`ensure_model`] admits at once before
+/// Maximum number of requests `ensure_model` admits at once before
 /// rejecting with a 503, from `LLMMAN_MAX_QUEUE` (mirrors Ollama's
-/// `OLLAMA_MAX_QUEUE`). See [`try_admit`].
+/// `OLLAMA_MAX_QUEUE`). See `try_admit`.
 pub(super) fn max_queue_from_env() -> usize {
     parse_max_queue(std::env::var("LLMMAN_MAX_QUEUE").ok().as_deref())
 }
@@ -252,11 +252,11 @@ fn parse_metrics_enabled(value: Option<&str>) -> bool {
     )
 }
 
-/// Maximum number of models [`ensure_model`] keeps loaded at once, from
+/// Maximum number of models `ensure_model` keeps loaded at once, from
 /// `LLMMAN_MAX_LOADED_MODELS` (mirrors Ollama's `OLLAMA_MAX_LOADED_MODELS`,
 /// but as one flat daemon-wide total, not per-GPU — llmman has no
 /// per-model memory estimate to size a per-GPU figure against). `0` =
-/// unbounded. See [`enforce_max_loaded_models`].
+/// unbounded. See `enforce_max_loaded_models`.
 pub(super) fn max_loaded_models_from_env() -> usize {
     parse_max_loaded_models(std::env::var("LLMMAN_MAX_LOADED_MODELS").ok().as_deref())
 }
