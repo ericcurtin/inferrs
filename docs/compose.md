@@ -2,8 +2,8 @@
 
 [`examples/compose`](../examples/compose) runs `llmman serve` behind a Caddy
 gateway. The same gateway exposes the built-in web UI and the Ollama, OpenAI,
-and Anthropic-compatible APIs. A named volume keeps pulled models and the
-downloaded `llama-server` between container replacements.
+and Anthropic-compatible APIs. A named volume keeps pulled models between
+container replacements.
 
 From the repository root:
 
@@ -32,9 +32,8 @@ in the Dockerfile together. A mismatched archive fails the image build.
 Bundling the pinned backend avoids depending on GitHub's rate-limited release
 API during startup. The defaults match versions exercised by this repository.
 
-The `llmman-data` volume is mounted at `/var/lib/llmman`. Its model store is
-`/var/lib/llmman/store`; the parent mount also preserves downloaded backend
-binaries and caches. Remove the deployment while retaining its models with
+The `llmman-data` volume is mounted at `/var/lib/llmman`, and its model store is
+`/var/lib/llmman/store`. Remove the deployment while retaining its models with
 `docker compose -f examples/compose/compose.yaml down`. Add `--volumes` only
 when the stored models should be deleted as well.
 
