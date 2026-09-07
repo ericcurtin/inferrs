@@ -32,6 +32,26 @@ pub enum ModelPath {
     /// A safetensors directory — serve with vllm, or (Apple Silicon
     /// macOS) `mlx_lm.server` — see `cmd::serve::use_mlx_for_safetensors`.
     SafeTensors(PathBuf),
+    /// A latent diffusion model (image / video / audio generation) —
+    /// served in-process by `crate::mediagen` from the transformer GGUF
+    /// plus the sidecars pulled next to it (see
+    /// `crate::hf::oci::ANNOTATION_ROLE`).
+    Diffusion(DiffusionPaths),
+}
+
+/// The files of a resolved [`ModelPath::Diffusion`] model.
+#[derive(Debug, Clone, Default)]
+pub struct DiffusionPaths {
+    /// The diffusion transformer GGUF (`--model`).
+    pub model: PathBuf,
+    /// Video VAE (`--vae`).
+    pub vae: Option<PathBuf>,
+    /// Audio VAE + vocoder (`--audio-vae`).
+    pub audio_vae: Option<PathBuf>,
+    /// Text embedding projection / connectors (`--text-proj`).
+    pub text_proj: Option<PathBuf>,
+    /// Text encoder GGUF (`--text-encoder`).
+    pub text_encoder: Option<PathBuf>,
 }
 
 impl ModelPath {
@@ -42,6 +62,7 @@ impl ModelPath {
         match self {
             ModelPath::Gguf(p, _) => p,
             ModelPath::SafeTensors(p) => p,
+            ModelPath::Diffusion(d) => &d.model,
         }
     }
 
@@ -52,7 +73,7 @@ impl ModelPath {
     pub fn mmproj(&self) -> Option<&Path> {
         match self {
             ModelPath::Gguf(_, mmproj) => mmproj.as_deref(),
-            ModelPath::SafeTensors(_) => None,
+            ModelPath::SafeTensors(_) | ModelPath::Diffusion(_) => None,
         }
     }
 
@@ -63,6 +84,7 @@ impl ModelPath {
         match self {
             ModelPath::Gguf(..) => "gguf",
             ModelPath::SafeTensors(_) => "safetensors",
+            ModelPath::Diffusion(_) => "diffusion",
         }
     }
 }
@@ -73,6 +95,7 @@ fn digest_hex(digest: &str) -> anyhow::Result<&str> {
     digest
         .split_once(':')
         .map(|(_, hex)| hex)
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| anyhow!("malformed digest: {digest}"))
 }
 
@@ -82,6 +105,15 @@ fn layer_filepath(l: &crate::storage::oci::Descriptor) -> Option<&str> {
             .or_else(|| a.get("org.opencontainers.image.title"))
             .map(|s| s.as_str())
     })
+}
+
+/// The diffusion sidecar role of a layer — see
+/// `crate::hf::oci::ANNOTATION_ROLE`.
+fn layer_role(l: &crate::storage::oci::Descriptor) -> Option<&str> {
+    l.annotations
+        .as_ref()
+        .and_then(|a| a.get(crate::hf::oci::ANNOTATION_ROLE))
+        .map(|s| s.as_str())
 }
 
 fn is_gguf_layer(l: &crate::storage::oci::Descriptor) -> bool {
@@ -135,10 +167,15 @@ fn extract_gguf_layer(
     let title = layer_filepath(layer).unwrap_or("model.gguf").to_owned();
     let layer_hex = digest_hex(&layer.digest)?;
 
-    // HF blobs are stored as raw GGUF — use directly.
-    if layer.media_type == HF_GGUF_MEDIA_TYPE {
+    // HF blobs are stored as raw GGUF — use directly. The same goes for
+    // the CNCF raw-weight layers `crate::hf::pull` writes: copying a
+    // multi-GiB GGUF into the cache would double its disk footprint for
+    // nothing.
+    if layer.media_type == HF_GGUF_MEDIA_TYPE
+        || layer.media_type == crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW
+    {
         let blob_path = store_path.join("blobs").join("sha256").join(layer_hex);
-        if blob_path.exists() {
+        if blob_path.exists() && blob_is_gguf(&blob_path) {
             eprintln!("[llmman] using blob directly: {}", blob_path.display());
             return Ok(blob_path);
         }
@@ -182,10 +219,74 @@ fn extract_gguf_layer(
     Err(anyhow!("no .gguf in tar layer {}", layer.digest))
 }
 
+/// True if the file at `path` starts with the GGUF magic.
+fn blob_is_gguf(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .map(|()| &magic == b"GGUF")
+        .unwrap_or(false)
+}
+
+/// The content-addressed blob of a raw (non-tar) layer, used as-is.
+fn raw_blob_path(
+    store_path: &Path,
+    layer: &crate::storage::oci::Descriptor,
+) -> anyhow::Result<PathBuf> {
+    let p = store_path
+        .join("blobs")
+        .join("sha256")
+        .join(digest_hex(&layer.digest)?);
+    if !p.exists() {
+        anyhow::bail!(
+            "missing blob {} for layer {:?}",
+            layer.digest,
+            layer_filepath(layer)
+        );
+    }
+    Ok(p)
+}
+
+/// A raw layer's blob under its original file name, as a symlink
+/// `<cache>/<digest>/<filename>`: the name carries the variant
+/// (`distilled` selects the sampling schedule).
+fn named_blob_path(
+    store_path: &Path,
+    cache_path: &Path,
+    layer: &crate::storage::oci::Descriptor,
+) -> anyhow::Result<PathBuf> {
+    let blob = raw_blob_path(store_path, layer)?;
+    let Some(name) = layer_filepath(layer).and_then(|p| Path::new(p).file_name()) else {
+        return Ok(blob);
+    };
+    // absolute: LLMMAN_MODELS may be relative
+    let blob = blob.canonicalize()?;
+    let dir = cache_path.join(digest_hex(&layer.digest)?);
+    std::fs::create_dir_all(&dir)?;
+    let link = dir.join(name);
+    if !link.exists() {
+        // a link left dangling by blob GC
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&blob, &link)
+            .with_context(|| format!("link {} -> {}", link.display(), blob.display()))?;
+        #[cfg(not(unix))]
+        std::fs::hard_link(&blob, &link)
+            .with_context(|| format!("link {} -> {}", link.display(), blob.display()))?;
+    }
+    Ok(link)
+}
+
 /// Ollama's `model.Capability` values reported in `/api/show`'s
 /// `capabilities` array (`ollama run` reads them to set `opts.MultiModal`).
 pub const CAPABILITY_COMPLETION: &str = "completion";
 pub const CAPABILITY_VISION: &str = "vision";
+/// Generates images (a latent diffusion model) — ollama's
+/// `CapabilityImage`. Such a model has no `"completion"`.
+pub const CAPABILITY_IMAGE: &str = "image";
+pub const CAPABILITY_VIDEO: &str = "video";
+pub const CAPABILITY_AUDIO: &str = "audio";
 
 /// The part of ollama's `Model.Capabilities()` (server/images.go) a
 /// manifest alone can answer, without extracting or opening a GGUF:
@@ -193,23 +294,47 @@ pub const CAPABILITY_VISION: &str = "vision";
 /// is present (`projectorCapabilities`) or the CNCF config's
 /// `config.capabilities.inputTypes` lists `"image"` (`configCapabilities`).
 pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) -> Vec<String> {
+    // Shape written by crate::hf::oci::build_cncf_manifest.
+    let config: Option<serde_json::Value> = store
+        .read_blob(&manifest.config.digest)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let config_types = |key: &str| -> Vec<String> {
+        config
+            .as_ref()
+            .and_then(|v| {
+                v.get("config")?
+                    .get("capabilities")?
+                    .get(key)?
+                    .as_array()
+                    .cloned()
+            })
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect()
+    };
+
+    // A diffusion model generates media instead of text: its capabilities
+    // are exactly the output types it was pulled with.
+    let outputs = config_types("outputTypes");
+    if outputs.iter().any(|t| t == CAPABILITY_IMAGE)
+        || manifest.layers.iter().any(|l| layer_role(l).is_some())
+    {
+        let mut caps: Vec<String> = outputs
+            .into_iter()
+            .filter(|t| t == CAPABILITY_IMAGE || t == CAPABILITY_VIDEO || t == CAPABILITY_AUDIO)
+            .collect();
+        if caps.is_empty() {
+            caps.push(CAPABILITY_IMAGE.to_string());
+        }
+        return caps;
+    }
+
     let mut caps = vec![CAPABILITY_COMPLETION.to_string()];
 
     let has_mmproj = gguf_layers(manifest).is_some_and(|(_, mmproj)| mmproj.is_some());
-
-    // Shape written by crate::hf::oci::build_cncf_manifest.
-    let config_says_image = store
-        .read_blob(&manifest.config.digest)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| {
-            v.get("config")?
-                .get("capabilities")?
-                .get("inputTypes")?
-                .as_array()
-                .map(|a| a.iter().any(|t| t.as_str() == Some("image")))
-        })
-        .unwrap_or(false);
+    let config_says_image = config_types("inputTypes").iter().any(|t| t == "image");
 
     if has_mmproj || config_says_image {
         caps.push(CAPABILITY_VISION.to_string());
@@ -230,7 +355,7 @@ fn gguf_layers(
     let layers: Vec<&crate::storage::oci::Descriptor> = manifest
         .layers
         .iter()
-        .filter(|l| is_gguf_layer(l))
+        .filter(|l| is_gguf_layer(l) && layer_role(l).is_none())
         .collect();
     let primary = *layers
         .iter()
@@ -256,6 +381,48 @@ pub fn resolve_model(
         .find(model_ref)
         .with_context(|| format!("model not found in store: {model_ref}"))?;
     let manifest = store.read_manifest(&desc.digest)?;
+
+    // ── diffusion → crate::mediagen ───────────────────────────────────────
+    if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
+        let (primary, _) = gguf_layers(&manifest)
+            .ok_or_else(|| anyhow!("{model_ref}: diffusion model has no transformer GGUF layer"))?;
+        // Every file keeps its name (see named_blob_path); a GGUF in a tar
+        // layer is extracted.
+        let named = |l: &crate::storage::oci::Descriptor| -> anyhow::Result<PathBuf> {
+            let raw = raw_blob_path(store_path, l);
+            if is_gguf_layer(l) && !raw.as_ref().is_ok_and(|p| blob_is_gguf(p)) {
+                extract_gguf_layer(&store, store_path, cache_path, l)
+            } else if raw.is_ok()
+                && (is_gguf_layer(l) || l.media_type == crate::hf::oci::MEDIA_TYPE_MODEL_WEIGHT_RAW)
+            {
+                named_blob_path(store_path, cache_path, l)
+            } else {
+                anyhow::bail!(
+                    "{model_ref}: unsupported layer {} ({})",
+                    l.digest,
+                    l.media_type
+                )
+            }
+        };
+        let mut paths = DiffusionPaths {
+            model: named(primary)?,
+            ..Default::default()
+        };
+        for l in &manifest.layers {
+            let Some(role) = layer_role(l) else { continue };
+            let p = named(l)?;
+            match role {
+                "vae" => paths.vae = Some(p),
+                "audio_vae" => paths.audio_vae = Some(p),
+                "text_proj" => paths.text_proj = Some(p),
+                "text_encoder" => paths.text_encoder = Some(p),
+                other => {
+                    eprintln!("[llmman] {model_ref}: ignoring layer with unknown role {other:?}")
+                }
+            }
+        }
+        return Ok(ModelPath::Diffusion(paths));
+    }
 
     // ── GGUF → llama-server ────────────────────────────────────────────────
     if let Some((primary, mmproj)) = gguf_layers(&manifest) {
@@ -490,6 +657,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(capabilities(&store, &m), vec!["completion", "vision"]);
+    }
+
+    #[test]
+    fn capabilities_of_a_diffusion_model_are_its_output_types() {
+        // A diffusion pull: the transformer GGUF plus role-annotated
+        // sidecars, config listing what it generates. No "completion".
+        let mut vae = descriptor("sha256:b", "ltx_video_vae.safetensors");
+        vae.annotations.get_or_insert_with(Default::default).insert(
+            crate::hf::oci::ANNOTATION_ROLE.to_string(),
+            "vae".to_string(),
+        );
+        let mut te = descriptor("sha256:c", "gemma-3-12b-it-Q4_K_M.gguf");
+        te.annotations.get_or_insert_with(Default::default).insert(
+            crate::hf::oci::ANNOTATION_ROLE.to_string(),
+            "text_encoder".to_string(),
+        );
+        let (store, mut m) =
+            manifest_with(vec![descriptor("sha256:a", "ltx-Q4_K_M.gguf"), vae, te]);
+        m.config = store
+            .write_blob(
+                "application/vnd.cncf.model.config.v1+json",
+                br#"{"config":{"format":"gguf","capabilities":{"inputTypes":["text"],"outputTypes":["image","video","audio"]}}}"#,
+            )
+            .unwrap();
+        assert_eq!(capabilities(&store, &m), vec!["image", "video", "audio"]);
+        // the text encoder GGUF is a sidecar, not the model
+        let (primary, mmproj) = gguf_layers(&m).unwrap();
+        assert_eq!(primary.digest, "sha256:a");
+        assert!(mmproj.is_none());
     }
 
     #[test]

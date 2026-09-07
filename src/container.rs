@@ -107,7 +107,19 @@ impl GpuBackend {
                 "--group-add".into(),
                 "video".into(),
             ],
-            GpuBackend::Vulkan => vec!["--device".into(), "/dev/dri".into()],
+            GpuBackend::Vulkan => {
+                let mut args = Vec::new();
+                if Path::new("/dev/dri").exists() {
+                    args.extend(["--device", "/dev/dri"].map(String::from));
+                }
+                // NVIDIA's Vulkan ICD comes from the container toolkit
+                if Path::new("/dev/nvidiactl").exists() {
+                    args.extend(
+                        ["--gpus", "all", "-e", "NVIDIA_DRIVER_CAPABILITIES=all"].map(String::from),
+                    );
+                }
+                args
+            }
         }
     }
 }
@@ -318,16 +330,9 @@ pub fn spawn(
         .to_str()
         .context("model directory is not valid UTF-8")?;
 
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "--rm".into(),
-        "--init".into(),
-        "-t".into(),
-        "-p".into(),
-        format!("127.0.0.1:{port}:{port}"),
-        "-v".into(),
-        format!("{model_dir_str}:/models:ro"),
-    ];
+    let mut args = run_args(backend, port);
+    args.push("-v".into());
+    args.push(format!("{model_dir_str}:/models:ro"));
     let mmproj_file = mmproj_path
         .map(|p| -> Result<&str> {
             let dir = p.parent().context("mmproj path has no parent directory")?;
@@ -341,27 +346,6 @@ pub fn spawn(
                 .context("mmproj path has no valid UTF-8 filename")
         })
         .transpose()?;
-    args.extend(backend.engine_args());
-    // Unlike a local llama-server child process, `docker run`/`podman run`
-    // does not inherit the host's environment into the container on its
-    // own — forward the same GPU device-selection vars Ollama documents
-    // (see cmd::serve::GPU_VISIBLE_DEVICE_VARS) so `GGML_VK_VISIBLE_DEVICES=1`
-    // etc. set on the host actually reaches llama-server inside the
-    // container too.
-    for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS {
-        if let Ok(val) = std::env::var(var) {
-            args.push("-e".into());
-            args.push(format!("{var}={val}"));
-        }
-    }
-    // Same as above, for llama.cpp's own env-configurable arguments —
-    // see LLAMA_CPP_ENV_PASSTHROUGH_VARS's doc comment.
-    for var in crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS {
-        if let Ok(val) = std::env::var(var) {
-            args.push("-e".into());
-            args.push(format!("{var}={val}"));
-        }
-    }
     args.push(image);
     args.extend([
         "-m".into(),
@@ -415,6 +399,35 @@ pub fn spawn(
         args.push(n.to_string());
     }
 
+    run(ociman, args)
+}
+
+/// The `run` prefix every container here starts with: attached with an
+/// init, the port published, the GPU passed through, and the GPU / llama.cpp
+/// env vars forwarded (`docker run` does not inherit the environment).
+fn run_args(backend: GpuBackend, port: u16) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--init".into(),
+        "-t".into(),
+        "-p".into(),
+        format!("127.0.0.1:{port}:{port}"),
+    ];
+    args.extend(backend.engine_args());
+    for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS
+        .iter()
+        .chain(crate::cmd::serve::LLAMA_CPP_ENV_PASSTHROUGH_VARS)
+    {
+        if let Ok(val) = std::env::var(var) {
+            args.push("-e".into());
+            args.push(format!("{var}={val}"));
+        }
+    }
+    args
+}
+
+fn run(ociman: ContainerManager, args: Vec<String>) -> Result<tokio::process::Child> {
     crate::debug_log!("spawning {} {}", ociman.binary(), args.join(" "));
     // Piped, not inherited, so cmd::serve can tail the container's
     // startup output (an OOM abort, a missing library, ...) exactly as it
@@ -427,6 +440,59 @@ pub fn spawn(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn {} {}", ociman.binary(), args.join(" ")))
+}
+
+/// Runs this binary as the media backend of a diffusion model inside the
+/// image [`spawn`] would use: it carries the ggml/llama libraries (in
+/// `/app`, next to `llama-server`), and for CUDA the runtime too. The
+/// binary, store and cache are bind-mounted read-only at their host paths.
+/// The image's glibc must be at least the host's.
+pub fn spawn_mediagen(
+    ociman: ContainerManager,
+    model_ref: &str,
+    store_path: &Path,
+    cache_path: &Path,
+    llama_cpp_version: Option<&str>,
+    port: u16,
+) -> Result<tokio::process::Child> {
+    let backend = detect_backend();
+    let image = backend.image_ref(llama_cpp_version);
+    eprintln!(
+        "[llmman] {}: detected {:?}, using image {:?} for media generation",
+        ociman.binary(),
+        backend,
+        image
+    );
+    let exe = std::env::current_exe().context("locating the llmman binary")?;
+    let utf8 = |p: &Path| -> Result<String> {
+        p.to_str()
+            .map(str::to_owned)
+            .with_context(|| format!("{} is not valid UTF-8", p.display()))
+    };
+    let (exe, store, cache) = (utf8(&exe)?, utf8(store_path)?, utf8(cache_path)?);
+    let mut args = run_args(backend, port);
+    args.extend([
+        "-v".into(),
+        format!("{exe}:/usr/local/bin/llmman:ro"),
+        "-v".into(),
+        format!("{store}:{store}:ro"),
+        "-v".into(),
+        format!("{cache}:{cache}:ro"),
+        "-e".into(),
+        format!("LLMMAN_MODELS={store}"),
+        "-e".into(),
+        "PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+        "--entrypoint".into(),
+        "/usr/local/bin/llmman".into(),
+        image,
+        "serve".into(),
+        model_ref.into(),
+        "--port".into(),
+        port.to_string(),
+        "--host".into(),
+        "0.0.0.0".into(),
+    ]);
+    run(ociman, args)
 }
 
 /// Gracefully stops a container started by [`spawn`] by sending SIGTERM to
@@ -561,10 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_backend_mounts_dri_only() {
+    fn vulkan_backend_passes_the_devices_the_host_has() {
+        let args = GpuBackend::Vulkan.engine_args();
         assert_eq!(
-            GpuBackend::Vulkan.engine_args(),
-            vec!["--device", "/dev/dri"]
+            args.contains(&"/dev/dri".to_string()),
+            Path::new("/dev/dri").exists()
+        );
+        assert_eq!(
+            args.contains(&"--gpus".to_string()),
+            Path::new("/dev/nvidiactl").exists()
         );
     }
 

@@ -57,7 +57,16 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
     .await
     .context("HF file list")?;
 
-    let manifest_desc = match api::select_gguf(&files, &tag) {
+    let diffusion = api::is_diffusion_repo(&files);
+    let selected = if diffusion {
+        api::select_diffusion_gguf(&files, &tag)
+    } else {
+        api::select_gguf(&files, &tag)
+    };
+    let manifest_desc = match selected {
+        Ok(shards) if diffusion && shards.len() != 1 => {
+            anyhow::bail!("{owner}/{repo}: split diffusion transformers are not supported");
+        }
         Ok(shards) => {
             meta.format = "gguf".to_string();
             let filepath_annotation = if shards.len() == 1 {
@@ -84,7 +93,75 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                     .await?,
                 );
             }
-            if let Some(mmproj) = api::select_mmproj(&files) {
+            if diffusion {
+                // The transformer needs its VAE(s), text projection and
+                // the text encoder it was trained with — see llama.cpp's
+                // common_download_get_hf_plan for the same resolution.
+                let model_path = &shards[0].path;
+                let sidecars = [
+                    (
+                        "vae",
+                        api::select_diffusion_sidecar(&files, model_path, "video_vae").or_else(
+                            || {
+                                api::select_diffusion_sidecar(&files, model_path, "_vae.")
+                                    .filter(|f| !f.path.to_lowercase().contains("audio_vae"))
+                            },
+                        ),
+                    ),
+                    (
+                        "audio_vae",
+                        api::select_diffusion_sidecar(&files, model_path, "audio_vae"),
+                    ),
+                    (
+                        "text_proj",
+                        api::select_diffusion_sidecar(&files, model_path, "embeddings_connectors"),
+                    ),
+                ];
+                for (role, file) in sidecars {
+                    let Some(file) = file else { continue };
+                    let mut d = download_layer(
+                        &dl_client,
+                        &head_client,
+                        &endpoint,
+                        &owner,
+                        &repo,
+                        &commit,
+                        &file,
+                        token.as_deref(),
+                        layout_dir,
+                        progress_key,
+                    )
+                    .await?;
+                    d.media_type = api::safetensors_media_type(&file.path).to_string();
+                    d.annotations = Some(BTreeMap::from([
+                        (oci::ANNOTATION_FILEPATH.to_string(), basename(&file.path)),
+                        (oci::ANNOTATION_ROLE.to_string(), role.to_string()),
+                    ]));
+                    layers.push(d);
+                    match role {
+                        "vae" => meta.diffusion_outputs.extend(["image", "video"]),
+                        "audio_vae" => meta.diffusion_outputs.push("audio"),
+                        _ => {}
+                    }
+                }
+                if let Some(te_ref) = api::diffusion_default_text_encoder(model_path) {
+                    let mut d = pull_text_encoder(
+                        &api_client,
+                        &dl_client,
+                        &head_client,
+                        &host,
+                        te_ref,
+                        token.as_deref(),
+                        layout_dir,
+                        progress_key,
+                    )
+                    .await?;
+                    d.annotations
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(oci::ANNOTATION_ROLE.to_string(), "text_encoder".to_string());
+                    layers.push(d);
+                }
+            } else if let Some(mmproj) = api::select_mmproj(&files) {
                 layers.push(
                     download_layer(
                         &dl_client,
@@ -189,6 +266,54 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// Downloads the text encoder GGUF of a diffusion model from its own
+/// repository (`owner/repo[:quant]`) into the same blob store, returning
+/// its layer descriptor. Blobs are content-addressed, so a text encoder
+/// shared by several diffusion models is stored once.
+#[allow(clippy::too_many_arguments)]
+async fn pull_text_encoder(
+    api_client: &reqwest::Client,
+    dl_client: &reqwest::Client,
+    head_client: &reqwest::Client,
+    host: &str,
+    reference: &str,
+    token: Option<&str>,
+    layout_dir: &Path,
+    progress_key: &str,
+) -> Result<Descriptor> {
+    let (_, owner, repo, tag) = api::parse_hf_ref(&format!("{host}/{reference}"))?;
+    let endpoint = super::hf_endpoint(host);
+    let info = api::fetch_model_info(api_client, &endpoint, &owner, &repo, token)
+        .await
+        .with_context(|| format!("HF model info for text encoder {reference}"))?;
+    let commit = info.commit().to_string();
+    let files = api::fetch_files(api_client, &endpoint, &owner, &repo, &commit, token)
+        .await
+        .with_context(|| format!("HF file list for text encoder {reference}"))?;
+    let shards = api::select_gguf(&files, &tag)?;
+    if shards.len() != 1 {
+        anyhow::bail!("text encoder {reference}: split GGUFs are not supported");
+    }
+    let mut d = download_layer(
+        dl_client,
+        head_client,
+        &endpoint,
+        &owner,
+        &repo,
+        &commit,
+        &shards[0],
+        token,
+        layout_dir,
+        progress_key,
+    )
+    .await?;
+    d.annotations = Some(BTreeMap::from([(
+        oci::ANNOTATION_FILEPATH.to_string(),
+        basename(&shards[0].path),
+    )]));
+    Ok(d)
+}
+
 /// Deletes its `.part` path on drop unless [`disarm`](Self::disarm) was
 /// called first — so a concurrent download cancelled mid-flight (a
 /// sibling in the same `buffer_unordered` batch failing first) still
@@ -269,6 +394,30 @@ async fn download_layer(
 
     let size = if meta.size > 0 { meta.size } else { file.size };
     progress::add_total(progress_key, size);
+
+    // The blob store is content-addressed and HF's X-Linked-Etag is the
+    // file's sha256, so a blob already present (the same text encoder
+    // shared by two diffusion models, a re-pull after a manifest change)
+    // needs no download at all.
+    if let Some(want) = &meta.digest {
+        let dest = layout_dir.join("blobs").join("sha256").join(want);
+        if std::fs::metadata(&dest)
+            .map(|m| m.is_file() && m.len() as i64 == size)
+            .unwrap_or(false)
+        {
+            progress::add_completed(progress_key, size);
+            return Ok(Descriptor {
+                media_type: oci::MEDIA_TYPE_MODEL_WEIGHT_RAW.to_string(),
+                digest: format!("sha256:{want}"),
+                size,
+                annotations: Some(BTreeMap::from([(
+                    oci::ANNOTATION_FILEPATH.to_string(),
+                    basename(&file.path),
+                )])),
+                ..Default::default()
+            });
+        }
+    }
 
     let tmp_dir = layout_dir.join("blobs").join("tmp");
     std::fs::create_dir_all(&tmp_dir)?;

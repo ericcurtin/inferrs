@@ -112,6 +112,21 @@ each is installed. Want a hosted model instead of a local one? Every command
 above takes `--provider`; see [Hosted providers](#hosted-providers). Want both
 at once, picked per request? See [Hybrid model pairs](#hybrid-model-pairs).
 
+### Generate images, video and audio
+
+A diffusion model repository works like any other: `run` pulls the transformer, its VAEs, the text
+projection and the text encoder it was trained with.
+
+```sh
+llmman run unsloth/LTX-2.3-GGUF "Draw a cat"                              # Image saved to: draw-a-cat-<timestamp>.png
+llmman run unsloth/LTX-2.3-GGUF --video --seconds 2 "waves on a beach"   # an mp4 with an audio track (needs ffmpeg)
+llmman run unsloth/LTX-2.3-GGUF --audio --seconds 3 "a cat purring"      # a 48 kHz stereo wav
+```
+
+Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|negative|seconds|media`
+adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
+`/v1/audio/speech` on `llmman serve`.
+
 ## Commands
 
 | Command | Description |

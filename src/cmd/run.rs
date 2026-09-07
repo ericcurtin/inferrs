@@ -92,6 +92,36 @@ pub struct RunArgs {
     /// terminal-width word wrap in `wrap_write` below.
     #[arg(long)]
     pub nowordwrap: bool,
+    /// Image generation models only (see `crate::imagegen`): output
+    /// width in pixels. Hidden, like ollama's own image flags.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub width: u32,
+    /// Image generation models only: output height in pixels.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub height: u32,
+    /// Image generation models only: denoising steps (0 = model default).
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub steps: u32,
+    /// Image generation models only: random seed.
+    #[arg(long, hide = true)]
+    pub seed: Option<u32>,
+    /// Image generation models only: guidance scale (>1 enables --negative).
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    pub cfg_scale: f32,
+    /// Image generation models only: negative prompt.
+    #[arg(long, hide = true, default_value = "")]
+    pub negative: String,
+    /// Media generation models only: generate a video (mp4) instead of
+    /// an image.
+    #[arg(long, hide = true, conflicts_with = "audio")]
+    pub video: bool,
+    /// Media generation models only: generate audio (wav) instead of an
+    /// image.
+    #[arg(long, hide = true)]
+    pub audio: bool,
+    /// Media generation models only: length of a --video / --audio clip.
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    pub seconds: f32,
     #[arg(
         value_name = "PROMPT",
         trailing_var_arg = true,
@@ -188,6 +218,30 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // well after the `> ` prompt had already been shown and read
             // from. The same Show also answers ollama's `opts.MultiModal`.
             let info = crate::daemon::ensure_model_pulled(&model)?;
+            // An image generation model has no chat at all: every prompt
+            // is a picture (ollama's `CapabilityImage` branch of
+            // RunHandler, before it dropped image generation).
+            if info.image() {
+                let interactive =
+                    prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
+                let opts = crate::imagegen::ImageOptions {
+                    media: if args.video {
+                        crate::imagegen::Media::Video
+                    } else if args.audio {
+                        crate::imagegen::Media::Audio
+                    } else {
+                        crate::imagegen::Media::Image
+                    },
+                    width: args.width,
+                    height: args.height,
+                    steps: args.steps,
+                    seed: args.seed,
+                    cfg_scale: args.cfg_scale,
+                    negative: args.negative.clone(),
+                    seconds: args.seconds,
+                };
+                return crate::imagegen::run(&model, &prompt, interactive, opts);
+            }
             let multimodal = info.multimodal();
             match overflow {
                 // The hosted half is validated and keyed as a bare

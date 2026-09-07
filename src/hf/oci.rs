@@ -141,7 +141,16 @@ pub struct ModelMeta {
     pub format: String,
     pub licenses: Vec<String>,
     pub vision: bool,
+    /// A latent diffusion model: generates media instead of text. The
+    /// listed output types (`"image"`, `"video"`, `"audio"`) become the
+    /// model's capabilities.
+    pub diffusion_outputs: Vec<&'static str>,
 }
+
+/// Layer annotation naming the part a sidecar plays in a diffusion
+/// model: `"vae"`, `"audio_vae"`, `"text_proj"` or `"text_encoder"`.
+/// Layers without it are the model itself (plus mmproj / license).
+pub const ANNOTATION_ROLE: &str = "org.llmman.role";
 
 /// Builds a conformant CNCF model-spec config blob and manifest
 /// referencing `layers`, writing each into `layout_dir`, and returns the
@@ -165,10 +174,17 @@ pub fn build_cncf_manifest(
         },
         config: ModelConfig {
             format: meta.format.clone(),
-            capabilities: meta.vision.then(|| ModelCapabilities {
-                input_types: vec!["text", "image"],
-                output_types: vec!["text"],
-            }),
+            capabilities: if !meta.diffusion_outputs.is_empty() {
+                Some(ModelCapabilities {
+                    input_types: vec!["text"],
+                    output_types: meta.diffusion_outputs.clone(),
+                })
+            } else {
+                meta.vision.then(|| ModelCapabilities {
+                    input_types: vec!["text", "image"],
+                    output_types: vec!["text"],
+                })
+            },
         },
     };
     let cfg_data = serde_json::to_vec(&model).context("marshal CNCF model config")?;

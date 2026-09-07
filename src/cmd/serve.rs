@@ -146,6 +146,15 @@ pub struct ServeArgs {
     /// resolves a local binary at all).
     #[arg(long, conflicts_with_all = ["ociman", "pull_oci"])]
     pub pull_bin: bool,
+
+    /// Run as the media backend for MODEL on this port, the way
+    /// `llama-server --port` is for a GGUF; see `mediagen_backend`.
+    #[arg(long, hide = true, requires = "model")]
+    pub port: Option<u16>,
+
+    /// Bind address of the media backend; `0.0.0.0` in a container.
+    #[arg(long, hide = true, requires = "port", default_value = "127.0.0.1")]
+    pub host: std::net::IpAddr,
 }
 
 /// Which local engine backs a resolved `ModelPath::SafeTensors`
@@ -3686,6 +3695,24 @@ async fn ensure_model(
                 let bin = local_llama_server_bin(state).await?;
                 let (child, tail) =
                     spawn_llama_server(&bin, path, mmproj.as_deref(), llama_opts).await?;
+                stderr_tail = Some(tail);
+                ModelProcess::Local(Engine::LlamaServer, child, None)
+            }
+            // diffusion models run in this binary (see mediagen_backend)
+            (ModelPath::Diffusion(_), Some(ociman)) => {
+                let mut child = crate::container::spawn_mediagen(
+                    ociman,
+                    model_ref,
+                    &state.0.store_path,
+                    &state.0.cache_path,
+                    state.0.llama_cpp_version.as_deref(),
+                    port,
+                )?;
+                stderr_tail = Some(tail_child_output(&mut child));
+                ModelProcess::Container(ociman, child)
+            }
+            (ModelPath::Diffusion(_), None) => {
+                let (child, tail) = spawn_mediagen_backend(model_ref, port, state).await?;
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
@@ -7397,6 +7424,84 @@ async fn handle_openai_embeddings(
     proxy_openai_passthrough(&state, &headers, body, "/v1/embeddings").await
 }
 
+// -- OpenAI media generation (/v1/images/generations, /v1/videos,
+//    /v1/audio/speech) --------------------------------------------------------
+//
+// Pass-throughs to a diffusion model's backend (crate::mediagen::server),
+// like handle_openai_embeddings.
+
+async fn handle_openai_images(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai_passthrough(&state, &headers, body, "/v1/images/generations").await
+}
+
+async fn handle_openai_videos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai_passthrough(&state, &headers, body, "/v1/videos").await
+}
+
+/// `GET /v1/videos/:id[/content]`: a completed video lives in the
+/// backend that generated it, and the job id names no model — so this
+/// asks every running local backend in turn and relays the first answer
+/// that is not a 404.
+async fn handle_openai_video_get(
+    State(state): State<AppState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Result<Response, AppError> {
+    let ports: Vec<u16> = {
+        let mgr = state.0.manager.lock().await;
+        mgr.running.values().map(|m| m.port).collect()
+    };
+    let path = uri.path();
+    // all backends at once, so one stalled backend does not delay the rest
+    let probes = ports.into_iter().map(|port| {
+        state
+            .0
+            .client
+            .get(format!("http://127.0.0.1:{port}{path}"))
+            .timeout(Duration::from_secs(30))
+            .send()
+    });
+    let found = futures::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .find(|r| r.status() != reqwest::StatusCode::NOT_FOUND);
+    if let Some(resp) = found {
+        let status = resp.status();
+        let mut builder = Response::builder().status(status);
+        for name in ["content-type", "content-disposition"] {
+            if let Some(v) = resp.headers().get(name) {
+                builder = builder.header(name, v);
+            }
+        }
+        let stream = resp
+            .bytes_stream()
+            .map(|item| item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
+        return Ok(builder
+            .body(Body::from_stream(stream))
+            .context("build video response")?);
+    }
+    let body = serde_json::json!({
+        "error": { "message": "video not found", "type": "not_found_error" }
+    });
+    Ok((StatusCode::NOT_FOUND, Json(body)).into_response())
+}
+
+async fn handle_openai_speech(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai_passthrough(&state, &headers, body, "/v1/audio/speech").await
+}
+
 // -- OpenAI Audio Transcriptions API (/v1/audio/transcriptions) -------------
 //
 // llama-server has its own native implementation (requires the model to
@@ -8128,8 +8233,12 @@ pub const GPU_VISIBLE_DEVICE_VARS: &[&str] = &[
 /// llama.cpp's own env-configurable arguments (`common/arg.cpp`'s
 /// `set_env`), forwarded the same way as [`GPU_VISIBLE_DEVICE_VARS`] —
 /// llama-server reads these itself, llmman just makes sure they reach it.
-pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] =
-    &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET", "LLAMA_ARG_THREADS"];
+pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
+    "LLAMA_ARG_FIT",
+    "LLAMA_ARG_FIT_TARGET",
+    "LLAMA_ARG_THREADS",
+    "LLAMA_ARG_N_GPU_LAYERS",
+];
 
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
@@ -8389,7 +8498,105 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
+    if let (Some(port), Some(model)) = (args.port, &args.model) {
+        return tokio::runtime::Runtime::new()?.block_on(mediagen_backend(model, port, args));
+    }
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
+}
+
+/// The ggml/llama libraries of the `llama-server` we would run: next to
+/// it in a release archive, in `../lib` for an installed build.
+fn llama_lib_dir(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
+    let bin = resolve_llama_server(pinned_version)?;
+    let dir = bin
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", bin.display()))?;
+    [dir.to_path_buf(), dir.join("../lib"), dir.join("../lib64")]
+        .into_iter()
+        .find(|d| crate::mediagen::ffi::has_libs(d))
+        .ok_or_else(|| {
+            anyhow!(
+                "no ggml/llama shared libraries next to {}; media generation needs a llama.cpp release or installed build",
+                bin.display()
+            )
+        })
+}
+
+/// `llmman serve MODEL --port PORT`: the media backend the daemon spawns
+/// for a diffusion model; same endpoints and `/health` as llama-server.
+async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyhow::Result<()> {
+    let store_path = default_store()?;
+    let cache_path = crate::default_cache()?;
+    let ModelPath::Diffusion(paths) = resolve_model(&store_path, &cache_path, model_ref)? else {
+        anyhow::bail!("{model_ref} is not a diffusion model");
+    };
+    let text_encoder = paths
+        .text_encoder
+        .clone()
+        .ok_or_else(|| anyhow!("{model_ref}: no text encoder in the model pack"))?;
+    let pinned = args.llama_cpp_version.clone();
+    let lib_dir = tokio::task::spawn_blocking(move || llama_lib_dir(pinned.as_deref())).await??;
+    // the graph builders hold `&'static Api`
+    let api: &'static crate::mediagen::ffi::Api =
+        Box::leak(Box::new(crate::mediagen::ffi::Api::load(&lib_dir)?));
+    let params = crate::mediagen::ContextParams {
+        model: paths.model.clone(),
+        vae: paths.vae.clone(),
+        audio_vae: paths.audio_vae.clone(),
+        text_proj: paths.text_proj.clone(),
+        text_model: text_encoder,
+        use_gpu: true,
+        // llama.cpp's own env var for -ngl
+        text_gpu_layers: std::env::var("LLAMA_ARG_N_GPU_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(999),
+        n_threads: std::env::var("LLAMA_ARG_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or_else(|| threads_from_env_or_host().map(|n| n as i32))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32)),
+        flash_attn: flash_attention_from_env().as_deref() != Some("off"),
+    };
+    let ctx =
+        tokio::task::spawn_blocking(move || crate::mediagen::Context::init(api, &params)).await??;
+    let router = crate::mediagen::server::router(
+        ctx,
+        model_ref.to_string(),
+        paths.model.to_string_lossy().into_owned(),
+    );
+    crate::mediagen::server::serve(router, (args.host, port).into()).await
+}
+
+/// Spawns this binary as a [`mediagen_backend`].
+async fn spawn_mediagen_backend(
+    model_ref: &str,
+    port: u16,
+    state: &AppState,
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+    let exe = std::env::current_exe().context("locating the llmman binary")?;
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.args(["serve", model_ref, "--port", &port.to_string()]);
+    if let Some(v) = &state.0.llama_cpp_version {
+        cmd.args(["--llama-cpp-version", v]);
+    }
+    for var in GPU_VISIBLE_DEVICE_VARS
+        .iter()
+        .chain(LLAMA_CPP_ENV_PASSTHROUGH_VARS)
+    {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    crate::debug_log!("spawning {}: {:?}", exe.display(), cmd);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn media generation backend from {}", exe.display()))?;
+    let tail = tail_child_output(&mut child);
+    Ok((child, tail))
 }
 
 /// The daemon's routes and the layers over them, split out of
@@ -8430,6 +8637,12 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             "/v1/responses/input_tokens",
             post(handle_openai_responses_input_tokens),
         )
+        // OpenAI media generation (crate::mediagen::server)
+        .route("/v1/images/generations", post(handle_openai_images))
+        .route("/v1/videos", post(handle_openai_videos))
+        .route("/v1/videos/:id", get(handle_openai_video_get))
+        .route("/v1/videos/:id/content", get(handle_openai_video_get))
+        .route("/v1/audio/speech", post(handle_openai_speech))
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages));
 
