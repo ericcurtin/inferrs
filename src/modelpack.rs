@@ -368,6 +368,58 @@ fn gguf_layers(
     Some((primary, mmproj))
 }
 
+/// Which [`ModelPath`] variant a manifest resolves to — see [`stored_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFormat {
+    Gguf,
+    SafeTensors,
+    Diffusion,
+}
+
+/// [`resolve_model`]'s classification: diffusion > GGUF > safetensors,
+/// `None` for "no servable model layer".
+fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
+    if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
+        Some(ModelFormat::Diffusion)
+    } else if gguf_layers(manifest).is_some() {
+        Some(ModelFormat::Gguf)
+    } else if manifest.layers.iter().any(is_safetensors_layer) {
+        Some(ModelFormat::SafeTensors)
+    } else {
+        None
+    }
+}
+
+/// The "nothing servable" error, naming the file extensions that were there.
+fn no_servable_layer(model_ref: &str, manifest: &crate::storage::oci::Manifest) -> anyhow::Error {
+    let exts: std::collections::HashSet<String> = manifest
+        .layers
+        .iter()
+        .filter_map(|l| layer_filepath(l))
+        .filter_map(|p| Path::new(p).extension()?.to_str().map(|e| e.to_lowercase()))
+        .collect();
+    if exts.is_empty() {
+        anyhow!("no servable model layer found in {model_ref}")
+    } else {
+        anyhow!(
+            "no servable model layer in {model_ref} — found {exts:?} files; \
+             llmman serve supports GGUF (llama-server) and safetensors (vllm/mlx)"
+        )
+    }
+}
+
+/// What [`resolve_model`] would resolve `model_ref` to, read off its
+/// manifest without extracting anything (for `--pull-oci`, which only
+/// needs to know which engine's image to pull).
+pub fn stored_format(store_path: &Path, model_ref: &str) -> anyhow::Result<ModelFormat> {
+    let store = OciStore::open(store_path)?;
+    let desc = store
+        .find(model_ref)
+        .with_context(|| format!("model not found in store: {model_ref}"))?;
+    let manifest = store.read_manifest(&desc.digest)?;
+    manifest_format(&manifest).ok_or_else(|| no_servable_layer(model_ref, &manifest))
+}
+
 /// Resolve `model_ref` (already present in the `OciStore` at `store_path`)
 /// to either a `.gguf` file or an extracted safetensors directory, caching
 /// any extraction under `cache_path`.
@@ -382,8 +434,12 @@ pub fn resolve_model(
         .with_context(|| format!("model not found in store: {model_ref}"))?;
     let manifest = store.read_manifest(&desc.digest)?;
 
+    let Some(format) = manifest_format(&manifest) else {
+        return Err(no_servable_layer(model_ref, &manifest));
+    };
+
     // ── diffusion → crate::mediagen ───────────────────────────────────────
-    if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
+    if format == ModelFormat::Diffusion {
         let (primary, _) = gguf_layers(&manifest)
             .ok_or_else(|| anyhow!("{model_ref}: diffusion model has no transformer GGUF layer"))?;
         // Every file keeps its name (see named_blob_path); a GGUF in a tar
@@ -438,26 +494,9 @@ pub fn resolve_model(
     }
 
     // ── safetensors → vllm / mlx_lm.server ──────────────────────────────
-    if manifest.layers.iter().any(is_safetensors_layer) {
-        let model_dir = extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
-        return Ok(ModelPath::SafeTensors(model_dir));
-    }
-
-    // Nothing usable found — report what was present.
-    let exts: std::collections::HashSet<String> = manifest
-        .layers
-        .iter()
-        .filter_map(|l| layer_filepath(l))
-        .filter_map(|p| Path::new(p).extension()?.to_str().map(|e| e.to_lowercase()))
-        .collect();
-    if exts.is_empty() {
-        anyhow::bail!("no servable model layer found in {model_ref}");
-    } else {
-        anyhow::bail!(
-            "no servable model layer in {model_ref} — found {exts:?} files; \
-             llmman serve supports GGUF (llama-server) and safetensors (vllm/mlx)"
-        );
-    }
+    debug_assert_eq!(format, ModelFormat::SafeTensors);
+    let model_dir = extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
+    Ok(ModelPath::SafeTensors(model_dir))
 }
 
 /// Extract CNCF-format safetensors layers to a cache directory and return the
@@ -698,6 +737,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(capabilities(&store, &m), vec!["completion"]);
+    }
+
+    #[test]
+    fn manifest_format_follows_resolve_models_precedence() {
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model.Q4_K_M.gguf"),
+            descriptor("sha256:b", "extra.safetensors"),
+        ]);
+        assert_eq!(manifest_format(&m), Some(ModelFormat::Gguf));
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "config.json"),
+            descriptor("sha256:b", "model-00001-of-00002.safetensors"),
+        ]);
+        assert_eq!(manifest_format(&m), Some(ModelFormat::SafeTensors));
+        let mut vae = descriptor("sha256:b", "vae.safetensors");
+        vae.annotations.get_or_insert_with(Default::default).insert(
+            crate::hf::oci::ANNOTATION_ROLE.to_string(),
+            "vae".to_string(),
+        );
+        let (_, m) = manifest_with(vec![descriptor("sha256:a", "ltx.gguf"), vae]);
+        assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
+        let (_, m) = manifest_with(vec![descriptor("sha256:a", "README.md")]);
+        assert_eq!(manifest_format(&m), None);
     }
 
     #[test]

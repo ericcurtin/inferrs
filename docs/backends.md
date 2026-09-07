@@ -8,6 +8,7 @@ already exists for the model format it finds, and runs it unmodified.
 | GGUF | [`llama-server`](https://github.com/ggml-org/llama.cpp) | Your `PATH` if it is there; otherwise a prebuilt upstream release matching your OS/arch/GPU, downloaded and cached on first use |
 | GGUF | `llama-server` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for your GPU |
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` |
+| safetensors | `vllm` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
 
 ## llama.cpp
@@ -42,6 +43,26 @@ Safetensors models are served by a separately installed `vllm`. Plain
 [vllm-metal](https://github.com/vllm-project/vllm-metal) is installed.
 `LLMMAN_CONTEXT_LENGTH` is forwarded as `--max-model-len`;
 `LLMMAN_LOAD_TIMEOUT` (default 10 minutes) bounds a stalled load.
+
+### In a container
+
+On Linux, `--ociman docker` (or `podman`) runs `vllm serve` from a vLLM
+image for a safetensors model, picked by the same GPU probe plus the
+host architecture:
+
+| Host GPU | x86_64 | aarch64 |
+|----------|--------|---------|
+| NVIDIA (CUDA 13) | `vllm/vllm-openai:latest-x86_64` | `vllm/vllm-openai:latest-aarch64` |
+| NVIDIA (CUDA 12) | `vllm/vllm-openai:latest-x86_64-cu129` | `vllm/vllm-openai:latest-aarch64-cu129` |
+| AMD (ROCm) | `rocm/vllm:latest` | not published upstream (`LLMMAN_LLM_LIBRARY=cpu` for the CPU image) |
+| Vulkan-only or none | `vllm/vllm-openai-cpu:latest-x86_64` | `vllm/vllm-openai-cpu:latest-arm64` |
+
+`--vllm-version <tag>` pins the release (the arch suffix is added for the
+`vllm/` images; for `rocm/vllm` it is the whole tag).
+`llmman serve --ociman docker --pull-oci <model>` pulls the image an
+already-pulled model needs (without a model, the llama.cpp image).
+`CUDA_VISIBLE_DEVICES` and friends plus every `VLLM_*` variable are
+forwarded into the container.
 
 ### `vllm serve` from llmman's store
 
