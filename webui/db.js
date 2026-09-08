@@ -1,7 +1,10 @@
 // Conversations in this browser's IndexedDB, one record each; the daemon
 // keeps none. A conversation:
 //   { id, title, model, createdAt, updatedAt, systemPrompt, temperature,
-//     maxTokens, messages: [{ role, content, reasoning?, model?, at }] }
+//     maxTokens, media?, messages: [{ role, content, reasoning?, model?, at,
+//     generate?, prompt?, request?, media?: { kind, blob, ... } }] }
+// The conversation's `media` is its generation options; a message's is the
+// generated picture, clip or sound, a Blob IndexedDB stores as is.
 
 const DB_NAME = "llmman";
 const DB_VERSION = 1;

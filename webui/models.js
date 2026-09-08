@@ -50,7 +50,7 @@ export function displayName(ref) {
 export function isAvailable(ref) {
   const remote = api.splitRemoteRef(ref);
   if (remote) return state.providers.some((p) => p.id === remote.provider);
-  return state.local.some((m) => m.id === ref && chattable(m));
+  return state.local.some((m) => m.id === ref && usable(m));
 }
 
 export function isLoaded(ref) {
@@ -84,15 +84,16 @@ export async function refresh({ quiet = false } = {}) {
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       state.loadedAt = Date.now();
-      // First run with nothing chosen: pick a loaded chat model, else the
-      // first chat model, so the composer is usable immediately.
+      // Nothing chosen yet: a loaded chat model, else the first chat model,
+      // else a media model, so the composer is usable immediately.
       if (!state.selected || !knownRef(state.selected)) {
         const chat = state.local.filter(chattable);
-        const pick = chat.find((m) => m.loaded) || chat[0];
+        const pick = chat.find((m) => m.loaded) || chat[0] || state.local.find(generative);
         if (pick) select(pick.id);
         else if (state.selected && !knownRef(state.selected)) select("");
       } else {
         $("#model-btn-name").textContent = displayName(state.selected);
+        emit(); // the capabilities may be new (a restored selection)
       }
     } catch (e) {
       if (!quiet) toast(`Could not list models: ${e.message}`, "error");
@@ -104,10 +105,10 @@ export async function refresh({ quiet = false } = {}) {
 }
 
 /**
- * `/api/show` per local model, for its capabilities: a store holds image
- * and video generation models too, and the chat picker should not offer
- * those. Cached by reference across refreshes; a failure leaves `null`,
- * which counts as chattable rather than hiding a model on a hiccup.
+ * `/api/show` per local model, for its capabilities: chat models and
+ * media generation models are offered differently. Cached by reference; a
+ * failure leaves `null`, which counts as chattable rather than hiding a
+ * model on a hiccup.
  */
 const capabilityCache = new Map();
 async function annotateCapabilities(local) {
@@ -131,6 +132,27 @@ export function chattable(m) {
   return !m.capabilities || m.capabilities.includes("completion");
 }
 
+/** The media a local model generates, in the composer's order; `[]` for a chat model. */
+function mediaOf(m) {
+  return ["image", "video", "audio"].filter((k) => m.capabilities?.includes(k));
+}
+
+/** Whether a local model generates media rather than text. */
+function generative(m) {
+  return !chattable(m) && mediaOf(m).length > 0;
+}
+
+/** Whether the picker offers a local model at all. */
+function usable(m) {
+  return chattable(m) || generative(m);
+}
+
+/** The media kinds `ref` generates; `[]` for a chat model, a hosted one or an unknown ref. */
+export function mediaCapabilities(ref) {
+  const m = state.local.find((m) => m.id === ref);
+  return m && generative(m) ? mediaOf(m) : [];
+}
+
 /** Capabilities that are not chat, for a label: "image", "video", ... */
 function otherCapabilities(m) {
   return (m.capabilities || []).filter((c) => c !== "completion" && c !== "vision" && c !== "tools").join(" · ");
@@ -138,7 +160,7 @@ function otherCapabilities(m) {
 
 function knownRef(ref) {
   if (api.splitRemoteRef(ref)) return true; // provider models are checked lazily
-  return state.local.some((m) => m.id === ref && chattable(m));
+  return state.local.some((m) => m.id === ref && usable(m));
 }
 
 async function ensureProviderModels() {
@@ -237,6 +259,7 @@ function renderMenu() {
   body.replaceChildren();
 
   const chatModels = state.local.filter(chattable);
+  const mediaModels = state.local.filter(generative);
   const local = chatModels.filter((m) => match(m.id));
   body.appendChild(section("i-chip", "Local"));
   if (!local.length) {
@@ -244,8 +267,8 @@ function renderMenu() {
       emptyRow(
         chatModels.length
           ? "No local model matches."
-          : state.local.length
-            ? "No local chat models — the store has only image/video models."
+          : mediaModels.length
+            ? "No local chat models — the store has only media generation models."
             : "No local models yet — pull one below, or `llmman pull <ref>`.",
       ),
     );
@@ -261,9 +284,21 @@ function renderMenu() {
       }),
     );
   }
-  const others = state.local.filter((m) => !chattable(m)).length;
-  if (others && !q) {
-    body.appendChild(emptyRow(`${others} image/video model${others === 1 ? "" : "s"} not shown — see Models.`));
+
+  const media = mediaModels.filter((m) => match(m.id) || mediaOf(m).some(match));
+  if (media.length) {
+    body.appendChild(section("i-image", "Generate"));
+    for (const m of media) {
+      body.appendChild(
+        menuItem({
+          ref: m.id,
+          name: m.id,
+          sub: [mediaOf(m).join(" · "), m.loaded ? "loaded" : ""].filter(Boolean).join(" · "),
+          dot: m.loaded ? "ok" : "",
+          eject: m.loaded,
+        }),
+      );
+    }
   }
 
   for (const p of state.providers) {
@@ -441,7 +476,7 @@ async function startPull() {
     // What appeared is what was pulled; if it was already there, match
     // the reference as the daemon canonicalizes it.
     const local =
-      state.local.find((m) => !before.has(m.id) && chattable(m)) ||
+      state.local.find((m) => !before.has(m.id) && usable(m)) ||
       state.local.find((m) => sameModel(m.id, ref));
     if (local) select(local.id);
     $("#pull-dialog").close();
@@ -520,9 +555,10 @@ async function renderModelsDialog() {
     row.appendChild(size);
     const actions = document.createElement("span");
     actions.className = "actions";
-    if (!known || chattable(known)) {
+    if (!known || usable(known)) {
+      const use = known && generative(known) ? `Use to generate ${mediaOf(known).join("/")}` : "Use in chat";
       actions.appendChild(
-        iconButton("i-check", "Use in chat", () => {
+        iconButton("i-check", use, () => {
           select(m.name);
           $("#models-dialog").close();
         }),

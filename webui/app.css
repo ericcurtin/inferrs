@@ -411,6 +411,35 @@ code, pre, kbd { font-family: var(--font-mono); }
   white-space: pre-wrap;
 }
 
+/* Generated media */
+.media {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
+  max-width: 100%;
+}
+.media img, .media video {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-code);
+}
+.media video { width: min(100%, 48rem); }
+.media audio { display: block; width: min(100%, 28rem); }
+.media-caption {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.media-progress {
+  flex: 1;
+  max-width: 14rem;
+}
+
 .thinking {
   font-family: var(--font-sans);
   margin-bottom: 0.75rem;
@@ -555,6 +584,31 @@ code, pre, kbd { font-family: var(--font-mono); }
 }
 .composer-left, .composer-right { display: flex; align-items: center; gap: 0.35rem; }
 
+/* Image / Video / Audio toggle */
+.kind-toggle {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--bg-active);
+}
+.kind-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.kind-toggle button svg { width: 0.95rem; height: 0.95rem; }
+.kind-toggle button:hover { color: var(--text); }
+.kind-toggle button[aria-pressed="true"] {
+  background: var(--bg-elevated);
+  color: var(--text-head);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
 .model-btn {
   display: inline-flex;
   align-items: center;
@@ -695,7 +749,13 @@ code, pre, kbd { font-family: var(--font-mono); }
 .menu-foot-btn:hover { background: var(--bg-hover); color: var(--text); }
 .menu-foot-btn svg { width: 1rem; height: 1rem; }
 
-.prompt-settings { width: 22rem; max-width: calc(100vw - 2rem); padding: 0.85rem; display: flex; flex-direction: column; gap: 0.75rem; }
+.prompt-settings { width: 22rem; max-width: calc(100vw - 2rem); padding: 0.85rem; }
+.settings-chat, .settings-media { display: flex; flex-direction: column; gap: 0.75rem; }
+.settings-media .field-row > input { width: 8.5rem; }
+.size-pair { display: inline-flex; align-items: center; gap: 0.35rem; }
+.size-pair input { width: 5.2rem; }
+.settings-media[data-kind="audio"] .media-visual,
+.settings-media[data-kind="image"] .media-timed { display: none; }
 
 .field { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.88rem; }
 .field > span { color: var(--text-secondary); font-weight: 500; }
@@ -888,4 +948,8 @@ code, pre, kbd { font-family: var(--font-mono); }
   .topbar-title { display: none; }
   .greeting h1 { font-size: 1.6rem; }
   .msg-user .bubble { max-width: 95%; }
+  .composer-row { flex-wrap: wrap; gap: 0.35rem; }
+  .kind-toggle button span { display: none; }
+  .kind-toggle button { padding: 0.3rem 0.55rem; }
+  .model-btn { max-width: 11rem; }
 }
