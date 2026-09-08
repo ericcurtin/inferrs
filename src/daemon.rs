@@ -1153,7 +1153,10 @@ pub fn api_error(body: &str) -> Option<String> {
 pub struct ProviderSummary {
     pub id: String,
     pub name: String,
-    pub key_env: String,
+    /// Absent for a provider `llmman.conf` defines without an
+    /// `api_key_env`: its key, if any, is in the file alone.
+    #[serde(default)]
+    pub key_env: Option<String>,
     /// Whether the key is set *where the daemon runs*. What this process
     /// itself holds is [`ProviderSummary::key_here`].
     pub key_set: bool,
@@ -1162,6 +1165,11 @@ pub struct ProviderSummary {
     /// bound, which this process's `LLMMAN_HOST` says nothing about.
     #[serde(default)]
     pub key_usable: bool,
+    /// Whether a request with no key at all is forwarded (a provider
+    /// `llmman.conf` defines — see `Provider::key_optional`). Absent from
+    /// an older daemon means no, the answer for every catalog provider.
+    #[serde(default)]
+    pub key_optional: bool,
     pub models: usize,
 }
 
@@ -1174,7 +1182,7 @@ impl ProviderSummary {
     /// Whether *this* process holds the key — the other way one reaches
     /// a provider, sent per request (see `client_api_key` in cmd::serve).
     pub fn key_here(&self) -> bool {
-        crate::providers::key_for(&self.id, &self.key_env).is_some()
+        crate::providers::key_for(&self.id, self.key_env.as_deref()).is_some()
     }
 }
 
@@ -1190,12 +1198,17 @@ pub struct ProviderDetail {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    pub key_env: String,
+    /// See [`ProviderSummary::key_env`].
+    #[serde(default)]
+    pub key_env: Option<String>,
     /// See [`ProviderSummary::key_set`].
     pub key_set: bool,
     /// See [`ProviderSummary::key_usable`].
     #[serde(default)]
     pub key_usable: bool,
+    /// See [`ProviderSummary::key_optional`].
+    #[serde(default)]
+    pub key_optional: bool,
     pub models: Vec<ProviderModel>,
 }
 
@@ -1226,7 +1239,7 @@ impl ProviderDetail {
     /// prompt, and every key, regardless. It does not name the
     /// `llmman.conf` entry, which is keyed by the provider id.
     pub fn api_key(&self) -> Option<String> {
-        crate::providers::key_for(&self.id, &self.key_env)
+        crate::providers::key_for(&self.id, self.key_env.as_deref())
     }
 
     /// Just the ids, for a caller that only needs to name one (see
@@ -1235,10 +1248,24 @@ impl ProviderDetail {
         self.models.iter().map(|m| m.id.as_str()).collect()
     }
 
+    /// Where a key for this provider would go, for an error that found
+    /// none (see `crate::providers::key_hint`).
+    pub fn key_hint(&self) -> String {
+        crate::providers::key_hint(&self.id, self.key_env.as_deref())
+    }
+
     /// Warns when this provider does not list `model` — a warning, since
     /// models.dev is a snapshot and a provider can serve a model (a new
     /// release, a fine-tune, a private deployment) before it lists one.
+    ///
+    /// Silent when it lists nothing at all: a configured provider whose
+    /// `/models` was unreachable has no list to be absent from, and "does
+    /// not list X / lists no models" would say so twice about a box that
+    /// may well serve X.
     pub fn warn_unlisted(&self, model: &str) {
+        if self.models.is_empty() {
+            return;
+        }
         if !self.models.iter().any(|m| m.id == model) {
             eprintln!(
                 "[llmman] warning: {} does not list model {model:?}\n{}",

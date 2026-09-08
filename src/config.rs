@@ -16,6 +16,10 @@
 //! [providers.openrouter]               # crate::providers
 //! api_key = "sk-or-..."
 //!
+//! [providers.gpubox]                   # a provider models.dev does not list
+//! base_url = "http://gpubox:8000/v1"
+//! wire     = "openai"                  # default; or "anthropic"
+//!
 //! [verify]                             # crate::verify
 //! default = "off"
 //!
@@ -76,11 +80,37 @@ pub struct AggregationConf {
     pub peers: Option<String>,
 }
 
+/// One `[providers.<id>]` table.
+///
+/// Two things at once, told apart by `base_url`. Without it the table
+/// attaches an `api_key` to a provider the models.dev catalog already
+/// lists. With it the table *defines* a provider of its own — an
+/// inference server on some host llmman would otherwise have no way to
+/// name: vLLM, llama-server, LM Studio, a proxy in front of OpenAI. Such
+/// an entry shadows a catalog provider with the same id, which is also
+/// how a catalog URL that is wrong for one network gets corrected.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderConf {
     #[serde(default)]
     api_key: Option<String>,
+    /// Base URL the wire's route is appended to (`/chat/completions`,
+    /// `/messages`). Plain `http://` is accepted here, unlike for a
+    /// catalog entry: this URL was typed by the user into their own
+    /// owner-only file, not fetched from the network at runtime.
+    #[serde(default)]
+    base_url: Option<String>,
+    /// What is spoken at `base_url`; `openai` unless said otherwise.
+    #[serde(default)]
+    wire: Option<crate::providers::Wire>,
+    /// Environment variable holding the key, for a defined provider that
+    /// wants one. A defined provider with neither this nor `api_key`
+    /// simply sends no credential — most local servers take none.
+    #[serde(default)]
+    api_key_env: Option<String>,
+    /// Display name for listings; the id when absent.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Hand-written so the key cannot reach a log through the derived
@@ -90,8 +120,50 @@ impl std::fmt::Debug for ProviderConf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderConf")
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("wire", &self.wire)
+            .field("api_key_env", &self.api_key_env)
+            .field("name", &self.name)
             .finish()
     }
+}
+
+impl ProviderConf {
+    /// Whether this table defines a provider rather than only keying one.
+    fn defines(&self) -> bool {
+        self.base_url.is_some()
+    }
+
+    /// The fields that only make sense on a definition, for the check in
+    /// [`validate`].
+    fn definition_only_fields(&self) -> Vec<&'static str> {
+        let mut set = Vec::new();
+        if self.wire.is_some() {
+            set.push("wire");
+        }
+        if self.api_key_env.is_some() {
+            set.push("api_key_env");
+        }
+        if self.name.is_some() {
+            set.push("name");
+        }
+        set
+    }
+}
+
+/// A provider `llmman.conf` defines, merged across every file that
+/// mentions it. What `crate::providers` turns into a `Provider`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredProvider {
+    pub id: String,
+    /// `name` from the file, else the id.
+    pub name: String,
+    /// Without its trailing slash, as `Provider::base_url` is kept.
+    pub base_url: String,
+    pub wire: crate::providers::Wire,
+    /// `api_key_env`, when set. The `api_key` itself is not here: it is
+    /// reached through [`provider_api_key`], behind the file-mode gate.
+    pub key_env: Option<String>,
 }
 
 /// The `[verify]` section. [`crate::verify`] owns what these strings
@@ -259,7 +331,117 @@ fn load() -> Result<Vec<File>, String> {
 /// Parse one `llmman.conf`. Split out from [`load`] so the format is
 /// testable without a file, a home directory, or a particular umask.
 pub(crate) fn parse(text: &str) -> Result<Conf, String> {
-    toml::from_str(text).map_err(|e| e.to_string())
+    let conf: Conf = toml::from_str(text).map_err(|e| e.to_string())?;
+    validate(&conf)?;
+    Ok(conf)
+}
+
+/// What the TOML shape alone cannot say. Run at parse time so `llmman
+/// config set providers.gpubox.base_url gpubox:8000` is refused on the
+/// spot, for the same reason a misspelled field is: a bad URL that
+/// parsed happily would surface as a connection error inside someone
+/// else's TUI, and a `wire` on a table that defines nothing would be a
+/// setting that silently never takes effect.
+fn validate(conf: &Conf) -> Result<(), String> {
+    for (id, p) in &conf.providers {
+        if let Some(url) = &p.base_url {
+            base_url_of(url).map_err(|e| format!("[providers.{id}] base_url: {e}"))?;
+        } else {
+            let only_on_definition = p.definition_only_fields();
+            if !only_on_definition.is_empty() {
+                return Err(format!(
+                    "[providers.{id}] sets {} but no base_url; those fields define a \
+                     provider, and without a base_url the table only holds a key for the \
+                     catalog provider {id:?}",
+                    only_on_definition.join(", ")
+                ));
+            }
+        }
+        if p.api_key_env
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return Err(format!("[providers.{id}] api_key_env is blank"));
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes a configured `base_url`: an absolute `http`/`https` URL,
+/// with any trailing slash gone so a route appends cleanly.
+///
+/// A route suffix someone pasted from a curl example
+/// (`.../v1/chat/completions`) is left alone rather than stripped: the
+/// URL is the user's own to get right, and `crate::providers::base_url_of`
+/// is for a catalog whose entries llmman cannot edit.
+fn base_url_of(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url:?}: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "{url:?}: scheme must be http or https, not {other}"
+            ))
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err(format!("{url:?}: no host"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!("{url:?}: a base URL has no query or fragment"));
+    }
+    Ok(url.trim_end_matches('/').to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Configured providers
+// ---------------------------------------------------------------------------
+
+/// Every provider `llmman.conf` defines (a `[providers.<id>]` with a
+/// `base_url`), sorted by id, for `crate::providers` to add to — and
+/// shadow — the catalog. Read once for the process, like the keys.
+pub fn configured_providers() -> &'static [ConfiguredProvider] {
+    static CACHE: OnceLock<Vec<ConfiguredProvider>> = OnceLock::new();
+    CACHE.get_or_init(|| configured_from(files().unwrap_or_default()))
+}
+
+/// Merged field by field, later files overriding earlier, the same way
+/// the keys merge: a user file that re-defines an id `/etc` defined
+/// replaces the fields it sets and keeps the rest. (Each file still has
+/// to carry the `base_url` — see [`validate`] — since a file is checked
+/// on its own.) Split out to be testable without a filesystem.
+fn configured_from(files: &[File]) -> Vec<ConfiguredProvider> {
+    let mut merged: HashMap<&str, ConfiguredProvider> = HashMap::new();
+    for file in files {
+        for (id, p) in file.conf.providers.iter().filter(|(_, p)| p.defines()) {
+            let base_url = p
+                .base_url
+                .as_deref()
+                .and_then(|u| base_url_of(u).ok())
+                .expect("validated at parse");
+            let entry = merged.entry(id).or_insert_with(|| ConfiguredProvider {
+                id: id.clone(),
+                name: id.clone(),
+                base_url: String::new(),
+                wire: crate::providers::Wire::OpenAi,
+                key_env: None,
+            });
+            entry.base_url = base_url;
+            if let Some(wire) = p.wire {
+                entry.wire = wire;
+            }
+            if let Some(var) = &p.api_key_env {
+                entry.key_env = Some(var.trim().to_string());
+            }
+            if let Some(name) = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                entry.name = name.to_string();
+            }
+        }
+    }
+    let mut out: Vec<ConfiguredProvider> = merged.into_values().collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +682,125 @@ mod tests {
     #[test]
     fn malformed_toml_is_an_error() {
         assert!(parse("[providers.openai").is_err());
+    }
+
+    // -- configured providers ------------------------------------------------
+
+    /// A `[providers.<id>]` with a `base_url` defines a provider; every
+    /// other field has a default. One without is only a key, as before.
+    #[test]
+    fn a_base_url_turns_a_provider_table_into_a_definition() {
+        let files = [file(
+            r#"
+            [providers.gpubox]
+            base_url = "http://gpubox:8000/v1/"
+
+            [providers.relay]
+            base_url    = "https://relay.example/v1"
+            wire        = "anthropic"
+            api_key_env = "RELAY_KEY"
+            name        = "Claude relay"
+            api_key     = "sk-relay"
+
+            [providers.openrouter]
+            api_key = "sk-or"
+            "#,
+        )];
+        let configured = configured_from(&files);
+        assert_eq!(
+            configured,
+            vec![
+                ConfiguredProvider {
+                    id: "gpubox".into(),
+                    name: "gpubox".into(),
+                    // Trailing slash gone: a route appends its own.
+                    base_url: "http://gpubox:8000/v1".into(),
+                    wire: crate::providers::Wire::OpenAi,
+                    key_env: None,
+                },
+                ConfiguredProvider {
+                    id: "relay".into(),
+                    name: "Claude relay".into(),
+                    base_url: "https://relay.example/v1".into(),
+                    wire: crate::providers::Wire::Anthropic,
+                    key_env: Some("RELAY_KEY".into()),
+                },
+            ]
+        );
+        // The key of a defined provider is reached the same way as any.
+        assert_eq!(
+            files[0]
+                .conf
+                .provider_keys()
+                .get("relay")
+                .map(String::as_str),
+            Some("sk-relay")
+        );
+        assert!(configured_from(&[]).is_empty());
+    }
+
+    /// A later file re-defining an id replaces the fields it sets and
+    /// keeps the rest, as keys merge.
+    #[test]
+    fn a_later_definition_overrides_field_by_field() {
+        let system =
+            file("[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\nname = \"Shared box\"");
+        let user = file(
+            "[providers.gpubox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"",
+        );
+        let merged = configured_from(&[system, user]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].base_url, "http://10.0.0.5:8000/v1");
+        assert_eq!(merged[0].name, "Shared box");
+        assert_eq!(merged[0].wire, crate::providers::Wire::Anthropic);
+    }
+
+    /// What `config set` has to refuse on the spot: a `base_url` that is
+    /// not an absolute http(s) URL, a definition field on a table that
+    /// defines nothing, a `wire` llmman does not speak.
+    #[test]
+    fn a_bad_provider_definition_is_a_parse_error() {
+        let bad = |body: &str| parse(&format!("[providers.gpubox]\n{body}")).expect_err(body);
+
+        assert!(bad("base_url = \"gpubox:8000\"").contains("base_url"));
+        assert!(bad("base_url = \"gpubox:8000/v1\"").contains("base_url"));
+        assert!(bad("base_url = \"ftp://gpubox/v1\"").contains("http or https"));
+        assert!(bad("base_url = \"http://\"").contains("base_url"));
+        assert!(bad("base_url = \"http://gpubox/v1?x=1\"").contains("query"));
+        assert!(bad("base_url = \"\"").contains("base_url"));
+
+        let err = bad("wire = \"anthropic\"");
+        assert!(err.contains("no base_url"), "{err}");
+        assert!(err.contains("wire"), "{err}");
+        let err = bad("api_key_env = \"X\"\nname = \"n\"");
+        assert!(err.contains("api_key_env, name"), "{err}");
+
+        assert!(bad("base_url = \"http://g/v1\"\nwire = \"ollama\"").contains("wire"));
+        assert!(bad("base_url = \"http://g/v1\"\napi_key_env = \" \"").contains("blank"));
+        assert!(bad("base_url = \"http://g/v1\"\nbase_ulr = \"x\"").contains("base_ulr"));
+
+        // And the good shapes parse: bare host, port, path, no path,
+        // IPv6, https.
+        for url in [
+            "http://gpubox:8000/v1",
+            "http://gpubox",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:8000/v1",
+            "https://relay.example/api/v1",
+        ] {
+            parse(&format!("[providers.gpubox]\nbase_url = {url:?}")).expect(url);
+        }
+    }
+
+    /// The definition fields show in `Debug`; the key still does not.
+    #[test]
+    fn debug_output_shows_a_definition_but_never_a_key() {
+        let c = conf(
+            "[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\napi_key = \"sk-secret-value\"",
+        );
+        let rendered = format!("{c:?}");
+        assert!(rendered.contains("gpubox:8000"), "{rendered}");
+        assert!(!rendered.contains("sk-secret-value"), "{rendered}");
     }
 
     // -- aggregation peers ---------------------------------------------------

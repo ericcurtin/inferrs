@@ -116,6 +116,11 @@ no price). `llmman providers`, `list --provider`, `run --provider` and
 `launch --provider` are all clients of it, so the catalog is fetched and
 cached in one process: the one that forwards the request upstream.
 
+A provider [defined in `llmman.conf`](providers.md#your-own-endpoints)
+appears alongside the catalog ones with `key_optional: true`, no
+`key_env` unless the file names one, and — on `/llmman/providers/{id}`
+— whatever model ids its own `GET /models` reports, unpriced.
+
 `/llmman/node` reports this node's memory and loaded/stored models; it
 is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
 
