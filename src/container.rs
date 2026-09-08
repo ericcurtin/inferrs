@@ -367,7 +367,7 @@ pub fn pull_image(
 
 /// Every `llama-server` knob `cmd::serve` resolves once per load and
 /// forwards identically to both a local child
-/// (`cmd::serve::spawn_llama_server`) and a containerized one ([`spawn`]).
+/// (`cmd::serve::backend::spawn_llama_server`) and a containerized one ([`spawn`]).
 /// One struct rather than seven repeated positional parameters, so
 /// adding a flag is a single edit that can't reach only one backend.
 #[derive(Debug, Clone, Copy)]

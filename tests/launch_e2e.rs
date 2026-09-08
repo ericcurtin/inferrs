@@ -26,7 +26,7 @@
 //! [`serve_mlx_safetensors_model`] is the one test in this file that
 //! isn't about a third-party integration at all: it exercises
 //! `llmman serve`'s own `mlx_lm.server` backend for safetensors models
-//! (see `cmd::serve::use_mlx_for_safetensors`) directly via `llmman run`,
+//! (see `cmd::serve::backend::use_mlx_for_safetensors`) directly via `llmman run`,
 //! against a real (tiny) safetensors model pulled from HuggingFace. Like
 //! every other test here it skips itself — rather than failing — when
 //! its own prerequisite (`mlx_lm.server` on `PATH`, and Apple Silicon
@@ -1065,7 +1065,7 @@ fn openclaw_pull_registry_flake(stderr: &str) -> bool {
 const MLX_MODEL: &str = "mlx-community/SmolLM2-135M-Instruct-8bit";
 
 /// Exercises `llmman serve`'s `mlx_lm.server` backend
-/// (`cmd::serve::use_mlx_for_safetensors`/`spawn_mlx_server`) end to end:
+/// (`cmd::serve::backend::use_mlx_for_safetensors`/`spawn_mlx_server`) end to end:
 /// a real `llmman run` against [`MLX_MODEL`], pulled fresh from
 /// HuggingFace, served locally by a real `mlx_lm.server` process — not a
 /// third-party integration launch like every other test in this file
