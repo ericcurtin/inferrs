@@ -317,7 +317,7 @@ pub(super) struct OllamaCopyRequest {
 }
 
 /// `POST /api/create` — the subset of ollama's `api.CreateRequest` this
-/// daemon honours; see [`handle_create`].
+/// daemon honours; see [`handle_create`](super::handle_create).
 #[derive(Debug, Deserialize)]
 pub(super) struct OllamaCreateRequest {
     #[serde(default)]
