@@ -261,6 +261,19 @@ mod docker {
                     )]));
                     layers.push(d);
                 }
+                // See the same step in pull.rs.
+                if api::is_diffusers_repo(&files) {
+                    let class = api::fetch_diffusers_pipeline_class(
+                        &api_client,
+                        &endpoint,
+                        &owner,
+                        &repo,
+                        &commit,
+                        token.as_deref(),
+                    )
+                    .await;
+                    meta.diffusion_outputs = api::diffusers_outputs(class.as_deref());
+                }
                 (layers, String::new())
             }
         };

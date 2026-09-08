@@ -197,7 +197,8 @@ setting may not behave identically.
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0`. Trades output quality for memory at long context lengths. |
 | `LLMMAN_LLM_LIBRARY` | Forces which GPU backend `llmman serve`/`run` picks (`cpu`, `cuda`/`cuda12`/`cuda_v12`, `cuda13`/`cuda_v13`, `rocm`, `vulkan`, or macOS-only `metal`), bypassing autodetection. Has no effect when a `llama-server` binary is already on `PATH` (its own backend is fixed), or on macOS's local-binary download (one asset per architecture, no separate choice to make). |
 | `LLMMAN_IGPU_ENABLE` | Counts integrated GPUs (Vulkan only) when probing for an accelerator. Defaults to disabled, since an integrated GPU is usually a worse choice than the discrete/CPU fallback it would otherwise be skipped in favor of. |
-| `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). |
+| `LLMMAN_LOAD_TIMEOUT` | How long to allow a model load to stall before giving up. Zero or negative means wait forever. Defaults to 10 minutes (`vllm` can take several minutes to load a large safetensors model). Also passed to vLLM-Omni as `--init-timeout` (a day when unbounded). |
+| `LLMMAN_VLLM_OMNI_GUARDRAILS` | When set (`1`/`true`/`yes`/`on`), a Diffusers-layout model served by vLLM-Omni keeps its safety guardrails on; llmman otherwise passes `--no-guardrails`. See [backends.md](backends.md#vllm-omni-diffusers-pipelines). |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root. |
 | `LLMMAN_VERIFY` | Overrides the signature-verification mode (`off`, `warn`, or `enforce`) for every reference, ignoring what `[verify]` selected. Does *not* supply trusted keys — those still come from `llmman.conf`, so `enforce` with no configured keys fails every check rather than passing them. Intended for CI, which can demand `enforce` without editing config files. See [verification.md](verification.md). |
 | `LLMMAN_SIGN_PASSWORD` | Passphrase for the `--sign-key` private key used by `push`/`transfer`, when it is an encrypted PEM. Falls back to `COSIGN_PASSWORD`. Read by the CLI process, which does the signing itself; neither key nor passphrase reaches the daemon. |
@@ -211,6 +212,7 @@ setting may not behave identically.
 |---------|-------------------------------------|-----------------------|
 | `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
 | `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
+| `vllm serve --omni` | Not forwarded: a diffusion pipeline has no context window. | — |
 | `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
 
 GPU device-selection variables `llmman serve` forwards to every

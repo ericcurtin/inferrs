@@ -68,14 +68,18 @@ pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
                 None
             }
         },
-        ModelPath::SafeTensors(_) | ModelPath::Diffusion(_) => None,
+        ModelPath::SafeTensors(_) | ModelPath::Diffusion(_) | ModelPath::Omni(_) => None,
     };
     let safetensors_config = match &resolved {
-        ModelPath::SafeTensors(dir) => read_json_file(&dir.join("config.json")),
+        ModelPath::SafeTensors(dir) | ModelPath::Omni(dir) => {
+            read_json_file(&dir.join("config.json"))
+        }
         ModelPath::Gguf(..) | ModelPath::Diffusion(_) => None,
     };
     let tokenizer_config = match &resolved {
-        ModelPath::SafeTensors(dir) => read_json_file(&dir.join("tokenizer_config.json")),
+        ModelPath::SafeTensors(dir) | ModelPath::Omni(dir) => {
+            read_json_file(&dir.join("tokenizer_config.json"))
+        }
         ModelPath::Gguf(..) | ModelPath::Diffusion(_) => None,
     };
 

@@ -78,6 +78,7 @@ Environment Variables:
       LLMMAN_LLM_LIBRARY             Set backend (cpu/cuda/cuda13/rocm/vulkan/metal) to bypass GPU autodetection
       LLMMAN_IGPU_ENABLE             Enable integrated GPUs
       LLMMAN_LOAD_TIMEOUT            How long to allow model loads to stall before giving up (default \"10m\")
+      LLMMAN_VLLM_OMNI_GUARDRAILS    Keep a Diffusers-layout model's vLLM-Omni safety guardrails on (default: off)
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
@@ -369,6 +370,10 @@ impl RunningModel {
 enum Engine {
     LlamaServer,
     Vllm,
+    /// `vllm serve --omni` (the vLLM-Omni plugin) for a [`ModelPath::Omni`]
+    /// model. Killed like [`Engine::Vllm`]; its media routes speak a
+    /// different dialect — see [`omni_images`] and [`omni_videos`].
+    VllmOmni,
     /// `mlx_lm.server` (the `mlx-lm` PyPI package) — Apple Silicon's own
     /// Metal-accelerated alternative to `vllm` for a
     /// [`ModelPath::SafeTensors`] directory, picked instead of it when
@@ -386,6 +391,7 @@ impl Engine {
         match self {
             Engine::LlamaServer => "llama-server",
             Engine::Vllm => "vllm",
+            Engine::VllmOmni => "vllm-omni",
             Engine::Mlx => "mlx",
         }
     }
@@ -434,7 +440,7 @@ impl Drop for ModelProcess {
             // indefinitely. spawn_vllm_server puts this child in its own
             // process group so the whole group can be killed here.
             #[cfg(unix)]
-            ModelProcess::Local(Engine::Vllm, _, pid) => {
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, pid) => {
                 if let Some(pid) = pid {
                     let result = unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
                     if result != 0 {
@@ -446,7 +452,7 @@ impl Drop for ModelProcess {
                 }
             }
             #[cfg(not(unix))]
-            ModelProcess::Local(Engine::Vllm, _, _) => {}
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, _) => {}
             // `mlx_lm.server` runs entirely as one process — a single
             // background generation thread plus a `ThreadingHTTPServer`,
             // no forked worker tree of its own the way vllm has above —
@@ -459,6 +465,12 @@ impl Drop for ModelProcess {
 }
 
 impl ModelProcess {
+    fn engine(&self) -> Engine {
+        match self {
+            ModelProcess::Local(engine, _, _) | ModelProcess::Container(_, engine, _) => *engine,
+        }
+    }
+
     /// True if the underlying child process hasn't exited on its own since
     /// this model was marked running. Nothing else ever tells `mgr.running`
     /// about a process exiting unexpectedly: every other removal is a
@@ -498,7 +510,7 @@ impl ModelProcess {
                 }
             }
             #[cfg(unix)]
-            ModelProcess::Local(Engine::Vllm, _, pid) => {
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, pid) => {
                 if let Some(pid) = pid {
                     unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
                 }
@@ -1933,6 +1945,16 @@ fn vllm_serve_args(
     args
 }
 
+/// `vllm <args>`, in its own process group so [`ModelProcess`]'s Drop can
+/// kill vllm's whole worker tree (not just this pid) without killing us.
+fn vllm_command(vllm: &Path, args: Vec<String>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(vllm);
+    cmd.args(args).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
 async fn spawn_vllm_server(
     model_dir: &Path,
     port: u16,
@@ -1940,21 +1962,130 @@ async fn spawn_vllm_server(
     max_model_len: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
-    let mut cmd = tokio::process::Command::new(&vllm);
-    cmd.args(vllm_serve_args(
+    let args = vllm_serve_args(
         model_dir.to_str().context("non-UTF-8 model path")?,
         "127.0.0.1",
         port,
         model_name,
         max_model_len,
-    ));
-    // Own process group so ModelProcess's Drop impl can kill vllm's whole
-    // worker tree, not just this one pid, without also killing ourselves.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.kill_on_drop(true)
+    );
+    vllm_command(&vllm, args)
         .spawn()
         .with_context(|| format!("spawn vllm from {}", vllm.display()))
+}
+
+/// Set (`1`/`true`/...) to keep Cosmos3's safety guardrails on under
+/// vLLM-Omni; see [`vllm_omni_serve_args`].
+const VLLM_OMNI_GUARDRAILS_VAR: &str = "LLMMAN_VLLM_OMNI_GUARDRAILS";
+
+/// argv after `vllm` for a [`ModelPath::Omni`] model: [`vllm_serve_args`]
+/// plus `--omni` (the vLLM-Omni plugin picks the pipeline from
+/// `model_index.json`), no `--max-model-len` (no context window).
+///
+/// `--no-guardrails` unless `LLMMAN_VLLM_OMNI_GUARDRAILS` is set: Cosmos3's
+/// guardrails need the `cosmos-guardrail` package and a runtime download of
+/// the gated `nvidia/Cosmos-1.0-Guardrail`, and vLLM-Omni refuses to start
+/// without them — a model served from llmman's store has neither.
+/// `--init-timeout` mirrors llmman's load deadline so vLLM-Omni's own
+/// (10 minutes) does not give up first.
+fn vllm_omni_serve_args(
+    model_dir: &str,
+    host: &str,
+    port: u16,
+    model_name: &str,
+    guardrails: bool,
+    init_timeout: Duration,
+) -> Vec<String> {
+    let mut args = vllm_serve_args(model_dir, host, port, model_name, None);
+    args.push("--omni".into());
+    if !guardrails {
+        args.push("--no-guardrails".into());
+    }
+    args.push("--init-timeout".into());
+    args.push(init_timeout.as_secs().max(1).to_string());
+    args
+}
+
+/// [`vllm_omni_serve_args`] from the environment; an unbounded
+/// `LLMMAN_LOAD_TIMEOUT` becomes a day.
+fn vllm_omni_serve_args_from_env(
+    model_dir: &str,
+    host: &str,
+    port: u16,
+    model_name: &str,
+) -> Vec<String> {
+    let guardrails = crate::env_flag_set(VLLM_OMNI_GUARDRAILS_VAR);
+    let init_timeout = load_timeout_from_env().unwrap_or(Duration::from_secs(24 * 3600));
+    vllm_omni_serve_args(model_dir, host, port, model_name, guardrails, init_timeout)
+}
+
+/// `vllm serve --omni` from the `vllm` on `PATH`. Stdio is piped like a
+/// llama-server's so a startup failure's reason reaches `wait_for_ready`.
+async fn spawn_vllm_omni_server(
+    model_dir: &Path,
+    port: u16,
+    model_name: &str,
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+    let vllm = which_binary("vllm")?;
+    if !vllm_has_omni_plugin(&vllm).await {
+        anyhow::bail!(
+            "{} has no vllm-omni plugin, which a Diffusers-layout model needs \
+             (`uv pip install vllm-omni` into the same environment, or serve it \
+             with --ociman docker to use the vllm/vllm-omni image)",
+            vllm.display()
+        );
+    }
+    let args = vllm_omni_serve_args_from_env(
+        model_dir.to_str().context("non-UTF-8 model path")?,
+        "127.0.0.1",
+        port,
+        model_name,
+    );
+    let mut cmd = vllm_command(&vllm, args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn vllm --omni from {}", vllm.display()))?;
+    let tail = tail_child_output(&mut child);
+    Ok((child, tail))
+}
+
+/// Longest [`vllm_has_omni_plugin`] waits before assuming yes.
+const OMNI_PLUGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Whether the Python behind the `vllm` console script can `import
+/// vllm_omni` — a clear error up front instead of vLLM's "unrecognized
+/// arguments: --omni" after importing torch. When the launcher is not a
+/// `#!/path/to/python` script, or the probe fails or stalls, the answer
+/// is yes and vLLM itself reports.
+async fn vllm_has_omni_plugin(vllm: &Path) -> bool {
+    let Some(python) = console_script_interpreter(vllm) else {
+        return true;
+    };
+    let probe = tokio::process::Command::new(&python)
+        .args(["-c", "import vllm_omni"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    match tokio::time::timeout(OMNI_PLUGIN_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+/// The interpreter of a `#!/path/to/python` script (not `#!/usr/bin/env`).
+fn console_script_interpreter(script: &Path) -> Option<PathBuf> {
+    let mut head = [0u8; 512];
+    let n = std::fs::File::open(script)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .ok()?;
+    let first = std::str::from_utf8(&head[..n]).ok()?.lines().next()?;
+    let interp = first.strip_prefix("#!")?.split_whitespace().next()?;
+    (!interp.ends_with("/env") && interp.contains("python")).then(|| PathBuf::from(interp))
 }
 
 /// Spawns `mlx_lm.server` (installed on `PATH` by `pip install mlx-lm`
@@ -3710,6 +3841,7 @@ async fn ensure_model(
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
                 let mut child = crate::container::spawn_vllm(
                     ociman,
+                    crate::container::ContainerEngine::Vllm,
                     dir,
                     state.0.vllm_version.as_deref(),
                     port,
@@ -3719,6 +3851,28 @@ async fn ensure_model(
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
                 ModelProcess::Container(ociman, Engine::Vllm, child)
+            }
+            // Diffusers-layout models go to vLLM-Omni (`vllm serve --omni`),
+            // never to plain vllm or mlx, which cannot load one.
+            (ModelPath::Omni(dir), Some(ociman)) => {
+                let mut child = crate::container::spawn_vllm(
+                    ociman,
+                    crate::container::ContainerEngine::VllmOmni,
+                    dir,
+                    state.0.vllm_version.as_deref(),
+                    port,
+                    |model_dir, host| {
+                        vllm_omni_serve_args_from_env(model_dir, host, port, model_ref)
+                    },
+                )?;
+                stderr_tail = Some(tail_child_output(&mut child));
+                ModelProcess::Container(ociman, Engine::VllmOmni, child)
+            }
+            (ModelPath::Omni(dir), None) => {
+                let (child, tail) = spawn_vllm_omni_server(dir, port, model_ref).await?;
+                stderr_tail = Some(tail);
+                let pid = child.id();
+                ModelProcess::Local(Engine::VllmOmni, child, pid)
             }
             (ModelPath::SafeTensors(_dir), None) if use_mlx_for_safetensors() => {
                 let child = spawn_mlx_server(port).await?;
@@ -7245,8 +7399,32 @@ async fn proxy_openai_passthrough(
             }
         }
     }
-    let (mut req, target, activity, response_model_override) =
+    let (req, target, activity, response_model_override) =
         resolve_openai_request(state, headers, body).await?;
+    forward_openai_request(
+        state,
+        headers,
+        req,
+        target,
+        activity,
+        response_model_override,
+        llama_path,
+    )
+    .await
+}
+
+/// [`proxy_openai_passthrough`] after the model is loaded: wire checks,
+/// then the proxy. Split out for [`handle_openai_media`].
+async fn forward_openai_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut req: serde_json::Value,
+    target: Target,
+    activity: ActivityGuard,
+    response_model_override: Option<String>,
+    llama_path: &str,
+) -> Result<Response, AppError> {
+    let embeddings = llama_path == "/v1/embeddings";
     if let Some(refusal) = unsupported_on_wire(&target, llama_path) {
         drop(activity);
         return Ok(refusal);
@@ -7342,14 +7520,15 @@ async fn handle_openai_embeddings(
 //    /v1/audio/speech) --------------------------------------------------------
 //
 // Pass-throughs to a diffusion model's backend (crate::mediagen::server),
-// like handle_openai_embeddings.
+// like handle_openai_embeddings — except for an `Engine::VllmOmni`
+// backend; see omni_images and omni_videos.
 
 async fn handle_openai_images(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai_passthrough(&state, &headers, body, "/v1/images/generations").await
+    handle_openai_media(&state, &headers, body, "/v1/images/generations").await
 }
 
 async fn handle_openai_videos(
@@ -7357,7 +7536,294 @@ async fn handle_openai_videos(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    proxy_openai_passthrough(&state, &headers, body, "/v1/videos").await
+    handle_openai_media(&state, &headers, body, "/v1/videos").await
+}
+
+/// [`proxy_openai_passthrough`], but translated for a vLLM-Omni backend.
+async fn handle_openai_media(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+    route: &str,
+) -> Result<Response, AppError> {
+    let (req, target, activity, override_) = resolve_openai_request(state, headers, body).await?;
+    if local_engine(state, &target).await == Some(Engine::VllmOmni) {
+        return if route == "/v1/videos" {
+            omni_videos(state, &target, req, activity).await
+        } else {
+            omni_images(state, &target, req, activity).await
+        };
+    }
+    forward_openai_request(state, headers, req, target, activity, override_, route).await
+}
+
+/// The engine behind a [`Target::Local`]; `None` for anything else, or a
+/// backend unloaded since `ensure_model` (the request then fails on its own).
+async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
+    let Target::Local(port) = target else {
+        return None;
+    };
+    let mgr = state.0.manager.lock().await;
+    mgr.running
+        .values()
+        .find(|m| m.port == *port)
+        .map(|m| m.process.engine())
+}
+
+// -- vLLM-Omni media dialect --------------------------------------------------
+//
+// `llmman run` and crate::mediagen speak llama-server's image API
+// (`width`/`height`/`steps`/`cfg_scale`, streamed `image_generation.*`
+// events, a synchronous `/v1/videos` job with a `content_url`). vLLM-Omni
+// speaks OpenAI's (`size`, `num_inference_steps`, `guidance_scale`, no
+// image streaming, a multipart asynchronous `/v1/videos`). Fields a
+// client did not send are not invented — the model's defaults apply.
+
+/// llama-server image fields renamed to vLLM-Omni's; `stream` removed and
+/// returned (vLLM-Omni's text-to-image does not stream). `Err` names a
+/// request that cannot be expressed: one dimension without the other
+/// (llama-server fills in a default; vLLM-Omni's `size` needs both).
+fn omni_image_request(mut req: serde_json::Value) -> Result<(serde_json::Value, bool), String> {
+    let stream = req["stream"].as_bool().unwrap_or(false);
+    let Some(obj) = req.as_object_mut() else {
+        return Ok((req, stream));
+    };
+    obj.remove("stream");
+    let dim = |v: Option<serde_json::Value>| v.and_then(|v| v.as_u64()).filter(|n| *n > 0);
+    let (width, height) = (dim(obj.remove("width")), dim(obj.remove("height")));
+    match (width, height) {
+        (Some(w), Some(h)) if !obj.contains_key("size") => {
+            obj.insert("size".into(), serde_json::json!(format!("{w}x{h}")));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("vLLM-Omni needs both width and height, or neither".into());
+        }
+        _ => {}
+    }
+    for (llama, omni) in [
+        ("steps", "num_inference_steps"),
+        ("cfg_scale", "guidance_scale"),
+    ] {
+        if let Some(v) = obj.remove(llama) {
+            if !obj.contains_key(omni) && v.as_f64().is_some_and(|n| n > 0.0) {
+                obj.insert(omni.into(), v);
+            }
+        }
+    }
+    if !obj.contains_key("response_format") {
+        obj.insert("response_format".into(), "b64_json".into());
+    }
+    Ok((req, stream))
+}
+
+/// `POST /v1/images/generations` on a vLLM-Omni backend. A streaming
+/// client gets one `image_generation.completed` event per image; a
+/// non-streaming one gets vLLM-Omni's response as is.
+async fn omni_images(
+    state: &AppState,
+    target: &Target,
+    req: serde_json::Value,
+    activity: ActivityGuard,
+) -> Result<Response, AppError> {
+    let (req, stream) = match omni_image_request(req) {
+        Ok(ok) => ok,
+        Err(m) => {
+            drop(activity);
+            return Err(AppError::status(StatusCode::BAD_REQUEST, m));
+        }
+    };
+    let resp = state
+        .0
+        .client
+        .post(target.url("/v1/images/generations"))
+        .json(&req)
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    if !stream || !resp.status().is_success() {
+        return Ok(relay(resp, activity));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("decode vllm-omni image response")?;
+    let created = body["created"]
+        .as_i64()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let mut events = String::new();
+    for image in body["data"].as_array().into_iter().flatten() {
+        let ev = serde_json::json!({
+            "type": "image_generation.completed",
+            "b64_json": image["b64_json"],
+            "revised_prompt": image["revised_prompt"],
+            "created_at": created,
+        });
+        events.push_str(&format!("data: {ev}\n\n"));
+    }
+    drop(activity);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from(events))
+        .context("build image event stream")?)
+}
+
+/// Form fields for vLLM-Omni's `/v1/videos` from a JSON body: llama-server
+/// names renamed (`steps`, `cfg_scale`, `frames`, `audio`), fractional
+/// `seconds` rounded to the whole seconds it takes, everything else by
+/// name (objects as JSON text, which is how it reads `extra_params`).
+fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(obj) = req.as_object() else {
+        return Vec::new();
+    };
+    let renamed = |name: &str| match name {
+        "steps" => Some("num_inference_steps"),
+        "cfg_scale" => Some("guidance_scale"),
+        "frames" => Some("num_frames"),
+        "audio" => Some("generate_sound"),
+        _ => None,
+    };
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    };
+    let mut fields: Vec<(String, String)> = Vec::new();
+    // Native names first, so an explicit one wins over its alias.
+    for (name, value) in obj {
+        if matches!(name.as_str(), "stream" | "response_format") || renamed(name).is_some() {
+            continue;
+        }
+        let value = if name == "seconds" {
+            match value.as_f64().or_else(|| value.as_str()?.parse().ok()) {
+                Some(s) if s > 0.0 => {
+                    serde_json::Value::String((s.round().max(1.0) as u64).to_string())
+                }
+                _ => continue,
+            }
+        } else {
+            value.clone()
+        };
+        if let Some(text) = text(&value) {
+            fields.push((name.clone(), text));
+        }
+    }
+    for (name, value) in obj {
+        let Some(native) = renamed(name) else {
+            continue;
+        };
+        if fields.iter().any(|(existing, _)| existing == native) {
+            continue;
+        }
+        if let Some(text) = text(value) {
+            fields.push((native.to_string(), text));
+        }
+    }
+    fields
+}
+
+/// A `multipart/form-data` body of text fields and its `content-type`.
+/// Both come from the caller: a name that is not a plain identifier is
+/// dropped (it would be written into a header), and the boundary is
+/// re-salted until no value contains it.
+fn multipart_form(fields: &[(String, String)]) -> (Vec<u8>, String) {
+    let fields: Vec<&(String, String)> = fields
+        .iter()
+        .filter(|(name, _)| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+        .collect();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let boundary = (0u32..)
+        .map(|salt| format!("----llmman{}{stamp:x}{salt:x}", std::process::id()))
+        .find(|b| !fields.iter().any(|(_, v)| v.contains(b.as_str())))
+        .unwrap_or_default();
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (body, format!("multipart/form-data; boundary={boundary}"))
+}
+
+/// How often [`omni_videos`] polls the job, and how long before it gives up.
+const OMNI_VIDEO_POLL: Duration = Duration::from_secs(1);
+const OMNI_VIDEO_MAX_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// `POST /v1/videos` on a vLLM-Omni backend: submit the multipart job,
+/// poll `GET /v1/videos/{id}` until `completed`/`failed`, answer with the
+/// job plus the `content_url` [`handle_openai_video_get`] serves.
+async fn omni_videos(
+    state: &AppState,
+    target: &Target,
+    req: serde_json::Value,
+    activity: ActivityGuard,
+) -> Result<Response, AppError> {
+    let (body, content_type) = multipart_form(&omni_video_fields(&req));
+    let resp = state
+        .0
+        .client
+        .post(target.url("/v1/videos"))
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("proxy request to {}", target.describe()))?;
+    if !resp.status().is_success() {
+        return Ok(relay(resp, activity));
+    }
+    let mut job: serde_json::Value = resp.json().await.context("decode vllm-omni video job")?;
+    let id = job["id"]
+        .as_str()
+        .context("vllm-omni video job has no id")?
+        .to_string();
+    let poll_url = target.url(&format!("/v1/videos/{id}"));
+    let deadline = Instant::now() + OMNI_VIDEO_MAX_WAIT;
+    while !matches!(job["status"].as_str(), Some("completed" | "failed")) {
+        if Instant::now() >= deadline {
+            drop(activity);
+            return Err(AppError::status(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("video job {id} did not finish within {OMNI_VIDEO_MAX_WAIT:?}"),
+            ));
+        }
+        sleep(OMNI_VIDEO_POLL).await;
+        let resp = state
+            .0
+            .client
+            .get(&poll_url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .with_context(|| format!("poll video job {id} on {}", target.describe()))?;
+        // A failed job comes back as its own error status and JSON body.
+        if !resp.status().is_success() {
+            return Ok(relay(resp, activity));
+        }
+        job = resp.json().await.context("decode vllm-omni video job")?;
+    }
+    drop(activity);
+    if job["status"] == "failed" {
+        let message = job["error"]["message"]
+            .as_str()
+            .unwrap_or("video generation failed")
+            .to_string();
+        let body = serde_json::json!({
+            "error": { "message": message, "type": "server_error" }
+        });
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response());
+    }
+    job["content_url"] = serde_json::json!(format!("/v1/videos/{id}/content"));
+    Ok(Json(job).into_response())
 }
 
 /// `GET /v1/videos/:id[/content]`: a completed video lives in the
@@ -8631,6 +9097,7 @@ fn pull_oci_engine(model: Option<&str>) -> anyhow::Result<crate::container::Cont
     })?;
     Ok(match format {
         crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
+        crate::modelpack::ModelFormat::Omni => crate::container::ContainerEngine::VllmOmni,
         crate::modelpack::ModelFormat::Gguf | crate::modelpack::ModelFormat::Diffusion => {
             crate::container::ContainerEngine::LlamaServer
         }
@@ -8653,7 +9120,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
         let engine = pull_oci_engine(_args.model.as_deref())?;
         let version = match engine {
-            crate::container::ContainerEngine::Vllm => _args.vllm_version.as_deref(),
+            crate::container::ContainerEngine::Vllm
+            | crate::container::ContainerEngine::VllmOmni => _args.vllm_version.as_deref(),
             crate::container::ContainerEngine::LlamaServer => _args.llama_cpp_version.as_deref(),
         };
         crate::container::pull_image(ociman, engine, version)?;
@@ -12650,6 +13118,217 @@ mod tests {
             [&args[2..i], &args[i + 2..]].concat()
         };
         assert_eq!(rest(&local), rest(&container));
+    }
+
+    // -- vLLM-Omni (Diffusers-layout models) -----------------------------------
+
+    #[test]
+    fn vllm_omni_serve_args_add_omni_and_disable_guardrails_by_default() {
+        let args = vllm_omni_serve_args(
+            "/models",
+            "0.0.0.0",
+            8000,
+            "nvidia/Cosmos3-Edge",
+            false,
+            Duration::from_secs(600),
+        );
+        // vllm-omni's own recipe: `vllm serve <model> --omni --host --port`
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[1], "/models");
+        assert!(args.contains(&"--omni".to_string()));
+        assert!(args.contains(&"--no-guardrails".to_string()));
+        let i = args.iter().position(|a| a == "--init-timeout").unwrap();
+        assert_eq!(args[i + 1], "600");
+        let i = args
+            .iter()
+            .position(|a| a == "--served-model-name")
+            .unwrap();
+        assert_eq!(args[i + 1], "nvidia/Cosmos3-Edge");
+        // a diffusion pipeline has no context window
+        assert!(!args.contains(&"--max-model-len".to_string()));
+    }
+
+    #[test]
+    fn vllm_omni_serve_args_keep_guardrails_when_asked() {
+        let args = vllm_omni_serve_args("/m", "127.0.0.1", 8000, "m", true, Duration::from_secs(1));
+        assert!(args.contains(&"--omni".to_string()));
+        assert!(!args.contains(&"--no-guardrails".to_string()));
+    }
+
+    #[test]
+    fn vllm_omni_engine_has_its_own_label() {
+        assert_eq!(Engine::VllmOmni.label(), "vllm-omni");
+    }
+
+    #[test]
+    fn console_script_interpreter_reads_a_python_shebang_only() {
+        let dir = std::env::temp_dir().join(format!("llmman-shebang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("vllm");
+        std::fs::write(
+            &script,
+            "#!/opt/venv/bin/python3\n# -*- coding: utf-8 -*-\n",
+        )
+        .unwrap();
+        assert_eq!(
+            console_script_interpreter(&script),
+            Some(PathBuf::from("/opt/venv/bin/python3"))
+        );
+        std::fs::write(&script, "#!/usr/bin/env python3\nimport sys\n").unwrap();
+        assert_eq!(console_script_interpreter(&script), None);
+        std::fs::write(&script, "#!/bin/sh\nexec vllm \"$@\"\n").unwrap();
+        assert_eq!(console_script_interpreter(&script), None);
+        std::fs::write(&script, b"\x7fELF\x02\x01\x01").unwrap();
+        assert_eq!(console_script_interpreter(&script), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn omni_image_request_translates_llama_server_fields() {
+        // what `llmman run` (crate::imagegen) sends
+        let req = serde_json::json!({
+            "model": "nvidia/Cosmos3-Edge",
+            "prompt": "a manatee",
+            "stream": true,
+            "response_format": "b64_json",
+            "width": 640,
+            "height": 480,
+            "steps": 8,
+            "seed": 42,
+            "cfg_scale": 5.0,
+            "negative_prompt": "blurry"
+        });
+        let (out, stream) = omni_image_request(req).unwrap();
+        assert!(stream);
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "model": "nvidia/Cosmos3-Edge",
+                "prompt": "a manatee",
+                "response_format": "b64_json",
+                "size": "640x480",
+                "num_inference_steps": 8,
+                "seed": 42,
+                "guidance_scale": 5.0,
+                "negative_prompt": "blurry"
+            })
+        );
+    }
+
+    #[test]
+    fn omni_image_request_leaves_a_native_request_alone_and_invents_nothing() {
+        // A vLLM-Omni-dialect client: nothing renamed, nothing added but
+        // the response format, and no size when none was asked for (the
+        // model's own default is the one that works for Cosmos3-Edge).
+        let req = serde_json::json!({
+            "model": "m", "prompt": "p", "size": "1024x1024",
+            "num_inference_steps": 50, "guidance_scale": 7.0
+        });
+        let (out, stream) = omni_image_request(req.clone()).unwrap();
+        assert!(!stream);
+        let mut expected = req;
+        expected["response_format"] = "b64_json".into();
+        assert_eq!(out, expected);
+        let (out, _) =
+            omni_image_request(serde_json::json!({"model": "m", "prompt": "p"})).unwrap();
+        assert!(out.get("size").is_none());
+        assert!(out.get("num_inference_steps").is_none());
+        // zero means "model default", as it does for llama-server
+        let (out, _) = omni_image_request(
+            serde_json::json!({"prompt": "p", "width": 0, "height": 0, "steps": 0}),
+        )
+        .unwrap();
+        assert!(out.get("size").is_none());
+        assert!(out.get("num_inference_steps").is_none());
+        // an explicit native field wins over a translated one
+        let (out, _) = omni_image_request(
+            serde_json::json!({"prompt": "p", "steps": 8, "num_inference_steps": 30}),
+        )
+        .unwrap();
+        assert_eq!(out["num_inference_steps"], 30);
+        // one dimension without the other cannot be expressed as a `size`
+        let err = omni_image_request(serde_json::json!({"prompt": "p", "width": 768})).unwrap_err();
+        assert!(err.contains("both width and height"), "{err}");
+    }
+
+    #[test]
+    fn omni_video_fields_translate_and_round_seconds() {
+        let req = serde_json::json!({
+            "model": "nvidia/Cosmos3-Edge",
+            "prompt": "waves",
+            "stream": false,
+            "seconds": 2.4,
+            "fps": 24,
+            "steps": 20,
+            "cfg_scale": 5.0,
+            "audio": false,
+            "seed": 7,
+            "extra_params": {"guardrails": false}
+        });
+        let fields: std::collections::HashMap<String, String> =
+            omni_video_fields(&req).into_iter().collect();
+        assert_eq!(fields["model"], "nvidia/Cosmos3-Edge");
+        assert_eq!(fields["prompt"], "waves");
+        assert_eq!(fields["seconds"], "2", "SecondStr is a whole number");
+        assert_eq!(fields["fps"], "24");
+        assert_eq!(fields["num_inference_steps"], "20");
+        assert_eq!(fields["guidance_scale"], "5.0");
+        assert_eq!(fields["generate_sound"], "false");
+        assert_eq!(fields["seed"], "7");
+        assert_eq!(fields["extra_params"], r#"{"guardrails":false}"#);
+        assert!(!fields.contains_key("stream"));
+        assert!(!fields.contains_key("steps"));
+        // sub-second clips round up to one second, not zero
+        let fields: std::collections::HashMap<String, String> =
+            omni_video_fields(&serde_json::json!({"prompt": "p", "seconds": 0.3}))
+                .into_iter()
+                .collect();
+        assert_eq!(fields["seconds"], "1");
+        // `frames` is llama-server's name for num_frames; a native one wins
+        let fields: std::collections::HashMap<String, String> =
+            omni_video_fields(&serde_json::json!({"prompt": "p", "frames": 33, "num_frames": 49}))
+                .into_iter()
+                .collect();
+        assert_eq!(fields["num_frames"], "49");
+    }
+
+    #[test]
+    fn multipart_form_is_well_formed_and_readable_back() {
+        let fields = vec![
+            ("model".to_string(), "m".to_string()),
+            ("prompt".to_string(), "a b\r\nc".to_string()),
+        ];
+        let (body, content_type) = multipart_form(&fields);
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap();
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(text.starts_with(&format!("--{boundary}\r\n")));
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+        // a name that is not an identifier would land in a header: dropped
+        let (filtered, _) = multipart_form(&[
+            ("ok_1".to_string(), "v".to_string()),
+            ("bad\"\r\nX: y".to_string(), "v".to_string()),
+        ]);
+        let filtered = String::from_utf8(filtered).unwrap();
+        assert!(filtered.contains("name=\"ok_1\""));
+        assert!(!filtered.contains("bad"), "{filtered}");
+        // a value containing the would-be boundary forces a different one
+        let (_, ct2) = multipart_form(&[("prompt".to_string(), format!("x{boundary}y"))]);
+        assert_ne!(ct2, content_type);
+        // and the same parser the daemon uses for uploads agrees
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", content_type.parse().unwrap());
+        let body = Bytes::from(body);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            rt.block_on(multipart_text_field(&body, &headers, "prompt")),
+            Some("a b\r\nc".to_string())
+        );
+        assert_eq!(
+            rt.block_on(multipart_text_field(&body, &headers, "model")),
+            Some("m".to_string())
+        );
     }
 
     /// `/api/embed` takes a string or an array of strings, and nothing
