@@ -28,7 +28,6 @@ use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::{Wire, PLACEHOLDER_API_KEY};
 use crate::storage::OciStore;
-use crate::webui;
 
 mod aggregation;
 mod anthropic;
@@ -36,7 +35,9 @@ mod backend;
 mod config;
 mod messages;
 mod responses;
+mod shell;
 mod types;
+mod webui;
 
 use backend::{
     find_free_port, local_llama_server_bin, resolve_llama_server, spawn_llama_server,
@@ -250,6 +251,8 @@ struct Inner {
     cache_path: PathBuf,
     // `record_prompt`'s file; None under LLMMAN_NOHISTORY (and in tests).
     prompt_log: Option<PathBuf>,
+    // Who may open the web UI's terminal — see the `shell` module.
+    shell: shell::Policy,
     client: Client,
 }
 
@@ -3851,43 +3854,10 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
 // Route handlers
 // ---------------------------------------------------------------------------
 
-fn gzipped(body: &'static [u8], content_type: &'static str) -> Response {
-    Response::builder()
-        .header("content-type", content_type)
-        .header("content-encoding", "gzip")
-        .header("cache-control", "public, max-age=3600")
-        .body(Body::from(body))
-        .unwrap()
-}
-
-async fn handle_root(headers: HeaderMap) -> impl IntoResponse {
-    let wants_html = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("text/html"))
-        .unwrap_or(false);
-    if wants_html {
-        gzipped(webui::INDEX_HTML, "text/html; charset=utf-8").into_response()
-    } else {
-        "llmman is running".into_response()
-    }
-}
-
-async fn handle_bundle_js() -> impl IntoResponse {
-    gzipped(webui::BUNDLE_JS, "application/javascript; charset=utf-8")
-}
-
-async fn handle_bundle_css() -> impl IntoResponse {
-    gzipped(webui::BUNDLE_CSS, "text/css; charset=utf-8")
-}
-
-async fn handle_loading_html() -> impl IntoResponse {
-    gzipped(webui::LOADING_HTML, "text/html; charset=utf-8")
-}
-
 async fn handle_props() -> impl IntoResponse {
-    // Return a minimal llama.cpp-compatible /props response in ROUTER mode.
-    // The web UI uses `role` to detect multi-model (router) vs single-model mode.
+    // A minimal llama.cpp-compatible /props reply in ROUTER mode, for
+    // clients that probe it to learn they are talking to a multi-model
+    // server. llmman's own web UI does not use it.
     Json(serde_json::json!({
         "role": "router",
         "total_slots": 0,
@@ -7463,17 +7433,16 @@ async fn spawn_mediagen_backend(
 /// assert against the real router instead of a copy of this layering.
 fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
     let app = Router::new()
-        // Web UI
-        .route("/", get(handle_root))
-        .route("/bundle.js", get(handle_bundle_js))
-        .route("/bundle.css", get(handle_bundle_css))
-        .route("/loading.html", get(handle_loading_html))
+        // Web UI — see the `webui` module
+        .route("/", get(webui::handle_root))
+        .route("/ui/*path", get(webui::handle_asset))
         // llama.cpp-compatible props endpoint (router mode)
         .route("/props", get(handle_props))
         // llmman's own API — see handle_llmman_providers
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
         .route("/llmman/node", get(aggregation::handle_node))
+        .route("/llmman/shell", get(shell::handle_shell))
         // Ollama API
         .merge(ollama_router())
         // OpenAI API
@@ -7769,6 +7738,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         prompt_log: crate::promptlog::enabled_from_env()
             .then(crate::promptlog::path)
             .transpose()?,
+        shell: shell::Policy::from_env(),
         client: Client::new(),
     }));
 
@@ -9846,6 +9816,11 @@ mod tests {
             store_path,
             cache_path: std::env::temp_dir(),
             prompt_log: None,
+            shell: shell::Policy {
+                disabled: None,
+                origins: default_allowed_origins(),
+                command: Vec::new(),
+            },
             client: Client::new(),
         }
     }
@@ -12976,19 +12951,293 @@ mod tests {
             .expect("request reaches the test router");
         assert_eq!(version.status(), StatusCode::OK);
 
-        // Off means off — see `build_router`. `/loading.html` because the
+        // Off means off — see `build_router`. `/ui/*path` because the
         // registry is process-wide and this asserts an absence: no other
         // test requests it, so the series exists only if this disabled
         // router wrote it, whatever status the handler returned.
         Client::new()
-            .get(format!("{url}/loading.html"))
+            .get(format!("{url}/ui/app.css"))
             .send()
             .await
             .expect("request reaches the test router");
         assert!(
-            !rendered_registry().contains("route=\"/loading.html\""),
+            !rendered_registry().contains("route=\"/ui/*path\""),
             "a router built with metrics disabled must not write to the registry"
         );
+    }
+
+    // -- web UI ---------------------------------------------------------
+
+    /// Binds `build_router(state, false)` on a free loopback port.
+    async fn serve_router(state: AppState) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state, false);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// `/` is the page only for a client that asks for HTML; everything
+    /// else gets the liveness line scripts have always seen.
+    #[tokio::test]
+    async fn the_root_is_the_web_ui_for_browsers_and_a_liveness_line_for_the_rest() {
+        let url = serve_router(test_state()).await;
+        let curl = Client::new().get(&url).send().await.unwrap();
+        assert_eq!(curl.status(), StatusCode::OK);
+        assert_eq!(curl.text().await.unwrap(), "llmman is running");
+
+        let browser = Client::new()
+            .get(&url)
+            .header("accept", "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(browser.status(), StatusCode::OK);
+        assert_eq!(
+            browser.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(browser.headers()["content-encoding"], "gzip");
+        let mut html = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(&browser.bytes().await.unwrap()[..]),
+            &mut html,
+        )
+        .unwrap();
+        // The page must reference its own assets under ui/ relatively, so
+        // a gateway prefix works (docs/compose.md).
+        assert!(html.contains("<!doctype html>"), "{html}");
+        assert!(html.contains("ui/app.js"), "{html}");
+        assert!(
+            !html.contains("\"/ui/"),
+            "asset paths must be relative: {html}"
+        );
+    }
+
+    /// Assets come gzipped with a content ETag; a matching `If-None-Match`
+    /// is a 304, and no `max-age` keeps an old UI alive past an upgrade.
+    #[tokio::test]
+    async fn web_ui_assets_are_gzipped_and_revalidate_by_etag() {
+        let url = serve_router(test_state()).await;
+        let client = Client::builder().no_gzip().build().unwrap();
+        let first = client
+            .get(format!("{url}/ui/app.css"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()["content-encoding"], "gzip");
+        assert_eq!(first.headers()["content-type"], "text/css; charset=utf-8");
+        assert_eq!(first.headers()["cache-control"], "no-cache");
+        let etag = first.headers()["etag"].to_str().unwrap().to_string();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+        let body = first.bytes().await.unwrap();
+        assert_eq!(&body[..2], &[0x1f, 0x8b], "not gzip");
+
+        for tag in [etag.clone(), format!("W/{etag}"), "*".to_string()] {
+            let again = client
+                .get(format!("{url}/ui/app.css"))
+                .header("if-none-match", &tag)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{tag}");
+        }
+
+        // The page is unframeable however it is reached.
+        for path in ["/", "/ui/index.html"] {
+            let page = client
+                .get(format!("{url}{path}"))
+                .header("accept", "text/html")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
+            assert_eq!(
+                page.headers()["content-security-policy"],
+                "frame-ancestors 'none'",
+                "{path}"
+            );
+        }
+        let css = client
+            .get(format!("{url}/ui/app.css"))
+            .send()
+            .await
+            .unwrap();
+        assert!(!css.headers().contains_key("x-frame-options"));
+
+        for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/vendor"] {
+            let r = client.get(format!("{url}{missing}")).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{missing}");
+        }
+    }
+
+    // -- /llmman/shell ------------------------------------------------------
+
+    fn shell_state(policy: shell::Policy) -> AppState {
+        let mut inner = test_inner(std::env::temp_dir());
+        inner.shell = policy;
+        AppState(Arc::new(inner))
+    }
+
+    fn ws_upgrade(client: &Client, url: &str, origin: Option<&str>) -> reqwest::RequestBuilder {
+        let mut req = client
+            .get(url)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let Some(origin) = origin {
+            req = req.header("origin", origin);
+        }
+        req
+    }
+
+    /// A plain GET reports the policy; an upgrade under a disabled policy
+    /// is refused with the same reason, so the UI can explain rather than
+    /// show a dead terminal.
+    #[tokio::test]
+    async fn a_disabled_shell_reports_why_and_refuses_the_upgrade() {
+        let url = serve_router(shell_state(shell::Policy {
+            disabled: Some("LLMMAN_SHELL is off".into()),
+            origins: default_allowed_origins(),
+            command: Vec::new(),
+        }))
+        .await;
+        let client = Client::new();
+        let status: shell::Status = client
+            .get(format!("{url}/llmman/shell"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            shell::Status {
+                enabled: false,
+                reason: Some("LLMMAN_SHELL is off".into()),
+            }
+        );
+        let upgrade = ws_upgrade(&client, &format!("{url}/llmman/shell"), None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upgrade.status(), StatusCode::FORBIDDEN);
+        assert_eq!(upgrade.text().await.unwrap(), "LLMMAN_SHELL is off");
+    }
+
+    /// Browsers do not apply CORS to WebSockets, so the route checks
+    /// `Origin` itself: a page on another site is refused, a localhost
+    /// page or a client with no page at all is not.
+    #[tokio::test]
+    async fn only_a_page_the_daemon_would_answer_cors_for_may_open_a_shell() {
+        let url = serve_router(shell_state(shell::Policy {
+            disabled: None,
+            origins: default_allowed_origins(),
+            command: Vec::new(),
+        }))
+        .await;
+        let client = Client::new();
+        let shell_url = format!("{url}/llmman/shell");
+
+        let evil = ws_upgrade(&client, &shell_url, Some("https://evil.example"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(evil.status(), StatusCode::FORBIDDEN);
+        assert!(evil.text().await.unwrap().contains("evil.example"));
+
+        let status: shell::Status = client
+            .get(&shell_url)
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !status.enabled,
+            "the status reply must agree with the refusal"
+        );
+
+        for origin in [
+            None,
+            Some("http://localhost:3000"),
+            Some("http://127.0.0.1"),
+        ] {
+            let status: shell::Status = {
+                let mut req = client.get(&shell_url);
+                if let Some(o) = origin {
+                    req = req.header("origin", o);
+                }
+                req.send().await.unwrap().json().await.unwrap()
+            };
+            assert!(status.enabled, "{origin:?} should be admitted");
+        }
+    }
+
+    /// The whole protocol over a real socket: bytes in, output out, the
+    /// exit status as the closing text frame. A fixed program, not the
+    /// runner's login shell. ConPTY asks the terminal for its cursor
+    /// position (`ESC[6n`) and holds the child until answered; xterm.js
+    /// does that in the browser, so the test does it here.
+    #[tokio::test]
+    async fn a_shell_session_round_trips_bytes_and_reports_the_exit_status() {
+        use futures::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        #[cfg(windows)]
+        let command = ["cmd.exe", "/c", "echo got:marker& exit 7"];
+        #[cfg(not(windows))]
+        let command = ["sh", "-c", "read line; echo \"got:$line\"; exit 7"];
+        let url = serve_router(shell_state(shell::Policy {
+            disabled: None,
+            origins: default_allowed_origins(),
+            command: command.map(str::to_string).to_vec(),
+        }))
+        .await;
+        let ws_url = format!("{}/llmman/shell", url.replace("http://", "ws://"));
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+
+        ws.send(WsMessage::Text(
+            r#"{"resize":{"cols":120,"rows":40}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        #[cfg(not(windows))]
+        ws.send(WsMessage::Binary(b"marker\r".to_vec()))
+            .await
+            .unwrap();
+
+        let mut output = Vec::new();
+        let mut exit = None;
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("no exit frame; output so far: {:?}", String::from_utf8_lossy(&output)),
+                frame = ws.next() => match frame {
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        if bytes.windows(4).any(|w| w == b"\x1b[6n") {
+                            ws.send(WsMessage::Binary(b"\x1b[1;1R".to_vec())).await.unwrap();
+                        }
+                        output.extend_from_slice(&bytes);
+                    }
+                    Some(Ok(WsMessage::Text(text))) => {
+                        exit = Some(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("socket error: {e}"),
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("got:marker"), "{text:?}");
+        assert_eq!(exit, Some(serde_json::json!({ "exit": 7 })), "{text:?}");
     }
 
     /// Hyper derives `Content-Length` from the body's size hint, and a

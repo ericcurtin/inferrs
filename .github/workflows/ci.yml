@@ -634,8 +634,8 @@ jobs:
           cargo package --no-verify --allow-dirty --list > "$files"
           for must in build.rs Cargo.toml Cargo.lock LICENSE README.md go-shim/go.mod go-shim/go.sum go-shim/shim.go \
                       go-shim/backend_docker.go go-shim/backend_podman.go \
-                      webui/index.html webui/bundle.js webui/bundle.css webui/loading.html \
-                      src/main.rs src/lib.rs src/webui.rs src/ffi.rs; do
+                      webui/index.html webui/app.js webui/app.css webui/vendor/xterm.js webui/vendor/addon-fit.js \
+                      src/main.rs src/lib.rs src/webui/mod.rs src/webui/content_type.rs src/ffi.rs; do
             grep -qx "$must" "$files" || { echo "::error::$must is missing from the .crate"; exit 1; }
           done
           for never in '^packaging/' '^vllm-plugin/' '^docs/' '^\.github/' '^fuzz/' '^go-shim/go-shim$'; do
