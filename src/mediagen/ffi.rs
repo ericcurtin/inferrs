@@ -189,16 +189,19 @@ pub type LogCallback =
     unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void);
 
 macro_rules! api {
-    ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*) => {
-        /// The bound function pointers.
+    ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*
+     optional: $(fn $oname:ident($($oarg:ident: $oty:ty),*) $(-> $oret:ty)?;)*) => {
+        /// The bound function pointers; `optional` ones may be absent from older releases.
         pub struct Api {
             _libs: Vec<Library>,
             $(pub $name: unsafe extern "C" fn($($arg: $ty),*) $(-> $ret)?,)*
+            $(pub $oname: Option<unsafe extern "C" fn($($oarg: $oty),*) $(-> $oret)?>,)*
         }
         impl Api {
             fn bind(libs: Vec<Library>) -> Result<Self> {
                 $(let $name = lookup(&libs, stringify!($name))?;)*
-                Ok(Self { _libs: libs, $($name,)* })
+                $(let $oname = lookup(&libs, stringify!($oname)).ok();)*
+                Ok(Self { _libs: libs, $($name,)* $($oname,)* })
             }
         }
     };
@@ -242,6 +245,7 @@ api! {
     fn ggml_sqrt(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_log(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_clamp(ctx: *mut GgmlContext, a: Tensor, min: f32, max: f32) -> Tensor;
+    fn ggml_cpy(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
     fn ggml_reshape_2d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64) -> Tensor;
     fn ggml_reshape_3d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64) -> Tensor;
     fn ggml_reshape_4d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> Tensor;
@@ -323,6 +327,11 @@ api! {
     fn llama_sampler_init_dist(seed: u32) -> *mut LlamaSampler;
     fn llama_sampler_sample(smpl: *mut LlamaSampler, ctx: *mut LlamaContextT, idx: i32) -> LlamaToken;
     fn llama_sampler_free(smpl: *mut LlamaSampler);
+
+    optional:
+    // direct 2-D convolution (no im2col), ggml >= mid-2025
+    fn ggml_conv_2d_direct(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> Tensor;
+    fn ggml_backend_supports_op(backend: GgmlBackend, op: Tensor) -> bool;
 }
 
 fn lookup<T: Copy>(libs: &[Library], name: &str) -> Result<T> {

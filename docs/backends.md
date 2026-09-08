@@ -10,7 +10,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` |
 | safetensors | `vllm` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
-| GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| GGUF diffusion (LTX-2, Cosmos3) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
 

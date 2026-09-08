@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -519,4 +519,107 @@ fn convert(api: &Api, from: u32, to: u32, src: &[u8], n: i64) -> Result<Option<V
         }
         other => bail!("cannot convert to ggml type {other}"),
     }
+}
+
+/// One tensor of a safetensors file as stored: dtype name, torch-order shape, raw bytes.
+pub struct RawTensor {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<i64>,
+    pub bytes: Vec<u8>,
+}
+
+impl RawTensor {
+    /// The bytes as f32 (F32 tensors only).
+    pub fn f32s(&self) -> Result<Vec<f32>> {
+        if self.dtype != "F32" {
+            bail!("{}: expected F32, got {}", self.name, self.dtype);
+        }
+        Ok(self
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    }
+}
+
+/// Every tensor of a safetensors file, sorted by name.
+pub fn read_safetensors_raw(path: &Path) -> Result<Vec<RawTensor>> {
+    let mut f = File::open(path).with_context(|| path.display().to_string())?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len)?;
+    let n = u64::from_le_bytes(len) as usize;
+    let mut header = vec![0u8; n];
+    f.read_exact(&mut header)?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header).context("safetensors header")?;
+    let entries = header.as_object().context("safetensors header")?;
+    let base = 8 + n as u64;
+    let mut out = Vec::new();
+    for (name, e) in entries {
+        if name == "__metadata__" {
+            continue;
+        }
+        let shape: Vec<i64> = e["shape"]
+            .as_array()
+            .with_context(|| format!("{name}: shape"))?
+            .iter()
+            .filter_map(serde_json::Value::as_i64)
+            .collect();
+        let (o0, o1) = (
+            e["data_offsets"][0]
+                .as_u64()
+                .with_context(|| format!("{name}: offsets"))?,
+            e["data_offsets"][1]
+                .as_u64()
+                .with_context(|| format!("{name}: offsets"))?,
+        );
+        f.seek(SeekFrom::Start(base + o0))?;
+        let mut bytes = vec![0u8; (o1 - o0) as usize];
+        f.read_exact(&mut bytes)?;
+        out.push(RawTensor {
+            name: name.clone(),
+            dtype: e["dtype"].as_str().context("dtype")?.to_string(),
+            shape,
+            bytes,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Writes `tensors` as a safetensors file (atomically, via a `.tmp` sibling).
+pub fn write_safetensors_raw(path: &Path, tensors: &[RawTensor], note: &str) -> Result<()> {
+    let mut hdr = serde_json::Map::new();
+    let mut offset = 0u64;
+    for t in tensors {
+        let end = offset + t.bytes.len() as u64;
+        hdr.insert(
+            t.name.clone(),
+            serde_json::json!({"dtype": t.dtype, "shape": t.shape, "data_offsets": [offset, end]}),
+        );
+        offset = end;
+    }
+    hdr.insert(
+        "__metadata__".into(),
+        serde_json::json!({"format": "pt", "llmman": note}),
+    );
+    let mut hb = serde_json::to_vec(&serde_json::Value::Object(hdr))?;
+    while !hb.len().is_multiple_of(8) {
+        hb.push(b' ');
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut w = std::io::BufWriter::new(File::create(&tmp)?);
+        w.write_all(&(hb.len() as u64).to_le_bytes())?;
+        w.write_all(&hb)?;
+        for t in tensors {
+            w.write_all(&t.bytes)?;
+        }
+        w.flush()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }

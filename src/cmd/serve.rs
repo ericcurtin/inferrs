@@ -7381,10 +7381,9 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
     let ModelPath::Diffusion(paths) = resolve_model(&store_path, &cache_path, model_ref)? else {
         anyhow::bail!("{model_ref} is not a diffusion model");
     };
-    let text_encoder = paths
-        .text_encoder
-        .clone()
-        .ok_or_else(|| anyhow!("{model_ref}: no text encoder in the model pack"))?;
+    if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
+        anyhow::bail!("{model_ref}: no text encoder in the model pack");
+    }
     let pinned = args.llama_cpp_version.clone();
     let lib_dir = tokio::task::spawn_blocking(move || llama_lib_dir(pinned.as_deref())).await??;
     // the graph builders hold `&'static Api`
@@ -7395,7 +7394,8 @@ async fn mediagen_backend(model_ref: &str, port: u16, args: &ServeArgs) -> anyho
         vae: paths.vae.clone(),
         audio_vae: paths.audio_vae.clone(),
         text_proj: paths.text_proj.clone(),
-        text_model: text_encoder,
+        text_model: paths.text_encoder.clone(),
+        files: paths.files.clone(),
         use_gpu: true,
         // llama.cpp's own env var for -ngl
         text_gpu_layers: std::env::var("LLAMA_ARG_N_GPU_LAYERS")

@@ -6,12 +6,14 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 
 pub mod backend;
+pub mod cosmos3;
 pub mod encode;
 pub mod ffi;
 pub mod ltx;
 pub mod server;
 pub mod weights;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -28,7 +30,10 @@ pub struct ContextParams {
     pub vae: Option<PathBuf>,
     pub audio_vae: Option<PathBuf>,
     pub text_proj: Option<PathBuf>,
-    pub text_model: PathBuf,
+    /// Text encoder GGUF; LTX needs one, Cosmos3 has none.
+    pub text_model: Option<PathBuf>,
+    /// Every named file of the model pack (`vae/config.json`, `tokenizer.json`, ...).
+    pub files: BTreeMap<String, PathBuf>,
     pub use_gpu: bool,
     /// GPU layers of the text encoder.
     pub text_gpu_layers: i32,
@@ -44,12 +49,80 @@ pub struct GenParams {
     pub height: i64,
     pub n_frames: i64,
     pub fps: f32,
+    /// `0` for the model's default.
     pub n_steps: i32,
+    /// `0` for the model's default (LTX: 1, Cosmos3: 6).
     pub cfg_scale: f32,
     /// `None` picks a random seed.
     pub seed: Option<u32>,
     pub gen_audio: bool,
     pub enhance_prompt: bool,
+    /// Conditioning image: image-to-video (and the first frame of an action run).
+    pub image: Option<Frames>,
+    /// Conditioning clip: an action run's observed video, or the leading frames
+    /// of a video-to-video run.
+    pub video: Option<Frames>,
+    /// Video-to-video: the latent frames kept from the clip (`(0, 1)` in the reference).
+    pub condition_frames: Vec<i64>,
+    /// Video-to-video: take the conditioning frames from the end of the clip.
+    pub condition_keep_last: bool,
+    /// An action-conditioned run (Cosmos3).
+    pub action: Option<ActionParams>,
+    /// Scheduler flow shift override (Cosmos3: Karras sigmas when `None`).
+    pub flow_shift: Option<f32>,
+}
+
+/// Decoded RGB frames, `[f][h][w][3]` bytes.
+#[derive(Clone, Debug, Default)]
+pub struct Frames {
+    pub width: i64,
+    pub height: i64,
+    pub n_frames: i64,
+    pub rgb: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionMode {
+    /// Video from the first frame and the given actions.
+    ForwardDynamics,
+    /// Actions connecting the frames of the given video.
+    InverseDynamics,
+    /// Video and actions from the first frame.
+    Policy,
+}
+
+impl ActionMode {
+    pub fn parse(s: &str) -> Option<ActionMode> {
+        match s {
+            "forward_dynamics" | "fd" => Some(ActionMode::ForwardDynamics),
+            "inverse_dynamics" | "id" => Some(ActionMode::InverseDynamics),
+            "policy" => Some(ActionMode::Policy),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ActionMode::ForwardDynamics => "forward_dynamics",
+            ActionMode::InverseDynamics => "inverse_dynamics",
+            ActionMode::Policy => "policy",
+        }
+    }
+}
+
+/// `CosmosActionCondition`.
+#[derive(Clone, Debug)]
+pub struct ActionParams {
+    pub mode: ActionMode,
+    /// Action transitions in the chunk; the clip has one more frame.
+    pub chunk_size: i64,
+    /// Embodiment domain (`bridge_orig_lerobot`, `av`, ...).
+    pub domain: String,
+    /// Conditioning canvas tier: 256, 480, 704 or 720.
+    pub resolution_tier: i64,
+    /// `[T][raw_action_dim]` for forward dynamics.
+    pub actions: Vec<Vec<f32>>,
+    pub view_point: String,
 }
 
 impl Default for GenParams {
@@ -62,10 +135,16 @@ impl Default for GenParams {
             n_frames: 1,
             fps: 24.0,
             n_steps: 0,
-            cfg_scale: 1.0,
+            cfg_scale: 0.0,
             seed: None,
             gen_audio: false,
             enhance_prompt: true,
+            image: None,
+            video: None,
+            condition_frames: vec![0, 1],
+            condition_keep_last: false,
+            action: None,
+            flow_shift: None,
         }
     }
 }
@@ -83,6 +162,8 @@ pub struct Output {
     pub pcm: Vec<f32>,
     pub revised_prompt: String,
     pub seed: u32,
+    /// Predicted actions `[T][raw_action_dim]` of an action run.
+    pub actions: Vec<Vec<f32>>,
 }
 
 impl Output {
@@ -92,11 +173,22 @@ impl Output {
     }
 }
 
+/// The loaded model of one of the supported architectures.
+enum Inner {
+    Ltx(Box<LtxCtx>),
+    Cosmos3(Box<cosmos3::Model>),
+}
+
 pub struct Context {
     // dropped in this order: weight buffers before their backend
+    inner: Inner,
+    be: Backend,
+}
+
+/// An LTX-2 model with its Gemma text encoder and prompt caches.
+struct LtxCtx {
     ltx: Model,
     text: Box<TextEncoder>,
-    be: Backend,
     distilled: bool,
     flash_attn: bool,
     has_video_vae: bool,
@@ -106,12 +198,24 @@ pub struct Context {
     ncond: Option<(String, TextCond)>,
 }
 
+fn is_ltx(arch: &str) -> bool {
+    matches!(arch, "ltxv" | "ltx-video" | "ltxav")
+}
+
 /// Is this GGUF a diffusion transformer we can run?
 pub fn is_diffusion_model(path: &Path) -> bool {
     weights::read_index(path)
         .ok()
         .and_then(|i| i.metadata.get("general.architecture").cloned())
-        .is_some_and(|a| matches!(a.as_str(), "ltxv" | "ltx-video" | "ltxav"))
+        .is_some_and(|a| is_ltx(&a) || cosmos3::is_cosmos3(&a))
+}
+
+/// Does this architecture run without a separate text encoder GGUF?
+pub fn needs_text_encoder(path: &Path) -> bool {
+    weights::read_index(path)
+        .ok()
+        .and_then(|i| i.metadata.get("general.architecture").cloned())
+        .is_none_or(|a| !cosmos3::is_cosmos3(&a))
 }
 
 /// Audio latent frames covering the whole clip; the decoded audio is trimmed to the video.
@@ -125,14 +229,14 @@ pub fn audio_latent_frames(hp: &ltx::Hparams, n_video_frames: i64, fps: f32) -> 
 
 /// mt19937 + `std::normal_distribution<float>` as libc++ implements it (Marsaglia polar in
 /// `float`), for the same noise as the C++ implementation given a seed.
-struct Mt19937 {
+pub(super) struct Mt19937 {
     mt: [u32; 624],
     i: usize,
     saved: Option<f32>,
 }
 
 impl Mt19937 {
-    fn new(seed: u32) -> Self {
+    pub(super) fn new(seed: u32) -> Self {
         let mut mt = [0u32; 624];
         mt[0] = seed;
         for i in 1..624 {
@@ -172,7 +276,7 @@ impl Mt19937 {
         self.next_u32() as f32 / 4294967296.0
     }
 
-    fn normal(&mut self) -> f32 {
+    pub(super) fn normal(&mut self) -> f32 {
         if let Some(v) = self.saved.take() {
             return v;
         }
@@ -198,9 +302,94 @@ impl Context {
             .get("general.architecture")
             .cloned()
             .unwrap_or_default();
-        if !matches!(arch.as_str(), "ltxv" | "ltx-video" | "ltxav") {
+        let mut be = Backend::new(api, p.use_gpu, p.n_threads, 64 * 1024)?;
+        let inner = if is_ltx(&arch) {
+            Inner::Ltx(Box::new(LtxCtx::load(api, &mut be, p, &idx)?))
+        } else if cosmos3::is_cosmos3(&arch) {
+            let m = cosmos3::Model::load(
+                api,
+                &be,
+                &idx,
+                &p.model,
+                p.vae.as_deref(),
+                &p.files,
+                p.flash_attn,
+            )?;
+            be.release_compute()?;
+            Inner::Cosmos3(Box::new(m))
+        } else {
             bail!("unsupported diffusion architecture {arch:?}");
+        };
+        Ok(Context { inner, be })
+    }
+
+    pub fn supports_video(&self) -> bool {
+        match &self.inner {
+            Inner::Ltx(l) => l.has_video_vae,
+            Inner::Cosmos3(_) => true,
         }
+    }
+
+    pub fn supports_audio(&self) -> bool {
+        match &self.inner {
+            Inner::Ltx(l) => l.ltx.hp.has_audio && l.has_audio_vae,
+            Inner::Cosmos3(m) => m.sound.is_some(),
+        }
+    }
+
+    pub fn family(&self) -> &'static str {
+        match &self.inner {
+            Inner::Ltx(_) => "ltx",
+            Inner::Cosmos3(_) => "cosmos3",
+        }
+    }
+
+    /// Denoising steps when a request does not say (0: the schedule decides).
+    pub fn default_steps(&self) -> i32 {
+        match &self.inner {
+            Inner::Ltx(_) => 0,
+            Inner::Cosmos3(_) => cosmos3::DEFAULT_STEPS,
+        }
+    }
+
+    pub fn default_cfg(&self) -> f32 {
+        match &self.inner {
+            Inner::Ltx(_) => 1.0,
+            Inner::Cosmos3(_) => cosmos3::DEFAULT_CFG,
+        }
+    }
+
+    /// Frames come in `stride * k + 1`.
+    pub fn temporal_stride(&self) -> i64 {
+        match &self.inner {
+            Inner::Ltx(l) => l.ltx.hp.vae_scale_t,
+            Inner::Cosmos3(m) => m.hp.vae_scale_t,
+        }
+    }
+
+    /// Runs the whole pipeline; `progress(step, n_steps)` returning `false` cancels.
+    pub fn generate(
+        &mut self,
+        p: &GenParams,
+        progress: impl FnMut(i32, i32) -> bool,
+    ) -> Result<Output> {
+        let out = match &mut self.inner {
+            Inner::Ltx(l) => l.generate_inner(&mut self.be, p, progress),
+            Inner::Cosmos3(m) => m.generate(&mut self.be, p, progress),
+        };
+        // frees the compute buffers; recreates the GPU backend after a failure
+        self.be.release_compute()?;
+        out
+    }
+}
+
+impl LtxCtx {
+    fn load(
+        api: &'static Api,
+        be: &mut Backend,
+        p: &ContextParams,
+        idx: &weights::Index,
+    ) -> Result<LtxCtx> {
         let mut hp = match idx.metadata.get("config") {
             Some(c) => ltx::Hparams::from_config(c)?,
             None => ltx::Hparams::default(),
@@ -215,7 +404,6 @@ impl Context {
             .to_lowercase()
             .contains("distilled");
 
-        let mut be = Backend::new(api, p.use_gpu, p.n_threads, 64 * 1024)?;
         let buft = be.weight_buft();
         let t0 = Instant::now();
         let dit = Weights::load(api, &p.model, buft, &LoadOpts::default())?;
@@ -290,9 +478,12 @@ impl Context {
 
         // text encoder, with room for prompt enhancement
         let n_ctx = ltx.hp.text_max_tokens.max(2048) as u32;
+        let text_model = p.text_model.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("LTX needs a text encoder GGUF (role \"text_encoder\")")
+        })?;
         let text = TextEncoder::load(
             api,
-            &p.text_model.to_string_lossy(),
+            &text_model.to_string_lossy(),
             p.text_gpu_layers,
             n_ctx,
             p.n_threads,
@@ -304,8 +495,7 @@ impl Context {
             t0.elapsed().as_secs_f64(),
             ltx.hp.has_audio
         );
-        Ok(Context {
-            be,
+        Ok(LtxCtx {
             ltx,
             text,
             distilled,
@@ -318,19 +508,11 @@ impl Context {
         })
     }
 
-    pub fn supports_video(&self) -> bool {
-        self.has_video_vae
-    }
-
-    pub fn supports_audio(&self) -> bool {
+    fn supports_audio(&self) -> bool {
         self.ltx.hp.has_audio && self.has_audio_vae
     }
 
-    pub fn hp(&self) -> &ltx::Hparams {
-        &self.ltx.hp
-    }
-
-    fn get_cond(&mut self, prompt: &str, negative: bool) -> Result<TextCond> {
+    fn get_cond(&mut self, be: &Backend, prompt: &str, negative: bool) -> Result<TextCond> {
         let slot = if negative { &self.ncond } else { &self.cond };
         if let Some((p, c)) = slot {
             if p == prompt {
@@ -350,7 +532,7 @@ impl Context {
         }
         let cond = ltx::text::build_text_cond(
             &self.ltx,
-            &self.be,
+            be,
             &packed,
             n_tokens,
             n_hidden,
@@ -395,20 +577,9 @@ impl Context {
         Ok(cond)
     }
 
-    /// Runs the whole pipeline; `progress(step, n_steps)` returning `false` cancels.
-    pub fn generate(
-        &mut self,
-        p: &GenParams,
-        progress: impl FnMut(i32, i32) -> bool,
-    ) -> Result<Output> {
-        let out = self.generate_inner(p, progress);
-        // frees the compute buffers; recreates the GPU backend after a failure
-        self.be.release_compute()?;
-        out
-    }
-
     fn generate_inner(
         &mut self,
+        be: &mut Backend,
         p: &GenParams,
         mut progress: impl FnMut(i32, i32) -> bool,
     ) -> Result<Output> {
@@ -429,7 +600,7 @@ impl Context {
             eprintln!("[llmman] mediagen: n_frames must be 8k+1, using {n_frames}");
         }
         let gen_audio = p.gen_audio && n_frames > 1 && self.supports_audio();
-        let cfg = p.cfg_scale;
+        let cfg = if p.cfg_scale > 0.0 { p.cfg_scale } else { 1.0 };
         let use_cfg = cfg > 1.0;
 
         // prompt enhancement, fixed seed like the reference pipelines
@@ -451,9 +622,9 @@ impl Context {
             }
         }
 
-        let cond = self.get_cond(&prompt, false)?;
+        let cond = self.get_cond(be, &prompt, false)?;
         let ncond = if use_cfg {
-            Some(self.get_cond(&p.negative_prompt, true)?)
+            Some(self.get_cond(be, &p.negative_prompt, true)?)
         } else {
             None
         };
@@ -501,7 +672,7 @@ impl Context {
                 fps: p.fps,
                 flash: self.flash_attn,
             };
-            let (mut v_pred, mut a_pred) = ltx::dit::forward(&self.ltx, &self.be, &inp)?;
+            let (mut v_pred, mut a_pred) = ltx::dit::forward(&self.ltx, be, &inp)?;
             if v_pred.len() != lat.x.len() || a_pred.len() != alat.x.len() {
                 bail!("transformer output does not match the latents");
             }
@@ -511,7 +682,7 @@ impl Context {
             }
             if let Some(nc) = &ncond {
                 let inp = ltx::dit::Inputs { cond: nc, ..inp };
-                let (v_unc, a_unc) = ltx::dit::forward(&self.ltx, &self.be, &inp)?;
+                let (v_unc, a_unc) = ltx::dit::forward(&self.ltx, be, &inp)?;
                 for (p, u) in v_pred.iter_mut().zip(&v_unc) {
                     *p = u + cfg * (*p - u);
                 }
@@ -540,7 +711,7 @@ impl Context {
         }
 
         // the transformer's compute buffers are of no use to the VAE
-        self.be.release_compute()?;
+        be.release_compute()?;
         let mut out = Output {
             fps: p.fps,
             revised_prompt: prompt,
@@ -549,8 +720,8 @@ impl Context {
         };
         {
             let t0 = Instant::now();
-            let dec = ltx::vae::decode(&self.ltx, &mut self.be, &lat);
-            self.be.release_compute()?;
+            let dec = ltx::vae::decode(&self.ltx, be, &lat);
+            be.release_compute()?;
             let (of, oh, ow, rgb) = dec?;
             eprintln!(
                 "[llmman] mediagen: decoded {of} frame(s) of {ow}x{oh} in {:.2} s",
@@ -567,7 +738,7 @@ impl Context {
         }
         if gen_audio {
             let t0 = Instant::now();
-            match ltx::audio::decode(&self.ltx, &self.be, &alat) {
+            match ltx::audio::decode(&self.ltx, be, &alat) {
                 Err(e) => eprintln!(
                     "[llmman] mediagen: audio decoding failed ({e}), returning video only"
                 ),
@@ -591,14 +762,14 @@ impl Context {
 }
 
 /// `MEDIAGEN_DUMP=<prefix>` writes intermediates as raw f32 files, like the C++ implementation.
-fn dump(name: &str, data: &[f32]) {
+pub(super) fn dump(name: &str, data: &[f32]) {
     if let Ok(prefix) = std::env::var("MEDIAGEN_DUMP") {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let _ = std::fs::write(format!("{prefix}.{name}.bin"), bytes);
     }
 }
 
-fn rand_seed() -> u32 {
+pub(super) fn rand_seed() -> u32 {
     let mut b = [0u8; 4];
     if std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))

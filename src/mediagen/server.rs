@@ -17,7 +17,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::{encode, Context, GenParams};
+use super::{encode, ActionMode, ActionParams, Context, GenParams};
 
 const MAX_DIM: i64 = 4096;
 const MAX_FRAMES: i64 = 1025;
@@ -39,6 +39,13 @@ pub struct Server {
     counter: AtomicU32,
     supports_video: bool,
     supports_audio: bool,
+    /// Frame counts are `stride * k + 1`.
+    temporal_stride: i64,
+    /// `"ltx"` or `"cosmos3"`.
+    family: &'static str,
+    /// The model's own defaults when a request leaves them out.
+    default_steps: i32,
+    default_cfg: f32,
 }
 
 type Shared = Arc<Server>;
@@ -129,7 +136,8 @@ fn common_params(body: &Value) -> Result<GenParams, Error> {
     p.width = round_dim("width", get_i64(body, "width", w), 32)?;
     p.height = round_dim("height", get_i64(body, "height", h), 32)?;
     p.n_steps = in_range("steps", get_i64(body, "steps", 0), 0, MAX_STEPS)? as i32;
-    p.cfg_scale = get_f64(body, "cfg_scale", 1.0) as f32;
+    // 0: the model's default
+    p.cfg_scale = get_f64(body, "cfg_scale", 0.0) as f32;
     p.seed = match get_i64(body, "seed", -1) {
         s if s < 0 => None,
         s => Some(in_range("seed", s, 0, u32::MAX as i64)? as u32),
@@ -137,6 +145,107 @@ fn common_params(body: &Value) -> Result<GenParams, Error> {
     p.enhance_prompt = get_bool(body, "enhance_prompt", true);
     p.negative_prompt = get_str(body, "negative_prompt");
     Ok(p)
+}
+
+/// A base64 field, with or without a `data:...;base64,` prefix.
+fn get_b64(body: &Value, k: &str) -> Result<Option<Vec<u8>>, Error> {
+    let Some(v) = body.get(k) else {
+        return Ok(None);
+    };
+    let s = v
+        .as_str()
+        .ok_or_else(|| Error::Invalid(format!("\"{k}\" must be a base64 string")))?;
+    let s = s.rsplit_once(";base64,").map_or(s, |(_, d)| d).trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map(Some)
+        .map_err(|e| Error::Invalid(format!("\"{k}\": invalid base64: {e}")))
+}
+
+/// The conditioning inputs of `/v1/videos`: `image` (PNG/JPEG), `video` (a
+/// container ffmpeg reads) and an `action` run.
+fn conditioning(body: &Value, p: &mut GenParams) -> Result<(), Error> {
+    if let Some(bytes) = get_b64(body, "image")?.or(get_b64(body, "input_reference")?) {
+        p.image = Some(encode::decode_image(&bytes).map_err(|e| Error::Invalid(e.to_string()))?);
+    }
+    if let Some(bytes) = get_b64(body, "video")? {
+        p.video = Some(encode::decode_video(&bytes).map_err(|e| Error::Invalid(e.to_string()))?);
+    }
+    if let Some(v) = body.get("condition_frames") {
+        p.condition_frames = v
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .filter(|f: &Vec<i64>| !f.is_empty())
+            .ok_or_else(|| {
+                Error::Invalid("\"condition_frames\" must be a list of latent frame indexes".into())
+            })?;
+    }
+    match body.get("condition_video_keep").and_then(Value::as_str) {
+        None | Some("first") => {}
+        Some("last") => p.condition_keep_last = true,
+        Some(_) => {
+            return Err(Error::Invalid(
+                "\"condition_video_keep\" must be first or last".into(),
+            ))
+        }
+    }
+    if let Some(f) = body.get("flow_shift").and_then(Value::as_f64) {
+        if !(f.is_finite() && f > 0.0) {
+            return Err(Error::Invalid("\"flow_shift\" must be positive".into()));
+        }
+        p.flow_shift = Some(f as f32);
+    }
+    let Some(a) = body.get("action") else {
+        return Ok(());
+    };
+    let mode = a
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(ActionMode::parse)
+        .ok_or_else(|| {
+            Error::Invalid(
+                "\"action.mode\" must be forward_dynamics, inverse_dynamics or policy".into(),
+            )
+        })?;
+    let actions: Vec<Vec<f32>> = match a.get("actions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
+            Error::Invalid("\"action.actions\" must be a [T][D] array of numbers".into())
+        })?,
+    };
+    let chunk_size = match a.get("chunk_size").and_then(Value::as_i64) {
+        Some(n) => n,
+        None if !actions.is_empty() => actions.len() as i64,
+        None => return Err(Error::Invalid("\"action.chunk_size\" is required".into())),
+    };
+    if p.image.is_none() && p.video.is_none() {
+        return Err(Error::Invalid(
+            "an action run needs \"image\" or \"video\"".into(),
+        ));
+    }
+    if mode == ActionMode::InverseDynamics && p.video.is_none() {
+        return Err(Error::Invalid("inverse dynamics needs \"video\"".into()));
+    }
+    if mode == ActionMode::ForwardDynamics && actions.is_empty() {
+        return Err(Error::Invalid(
+            "forward dynamics needs \"action.actions\"".into(),
+        ));
+    }
+    p.action = Some(ActionParams {
+        mode,
+        chunk_size: in_range("action.chunk_size", chunk_size, 1, 1024)?,
+        domain: get_str(a, "domain"),
+        resolution_tier: a
+            .get("resolution_tier")
+            .and_then(Value::as_i64)
+            .unwrap_or(480),
+        actions,
+        view_point: match get_str(a, "view_point") {
+            s if s.is_empty() => "ego_view".to_string(),
+            s => s,
+        },
+    });
+    Ok(())
 }
 
 fn check_pixels(p: &GenParams) -> Result<(), Error> {
@@ -173,7 +282,7 @@ async fn models(State(s): State<Shared>) -> Json<Value> {
         "models": [{
             "name": s.model_name, "model": s.model_name, "modified_at": "", "size": "", "digest": "",
             "type": "model", "description": "", "tags": [""], "capabilities": caps, "parameters": "",
-            "details": {"parent_model": "", "format": "gguf", "family": "ltx", "families": ["ltx"],
+            "details": {"parent_model": "", "format": "gguf", "family": s.family, "families": [s.family],
                         "parameter_size": "", "quantization_level": ""}
         }],
         "object": "list",
@@ -189,7 +298,7 @@ async fn props(State(s): State<Shared>) -> Json<Value> {
             "vision": false, "video": false, "audio": false,
             "image_generation": s.supports_video, "video_generation": s.supports_video, "audio_generation": s.supports_audio,
         },
-        "default_generation_settings": {"width": 768, "height": 512, "fps": 24.0, "steps": 0, "cfg_scale": 1.0},
+        "default_generation_settings": {"width": 768, "height": 512, "fps": 24.0, "steps": s.default_steps, "cfg_scale": s.default_cfg},
         "build_info": format!("llmman {}", env!("CARGO_PKG_VERSION")),
     }))
 }
@@ -322,9 +431,15 @@ async fn videos(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
         };
     }
     let n_frames = in_range("frames", n_frames, 9, MAX_FRAMES)?;
-    p.n_frames = (n_frames - 1) / 8 * 8 + 1;
+    let st = s.temporal_stride;
+    p.n_frames = (n_frames - 1) / st * st + 1;
+    conditioning(&body, &mut p)?;
+    if let Some(a) = &p.action {
+        // the clip is the action chunk plus one frame, on the tier's canvas
+        p.n_frames = a.chunk_size + 1;
+    }
     check_pixels(&p)?;
-    p.gen_audio = get_bool(&body, "audio", s.supports_audio);
+    p.gen_audio = get_bool(&body, "audio", s.supports_audio && p.action.is_none());
     let response_format = body
         .get("response_format")
         .and_then(|v| v.as_str())
@@ -353,6 +468,9 @@ async fn videos(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
         "fps": out.fps, "n_frames": out.n_frames, "has_audio": !out.pcm.is_empty(),
         "revised_prompt": out.revised_prompt,
     });
+    if !out.actions.is_empty() {
+        job["actions"] = json!(out.actions);
+    }
     if !mp4.is_empty() {
         job["content_url"] = json!(format!("/v1/videos/{id}/content"));
     }
@@ -451,7 +569,8 @@ async fn speech(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
     // audio is generated jointly with a small video
     p.width = 256;
     p.height = 256;
-    p.n_frames = (((seconds * p.fps as f64).round() as i64) / 8 * 8 + 1).max(9);
+    let st = s.temporal_stride;
+    p.n_frames = (((seconds * p.fps as f64).round() as i64) / st * st + 1).max(9);
     p.gen_audio = true;
     let out = generate(s, p, None, Arc::new(AtomicBool::new(false))).await?;
     if out.pcm.is_empty() {
@@ -468,6 +587,10 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     let s = Arc::new(Server {
         supports_video: ctx.supports_video(),
         supports_audio: ctx.supports_audio(),
+        temporal_stride: ctx.temporal_stride(),
+        family: ctx.family(),
+        default_steps: ctx.default_steps(),
+        default_cfg: ctx.default_cfg(),
         ctx: Mutex::new(ctx),
         model_name,
         model_path,

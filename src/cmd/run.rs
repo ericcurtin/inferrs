@@ -122,6 +122,44 @@ pub struct RunArgs {
     /// Media generation models only: length of a --video / --audio clip.
     #[arg(long, hide = true, default_value_t = 0.0)]
     pub seconds: f32,
+    /// Media generation models only: conditioning image (PNG/JPEG) for
+    /// image-to-video, or an action run's first frame.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub image: Option<std::path::PathBuf>,
+    /// Media generation models only: the conditioning video of a
+    /// video-to-video or action run.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub input_video: Option<std::path::PathBuf>,
+    /// Video-to-video: latent frames kept from --input-video (default 0,1).
+    #[arg(long, hide = true, value_name = "IDX,IDX", default_value = "")]
+    pub condition_frames: String,
+    /// Video-to-video: take the conditioning frames from the end of the clip.
+    #[arg(long, hide = true)]
+    pub condition_keep_last: bool,
+    /// Cosmos3 action run: forward_dynamics, inverse_dynamics or policy.
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub action_mode: Option<String>,
+    /// Cosmos3 action run: embodiment domain (bridge_orig_lerobot, av, ...).
+    #[arg(long, hide = true, default_value = "")]
+    pub action_domain: String,
+    /// Cosmos3 action run: JSON file with the [T][D] actions (forward dynamics).
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub actions: Option<std::path::PathBuf>,
+    /// Cosmos3 action run: action transitions in the chunk.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub action_chunk: u32,
+    /// Cosmos3 action run: conditioning canvas tier (256, 480, 704, 720).
+    #[arg(long, hide = true, default_value_t = 480)]
+    pub action_tier: u32,
+    /// Cosmos3 action run: camera viewpoint (ego_view, third_person_view, ...).
+    #[arg(long, hide = true, default_value = "ego_view")]
+    pub action_view: String,
+    /// Media generation models only: frames per second of the clip.
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    pub fps: f32,
+    /// Cosmos3: scheduler flow shift (the reference action runs use 10).
+    #[arg(long, hide = true)]
+    pub flow_shift: Option<f32>,
     #[arg(
         value_name = "PROMPT",
         trailing_var_arg = true,
@@ -239,6 +277,23 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
                     cfg_scale: args.cfg_scale,
                     negative: args.negative.clone(),
                     seconds: args.seconds,
+                    fps: args.fps,
+                    flow_shift: args.flow_shift,
+                    image: args.image.clone(),
+                    input_video: args.input_video.clone(),
+                    condition_frames: args.condition_frames.clone(),
+                    condition_keep_last: args.condition_keep_last,
+                    action: args
+                        .action_mode
+                        .as_ref()
+                        .map(|mode| crate::imagegen::ActionOptions {
+                            mode: mode.clone(),
+                            domain: args.action_domain.clone(),
+                            actions: args.actions.clone(),
+                            chunk: args.action_chunk,
+                            tier: args.action_tier,
+                            view: args.action_view.clone(),
+                        }),
                 };
                 return crate::imagegen::run(&model, &prompt, interactive, opts);
             }

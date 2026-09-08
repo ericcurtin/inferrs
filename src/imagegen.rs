@@ -34,6 +34,28 @@ pub struct ImageOptions {
     pub negative: String,
     /// `--video` / `--audio` clip length; 0 = server default.
     pub seconds: f32,
+    /// `--fps`; 0 = server default.
+    pub fps: f32,
+    pub flow_shift: Option<f32>,
+    /// `--image`: conditioning image for image-to-video / an action run.
+    pub image: Option<PathBuf>,
+    /// `--input-video`: a video-to-video or action run's conditioning clip.
+    pub input_video: Option<PathBuf>,
+    /// `--condition-frames`: comma-separated latent frame indexes.
+    pub condition_frames: String,
+    pub condition_keep_last: bool,
+    pub action: Option<ActionOptions>,
+}
+
+/// `--action-*`: a Cosmos3 action run.
+#[derive(Debug, Clone, Default)]
+pub struct ActionOptions {
+    pub mode: String,
+    pub domain: String,
+    pub actions: Option<PathBuf>,
+    pub chunk: u32,
+    pub tier: u32,
+    pub view: String,
 }
 
 impl ImageOptions {
@@ -71,14 +93,57 @@ impl ImageOptions {
 
     /// The `/v1/videos` request: no streaming, the mp4 is fetched from
     /// the job's `content_url` afterwards.
-    fn video_request(&self, model: &str, prompt: &str) -> serde_json::Value {
+    fn video_request(&self, model: &str, prompt: &str) -> Result<serde_json::Value> {
         let mut req = self.request(model, prompt);
         req["stream"] = false.into();
         req.as_object_mut().map(|o| o.remove("response_format"));
         if self.seconds > 0.0 {
             req["seconds"] = self.seconds.into();
         }
-        req
+        if self.fps > 0.0 {
+            req["fps"] = self.fps.into();
+        }
+        if let Some(f) = self.flow_shift {
+            req["flow_shift"] = f.into();
+        }
+        let b64 = |path: &PathBuf| -> Result<String> {
+            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        };
+        if let Some(p) = &self.image {
+            req["image"] = b64(p)?.into();
+        }
+        if let Some(p) = &self.input_video {
+            req["video"] = b64(p)?.into();
+            if !self.condition_frames.is_empty() {
+                let idx: Vec<i64> = self
+                    .condition_frames
+                    .split(',')
+                    .map(|v| v.trim().parse::<i64>())
+                    .collect::<Result<_, _>>()
+                    .context("--condition-frames takes comma-separated integers")?;
+                req["condition_frames"] = idx.into();
+            }
+            if self.condition_keep_last {
+                req["condition_video_keep"] = "last".into();
+            }
+        }
+        if let Some(a) = &self.action {
+            let mut act = serde_json::json!({
+                "mode": a.mode, "domain": a.domain, "resolution_tier": a.tier, "view_point": a.view,
+            });
+            if a.chunk > 0 {
+                act["chunk_size"] = a.chunk.into();
+            }
+            if let Some(p) = &a.actions {
+                let text =
+                    std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
+                act["actions"] = serde_json::from_str(&text)
+                    .with_context(|| format!("parse {}", p.display()))?;
+            }
+            req["action"] = act;
+        }
+        Ok(req)
     }
 
     /// The `/v1/audio/speech` request: OpenAI's field is `input`.
@@ -276,13 +341,20 @@ fn generate_video(model: &str, prompt: &str, opts: &ImageOptions) -> Result<Path
     let _pb = Spinner(spinner("Generating video..."));
     let resp = client
         .post(format!("{}/v1/videos", crate::daemon::server()))
-        .json(&opts.video_request(model, prompt))
+        .json(&opts.video_request(model, prompt)?)
         .send()
         .context("request /v1/videos")?;
     if !resp.status().is_success() {
         return Err(fail(resp));
     }
     let job: serde_json::Value = resp.json().context("decode /v1/videos response")?;
+    if let Some(actions) = job.get("actions").filter(|a| a.is_array()) {
+        // an action run's predictions, next to the video
+        let path = output_path(prompt, "json");
+        std::fs::write(&path, serde_json::to_string_pretty(actions)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        println!("Actions saved to: {}", path.display());
+    }
     let Some(content_url) = job["content_url"].as_str() else {
         anyhow::bail!(
             "the server generated {} frames but has no ffmpeg to mux an mp4; install ffmpeg next to llama-server",
@@ -513,7 +585,7 @@ mod tests {
             seed: Some(1),
             ..Default::default()
         };
-        let v = opts.video_request("m", "waves");
+        let v = opts.video_request("m", "waves").unwrap();
         assert_eq!(v["stream"], false);
         assert_eq!(v["seconds"], 2.0);
         assert!(v.get("response_format").is_none());
