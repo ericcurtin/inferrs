@@ -37,7 +37,14 @@ pub enum ModelPath {
     /// plus the sidecars pulled next to it (see
     /// `crate::hf::oci::ANNOTATION_ROLE`).
     Diffusion(DiffusionPaths),
+    /// A Diffusers-layout safetensors directory (a root `model_index.json`,
+    /// weights in `transformer/`, `vae/`, ...) such as `nvidia/Cosmos3-Edge`
+    /// — served by vLLM-Omni (`vllm serve --omni`); plain vllm cannot.
+    Omni(PathBuf),
 }
+
+/// The Diffusers pipeline index that marks a [`ModelPath::Omni`] repo.
+pub const DIFFUSERS_MODEL_INDEX: &str = "model_index.json";
 
 /// The files of a resolved [`ModelPath::Diffusion`] model.
 #[derive(Debug, Clone, Default)]
@@ -61,7 +68,7 @@ impl ModelPath {
     pub fn path(&self) -> &Path {
         match self {
             ModelPath::Gguf(p, _) => p,
-            ModelPath::SafeTensors(p) => p,
+            ModelPath::SafeTensors(p) | ModelPath::Omni(p) => p,
             ModelPath::Diffusion(d) => &d.model,
         }
     }
@@ -73,7 +80,7 @@ impl ModelPath {
     pub fn mmproj(&self) -> Option<&Path> {
         match self {
             ModelPath::Gguf(_, mmproj) => mmproj.as_deref(),
-            ModelPath::SafeTensors(_) | ModelPath::Diffusion(_) => None,
+            ModelPath::SafeTensors(_) | ModelPath::Diffusion(_) | ModelPath::Omni(_) => None,
         }
     }
 
@@ -85,6 +92,7 @@ impl ModelPath {
             ModelPath::Gguf(..) => "gguf",
             ModelPath::SafeTensors(_) => "safetensors",
             ModelPath::Diffusion(_) => "diffusion",
+            ModelPath::Omni(_) => "omni",
         }
     }
 }
@@ -129,6 +137,19 @@ fn is_safetensors_layer(l: &crate::storage::oci::Descriptor) -> bool {
     layer_filepath(l)
         .map(|p| p.to_lowercase().ends_with(".safetensors"))
         .unwrap_or(false)
+}
+
+/// The layer holding the repo's *root* `model_index.json` (a Diffusers
+/// pipeline index; a nested one is some vendored pipeline's, not this
+/// repo's).
+fn is_diffusers_index_layer(l: &crate::storage::oci::Descriptor) -> bool {
+    layer_filepath(l) == Some(DIFFUSERS_MODEL_INDEX)
+}
+
+/// A Diffusers-layout repo: a root `model_index.json` next to safetensors.
+fn is_diffusers_manifest(manifest: &crate::storage::oci::Manifest) -> bool {
+    manifest.layers.iter().any(is_diffusers_index_layer)
+        && manifest.layers.iter().any(is_safetensors_layer)
 }
 
 /// True if a (already-confirmed-GGUF) layer looks like a multimodal
@@ -316,10 +337,12 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
     };
 
     // A diffusion model generates media instead of text: its capabilities
-    // are exactly the output types it was pulled with.
+    // are exactly the output types it was pulled with. A Diffusers-layout
+    // repo pulled before those were recorded still generates images.
     let outputs = config_types("outputTypes");
     if outputs.iter().any(|t| t == CAPABILITY_IMAGE)
         || manifest.layers.iter().any(|l| layer_role(l).is_some())
+        || is_diffusers_manifest(manifest)
     {
         let mut caps: Vec<String> = outputs
             .into_iter()
@@ -374,15 +397,19 @@ pub enum ModelFormat {
     Gguf,
     SafeTensors,
     Diffusion,
+    /// Diffusers-layout safetensors — see [`ModelPath::Omni`].
+    Omni,
 }
 
-/// [`resolve_model`]'s classification: diffusion > GGUF > safetensors,
-/// `None` for "no servable model layer".
+/// [`resolve_model`]'s classification: diffusion > GGUF > Diffusers
+/// (omni) > safetensors, `None` for "no servable model layer".
 fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
     if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
         Some(ModelFormat::Diffusion)
     } else if gguf_layers(manifest).is_some() {
         Some(ModelFormat::Gguf)
+    } else if is_diffusers_manifest(manifest) {
+        Some(ModelFormat::Omni)
     } else if manifest.layers.iter().any(is_safetensors_layer) {
         Some(ModelFormat::SafeTensors)
     } else {
@@ -403,7 +430,7 @@ fn no_servable_layer(model_ref: &str, manifest: &crate::storage::oci::Manifest) 
     } else {
         anyhow!(
             "no servable model layer in {model_ref} — found {exts:?} files; \
-             llmman serve supports GGUF (llama-server) and safetensors (vllm/mlx)"
+             llmman serve supports GGUF (llama-server) and safetensors (vllm/vllm-omni/mlx)"
         )
     }
 }
@@ -493,14 +520,39 @@ pub fn resolve_model(
         return Ok(ModelPath::Gguf(primary_path, mmproj_path));
     }
 
-    // ── safetensors → vllm / mlx_lm.server ──────────────────────────────
-    debug_assert_eq!(format, ModelFormat::SafeTensors);
+    // ── safetensors → vllm / vllm-omni / mlx_lm.server ──────────────────
     let model_dir = extract_safetensors_dir(store_path, cache_path, &desc.digest, &manifest)?;
-    Ok(ModelPath::SafeTensors(model_dir))
+    Ok(match format {
+        ModelFormat::Omni => ModelPath::Omni(model_dir),
+        _ => {
+            debug_assert_eq!(format, ModelFormat::SafeTensors);
+            ModelPath::SafeTensors(model_dir)
+        }
+    })
+}
+
+/// The model directory of an extracted checkout: the parent of the
+/// shallowest `config.json` or `model_index.json` (a Diffusers repo has a
+/// `config.json` per component, so "first in layer order" is wrong), else
+/// the checkout root.
+fn safetensors_model_dir(cache_dir: &Path, rel_paths: &[&str]) -> PathBuf {
+    rel_paths
+        .iter()
+        .filter(|p| {
+            Path::new(p)
+                .file_name()
+                .is_some_and(|n| n == "config.json" || n == DIFFUSERS_MODEL_INDEX)
+        })
+        .min_by_key(|p| p.matches('/').count())
+        .and_then(|p| Path::new(p).parent())
+        // `join("")` would leave a trailing separator on the root case.
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| cache_dir.join(parent))
+        .unwrap_or_else(|| cache_dir.to_path_buf())
 }
 
 /// Extract CNCF-format safetensors layers to a cache directory and return the
-/// model directory (parent of `config.json`).
+/// model directory (see [`safetensors_model_dir`]).
 fn extract_safetensors_dir(
     store_path: &Path,
     cache_path: &Path,
@@ -545,24 +597,13 @@ fn extract_safetensors_dir(
         eprintln!("[llmman] extracted {rel_path}");
     }
 
-    // Model dir = parent of config.json
-    for layer in &manifest.layers {
-        let Some(rel_path) = layer_filepath(layer) else {
-            continue;
-        };
-        if Path::new(rel_path)
-            .file_name()
-            .map(|n| n == "config.json")
-            .unwrap_or(false)
-        {
-            let config = cache_dir.join(rel_path);
-            return config
-                .parent()
-                .map(|p| p.to_path_buf())
-                .ok_or_else(|| anyhow!("config.json has no parent directory"));
-        }
-    }
-    Ok(cache_dir)
+    let rel_paths: Vec<&str> = manifest
+        .layers
+        .iter()
+        .filter_map(layer_filepath)
+        .filter(|p| crate::sources::is_safe_relative_path(p))
+        .collect();
+    Ok(safetensors_model_dir(&cache_dir, &rel_paths))
 }
 
 #[cfg(test)]
@@ -760,6 +801,111 @@ mod tests {
         assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
         let (_, m) = manifest_with(vec![descriptor("sha256:a", "README.md")]);
         assert_eq!(manifest_format(&m), None);
+    }
+
+    /// The layers `llmman pull nvidia/Cosmos3-Edge` records (the
+    /// Diffusers layout: a root pipeline index, per-component subdirs).
+    fn cosmos3_layers() -> Vec<crate::storage::oci::Descriptor> {
+        vec![
+            descriptor("sha256:a", "config.json"),
+            descriptor("sha256:b", "model_index.json"),
+            descriptor("sha256:c", "scheduler/scheduler_config.json"),
+            descriptor("sha256:d", "transformer/config.json"),
+            descriptor(
+                "sha256:e",
+                "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+            ),
+            descriptor("sha256:f", "vae/config.json"),
+            descriptor("sha256:g", "vae/diffusion_pytorch_model.safetensors"),
+            descriptor("sha256:h", "vision_encoder/model.safetensors"),
+        ]
+    }
+
+    #[test]
+    fn a_root_model_index_makes_a_safetensors_repo_omni() {
+        let (_, m) = manifest_with(cosmos3_layers());
+        assert_eq!(manifest_format(&m), Some(ModelFormat::Omni));
+        // a GGUF transformer with role-annotated sidecars still wins
+        let mut layers = cosmos3_layers();
+        let mut vae = descriptor("sha256:z", "vae.safetensors");
+        vae.annotations.get_or_insert_with(Default::default).insert(
+            crate::hf::oci::ANNOTATION_ROLE.to_string(),
+            "vae".to_string(),
+        );
+        layers.push(descriptor("sha256:y", "ltx.gguf"));
+        layers.push(vae);
+        let (_, m) = manifest_with(layers);
+        assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
+    }
+
+    #[test]
+    fn a_nested_model_index_or_one_without_weights_is_not_omni() {
+        // A pipeline vendored inside an LLM repo does not make it one.
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "config.json"),
+            descriptor("sha256:b", "model.safetensors"),
+            descriptor("sha256:c", "examples/pipeline/model_index.json"),
+        ]);
+        assert_eq!(manifest_format(&m), Some(ModelFormat::SafeTensors));
+        // An index with nothing to serve is still nothing to serve.
+        let (_, m) = manifest_with(vec![descriptor("sha256:a", "model_index.json")]);
+        assert_eq!(manifest_format(&m), None);
+    }
+
+    #[test]
+    fn capabilities_of_an_omni_model_are_media_even_without_recorded_outputs() {
+        // Pulled before the pull recorded outputTypes: still not a chat model.
+        let (store, m) = manifest_with(cosmos3_layers());
+        assert_eq!(capabilities(&store, &m), vec!["image"]);
+        let (store, mut m) = manifest_with(cosmos3_layers());
+        m.config = store
+            .write_blob(
+                "application/vnd.cncf.model.config.v1+json",
+                br#"{"config":{"format":"safetensors","capabilities":{"inputTypes":["text"],"outputTypes":["image","video"]}}}"#,
+            )
+            .unwrap();
+        assert_eq!(capabilities(&store, &m), vec!["image", "video"]);
+    }
+
+    #[test]
+    fn model_dir_is_the_parent_of_the_shallowest_config_json() {
+        let cache = Path::new("/cache/abc");
+        // Diffusers: transformer/config.json is listed before the root one.
+        let dir = safetensors_model_dir(
+            cache,
+            &[
+                "transformer/config.json",
+                "vae/config.json",
+                "config.json",
+                "model_index.json",
+            ],
+        );
+        assert_eq!(dir, cache);
+        // A plain LLM checkout, as before.
+        assert_eq!(
+            safetensors_model_dir(cache, &["config.json", "model.safetensors"]),
+            cache
+        );
+        // A repo whose only config.json is nested still resolves into it.
+        assert_eq!(
+            safetensors_model_dir(cache, &["sub/config.json", "sub/model.safetensors"]),
+            cache.join("sub")
+        );
+        // A pure Diffusers repo: no root config.json, only the pipeline
+        // index there and a config.json per component.
+        assert_eq!(
+            safetensors_model_dir(cache, &["vae/config.json", "model_index.json"]),
+            cache
+        );
+        assert_eq!(safetensors_model_dir(cache, &["a.safetensors"]), cache);
+    }
+
+    #[test]
+    fn omni_variant_reports_its_format_and_path() {
+        let p = ModelPath::Omni(PathBuf::from("/cache/cosmos"));
+        assert_eq!(p.format(), "omni");
+        assert_eq!(p.path(), Path::new("/cache/cosmos"));
+        assert_eq!(p.mmproj(), None);
     }
 
     #[test]

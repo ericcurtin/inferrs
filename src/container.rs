@@ -243,6 +243,24 @@ impl VllmBackend {
         Ok(format!("docker.io/vllm/{repo}:{v}-{suffix}"))
     }
 
+    /// The `vllm/vllm-omni` image for a Diffusers-layout model: CUDA only,
+    /// `<version>-{x86_64,aarch64}`; `version` is vLLM-Omni's release.
+    fn omni_image_ref(self, arch: HostArch, version: Option<&str>) -> Result<String> {
+        let v = version.unwrap_or("latest");
+        let suffix = match (self, arch) {
+            (VllmBackend::Cuda12 | VllmBackend::Cuda13, HostArch::X86_64) => "x86_64",
+            (VllmBackend::Cuda12 | VllmBackend::Cuda13, HostArch::Aarch64) => "aarch64",
+            (VllmBackend::Rocm, _) => anyhow::bail!(
+                "an AMD GPU was detected, but vllm/vllm-omni publishes only CUDA images \
+                 (install vllm-omni locally and drop --ociman to serve this model)"
+            ),
+            (VllmBackend::Cpu, _) => anyhow::bail!(
+                "no CUDA GPU was detected, and vllm/vllm-omni publishes only CUDA images"
+            ),
+        };
+        Ok(format!("docker.io/vllm/vllm-omni:{v}-{suffix}"))
+    }
+
     /// GPU passthrough plus what vLLM's deployment docs ask for: `--ipc=host`
     /// (its workers share tensors over `/dev/shm`) and, for the CPU image,
     /// `SYS_NICE` and an unconfined seccomp profile for NUMA thread binding.
@@ -270,6 +288,8 @@ pub enum ContainerEngine {
     LlamaServer,
     /// `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` (safetensors).
     Vllm,
+    /// `vllm/vllm-omni` (Diffusers-layout safetensors: `vllm serve --omni`).
+    VllmOmni,
 }
 
 /// The image [`spawn`] / [`spawn_vllm`] would run here for `engine`.
@@ -279,6 +299,10 @@ fn image_for(engine: ContainerEngine, version: Option<&str>) -> Result<String> {
         ContainerEngine::Vllm => {
             let (backend, arch) = VllmBackend::detect()?;
             backend.image_ref(arch, version)
+        }
+        ContainerEngine::VllmOmni => {
+            let (backend, arch) = VllmBackend::detect()?;
+            backend.omni_image_ref(arch, version)
         }
     }
 }
@@ -560,21 +584,28 @@ fn run_args(engine_args: Vec<String>, port: u16, passthrough_vars: &[&str]) -> V
 }
 
 /// The vLLM counterpart of [`spawn`]: `vllm serve` on a safetensors
-/// directory (mounted at `/models`) in the image [`VllmBackend`] picks.
+/// directory (mounted at `/models`) in the image [`VllmBackend`] picks for
+/// `engine` (`Vllm` or `VllmOmni`; same `vllm` binary and mount).
 /// `serve_args` builds the argv after `vllm` from the in-container model
-/// dir and bind address, so it's `cmd::serve::vllm_serve_args` unchanged.
-/// `--entrypoint vllm` is explicit because `rocm/vllm`'s default is a
-/// shell. Every `VLLM_*` env var is forwarded, as a local child would
-/// inherit them.
+/// dir and bind address. `--entrypoint vllm` is explicit because
+/// `rocm/vllm`'s default is a shell and `vllm/vllm-omni`'s is empty.
+/// Every `VLLM_*` env var is forwarded, as a local child would inherit
+/// them, plus the Hub token variables (guardrail downloads).
 pub fn spawn_vllm(
     ociman: ContainerManager,
+    engine: ContainerEngine,
     model_dir: &Path,
     vllm_version: Option<&str>,
     port: u16,
     serve_args: impl FnOnce(&str, &str) -> Vec<String>,
 ) -> Result<tokio::process::Child> {
     let (backend, arch) = VllmBackend::detect()?;
-    let image = backend.image_ref(arch, vllm_version)?;
+    let image = match engine {
+        ContainerEngine::VllmOmni => backend.omni_image_ref(arch, vllm_version)?,
+        ContainerEngine::Vllm | ContainerEngine::LlamaServer => {
+            backend.image_ref(arch, vllm_version)?
+        }
+    };
     eprintln!(
         "[llmman] {}: detected {:?} on {:?}, using image {:?}",
         ociman.binary(),
@@ -585,7 +616,9 @@ pub fn spawn_vllm(
     let model_dir = mount_source(model_dir)?;
     let vllm_vars: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| k.starts_with("VLLM_"))
+        .filter(|k| {
+            k.starts_with("VLLM_") || matches!(k.as_str(), "HF_TOKEN" | "HUGGING_FACE_HUB_TOKEN")
+        })
         .collect();
     let vllm_vars: Vec<&str> = vllm_vars.iter().map(String::as_str).collect();
     let args = vllm_run_args(backend, image, &model_dir, port, &vllm_vars, serve_args);
@@ -956,6 +989,42 @@ mod tests {
             .to_string();
         assert!(err.contains("rocm/vllm"), "{err}");
         assert!(err.contains("LLMMAN_LLM_LIBRARY=cpu"), "{err}");
+    }
+
+    #[test]
+    fn vllm_omni_image_refs_match_docker_hub_tag_spellings() {
+        // hub.docker.com/r/vllm/vllm-omni/tags: latest-x86_64, latest-aarch64,
+        // v0.28.0-x86_64, ... — one CUDA build, no -cu129 variant.
+        for cuda in [VllmBackend::Cuda12, VllmBackend::Cuda13] {
+            assert_eq!(
+                cuda.omni_image_ref(HostArch::X86_64, None).unwrap(),
+                "docker.io/vllm/vllm-omni:latest-x86_64"
+            );
+            assert_eq!(
+                cuda.omni_image_ref(HostArch::Aarch64, None).unwrap(),
+                "docker.io/vllm/vllm-omni:latest-aarch64"
+            );
+            assert_eq!(
+                cuda.omni_image_ref(HostArch::Aarch64, Some("v0.28.0"))
+                    .unwrap(),
+                "docker.io/vllm/vllm-omni:v0.28.0-aarch64"
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_omni_has_only_cuda_images() {
+        let err = VllmBackend::Rocm
+            .omni_image_ref(HostArch::X86_64, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vllm/vllm-omni"), "{err}");
+        assert!(err.contains("--ociman"), "{err}");
+        let err = VllmBackend::Cpu
+            .omni_image_ref(HostArch::X86_64, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CUDA"), "{err}");
     }
 
     #[test]

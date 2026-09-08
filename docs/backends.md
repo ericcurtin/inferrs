@@ -10,6 +10,9 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` |
 | safetensors | `vllm` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
+| GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
+| Diffusers safetensors | `vllm serve --omni` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
 
 ## llama.cpp
 
@@ -63,6 +66,40 @@ host architecture:
 already-pulled model needs (without a model, the llama.cpp image).
 `CUDA_VISIBLE_DEVICES` and friends plus every `VLLM_*` variable are
 forwarded into the container.
+
+### vLLM-Omni (Diffusers pipelines)
+
+A safetensors repository laid out as a Diffusers pipeline (a root
+`model_index.json` next to `transformer/`, `vae/`, ...), such as
+[`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge), is
+served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni): the same
+`vllm` launcher with `--omni`. Plain `vllm serve` cannot load one.
+
+```sh
+uv pip install vllm==0.28.0 vllm-omni     # into the environment `vllm` runs from
+llmman run nvidia/Cosmos3-Edge "A robot arm cleaning a plate in a kitchen"
+llmman run nvidia/Cosmos3-Edge --video --seconds 2 "A robot arm cleaning a plate"
+```
+
+If `vllm` is a `#!/path/to/python` script whose Python cannot import
+`vllm_omni`, the load fails up front with a message saying so; otherwise
+vLLM itself reports `unrecognized arguments: --omni`. The model answers
+`/v1/images/generations` and `/v1/videos`, in llama-server's dialect
+(`width`/`height`/`steps`/`cfg_scale`, streamed `image_generation.*`
+events, a video job with a `content_url`) and vLLM-Omni's own (`size`,
+`num_inference_steps`, `guidance_scale`, `num_frames`, `extra_params`);
+unsent fields are left to the model's defaults. There is no
+`/v1/audio/speech` for these models.
+
+Cosmos3's safety guardrails are disabled (`--no-guardrails`): they need
+the `cosmos-guardrail` package and a runtime download of the gated
+`nvidia/Cosmos-1.0-Guardrail`, without which the server refuses to start.
+`LLMMAN_VLLM_OMNI_GUARDRAILS=1` leaves them on. `LLMMAN_LOAD_TIMEOUT` is
+also passed as `--init-timeout`.
+
+With `--ociman`, the image is `vllm/vllm-omni:latest-x86_64` or
+`latest-aarch64` (CUDA only; `--vllm-version` pins vLLM-Omni's release,
+e.g. `v0.28.0`). `--pull-oci <model>` picks it for a pulled Diffusers model.
 
 ### `vllm serve` from llmman's store
 

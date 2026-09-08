@@ -127,6 +127,17 @@ Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|
 adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
 `/v1/audio/speech` on `llmman serve`.
 
+A Diffusers-layout safetensors repository (a root `model_index.json`), such as NVIDIA's
+Cosmos3 world models, is served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
+--omni`; install `vllm-omni` next to `vllm`, or use `--ociman docker` for the `vllm/vllm-omni` image):
+
+```sh
+llmman run nvidia/Cosmos3-Edge "A robot arm cleaning a plate in a kitchen"              # 640x640 png
+llmman run nvidia/Cosmos3-Edge --video --seconds 2 "A robot arm cleaning a plate"       # 832x480 mp4
+```
+
+See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
+
 ## Commands
 
 | Command | Description |

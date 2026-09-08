@@ -223,6 +223,12 @@ pub async fn pull(reference: &str, layout_dir: &Path, progress_key: &str) -> Res
                     .await?;
             indexed_layers.sort_by_key(|(i, _)| *i);
             let layers: Vec<Descriptor> = indexed_layers.into_iter().map(|(_, d)| d).collect();
+            // A Diffusers pipeline (served by vLLM-Omni) generates media,
+            // not text: say so in the config, as a GGUF diffusion pull does.
+            if api::is_diffusers_repo(&files) {
+                let class = api::diffusers_pipeline_class(layout_dir, &layers);
+                meta.diffusion_outputs = api::diffusers_outputs(class.as_deref());
+            }
             oci::build_cncf_manifest(layout_dir, &meta, &format!("{owner}/{repo}"), "", layers)?
         }
     };

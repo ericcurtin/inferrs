@@ -276,6 +276,81 @@ fn basename_lower(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_lowercase()
 }
 
+/// A Diffusers pipeline in safetensors (a root `model_index.json`, e.g.
+/// `nvidia/Cosmos3-Edge`): pulled as safetensors, served by vLLM-Omni.
+pub fn is_diffusers_repo(files: &[HfFile]) -> bool {
+    files
+        .iter()
+        .any(|f| f.kind == "file" && f.path == crate::modelpack::DIFFUSERS_MODEL_INDEX)
+        && files
+            .iter()
+            .any(|f| f.kind == "file" && basename_lower(&f.path).ends_with(".safetensors"))
+}
+
+/// Substrings of the `_class_name`s vLLM-Omni registers with
+/// `final_output_type="video"` (its `diffusion/registry.py`), lowercased.
+const VIDEO_PIPELINE_HINTS: &[&str] = &[
+    "video",
+    "omni",
+    "cosmos",
+    "wan",
+    "ltx",
+    "magi",
+    "helios",
+    "lingbot",
+    "longcat",
+    "minimaxh3",
+];
+
+/// A Diffusers pipeline's `outputTypes` from its `_class_name`: the video
+/// families vLLM-Omni serves also make video, anything else only images.
+pub fn diffusers_outputs(class_name: Option<&str>) -> Vec<&'static str> {
+    let lower = class_name.unwrap_or("").to_lowercase();
+    if VIDEO_PIPELINE_HINTS.iter().any(|h| lower.contains(h)) {
+        vec!["image", "video"]
+    } else {
+        vec!["image"]
+    }
+}
+
+/// [`diffusers_pipeline_class`] for a transfer, which keeps no layers:
+/// fetches the index from the Hub. `None` on failure.
+pub async fn fetch_diffusers_pipeline_class(
+    client: &reqwest::Client,
+    endpoint: &str,
+    owner: &str,
+    repo: &str,
+    commit: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    let url = format!(
+        "{endpoint}{owner}/{repo}/resolve/{commit}/{}",
+        crate::modelpack::DIFFUSERS_MODEL_INDEX
+    );
+    pipeline_class(&get_json(client, &url, token).await.ok()?)
+}
+
+fn pipeline_class(index: &serde_json::Value) -> Option<String> {
+    index.get("_class_name")?.as_str().map(str::to_string)
+}
+
+/// The `_class_name` of the pipeline index among `layers`, already
+/// downloaded into the OCI layout at `layout_dir`.
+pub fn diffusers_pipeline_class(
+    layout_dir: &std::path::Path,
+    layers: &[oci::Descriptor],
+) -> Option<String> {
+    let index = layers.iter().find(|d| {
+        d.annotations
+            .as_ref()
+            .and_then(|a| a.get(oci::ANNOTATION_FILEPATH))
+            .is_some_and(|p| p == crate::modelpack::DIFFUSERS_MODEL_INDEX)
+    })?;
+    let hex = index.digest.strip_prefix("sha256:")?;
+    let bytes = std::fs::read(layout_dir.join("blobs").join("sha256").join(hex)).ok()?;
+    pipeline_class(&serde_json::from_slice(&bytes).ok()?)
+}
+
 /// Like [`select_gguf`], but when no quant is requested prefers the fast
 /// `distilled` variant that diffusion repos ship next to the `dev` one.
 pub fn select_diffusion_gguf(files: &[HfFile], tag: &str) -> Result<Vec<HfFile>> {
@@ -721,5 +796,84 @@ mod tests {
             None
         );
         assert_eq!(diffusion_default_text_encoder("flux-dev-Q8_0.gguf"), None);
+    }
+
+    /// `nvidia/Cosmos3-Edge`'s listing (weights only; assets elided).
+    fn cosmos3_repo() -> Vec<HfFile> {
+        vec![
+            file("README.md", 10),
+            file("config.json", 1),
+            file("model_index.json", 1),
+            file("model.safetensors.index.json", 1),
+            file("scheduler/scheduler_config.json", 1),
+            file("transformer/config.json", 1),
+            file(
+                "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+                5,
+            ),
+            file(
+                "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+                2,
+            ),
+            file("vae/config.json", 1),
+            file("vae/diffusion_pytorch_model.safetensors", 1),
+            file("vision_encoder/model.safetensors", 1),
+            file("assets/example_i2v_input.jpg", 1),
+        ]
+    }
+
+    #[test]
+    fn diffusers_repo_is_detected_by_its_root_pipeline_index() {
+        let files = cosmos3_repo();
+        assert!(is_diffusers_repo(&files));
+        // Not the GGUF-sidecar kind: nothing in it is named like an LTX VAE,
+        // so it must fall through to the safetensors pull, nested paths intact.
+        assert!(!is_diffusion_repo(&files));
+        assert!(select_gguf(&files, "").is_err());
+        let picked = select_downloadable_hf_files(&files);
+        let paths: Vec<&str> = picked.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"model_index.json"));
+        assert!(paths.contains(&"vae/diffusion_pytorch_model.safetensors"));
+        assert!(paths.contains(&"transformer/config.json"));
+        assert!(!paths.contains(&"assets/example_i2v_input.jpg"));
+        // A plain LLM repo, and an index without weights, are not one.
+        assert!(!is_diffusers_repo(&[
+            file("config.json", 1),
+            file("model.safetensors", 1)
+        ]));
+        assert!(!is_diffusers_repo(&[file("model_index.json", 1)]));
+        // A nested index does not make the repo a pipeline.
+        assert!(!is_diffusers_repo(&[
+            file("model.safetensors", 1),
+            file("demo/model_index.json", 1)
+        ]));
+    }
+
+    #[test]
+    fn diffusers_outputs_follow_the_pipeline_class() {
+        assert_eq!(
+            diffusers_outputs(Some("Cosmos3OmniPipeline")),
+            vec!["image", "video"]
+        );
+        for video in [
+            "WanPipeline",
+            "LTX2Pipeline",
+            "HunyuanVideo15Pipeline",
+            "Magi2Pipeline",
+        ] {
+            assert_eq!(
+                diffusers_outputs(Some(video)),
+                vec!["image", "video"],
+                "{video}"
+            );
+        }
+        for image in ["QwenImagePipeline", "FluxPipeline", "LancePipeline"] {
+            assert_eq!(diffusers_outputs(Some(image)), vec!["image"], "{image}");
+        }
+        assert_eq!(
+            diffusers_outputs(None),
+            vec!["image"],
+            "unknown: at least an image model"
+        );
     }
 }
