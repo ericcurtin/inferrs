@@ -50,6 +50,67 @@ no authentication, so `run` and `launch` never send a key to a remote
 for a caller that presented none. (`providers` and `list --provider`
 read the catalog only and work against any daemon.)
 
+## Your own endpoints
+
+A provider models.dev has never heard of — vLLM or llama-server on a
+box down the hall, LM Studio on a laptop, a proxy in front of OpenAI —
+is defined in `llmman.conf` by giving a `[providers.<id>]` a
+`base_url`:
+
+```toml
+[providers.gpubox]
+base_url = "http://gpubox:8000/v1"
+```
+
+```console
+$ llmman config set providers.gpubox.base_url http://gpubox:8000/v1
+$ llmman providers gpubox
+PROVIDER    NAME      API KEY    KEY            MODELS
+gpubox      gpubox    -          none needed    -
+$ llmman list --provider gpubox                # asks the box's own /models
+$ llmman launch opencode --provider gpubox --model qwen3-coder
+```
+
+From there it is a provider like any other: `run`, `list`, `launch` and
+`--overflow-provider` all take the id, and requests still go through
+`llmman serve`, which forwards to the URL.
+
+| Field | Meaning |
+|-------|---------|
+| `base_url` | Required to define one. An absolute `http://` or `https://` URL the wire's route is appended to — `/chat/completions` for `openai`, `/messages` for `anthropic` — so it usually ends in `/v1`. |
+| `wire` | `openai` (default) or `anthropic`. See [Wire formats](#wire-formats). |
+| `api_key` | Sent as the wire's credential when set. Most local servers take none, and none is sent. |
+| `api_key_env` | An environment variable to read the key from instead; it wins over `api_key`, as for a catalog provider. `""` clears one an earlier file named. |
+| `name` | Display name for listings. The id when absent. |
+
+The rules the catalog is filtered by do not apply. They vet a list
+fetched from the network at runtime; a URL you wrote into your own
+owner-only file needs no vetting beyond parsing. So a defined provider
+may be plain `http` — that is the point on a LAN — and may take no key.
+If it has a key *and* a plain-http URL, whichever process is about to
+send the key warns that it crosses the network in cleartext, and sends
+it.
+
+A defined provider with a catalog id (`[providers.openai]` with a
+`base_url`) replaces the catalog entry, which is how a proxy or regional
+endpoint gets used without renaming the provider in every integration's
+config. The catalog's model list goes with it.
+
+Models are not listed in the file. For an `openai`-wire provider,
+`list --provider <id>` and the `--model` check ask the endpoint's own
+`GET /models` and take what it says; a box that is down or lacks the
+route lists nothing, and the request still goes to it. An `anthropic`
+provider has no such route and lists nothing. `llmman providers` shows
+`-` in the models column for the same reason.
+
+`llmman serve` reads `llmman.conf` once, at startup, so a provider added
+while it runs needs a restart to appear. A machine that cannot reach
+models.dev at all still has its defined providers.
+
+The `base_url` is reported by the daemon's API and printed in warnings,
+so it may not carry a `user:password@`; `api_key` is where a credential
+goes. The id may not contain `/`.
+
 ## Hybrid model pairs
 
 `--overflow-provider` and `--overflow-model` pair the local `--model`
@@ -141,10 +202,16 @@ Each provider is spoken to in one of two wire formats, reported as
 
 - `openai`: OpenAI Chat Completions with `Authorization: Bearer <key>`.
   Every `@ai-sdk/openai-compatible` provider, plus the hand-checked
-  endpoints for `openai`, `google`, `groq`, `mistral` and the rest.
+  endpoints for `openai`, `google`, `groq`, `mistral` and the rest, and
+  the default for a provider [defined in `llmman.conf`](#your-own-endpoints).
 - `anthropic`: the Anthropic Messages API with `x-api-key: <key>`.
   `anthropic` itself. Other Messages-compatible endpoints are not
-  offered: their auth scheme varies and has not been checked.
+  offered from the catalog, since their auth scheme varies and has not
+  been checked; one you know takes `x-api-key` can be defined with
+  `wire = "anthropic"`.
+
+A provider that takes no key gets no credential header at all, not an
+empty one.
 
 Anthropic is never reached through its OpenAI-compatibility shim. What a
 request becomes on the way to a `wire: anthropic` provider depends on

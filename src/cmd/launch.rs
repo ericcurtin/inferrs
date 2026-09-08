@@ -321,13 +321,18 @@ fn resolve_provider_model(
     // Read here, not left to the daemon, so a missing key names the
     // variable to set in llmman's own output. It travels per request in
     // the integration's own Authorization header (see client_api_key in
-    // cmd::serve), never to disk or a command line.
-    //
-    // The placeholder goes instead whenever the daemon's key is the one
-    // that matters — an integration that cannot carry one, or a shell
-    // without one where the daemon has it — since that is what makes
-    // serve fall back to its own.
-    let key = match (entry.api_key(), key_travels_per_request) {
+    // cmd::serve), never to disk or a command line. The placeholder goes
+    // instead whenever the daemon's key is the one that matters — an
+    // integration that cannot carry one, or a shell without one where
+    // the daemon has it — or when the provider takes none at all
+    // (`key_optional`): it is what tells serve the header is not a
+    // credential.
+    let key = if key_travels_per_request {
+        entry.client_key()
+    } else {
+        None
+    };
+    let key = match (key, key_travels_per_request) {
         (Some(key), true) => key,
         (_, false) => {
             // Fatal, not a warning: this integration cannot carry a key,
@@ -336,12 +341,12 @@ fn resolve_provider_model(
             // would spend it. Warning and handing off would surface as a
             // 401 inside someone else's TUI.
             anyhow::ensure!(
-                entry.key_usable,
+                entry.key_usable || entry.key_optional,
                 "{integration} is configured through a file, so it cannot send an API key: \
                  llmman serve needs a key of its own, and must be bound to loopback to \
                  spend it.\n\
                  Where the daemon runs, {}, then restart it.",
-                providers::key_hint(&entry.id, &entry.key_env)
+                entry.key_hint()
             );
             providers::PLACEHOLDER_API_KEY.to_string()
         }
@@ -352,11 +357,8 @@ fn resolve_provider_model(
             );
             providers::PLACEHOLDER_API_KEY.to_string()
         }
-        (None, true) => anyhow::bail!(
-            "no API key for {} — {}",
-            entry.name,
-            providers::key_hint(&entry.id, &entry.key_env)
-        ),
+        (None, true) if entry.key_optional => providers::PLACEHOLDER_API_KEY.to_string(),
+        (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
     Ok((providers::format_remote_ref(provider, model), key))

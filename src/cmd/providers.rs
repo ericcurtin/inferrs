@@ -47,7 +47,7 @@ pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
     let name_w = shown.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
     let key_w = shown
         .iter()
-        .map(|p| p.key_env.len())
+        .map(|p| key_env(p).len())
         .max()
         .unwrap_or(7)
         .max(7);
@@ -67,9 +67,9 @@ pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
             "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<14}    {}",
             p.id,
             p.name,
-            p.key_env,
+            key_env(p),
             key_status(p),
-            p.models,
+            model_count(p),
             id_w = id_w,
             name_w = name_w,
             key_w = key_w,
@@ -87,6 +87,22 @@ fn matches(provider: &ProviderSummary, needle: Option<&str>) -> bool {
     provider.id.to_lowercase().contains(needle) || provider.name.to_lowercase().contains(needle)
 }
 
+/// The variable column: `-` for a configured provider that names none.
+fn key_env(provider: &ProviderSummary) -> &str {
+    provider.key_env.as_deref().unwrap_or("-")
+}
+
+/// The models column: `-` for a configured provider, whose endpoint is
+/// only asked by `llmman list --provider <id>`; `0` would read as
+/// "serves nothing".
+fn model_count(provider: &ProviderSummary) -> String {
+    if provider.key_optional && provider.models == 0 {
+        "-".to_string()
+    } else {
+        provider.models.to_string()
+    }
+}
+
 /// Where a *usable* key is — the one thing to act on before `--provider`
 /// works.
 ///
@@ -95,12 +111,14 @@ fn matches(provider: &ProviderSummary, needle: Option<&str>) -> bool {
 /// is not "shell". "withheld" is one the daemon has but will not spend,
 /// being bound where others could reach it (see `resolve_remote_target`
 /// in cmd::serve) — a state of its own, since what needs fixing there is
-/// the bind, not the key.
+/// the bind, not the key. "none needed" is a keyless provider: nothing
+/// to act on.
 fn key_status(provider: &ProviderSummary) -> &'static str {
     match (provider.key_usable, provider.key_here(), provider.key_set) {
         (true, _, _) => "set",
         (false, true, _) => "set (client)",
         (false, false, true) => "set (withheld)",
+        (false, false, false) if provider.key_optional => "none needed",
         (false, false, false) => "unset",
     }
 }
@@ -113,9 +131,10 @@ mod tests {
         ProviderSummary {
             id: id.to_string(),
             name: name.to_string(),
-            key_env: "LLMMAN_TEST_PROVIDER_KEY_UNSET".to_string(),
+            key_env: Some("LLMMAN_TEST_PROVIDER_KEY_UNSET".to_string()),
             key_set: false,
             key_usable: false,
+            key_optional: false,
             models: 0,
         }
     }
@@ -145,6 +164,19 @@ mod tests {
         // the variable.
         p.key_set = true;
         assert_eq!(key_status(&p), "set (withheld)");
+        p.key_usable = true;
+        assert_eq!(key_status(&p), "set");
+
+        // A provider that takes no key is not "unset": there is nothing
+        // to set. One that has a key anyway reports it as any other.
+        let mut p = summary("gpubox", "GPU box");
+        p.key_env = None;
+        p.key_optional = true;
+        assert_eq!(key_status(&p), "none needed");
+        assert_eq!(key_env(&p), "-");
+        assert_eq!(model_count(&p), "-");
+        assert_eq!(model_count(&summary("openai", "OpenAI")), "0");
+        p.key_set = true;
         p.key_usable = true;
         assert_eq!(key_status(&p), "set");
     }

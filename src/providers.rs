@@ -31,9 +31,16 @@
 //!
 //! Everything filtered out is deliberately *absent* rather than
 //! half-supported: a provider llmman offers is one it can actually reach.
+//!
+//! The one way past the filter is `llmman.conf`: a `[providers.<id>]`
+//! with a `base_url` defines a provider by hand and is merged into the
+//! catalog in [`catalog`]. The rules above vet a list fetched from the
+//! network; a URL the user wrote needs none, so a defined provider may be
+//! plain `http` and may take no key ([`Provider::key_optional`]).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -66,7 +73,12 @@ const OPENAI_COMPATIBLE_NPM: &[&str] = &[
 
 /// The wire format `llmman serve` speaks to a provider: the route, the
 /// credential header, and whether a request is translated on the way.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Deserialize` for the `wire = "openai"` field of a provider defined in
+/// `llmman.conf` (see [`crate::config`]), spelled as [`Wire::as_str`]
+/// reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Wire {
     /// OpenAI Chat Completions, `Authorization: Bearer <key>`.
     OpenAi,
@@ -265,13 +277,19 @@ pub struct Provider {
     /// Base URL that the wire's route (`/chat/completions`, `/messages`,
     /// ...) is appended to. Never has a trailing slash.
     pub base_url: String,
-    /// Environment variable holding this provider's API key.
-    pub key_env: String,
+    /// Environment variable holding this provider's API key. Always set
+    /// for a catalog provider; a configured one may name none.
+    pub key_env: Option<String>,
     /// What is spoken at `base_url`.
     pub wire: Wire,
+    /// Whether a request may go upstream with no credential. True only
+    /// for a provider `llmman.conf` defines; for a catalog one a keyless
+    /// request is a certain 401, better reported before the handoff.
+    pub key_optional: bool,
     /// Models this provider serves, sorted by id. Used to validate
     /// `--model`, to suggest values, and to answer `llmman list
-    /// --provider`; the id is never sent upstream verbatim.
+    /// --provider`; the id is never sent upstream verbatim. Empty for a
+    /// configured provider, whose endpoint is asked instead.
     pub models: Vec<Model>,
 }
 
@@ -300,13 +318,27 @@ impl Provider {
     /// This provider's API key, or `None` when neither the environment
     /// nor `llmman.conf` has one. See [`key_for`].
     pub fn api_key(&self) -> Option<String> {
-        key_for(&self.id, &self.key_env)
+        key_for(&self.id, self.key_env.as_deref())
     }
 
     /// Appends an OpenAI route to this provider's base URL. See
     /// [`rebase_url`].
     pub fn url(&self, route: &str) -> String {
         rebase_url(&self.base_url, route)
+    }
+
+    /// A provider as `llmman.conf` defines it. No models: `cmd::serve`
+    /// asks the endpoint when a caller wants the list.
+    pub fn from_configured(conf: &crate::config::ConfiguredProvider) -> Self {
+        Self {
+            id: conf.id.clone(),
+            name: conf.name.clone(),
+            base_url: conf.base_url.clone(),
+            key_env: conf.key_env.clone(),
+            wire: conf.wire,
+            key_optional: true,
+            models: Vec::new(),
+        }
     }
 }
 
@@ -321,8 +353,11 @@ impl Provider {
 ///
 /// Free-standing because a `/llmman/providers` client learns only the id
 /// and the variable's *name* from the daemon, never a [`Provider`].
-pub fn key_for(id: &str, var: &str) -> Option<String> {
-    resolve_key(key_from_env(var), crate::config::provider_api_key(id))
+pub fn key_for(id: &str, var: Option<&str>) -> Option<String> {
+    resolve_key(
+        var.and_then(key_from_env),
+        crate::config::provider_api_key(id),
+    )
 }
 
 /// Split out so the precedence is testable without touching the process
@@ -346,12 +381,19 @@ fn key_from_env(var: &str) -> Option<String> {
 /// Both places llmman looks, named, for an error that fires because it
 /// found neither. One string so every such message agrees: a user told
 /// only about the variable would never learn the file exists.
-pub fn key_hint(id: &str, var: &str) -> String {
-    format!(
-        "set {var} in the environment, or add a [providers.{}] api_key to {}",
-        toml_key(id),
-        crate::config::user_path_display()
-    )
+pub fn key_hint(id: &str, var: Option<&str>) -> String {
+    match var {
+        Some(var) => format!(
+            "set {var} in the environment, or add a [providers.{}] api_key to {}",
+            toml_key(id),
+            crate::config::user_path_display()
+        ),
+        None => format!(
+            "add an api_key to [providers.{}] in {}",
+            toml_key(id),
+            crate::config::user_path_display()
+        ),
+    }
 }
 
 /// `id` as a TOML key, quoted when it is not a bare one.
@@ -555,6 +597,39 @@ impl Catalog {
         );
         Ok(Self { providers })
     }
+
+    /// The providers `llmman.conf` defines and nothing else (see [`catalog`]).
+    pub fn from_configured(configured: &[crate::config::ConfiguredProvider]) -> Self {
+        Self::default().with_configured(configured)
+    }
+
+    /// Adds the providers `llmman.conf` defines. One with a catalog id
+    /// shadows the catalog entry — the way to put a proxy in front of
+    /// `api.openai.com`. A plain-http `base_url` with a key behind it is
+    /// warned about once per load, not refused: the URL is the user's own.
+    pub fn with_configured(mut self, configured: &[crate::config::ConfiguredProvider]) -> Self {
+        for conf in configured {
+            let provider = Provider::from_configured(conf);
+            if provider.base_url.starts_with("http://") && provider.api_key().is_some() {
+                eprintln!(
+                    "[llmman] warning: provider {} has an API key and a plain-http base_url \
+                     ({}); the key will cross the network in cleartext",
+                    provider.id, provider.base_url
+                );
+            }
+            if self
+                .providers
+                .insert(provider.id.clone(), provider)
+                .is_some()
+            {
+                crate::debug_log!(
+                    "provider catalog: {} from llmman.conf shadows the models.dev entry",
+                    conf.id
+                );
+            }
+        }
+        self
+    }
 }
 
 /// A models.dev catalog entry, narrowed to the fields llmman reads —
@@ -671,8 +746,9 @@ fn routable(id: &str, raw: RawProvider) -> Option<Provider> {
         id: id.to_string(),
         name: raw.name,
         base_url: base_url_of(base_url),
-        key_env,
+        key_env: Some(key_env),
         wire,
+        key_optional: false,
         // Sorted by id, since `models` came out of a BTreeMap.
         models: raw
             .models
@@ -719,37 +795,85 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 type Cached = (Instant, Duration, Result<Arc<Catalog>, String>);
 static CATALOG: Mutex<Option<Cached>> = Mutex::new(None);
 
-/// The routable provider catalog, fetched from models.dev on first use.
+/// Whether a background refresh (see [`catalog`]) is in flight.
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+
+/// The routable provider catalog, fetched from models.dev on first use,
+/// with the providers `llmman.conf` defines merged on top
+/// ([`Catalog::with_configured`]).
 ///
 /// Memoized, but not for the life of the process: `llmman serve` runs for
 /// days, so a success is re-checked after [`CACHE_TTL`] and a failure
-/// after [`RETRY_COOLDOWN`] — otherwise one blip at startup would leave a
-/// daemon with no providers until someone restarted it.
-///
-/// The lock is held across the fetch, so concurrent callers wait for one
-/// load rather than racing several. Blocking: callers on an async runtime
-/// (`cmd::serve`) must go through `spawn_blocking`.
+/// after [`RETRY_COOLDOWN`]. An expired *success* is served as-is while
+/// a background thread refreshes it, so a request never waits on
+/// models.dev once there is anything to serve — in particular on an
+/// offline machine, where the configured providers stand alone and the
+/// retry would otherwise block a request for [`FETCH_TIMEOUT`] every
+/// cooldown. Only the first load, or one after a total failure, runs
+/// inline; the lock is held across it so concurrent callers wait for one
+/// load rather than racing several. Blocking: callers on an async
+/// runtime (`cmd::serve`) must go through `spawn_blocking`.
 pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
     let mut cached = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
-    let live = cached
-        .as_ref()
-        .is_some_and(|(at, good_for, _)| at.elapsed() < *good_for);
-    if !live {
-        // A stale catalog is held only as long as a failure: what
-        // produced it was a failed refresh, whatever it managed to
-        // return. See Loaded.
-        *cached = Some(match load() {
-            Ok(loaded) => (
-                Instant::now(),
-                loaded.good_for(),
-                Ok(Arc::new(loaded.into_catalog())),
-            ),
-            Err(e) => (Instant::now(), RETRY_COOLDOWN, Err(format!("{e:#}"))),
-        });
+    match cached.as_ref() {
+        Some((at, good_for, result)) if at.elapsed() < *good_for => result_of(result),
+        Some((_, _, Ok(stale))) => {
+            let stale = stale.clone();
+            if !REFRESHING.swap(true, Ordering::AcqRel) {
+                std::thread::spawn(|| {
+                    // Cleared on the way out however the load ends.
+                    struct Done;
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            REFRESHING.store(false, Ordering::Release);
+                        }
+                    }
+                    let _done = Done;
+                    let entry = load_entry();
+                    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                });
+            }
+            Ok(stale)
+        }
+        _ => {
+            let entry = load_entry();
+            let result = result_of(&entry.2);
+            *cached = Some(entry);
+            result
+        }
     }
-    match &cached.as_ref().expect("just populated").2 {
-        Ok(catalog) => Ok(catalog.clone()),
-        Err(e) => Err(anyhow::anyhow!(e.clone())),
+}
+
+fn result_of(result: &Result<Arc<Catalog>, String>) -> anyhow::Result<Arc<Catalog>> {
+    result.clone().map_err(anyhow::Error::msg)
+}
+
+/// One load, as [`catalog`] caches it. A failed load still yields a
+/// catalog when `llmman.conf` defines providers: a machine with no route
+/// out and a vLLM on the LAN is exactly where those are wanted. A stale
+/// or configured-only result is held only for [`RETRY_COOLDOWN`], since
+/// what produced it was a failed refresh.
+fn load_entry() -> Cached {
+    let configured = crate::config::configured_providers();
+    let now = Instant::now();
+    match load() {
+        Ok(loaded) => (
+            now,
+            loaded.good_for(),
+            Ok(Arc::new(loaded.into_catalog().with_configured(configured))),
+        ),
+        Err(e) if !configured.is_empty() => {
+            eprintln!(
+                "[llmman] using only the {} provider(s) defined in llmman.conf ({e:#})",
+                configured.len()
+            );
+            (
+                now,
+                RETRY_COOLDOWN,
+                Ok(Arc::new(Catalog::from_configured(configured))),
+            )
+        }
+        Err(e) => (now, RETRY_COOLDOWN, Err(format!("{e:#}"))),
     }
 }
 
@@ -970,7 +1094,7 @@ mod tests {
         let p = catalog.get("openrouter").expect("openrouter is routable");
         assert_eq!(p.name, "OpenRouter");
         assert_eq!(p.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(p.key_env, "OPENROUTER_API_KEY");
+        assert_eq!(p.key_env.as_deref(), Some("OPENROUTER_API_KEY"));
         assert_eq!(p.wire, Wire::OpenAi);
         // Sorted by id; an unpriced model keeps `None`, not a zero.
         assert_eq!(
@@ -1015,14 +1139,14 @@ mod tests {
         );
         let anthropic = catalog.get("anthropic").expect("anthropic is routable");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
-        assert_eq!(anthropic.key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(anthropic.key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         // Its own Messages API, never the OpenAI-compatibility shim.
         assert_eq!(anthropic.wire, Wire::Anthropic);
 
         // Three candidate variables in the catalog, one unambiguous
         // choice from the builtin.
         let google = catalog.get("google").expect("google is routable");
-        assert_eq!(google.key_env, "GEMINI_API_KEY");
+        assert_eq!(google.key_env.as_deref(), Some("GEMINI_API_KEY"));
         assert_eq!(google.wire, Wire::OpenAi);
     }
 
@@ -1174,7 +1298,11 @@ mod tests {
             );
             assert!(!p.base_url.ends_with('/'), "{}: {}", p.id, p.base_url);
             assert!(!p.base_url.contains("${"), "{}: {}", p.id, p.base_url);
-            assert!(!p.key_env.is_empty(), "{} has no key variable", p.id);
+            assert!(
+                p.key_env.as_deref().is_some_and(|v| !v.is_empty()),
+                "{} has no key variable",
+                p.id
+            );
         }
 
         // The providers someone actually reaches for, at the endpoints
@@ -1371,7 +1499,8 @@ mod tests {
             id: "groq".into(),
             name: "Groq".into(),
             base_url: "https://api.groq.com/openai/v1".into(),
-            key_env: "GROQ_API_KEY".into(),
+            key_env: Some("GROQ_API_KEY".into()),
+            key_optional: false,
             wire: Wire::OpenAi,
             models: vec![],
         };
@@ -1410,7 +1539,8 @@ mod tests {
             id: "test".into(),
             name: "Test".into(),
             base_url: "https://example.invalid/v1".into(),
-            key_env: "LLMMAN_TEST_PROVIDER_KEY_UNSET".into(),
+            key_env: Some("LLMMAN_TEST_PROVIDER_KEY_UNSET".into()),
+            key_optional: false,
             wire: Wire::OpenAi,
             models: vec![],
         };
@@ -1450,10 +1580,145 @@ mod tests {
     /// Both places, in one message.
     #[test]
     fn key_hint_names_the_variable_and_the_config_file() {
-        let hint = key_hint("openrouter", "OPENROUTER_API_KEY");
+        let hint = key_hint("openrouter", Some("OPENROUTER_API_KEY"));
         assert!(hint.contains("OPENROUTER_API_KEY"), "{hint}");
         assert!(hint.contains("[providers.openrouter]"), "{hint}");
         assert!(hint.contains("llmman.conf"), "{hint}");
+
+        // No variable to name: the file alone, and no dangling "or".
+        let hint = key_hint("gpubox", None);
+        assert!(hint.contains("[providers.gpubox]"), "{hint}");
+        assert!(hint.contains("llmman.conf"), "{hint}");
+        assert!(!hint.contains("environment"), "{hint}");
+    }
+
+    fn configured(id: &str, base_url: &str, wire: Wire) -> crate::config::ConfiguredProvider {
+        crate::config::ConfiguredProvider {
+            id: id.into(),
+            name: id.into(),
+            base_url: base_url.into(),
+            wire,
+            key_env: None,
+        }
+    }
+
+    /// A provider `llmman.conf` defines joins the catalog as a full
+    /// [`Provider`]: no models, no key demanded, plain `http` allowed —
+    /// none of which a catalog entry could get away with.
+    #[test]
+    fn configured_providers_join_the_catalog_with_key_optional() {
+        let catalog = catalog_from(
+            r#"{
+                "openrouter": {
+                    "id": "openrouter", "name": "OpenRouter",
+                    "api": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider",
+                    "env": ["OPENROUTER_API_KEY"],
+                    "models": { "m": {} }
+                }
+            }"#,
+        )
+        .with_configured(&[
+            configured("gpubox", "http://gpubox:8000/v1", Wire::OpenAi),
+            crate::config::ConfiguredProvider {
+                id: "relay".into(),
+                name: "Claude relay".into(),
+                base_url: "https://relay.example/v1".into(),
+                wire: Wire::Anthropic,
+                key_env: Some("RELAY_KEY".into()),
+            },
+        ]);
+
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(
+            catalog.ids().collect::<Vec<_>>(),
+            ["gpubox", "openrouter", "relay"]
+        );
+
+        let gpubox = catalog.get("gpubox").unwrap();
+        assert_eq!(gpubox.base_url, "http://gpubox:8000/v1");
+        assert_eq!(gpubox.wire, Wire::OpenAi);
+        assert!(gpubox.key_optional);
+        assert_eq!(gpubox.key_env, None);
+        assert!(gpubox.models.is_empty());
+        assert_eq!(gpubox.api_key(), None);
+        assert_eq!(
+            gpubox.url("/v1/chat/completions"),
+            "http://gpubox:8000/v1/chat/completions"
+        );
+
+        let relay = catalog.get("relay").unwrap();
+        assert_eq!(relay.name, "Claude relay");
+        assert_eq!(relay.wire, Wire::Anthropic);
+        assert_eq!(relay.key_env.as_deref(), Some("RELAY_KEY"));
+        assert!(relay.key_optional);
+
+        // The catalog entry is as it was.
+        let openrouter = catalog.get("openrouter").unwrap();
+        assert!(!openrouter.key_optional);
+        assert_eq!(openrouter.models.len(), 1);
+    }
+
+    /// The file is the user's deliberate word, so it wins over the
+    /// catalog for the same id — the one way to point `openai` at a
+    /// proxy without renaming every integration's model.
+    #[test]
+    fn a_configured_provider_shadows_the_catalog_entry_with_its_id() {
+        let catalog = catalog_from(
+            r#"{
+                "openai": {
+                    "id": "openai", "name": "OpenAI",
+                    "npm": "@ai-sdk/openai", "env": ["OPENAI_API_KEY"],
+                    "models": { "gpt-5": {} }
+                }
+            }"#,
+        )
+        .with_configured(&[configured(
+            "openai",
+            "http://proxy.corp:4000/v1",
+            Wire::OpenAi,
+        )]);
+        assert_eq!(catalog.len(), 1);
+        let p = catalog.get("openai").unwrap();
+        assert_eq!(p.base_url, "http://proxy.corp:4000/v1");
+        assert!(p.key_optional);
+        assert!(
+            p.models.is_empty(),
+            "the catalog's models are not the proxy's"
+        );
+    }
+
+    /// With no models.dev at all — offline, or a first run with no cache
+    /// — the configured providers are still a catalog. That is the case
+    /// they exist for.
+    #[test]
+    fn configured_providers_stand_alone_without_the_catalog() {
+        let catalog = Catalog::from_configured(&[configured(
+            "gpubox",
+            "http://gpubox:8000/v1",
+            Wire::OpenAi,
+        )]);
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.get("gpubox").is_some());
+        assert!(Catalog::from_configured(&[]).is_empty());
+    }
+
+    /// `wire = "openai"` in the file is the same spelling the daemon's
+    /// API reports; anything else is a parse error, not a default.
+    #[test]
+    fn wire_deserializes_from_its_reported_name() {
+        #[derive(Deserialize)]
+        struct W {
+            wire: Wire,
+        }
+        let parse = |s: &str| toml::from_str::<W>(&format!("wire = {s:?}")).map(|w| w.wire);
+        assert_eq!(parse("openai").unwrap(), Wire::OpenAi);
+        assert_eq!(parse("anthropic").unwrap(), Wire::Anthropic);
+        assert!(parse("OpenAI").is_err());
+        assert!(parse("ollama").is_err());
+        for wire in [Wire::OpenAi, Wire::Anthropic] {
+            assert_eq!(parse(wire.as_str()).unwrap(), wire);
+        }
     }
 
     /// models.dev ships `wafer.ai`, and `[providers.wafer.ai]` is two
@@ -1462,9 +1727,9 @@ mod tests {
     #[test]
     fn key_hint_quotes_a_provider_id_that_is_not_a_bare_toml_key() {
         assert!(
-            key_hint("wafer.ai", "WAFER_API_KEY").contains(r#"[providers."wafer.ai"]"#),
+            key_hint("wafer.ai", Some("WAFER_API_KEY")).contains(r#"[providers."wafer.ai"]"#),
             "{}",
-            key_hint("wafer.ai", "WAFER_API_KEY")
+            key_hint("wafer.ai", Some("WAFER_API_KEY"))
         );
         assert_eq!(toml_key("openrouter"), "openrouter");
         assert_eq!(toml_key("z-ai"), "z-ai");

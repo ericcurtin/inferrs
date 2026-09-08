@@ -22,8 +22,8 @@ The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/b
 ## llmman.conf
 
 Everything that needs a file rather than an environment variable lives in
-one place: short-name aliases, provider API keys, the signature trust
-policy, and the peers of an aggregation.
+one place: short-name aliases, provider API keys and endpoints, the
+signature trust policy, and the peers of an aggregation.
 
 ```toml
 # ~/.config/llmman/llmman.conf
@@ -33,6 +33,9 @@ gemma4 = "docker.io/ai/gemma4"
 
 [providers.openrouter]
 api_key = "sk-or-..."
+
+[providers.gpubox]                 # an endpoint models.dev does not list
+base_url = "http://gpubox:8000/v1"
 
 [verify]
 default = "off"
@@ -139,6 +142,29 @@ travels per request in an `Authorization` header. A key found by
 `llmman serve` is the fallback for a request that presents none, and is
 only spent for a daemon bound to loopback. `llmman providers` reports
 which of the two has a usable key.
+
+### Your own provider endpoints
+
+A `[providers.<id>]` that sets `base_url` *defines* a provider rather
+than keying a catalog one — an inference server at some host or URL
+models.dev does not list, or a replacement URL for one it does:
+
+```toml
+[providers.gpubox]
+base_url    = "http://gpubox:8000/v1"   # required; http or https
+wire        = "openai"                  # default; or "anthropic"
+api_key     = "..."                     # optional: most local servers take none
+api_key_env = "GPUBOX_API_KEY"          # optional: a variable to read it from
+name        = "GPU box"                 # optional: for listings
+```
+
+`wire`, `api_key_env` and `name` only mean something on a definition, so
+a table that sets one without `base_url` is rejected, as is a `base_url`
+that is not an absolute `http`/`https` URL — by `llmman config set` on
+the spot, or at load with the rest of the file. Later files override
+earlier ones field by field. `llmman serve` reads the file at startup,
+so a new definition needs a restart. See
+[providers.md](providers.md#your-own-endpoints) for how one is used.
 
 ### Short-name aliases
 

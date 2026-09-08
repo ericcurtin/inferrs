@@ -1700,9 +1700,10 @@ struct RemoteTarget {
     /// The catalog's output ceiling, for a wire that requires
     /// `max_tokens` (see [`anthropic::DEFAULT_MAX_TOKENS`]).
     max_output: Option<u32>,
-    /// API key for this request. See [`resolve_remote_target`] for where
-    /// it comes from.
-    api_key: String,
+    /// API key for this request, or `None` for a provider that takes
+    /// none (see `Provider::key_optional`). See [`resolve_remote_target`]
+    /// for where it comes from.
+    api_key: Option<String>,
 }
 
 impl std::fmt::Debug for RemoteTarget {
@@ -1712,7 +1713,7 @@ impl std::fmt::Debug for RemoteTarget {
             .field("base_url", &self.base_url)
             .field("wire", &self.wire)
             .field("model", &self.model)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -1740,15 +1741,21 @@ impl Target {
     /// auth, which is why nothing below ever forwarded the client's own
     /// `Authorization` header upstream — and must keep not forwarding it,
     /// so a key meant for one provider can never be relayed to another.
+    /// A keyless remote target gets no credential header either.
     fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::Local(_) => req,
             Self::Peer(_) => req.header(aggregation::HOP, "1"),
-            Self::Remote(remote) => match remote.wire {
-                Wire::OpenAi => req.bearer_auth(&remote.api_key),
-                Wire::Anthropic => req
-                    .header("x-api-key", &remote.api_key)
-                    .header("anthropic-version", anthropic::VERSION),
+            Self::Remote(remote) => match (remote.wire, remote.api_key.as_deref()) {
+                (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
+                (Wire::OpenAi, None) => req,
+                (Wire::Anthropic, key) => {
+                    let req = req.header("anthropic-version", anthropic::VERSION);
+                    match key {
+                        Some(key) => req.header("x-api-key", key),
+                        None => req,
+                    }
+                }
             },
         }
     }
@@ -1904,29 +1911,34 @@ async fn resolve_remote_target(
             .then(|| provider.api_key())
             .flatten()
     };
-    let api_key = client_api_key(headers).or_else(own_key).ok_or_else(|| {
-        AppError(
-            anyhow!(
-                "no API key for provider {provider_id:?} — send it as an Authorization \
-                 header{}",
-                if is_cross_site(headers) {
-                    ". This request came from another site, so llmman serve's own \
-                     environment is deliberately not used"
-                        .to_string()
-                } else if crate::daemon::reachable_only_locally() {
-                    format!(
-                        ", or give llmman serve a key of its own: {}",
-                        crate::providers::key_hint(&provider.id, &provider.key_env)
-                    )
-                } else {
-                    ". llmman serve is not bound to loopback, so its own environment is \
-                     deliberately not used"
-                        .to_string()
-                }
-            ),
-            StatusCode::UNAUTHORIZED,
-        )
-    })?;
+    let api_key = match client_api_key(headers).or_else(own_key) {
+        Some(key) => Some(key),
+        // A configured provider that takes no key goes up bare.
+        None if provider.key_optional => None,
+        None => {
+            return Err(AppError(
+                anyhow!(
+                    "no API key for provider {provider_id:?} — send it as an Authorization \
+                     header{}",
+                    if is_cross_site(headers) {
+                        ". This request came from another site, so llmman serve's own \
+                         environment is deliberately not used"
+                            .to_string()
+                    } else if crate::daemon::reachable_only_locally() {
+                        format!(
+                            ", or give llmman serve a key of its own: {}",
+                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref())
+                        )
+                    } else {
+                        ". llmman serve is not bound to loopback, so its own environment is \
+                         deliberately not used"
+                            .to_string()
+                    }
+                ),
+                StatusCode::UNAUTHORIZED,
+            ));
+        }
+    };
 
     let target = RemoteTarget {
         provider: provider_id,
@@ -3985,11 +3997,14 @@ struct ProviderSummary {
     id: String,
     name: String,
     base_url: String,
-    key_env: String,
+    /// Absent for a configured provider that names no variable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_env: Option<String>,
     /// What is spoken at `base_url`: `openai` or `anthropic` (see
     /// [`crate::providers::Wire`]).
     wire: &'static str,
-    /// Whether *this daemon's* environment holds `key_env`.
+    /// Whether this daemon holds a key for it, in its environment or its
+    /// `llmman.conf`.
     key_set: bool,
     /// Whether it would actually spend it for a request that presents no
     /// key of its own — `key_set` plus this daemon's own bind check, which
@@ -3997,6 +4012,9 @@ struct ProviderSummary {
     /// "will my keyless request work" has to read this, not `key_set`:
     /// its own `LLMMAN_HOST` says nothing about how the daemon is bound.
     key_usable: bool,
+    /// Whether a keyless request is forwarded anyway (see
+    /// `Provider::key_optional`).
+    key_optional: bool,
     models: usize,
 }
 
@@ -4010,6 +4028,7 @@ impl From<&crate::providers::Provider> for ProviderSummary {
             wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
             key_usable: daemon_key_usable(p),
+            key_optional: p.key_optional,
             models: p.models.len(),
         }
     }
@@ -4034,12 +4053,16 @@ struct ProviderResponse {
     id: String,
     name: String,
     base_url: String,
-    key_env: String,
+    /// See [`ProviderSummary::key_env`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_env: Option<String>,
     /// See [`ProviderSummary::wire`].
     wire: &'static str,
     key_set: bool,
     /// See [`ProviderSummary::key_usable`].
     key_usable: bool,
+    /// See [`ProviderSummary::key_optional`].
+    key_optional: bool,
     models: Vec<ProviderModelResponse>,
 }
 
@@ -4071,6 +4094,7 @@ impl From<&crate::providers::Provider> for ProviderResponse {
             wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
             key_usable: daemon_key_usable(p),
+            key_optional: p.key_optional,
             models: p
                 .models
                 .iter()
@@ -4096,7 +4120,11 @@ async fn handle_llmman_providers() -> Result<impl IntoResponse, AppError> {
 
 /// `GET /llmman/providers/:id` — one provider, or a 404 naming
 /// near-matches (see [`crate::providers::unknown_provider_error`]).
+///
+/// A configured provider's models come from its endpoint instead
+/// ([`configured_provider_models`]).
 async fn handle_llmman_provider(
+    State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let catalog = provider_catalog().await?;
@@ -4106,7 +4134,68 @@ async fn handle_llmman_provider(
             StatusCode::NOT_FOUND,
         )
     })?;
-    Ok(Json(ProviderResponse::from(provider)))
+    let mut response = ProviderResponse::from(provider);
+    if provider.key_optional && provider.models.is_empty() {
+        response.models = configured_provider_models(&state.0.client, provider)
+            .await
+            .into_iter()
+            .map(|id| ProviderModelResponse { id, cost: None })
+            .collect();
+    }
+    Ok(Json(response))
+}
+
+/// How long a configured provider gets to answer `GET /models`. Short:
+/// this sits in front of `llmman launch`, and a box that is down should
+/// cost a moment, not a hang.
+const CONFIGURED_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The model ids an OpenAI-wire configured provider reports at
+/// `GET {base_url}/models`, or none when it cannot or does not: the
+/// listing is a convenience, and an endpoint without it still takes
+/// requests. The daemon's own key is sent under the same bind rule as
+/// for a request (`daemon_key_usable`).
+async fn configured_provider_models(
+    client: &Client,
+    provider: &crate::providers::Provider,
+) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct ModelsResponse {
+        #[serde(default)]
+        data: Vec<ModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+
+    if provider.wire != Wire::OpenAi {
+        return Vec::new();
+    }
+    let url = provider.url("/v1/models");
+    let mut req = client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
+    if daemon_key_usable(provider) {
+        if let Some(key) = provider.api_key() {
+            req = req.bearer_auth(key);
+        }
+    }
+    let listed = async {
+        let resp = req.send().await?.error_for_status()?;
+        resp.json::<ModelsResponse>().await
+    }
+    .await;
+    match listed {
+        Ok(models) => {
+            let mut ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+        Err(e) => {
+            crate::debug_log!("provider {}: GET {url} failed: {e}", provider.id);
+            Vec::new()
+        }
+    }
 }
 
 /// Ollama's GET /api/version, extended with this daemon's own identity —
@@ -7953,7 +8042,7 @@ mod tests {
             wire,
             model: "mock-model".into(),
             max_output: None,
-            api_key: "sk-test".into(),
+            api_key: Some("sk-test".into()),
         }))
     }
 
@@ -8610,7 +8699,7 @@ mod tests {
             wire,
             model: model.into(),
             max_output: None,
-            api_key: "k".into(),
+            api_key: Some("k".into()),
         }
     }
 
@@ -9255,7 +9344,7 @@ mod tests {
                         wire: Wire::OpenAi,
                         model: "claude".into(),
                         max_output: None,
-                        api_key: "k".into(),
+                        api_key: Some("k".into()),
                     }))
                 } else {
                     Target::Local(1)
@@ -9794,6 +9883,138 @@ mod tests {
                 "{fields:?} carries a key"
             );
         }
+    }
+
+    /// A provider `llmman.conf` defines tells its clients it takes no
+    /// key and names no variable, so `launch`/`run` know not to demand
+    /// one — and the listing does not print a `null` where a variable
+    /// name goes.
+    #[test]
+    fn a_configured_provider_reports_its_key_as_optional() {
+        let catalog = fixture_catalog().with_configured(&[crate::config::ConfiguredProvider {
+            id: "gpubox".into(),
+            name: "GPU box".into(),
+            base_url: "http://gpubox:8000/v1".into(),
+            wire: Wire::OpenAi,
+            key_env: None,
+        }]);
+        let provider = catalog.get("gpubox").unwrap();
+        let json = serde_json::to_value(ProviderSummary::from(provider)).unwrap();
+        assert_eq!(json["key_optional"], true);
+        assert_eq!(json["key_set"], false);
+        assert!(json.get("key_env").is_none(), "{json}");
+        assert_eq!(json["base_url"], "http://gpubox:8000/v1");
+        // The catalog entry is untouched, and still demands its key.
+        let json = serde_json::to_value(ProviderSummary::from(catalog.get("openrouter").unwrap()))
+            .unwrap();
+        assert_eq!(json["key_optional"], false);
+    }
+
+    /// A keyless target sends no credential header at all — not an empty
+    /// bearer, which vLLM and llama-server reject as a malformed token —
+    /// while the Anthropic wire still gets its version header.
+    #[test]
+    fn a_keyless_remote_target_sends_no_credential_header() {
+        let client = Client::new();
+        let keyless = |wire: Wire| {
+            Target::Remote(Arc::new(RemoteTarget {
+                provider: "gpubox".into(),
+                base_url: "http://gpubox:8000/v1".into(),
+                wire,
+                model: "m".into(),
+                max_output: None,
+                api_key: None,
+            }))
+        };
+        let headers = |target: &Target| {
+            target
+                .authorize(client.post("http://gpubox:8000/v1/x"))
+                .build()
+                .unwrap()
+                .headers()
+                .clone()
+        };
+        let openai = headers(&keyless(Wire::OpenAi));
+        assert!(
+            openai.get(reqwest::header::AUTHORIZATION).is_none(),
+            "{openai:?}"
+        );
+        let anthropic = headers(&keyless(Wire::Anthropic));
+        assert!(anthropic.get("x-api-key").is_none(), "{anthropic:?}");
+        assert_eq!(
+            anthropic.get("anthropic-version").unwrap(),
+            anthropic::VERSION
+        );
+        // And with a key, the header is back.
+        let keyed = headers(&remote_target_on("http://gpubox:8000/v1", Wire::OpenAi));
+        assert_eq!(
+            keyed.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
+        );
+    }
+
+    /// The models of a configured provider come from its own `/models`,
+    /// so `list --provider gpubox` shows what the box actually serves; a
+    /// box that is down or lacks the route costs an empty list, never an
+    /// error, since requests can still go to it.
+    #[tokio::test]
+    async fn a_configured_providers_models_are_asked_of_its_endpoint() {
+        // A mock vLLM: `/v1/models` in OpenAI's list shape, recording the
+        // headers it was sent; nothing else.
+        let seen: Arc<tokio::sync::Mutex<Vec<HeaderMap>>> = Arc::default();
+        let captured = seen.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| async move {
+                captured.lock().await.push(headers);
+                Json(serde_json::json!({ "object": "list", "data": [
+                    { "id": "qwen3-coder", "object": "model" },
+                    { "id": "gemma4", "object": "model" },
+                    { "id": "gemma4", "object": "model" }
+                ]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://127.0.0.1:{}/v1",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider =
+            crate::providers::Provider::from_configured(&crate::config::ConfiguredProvider {
+                id: "gpubox".into(),
+                name: "gpubox".into(),
+                base_url: base.clone(),
+                wire: Wire::OpenAi,
+                key_env: None,
+            });
+        let client = Client::new();
+        let models = configured_provider_models(&client, &provider).await;
+        assert_eq!(
+            models,
+            vec!["gemma4".to_string(), "qwen3-coder".to_string()]
+        );
+        let calls = seen.lock().await;
+        assert!(
+            calls[0].get("authorization").is_none(),
+            "a keyless provider was sent a bearer: {:?}",
+            calls[0]
+        );
+        drop(calls);
+
+        // Nothing listening: an empty list, not a failure.
+        let mut down = provider.clone();
+        down.base_url = "http://127.0.0.1:9/v1".into();
+        assert!(configured_provider_models(&client, &down).await.is_empty());
+
+        // The Anthropic wire has no /models, and is not asked.
+        let mut anthropic = provider.clone();
+        anthropic.wire = Wire::Anthropic;
+        assert!(configured_provider_models(&client, &anthropic)
+            .await
+            .is_empty());
+        assert_eq!(seen.lock().await.len(), 1, "no second request was made");
     }
 
     // -- Idle-timeout auto-unload reaper --------------------------------------
