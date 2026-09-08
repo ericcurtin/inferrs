@@ -59,6 +59,8 @@ pub struct DiffusionPaths {
     pub text_proj: Option<PathBuf>,
     /// Text encoder GGUF (`--text-encoder`).
     pub text_encoder: Option<PathBuf>,
+    /// Every raw layer by its `org.cncf.model.filepath` (tokenizer, configs, ...).
+    pub files: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl ModelPath {
@@ -492,6 +494,12 @@ pub fn resolve_model(
             ..Default::default()
         };
         for l in &manifest.layers {
+            // raw layers only: a tar layer's blob is the archive, not the file
+            if let (Some(fp), true) = (layer_filepath(l), l.media_type.ends_with(".raw")) {
+                paths
+                    .files
+                    .insert(fp.to_string(), named_blob_path(store_path, cache_path, l)?);
+            }
             let Some(role) = layer_role(l) else { continue };
             let p = named(l)?;
             match role {
@@ -499,6 +507,8 @@ pub fn resolve_model(
                 "audio_vae" => paths.audio_vae = Some(p),
                 "text_proj" => paths.text_proj = Some(p),
                 "text_encoder" => paths.text_encoder = Some(p),
+                // Cosmos3 sidecars its generation path does not use
+                "vision_encoder" | "sound_tokenizer" => {}
                 other => {
                     eprintln!("[llmman] {model_ref}: ignoring layer with unknown role {other:?}")
                 }
@@ -671,13 +681,16 @@ mod tests {
     fn manifest_with(
         layers: Vec<crate::storage::oci::Descriptor>,
     ) -> (OciStore, crate::storage::oci::Manifest) {
+        // parallel tests can share a clock tick; the counter keeps their stores apart
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "llmman-modelpack-caps-{}-{}",
+            "llmman-modelpack-caps-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let store = OciStore::open(&dir).unwrap();
         let config = store

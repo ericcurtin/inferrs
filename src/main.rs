@@ -22,7 +22,7 @@ enum Commands {
     /// Launch an integration
     Launch(cmd::launch::LaunchArgs),
     /// Run a model interactively or with a one-shot prompt
-    Run(cmd::run::RunArgs),
+    Run(Box<cmd::run::RunArgs>),
     /// Package model files into a local OCI image
     Build(cmd::build::BuildArgs),
     /// Log in to a container registry or HuggingFace

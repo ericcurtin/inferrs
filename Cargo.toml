@@ -66,6 +66,11 @@ flate2     = "1"
 zip        = { version = "2", default-features = false, features = ["deflate"] }
 libloading = "0.8"
 multer     = "3"
+# Cosmos3 prompts are tokenized from the pack's tokenizer.json (mediagen::cosmos3);
+# pure-Rust build, the pre-tokenizer regexes need fancy-regex's lookahead.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+# conditioning images for image-to-video and action runs
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Real Xet-protocol downloads for HuggingFace files too large for the
 # plain-HTTP path to reliably serve — see src/xet_fetch.rs. Its

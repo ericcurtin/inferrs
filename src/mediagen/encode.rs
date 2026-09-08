@@ -159,6 +159,86 @@ pub fn mp4(res: &Output) -> Result<Vec<u8>> {
     out
 }
 
+/// A PNG/JPEG (or a data URL) as one RGB frame.
+pub fn decode_image(bytes: &[u8]) -> Result<super::Frames> {
+    let img = image::load_from_memory(bytes)
+        .context("decoding the conditioning image (PNG or JPEG)")?
+        .to_rgb8();
+    Ok(super::Frames {
+        width: img.width() as i64,
+        height: img.height() as i64,
+        n_frames: 1,
+        rgb: img.into_raw(),
+    })
+}
+
+/// A video container (anything ffmpeg reads) as RGB frames.
+pub fn decode_video(bytes: &[u8]) -> Result<super::Frames> {
+    if !has_ffmpeg() {
+        bail!("decoding a conditioning video needs the ffmpeg binary in PATH");
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-mediagen-in-{}-{:08x}",
+        std::process::id(),
+        super::rand_seed()
+    ));
+    std::fs::create_dir(&dir).context("creating a temporary directory")?;
+    let run = || -> Result<super::Frames> {
+        let src = dir.join("in.bin");
+        std::fs::write(&src, bytes)?;
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&src)
+            .output()
+            .context("running ffprobe")?;
+        if !probe.status.success() {
+            bail!("ffprobe: {}", String::from_utf8_lossy(&probe.stderr).trim());
+        }
+        let dims = String::from_utf8_lossy(&probe.stdout);
+        let mut it = dims.trim().split(',');
+        let (w, h): (i64, i64) = (
+            it.next()
+                .and_then(|v| v.trim().parse().ok())
+                .context("video width")?,
+            it.next()
+                .and_then(|v| v.trim().parse().ok())
+                .context("video height")?,
+        );
+        let out = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-i"])
+            .arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .context("running ffmpeg")?;
+        if !out.status.success() {
+            bail!("ffmpeg: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let frame = (w * h * 3) as usize;
+        let n = out.stdout.len() / frame;
+        if n == 0 {
+            bail!("the conditioning video has no frames");
+        }
+        Ok(super::Frames {
+            width: w,
+            height: h,
+            n_frames: n as i64,
+            rgb: out.stdout[..n * frame].to_vec(),
+        })
+    };
+    let r = run();
+    let _ = std::fs::remove_dir_all(&dir);
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -99,6 +99,36 @@ impl Backend {
         Some((free, total))
     }
 
+    /// The GPU backend's name (`"Metal"`, `"CUDA0"`, `"Vulkan0"`, ...), `""` without one.
+    pub fn gpu_name(&self) -> String {
+        if self.gpu.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr((self.api.ggml_backend_name)(self.gpu)) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Does the GPU run `ggml_conv_2d_direct` (F16 kernel), or would it fall back to CPU?
+    pub fn supports_direct_conv(&self) -> bool {
+        let (Some(conv), Some(supports)) = (
+            self.api.ggml_conv_2d_direct,
+            self.api.ggml_backend_supports_op,
+        ) else {
+            return false;
+        };
+        if self.gpu.is_null() {
+            return false;
+        }
+        let Ok(ctx) = Ctx::new(self.api, 16 * 1024, true) else {
+            return false;
+        };
+        let k = ctx.new_tensor(ffi::ty::F16, &[3, 3, 8, 8]);
+        let x = ctx.new_tensor(ffi::ty::F32, &[16, 16, 8, 2]);
+        let y = unsafe { conv(ctx.raw, k, x, 1, 1, 1, 1, 1, 1) };
+        unsafe { supports(self.gpu, y) }
+    }
+
     /// Recreates the scheduler, freeing its compute buffers, and the GPU
     /// backend if it is in an error state.
     pub fn release_compute(&mut self) -> Result<()> {
