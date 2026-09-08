@@ -11,8 +11,10 @@ From the repository root:
 docker compose -f examples/compose/compose.yaml up --build
 ```
 
-Open <http://localhost:8080/> for the web UI. Clients can use the same address
-as their API base URL. For example:
+Open <http://localhost:8080/> for the web UI. Its Shell tab is unavailable
+here: the daemon binds `0.0.0.0` inside the container, and the shell is
+only offered by a daemon bound to loopback (see [webui.md](webui.md)).
+Clients can use the same address as their API base URL. For example:
 
 ```sh
 curl http://localhost:8080/api/version

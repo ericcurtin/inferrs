@@ -263,8 +263,9 @@ your GPU if no `llama-server` is on `PATH`; safetensors by
 [`vllm`](https://github.com/vllm-project/vllm), or by
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
-API (what Codex speaks) all work; there is a web UI at `/` and an
-optional Prometheus `/metrics`.
+API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
+`/` (chat with any local or hosted model, and a terminal) and an optional
+Prometheus `/metrics`.
 
 The full endpoint list and per-API notes are in [docs/api.md](docs/api.md);
 backend selection in [docs/backends.md](docs/backends.md); bind address,

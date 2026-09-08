@@ -48,8 +48,12 @@ walkdir    = "2"
 chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 tar        = "0.4"
-axum       = "0.7"
+# `ws` for the web UI's terminal (`/llmman/shell`, src/cmd/serve/shell.rs).
+axum       = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# The pty behind that terminal: one crate for Unix ptys and Windows
+# ConPTY, and its default program is already "the user's login shell".
+portable-pty = "0.9"
 libc       = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 toml       = { version = "0.8", default-features = false, features = ["parse"] }
@@ -104,8 +108,16 @@ podman = []
 # change any parsing behavior, only visibility.
 fuzzing = []
 
+[dev-dependencies]
+# A WebSocket client for the `/llmman/shell` tests; the same crate axum's
+# `ws` feature already builds, at the version it pins.
+tokio-tungstenite = "0.24"
+
 [build-dependencies]
 flate2 = "1"
+# build.rs pins the web UI's downloaded mark by hash (see FETCHED_ASSETS).
+sha2   = "0.10"
+hex    = "0.4"
 
 # `cargo binstall llmman` fetches the prebuilt release binary instead of
 # compiling, so it needs neither a Rust nor a Go toolchain.

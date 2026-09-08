@@ -9,8 +9,9 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`) |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node` |
-| llama.cpp | `/props`, and the llama.cpp web UI at `/` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/node`, `/llmman/shell` |
+| Web UI | `/` and `/ui/*` — see [webui.md](webui.md) |
+| llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
 Use it as a drop-in Ollama server:
@@ -20,7 +21,7 @@ OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 ```
 
 Or with any Ollama, OpenAI or Anthropic client. `http://127.0.0.1:17434/`
-in a browser is llama.cpp's web UI.
+in a browser is llmman's own web UI ([webui.md](webui.md)).
 
 ## Model lifecycle
 
