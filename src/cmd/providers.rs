@@ -87,15 +87,14 @@ fn matches(provider: &ProviderSummary, needle: Option<&str>) -> bool {
     provider.id.to_lowercase().contains(needle) || provider.name.to_lowercase().contains(needle)
 }
 
-/// The variable column: `-` for a provider `llmman.conf` defines without
-/// naming one, whose key (if any) is in the file alone.
+/// The variable column: `-` for a configured provider that names none.
 fn key_env(provider: &ProviderSummary) -> &str {
     provider.key_env.as_deref().unwrap_or("-")
 }
 
-/// The models column: a configured provider has no catalog models, and
-/// `0` would read as "serves nothing" when the truth is "not asked" —
-/// `llmman list --provider <id>` asks its endpoint.
+/// The models column: `-` for a configured provider, whose endpoint is
+/// only asked by `llmman list --provider <id>`; `0` would read as
+/// "serves nothing".
 fn model_count(provider: &ProviderSummary) -> String {
     if provider.key_optional && provider.models == 0 {
         "-".to_string()
@@ -112,8 +111,8 @@ fn model_count(provider: &ProviderSummary) -> String {
 /// is not "shell". "withheld" is one the daemon has but will not spend,
 /// being bound where others could reach it (see `resolve_remote_target`
 /// in cmd::serve) — a state of its own, since what needs fixing there is
-/// the bind, not the key. "none needed" is a provider that takes no key
-/// and has none: nothing to act on.
+/// the bind, not the key. "none needed" is a keyless provider: nothing
+/// to act on.
 fn key_status(provider: &ProviderSummary) -> &'static str {
     match (provider.key_usable, provider.key_here(), provider.key_set) {
         (true, _, _) => "set",

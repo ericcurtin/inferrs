@@ -1153,8 +1153,7 @@ pub fn api_error(body: &str) -> Option<String> {
 pub struct ProviderSummary {
     pub id: String,
     pub name: String,
-    /// Absent for a provider `llmman.conf` defines without an
-    /// `api_key_env`: its key, if any, is in the file alone.
+    /// Absent for a configured provider that names no variable.
     #[serde(default)]
     pub key_env: Option<String>,
     /// Whether the key is set *where the daemon runs*. What this process
@@ -1165,9 +1164,8 @@ pub struct ProviderSummary {
     /// bound, which this process's `LLMMAN_HOST` says nothing about.
     #[serde(default)]
     pub key_usable: bool,
-    /// Whether a request with no key at all is forwarded (a provider
-    /// `llmman.conf` defines — see `Provider::key_optional`). Absent from
-    /// an older daemon means no, the answer for every catalog provider.
+    /// Whether a keyless request is forwarded (see
+    /// `Provider::key_optional`); absent from an older daemon means no.
     #[serde(default)]
     pub key_optional: bool,
     pub models: usize,
@@ -1248,22 +1246,32 @@ impl ProviderDetail {
         self.models.iter().map(|m| m.id.as_str()).collect()
     }
 
-    /// Where a key for this provider would go, for an error that found
-    /// none (see `crate::providers::key_hint`).
+    /// Where a key for this provider would go (see
+    /// `crate::providers::key_hint`).
     pub fn key_hint(&self) -> String {
         crate::providers::key_hint(&self.id, self.key_env.as_deref())
     }
 
+    /// Resolves the key this process would send, warning once if it is
+    /// about to cross the network in cleartext — the daemon's own
+    /// startup warning only covers the key *it* holds.
+    pub fn client_key(&self) -> Option<String> {
+        let key = self.api_key();
+        if key.is_some() && self.base_url.starts_with("http://") {
+            eprintln!(
+                "[llmman] warning: the API key for {} goes to {} over plain http",
+                self.name, self.base_url
+            );
+        }
+        key
+    }
+
     /// Warns when this provider does not list `model` — a warning, since
-    /// models.dev is a snapshot and a provider can serve a model (a new
-    /// release, a fine-tune, a private deployment) before it lists one.
-    ///
-    /// Silent when it lists nothing at all: a configured provider whose
-    /// `/models` was unreachable has no list to be absent from, and "does
-    /// not list X / lists no models" would say so twice about a box that
-    /// may well serve X.
+    /// models.dev is a snapshot and a provider can serve a model before it
+    /// lists one. Silent for a configured provider whose `/models` said
+    /// nothing: there is no list to be absent from.
     pub fn warn_unlisted(&self, model: &str) {
-        if self.models.is_empty() {
+        if self.key_optional && self.models.is_empty() {
             return;
         }
         if !self.models.iter().any(|m| m.id == model) {

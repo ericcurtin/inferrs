@@ -33,15 +33,14 @@
 //! half-supported: a provider llmman offers is one it can actually reach.
 //!
 //! The one way past the filter is `llmman.conf`: a `[providers.<id>]`
-//! with a `base_url` defines a provider by hand — an inference server on
-//! some host models.dev has never heard of — and is added to (or shadows)
-//! the catalog in [`catalog`]. Those rules exist to vet a list fetched
-//! from the network; a URL the user wrote into their own file needs no
-//! vetting beyond parsing, so a defined provider may be plain `http`,
-//! and may take no key at all. See [`Provider::key_optional`].
+//! with a `base_url` defines a provider by hand and is merged into the
+//! catalog in [`catalog`]. The rules above vet a list fetched from the
+//! network; a URL the user wrote needs none, so a defined provider may be
+//! plain `http` and may take no key ([`Provider::key_optional`]).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -279,22 +278,18 @@ pub struct Provider {
     /// ...) is appended to. Never has a trailing slash.
     pub base_url: String,
     /// Environment variable holding this provider's API key. Always set
-    /// for a catalog provider; a configured one may name none, and then
-    /// only `llmman.conf` can hold its key.
+    /// for a catalog provider; a configured one may name none.
     pub key_env: Option<String>,
     /// What is spoken at `base_url`.
     pub wire: Wire,
-    /// Whether a request may go upstream with no credential at all.
-    /// True for a provider defined in `llmman.conf` — a vLLM or
-    /// llama-server on the LAN usually takes none — and never for a
-    /// catalog one, where a keyless request is a certain 401 better
-    /// reported before the handoff than inside an integration.
+    /// Whether a request may go upstream with no credential. True only
+    /// for a provider `llmman.conf` defines; for a catalog one a keyless
+    /// request is a certain 401, better reported before the handoff.
     pub key_optional: bool,
     /// Models this provider serves, sorted by id. Used to validate
     /// `--model`, to suggest values, and to answer `llmman list
     /// --provider`; the id is never sent upstream verbatim. Empty for a
-    /// configured provider, whose endpoint is asked instead (see
-    /// `cmd::serve`).
+    /// configured provider, whose endpoint is asked instead.
     pub models: Vec<Model>,
 }
 
@@ -332,9 +327,8 @@ impl Provider {
         rebase_url(&self.base_url, route)
     }
 
-    /// A provider as `llmman.conf` defines it. No models: the file names
-    /// an endpoint, not what it serves, and `cmd::serve` asks the
-    /// endpoint itself when a caller wants the list.
+    /// A provider as `llmman.conf` defines it. No models: `cmd::serve`
+    /// asks the endpoint when a caller wants the list.
     pub fn from_configured(conf: &crate::config::ConfiguredProvider) -> Self {
         Self {
             id: conf.id.clone(),
@@ -350,8 +344,7 @@ impl Provider {
 
 /// The API key for provider `id`: `var` from the environment, else the
 /// `[providers.<id>]` entry in `llmman.conf` (see [`crate::config`]).
-/// `None` when neither has one — or when there is no variable to read
-/// and the file has nothing, the case for most configured providers.
+/// `None` when neither has one.
 ///
 /// The environment wins, as it does for `aws` and `gh`: the file is the
 /// standing answer, an `export` the deliberate this-session-only
@@ -395,8 +388,6 @@ pub fn key_hint(id: &str, var: Option<&str>) -> String {
             toml_key(id),
             crate::config::user_path_display()
         ),
-        // A configured provider that names no variable: the file is the
-        // one place, so there is no "or".
         None => format!(
             "add an api_key to [providers.{}] in {}",
             toml_key(id),
@@ -607,22 +598,15 @@ impl Catalog {
         Ok(Self { providers })
     }
 
-    /// The providers `llmman.conf` defines, and nothing else — what a
-    /// machine that cannot reach models.dev still has (see [`catalog`]).
+    /// The providers `llmman.conf` defines and nothing else (see [`catalog`]).
     pub fn from_configured(configured: &[crate::config::ConfiguredProvider]) -> Self {
         Self::default().with_configured(configured)
     }
 
     /// Adds the providers `llmman.conf` defines. One with a catalog id
-    /// shadows the catalog entry: the file is the user's deliberate
-    /// answer, and is also the only way to correct a catalog URL for a
-    /// network where it is wrong (a proxy in front of `api.openai.com`).
-    ///
-    /// A plaintext `base_url` with a key behind it is warned about here,
-    /// once per load, rather than refused as a catalog entry's would be:
-    /// the URL is the user's own, and `http://gpubox:8000` on a LAN is
-    /// the whole point — but a key on that wire is still a key on that
-    /// wire, and the file cannot say which the user weighed.
+    /// shadows the catalog entry — the way to put a proxy in front of
+    /// `api.openai.com`. A plain-http `base_url` with a key behind it is
+    /// warned about once per load, not refused: the URL is the user's own.
     pub fn with_configured(mut self, configured: &[crate::config::ConfiguredProvider]) -> Self {
         for conf in configured {
             let provider = Provider::from_configured(conf);
@@ -811,55 +795,85 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 type Cached = (Instant, Duration, Result<Arc<Catalog>, String>);
 static CATALOG: Mutex<Option<Cached>> = Mutex::new(None);
 
-/// The routable provider catalog, fetched from models.dev on first use.
+/// Whether a background refresh (see [`catalog`]) is in flight.
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+
+/// The routable provider catalog, fetched from models.dev on first use,
+/// with the providers `llmman.conf` defines merged on top
+/// ([`Catalog::with_configured`]).
 ///
 /// Memoized, but not for the life of the process: `llmman serve` runs for
 /// days, so a success is re-checked after [`CACHE_TTL`] and a failure
-/// after [`RETRY_COOLDOWN`] — otherwise one blip at startup would leave a
-/// daemon with no providers until someone restarted it.
-///
-/// The lock is held across the fetch, so concurrent callers wait for one
-/// load rather than racing several. Blocking: callers on an async runtime
-/// (`cmd::serve`) must go through `spawn_blocking`.
-///
-/// The providers `llmman.conf` defines are merged in on top (see
-/// [`Catalog::with_configured`]), and stand alone when models.dev cannot
-/// be loaded at all: a machine with no route out and a vLLM on the LAN
-/// is exactly where a defined provider is wanted, and must not be held
-/// hostage to a catalog it has no use for.
+/// after [`RETRY_COOLDOWN`]. An expired *success* is served as-is while
+/// a background thread refreshes it, so a request never waits on
+/// models.dev once there is anything to serve — in particular on an
+/// offline machine, where the configured providers stand alone and the
+/// retry would otherwise block a request for [`FETCH_TIMEOUT`] every
+/// cooldown. Only the first load, or one after a total failure, runs
+/// inline; the lock is held across it so concurrent callers wait for one
+/// load rather than racing several. Blocking: callers on an async
+/// runtime (`cmd::serve`) must go through `spawn_blocking`.
 pub fn catalog() -> anyhow::Result<Arc<Catalog>> {
     let mut cached = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
-    let live = cached
-        .as_ref()
-        .is_some_and(|(at, good_for, _)| at.elapsed() < *good_for);
-    if !live {
-        let configured = crate::config::configured_providers();
-        // A stale catalog is held only as long as a failure: what
-        // produced it was a failed refresh, whatever it managed to
-        // return. See Loaded.
-        *cached = Some(match load() {
-            Ok(loaded) => (
-                Instant::now(),
-                loaded.good_for(),
-                Ok(Arc::new(loaded.into_catalog().with_configured(configured))),
-            ),
-            Err(e) if !configured.is_empty() => {
-                eprintln!(
-                    "[llmman] using only the {} provider(s) defined in llmman.conf ({e:#})",
-                    configured.len()
-                );
-                (
-                    Instant::now(),
-                    RETRY_COOLDOWN,
-                    Ok(Arc::new(Catalog::from_configured(configured))),
-                )
+    match cached.as_ref() {
+        Some((at, good_for, result)) if at.elapsed() < *good_for => result_of(result),
+        Some((_, _, Ok(stale))) => {
+            let stale = stale.clone();
+            if !REFRESHING.swap(true, Ordering::AcqRel) {
+                std::thread::spawn(|| {
+                    // Cleared on the way out however the load ends.
+                    struct Done;
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            REFRESHING.store(false, Ordering::Release);
+                        }
+                    }
+                    let _done = Done;
+                    let entry = load_entry();
+                    *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+                });
             }
-            Err(e) => (Instant::now(), RETRY_COOLDOWN, Err(format!("{e:#}"))),
-        });
+            Ok(stale)
+        }
+        _ => {
+            let entry = load_entry();
+            let result = result_of(&entry.2);
+            *cached = Some(entry);
+            result
+        }
     }
-    match &cached.as_ref().expect("just populated").2 {
-        Ok(catalog) => Ok(catalog.clone()),
-        Err(e) => Err(anyhow::anyhow!(e.clone())),
+}
+
+fn result_of(result: &Result<Arc<Catalog>, String>) -> anyhow::Result<Arc<Catalog>> {
+    result.clone().map_err(anyhow::Error::msg)
+}
+
+/// One load, as [`catalog`] caches it. A failed load still yields a
+/// catalog when `llmman.conf` defines providers: a machine with no route
+/// out and a vLLM on the LAN is exactly where those are wanted. A stale
+/// or configured-only result is held only for [`RETRY_COOLDOWN`], since
+/// what produced it was a failed refresh.
+fn load_entry() -> Cached {
+    let configured = crate::config::configured_providers();
+    let now = Instant::now();
+    match load() {
+        Ok(loaded) => (
+            now,
+            loaded.good_for(),
+            Ok(Arc::new(loaded.into_catalog().with_configured(configured))),
+        ),
+        Err(e) if !configured.is_empty() => {
+            eprintln!(
+                "[llmman] using only the {} provider(s) defined in llmman.conf ({e:#})",
+                configured.len()
+            );
+            (
+                now,
+                RETRY_COOLDOWN,
+                Ok(Arc::new(Catalog::from_configured(configured))),
+            )
+        }
+        Err(e) => (now, RETRY_COOLDOWN, Err(format!("{e:#}"))),
     }
 }
 

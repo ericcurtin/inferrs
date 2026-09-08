@@ -1741,9 +1741,7 @@ impl Target {
     /// auth, which is why nothing below ever forwarded the client's own
     /// `Authorization` header upstream — and must keep not forwarding it,
     /// so a key meant for one provider can never be relayed to another.
-    /// A remote target without a key (a configured provider that takes
-    /// none) likewise gets no credential header, only the wire's other
-    /// ones.
+    /// A keyless remote target gets no credential header either.
     fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::Local(_) => req,
@@ -1915,9 +1913,7 @@ async fn resolve_remote_target(
     };
     let api_key = match client_api_key(headers).or_else(own_key) {
         Some(key) => Some(key),
-        // A configured provider that takes no key: the request goes up
-        // bare. Not a catalog one, where that is a certain 401 better
-        // explained here than relayed from upstream.
+        // A configured provider that takes no key goes up bare.
         None if provider.key_optional => None,
         None => {
             return Err(AppError(
@@ -4001,8 +3997,7 @@ struct ProviderSummary {
     id: String,
     name: String,
     base_url: String,
-    /// Absent for a configured provider that names no variable, whose
-    /// key — if it has one — is in `llmman.conf` alone.
+    /// Absent for a configured provider that names no variable.
     #[serde(skip_serializing_if = "Option::is_none")]
     key_env: Option<String>,
     /// What is spoken at `base_url`: `openai` or `anthropic` (see
@@ -4017,9 +4012,8 @@ struct ProviderSummary {
     /// "will my keyless request work" has to read this, not `key_set`:
     /// its own `LLMMAN_HOST` says nothing about how the daemon is bound.
     key_usable: bool,
-    /// Whether a request with no key at all is forwarded anyway (see
-    /// `Provider::key_optional`). True for a provider `llmman.conf`
-    /// defines.
+    /// Whether a keyless request is forwarded anyway (see
+    /// `Provider::key_optional`).
     key_optional: bool,
     models: usize,
 }
@@ -4127,8 +4121,8 @@ async fn handle_llmman_providers() -> Result<impl IntoResponse, AppError> {
 /// `GET /llmman/providers/:id` — one provider, or a 404 naming
 /// near-matches (see [`crate::providers::unknown_provider_error`]).
 ///
-/// A provider `llmman.conf` defines has no catalog models; its endpoint
-/// is asked instead (see [`configured_provider_models`]).
+/// A configured provider's models come from its endpoint instead
+/// ([`configured_provider_models`]).
 async fn handle_llmman_provider(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -4151,22 +4145,16 @@ async fn handle_llmman_provider(
     Ok(Json(response))
 }
 
-/// How long a configured provider gets to answer `GET /models` before
-/// the listing goes out without one. Short: this sits in front of
-/// `llmman launch`, and a LAN box that is down should cost a moment, not
-/// a hang.
+/// How long a configured provider gets to answer `GET /models`. Short:
+/// this sits in front of `llmman launch`, and a box that is down should
+/// cost a moment, not a hang.
 const CONFIGURED_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The model ids a configured provider reports at `GET {base_url}/models`
-/// — the OpenAI route vLLM, llama-server, LM Studio and every compatible
-/// proxy answer — or none when it cannot, or does not: the listing is a
-/// convenience for `llmman list --provider` and the `--model` check, and
-/// an endpoint that lacks it is still one requests can go to.
-///
-/// Authenticated the way a request would be (see `resolve_remote_target`),
-/// minus the caller's own key: this is a GET the daemon makes for itself,
-/// so only its own key is on offer, and only under the bind rule that
-/// gates spending it for a request.
+/// The model ids an OpenAI-wire configured provider reports at
+/// `GET {base_url}/models`, or none when it cannot or does not: the
+/// listing is a convenience, and an endpoint without it still takes
+/// requests. The daemon's own key is sent under the same bind rule as
+/// for a request (`daemon_key_usable`).
 async fn configured_provider_models(
     client: &Client,
     provider: &crate::providers::Provider,

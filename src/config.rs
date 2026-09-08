@@ -80,32 +80,23 @@ pub struct AggregationConf {
     pub peers: Option<String>,
 }
 
-/// One `[providers.<id>]` table.
-///
-/// Two things at once, told apart by `base_url`. Without it the table
-/// attaches an `api_key` to a provider the models.dev catalog already
-/// lists. With it the table *defines* a provider of its own — an
-/// inference server on some host llmman would otherwise have no way to
-/// name: vLLM, llama-server, LM Studio, a proxy in front of OpenAI. Such
-/// an entry shadows a catalog provider with the same id, which is also
-/// how a catalog URL that is wrong for one network gets corrected.
+/// One `[providers.<id>]` table. Without `base_url` it keys a catalog
+/// provider; with it, it *defines* one — an inference server at a host
+/// models.dev does not list — and shadows any catalog entry with its id.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderConf {
     #[serde(default)]
     api_key: Option<String>,
-    /// Base URL the wire's route is appended to (`/chat/completions`,
-    /// `/messages`). Plain `http://` is accepted here, unlike for a
-    /// catalog entry: this URL was typed by the user into their own
-    /// owner-only file, not fetched from the network at runtime.
+    /// Base URL the wire's route is appended to. Plain `http://` is
+    /// allowed: the user typed it into their own owner-only file.
     #[serde(default)]
     base_url: Option<String>,
-    /// What is spoken at `base_url`; `openai` unless said otherwise.
+    /// What is spoken at `base_url`; `openai` by default.
     #[serde(default)]
     wire: Option<crate::providers::Wire>,
-    /// Environment variable holding the key, for a defined provider that
-    /// wants one. A defined provider with neither this nor `api_key`
-    /// simply sends no credential — most local servers take none.
+    /// Variable holding the key. With neither this nor `api_key`, no
+    /// credential is sent — most local servers take none.
     #[serde(default)]
     api_key_env: Option<String>,
     /// Display name for listings; the id when absent.
@@ -134,8 +125,7 @@ impl ProviderConf {
         self.base_url.is_some()
     }
 
-    /// The fields that only make sense on a definition, for the check in
-    /// [`validate`].
+    /// Fields that only mean something on a definition (see [`validate`]).
     fn definition_only_fields(&self) -> Vec<&'static str> {
         let mut set = Vec::new();
         if self.wire.is_some() {
@@ -336,25 +326,31 @@ pub(crate) fn parse(text: &str) -> Result<Conf, String> {
     Ok(conf)
 }
 
-/// What the TOML shape alone cannot say. Run at parse time so `llmman
-/// config set providers.gpubox.base_url gpubox:8000` is refused on the
-/// spot, for the same reason a misspelled field is: a bad URL that
-/// parsed happily would surface as a connection error inside someone
-/// else's TUI, and a `wire` on a table that defines nothing would be a
-/// setting that silently never takes effect.
+/// What the TOML shape alone cannot say, checked at parse time so
+/// `llmman config set` refuses it on the spot.
 fn validate(conf: &Conf) -> Result<(), String> {
     for (id, p) in &conf.providers {
-        if let Some(url) = &p.base_url {
-            base_url_of(url).map_err(|e| format!("[providers.{id}] base_url: {e}"))?;
-        } else {
-            let only_on_definition = p.definition_only_fields();
-            if !only_on_definition.is_empty() {
-                return Err(format!(
-                    "[providers.{id}] sets {} but no base_url; those fields define a \
-                     provider, and without a base_url the table only holds a key for the \
-                     catalog provider {id:?}",
-                    only_on_definition.join(", ")
-                ));
+        // `<provider>/<model>` is how a reference travels (see
+        // `crate::providers::split_remote_ref`), so a slash in the id
+        // could never be routed.
+        if id.is_empty() || id.contains('/') {
+            return Err(format!(
+                "[providers.{id:?}]: a provider id cannot be empty or contain '/'"
+            ));
+        }
+        match &p.base_url {
+            Some(url) => {
+                base_url_of(url).map_err(|e| format!("[providers.{id}] base_url: {e}"))?;
+            }
+            None => {
+                let only_on_definition = p.definition_only_fields();
+                if !only_on_definition.is_empty() {
+                    return Err(format!(
+                        "[providers.{id}] sets {} but no base_url, so it only keys the catalog \
+                         provider {id:?}",
+                        only_on_definition.join(", ")
+                    ));
+                }
             }
         }
         if p.api_key_env
@@ -367,13 +363,11 @@ fn validate(conf: &Conf) -> Result<(), String> {
     Ok(())
 }
 
-/// Normalizes a configured `base_url`: an absolute `http`/`https` URL,
-/// with any trailing slash gone so a route appends cleanly.
-///
-/// A route suffix someone pasted from a curl example
-/// (`.../v1/chat/completions`) is left alone rather than stripped: the
-/// URL is the user's own to get right, and `crate::providers::base_url_of`
-/// is for a catalog whose entries llmman cannot edit.
+/// Normalizes a configured `base_url`: an absolute `http`/`https` URL
+/// with no query, fragment or userinfo, lowercased scheme and host, and
+/// no trailing slash. Userinfo is refused because the URL is reported by
+/// the daemon's API and printed in warnings; `api_key` is where a
+/// credential goes.
 fn base_url_of(url: &str) -> Result<String, String> {
     let url = url.trim();
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url:?}: {e}"))?;
@@ -388,29 +382,30 @@ fn base_url_of(url: &str) -> Result<String, String> {
     if parsed.host_str().is_none() {
         return Err(format!("{url:?}: no host"));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "{url:?}: a base URL cannot carry a username or password; use api_key"
+        ));
+    }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(format!("{url:?}: a base URL has no query or fragment"));
     }
-    Ok(url.trim_end_matches('/').to_string())
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Configured providers
 // ---------------------------------------------------------------------------
 
-/// Every provider `llmman.conf` defines (a `[providers.<id>]` with a
-/// `base_url`), sorted by id, for `crate::providers` to add to — and
-/// shadow — the catalog. Read once for the process, like the keys.
+/// Every provider `llmman.conf` defines, sorted by id. Read once for the
+/// process, like the keys.
 pub fn configured_providers() -> &'static [ConfiguredProvider] {
     static CACHE: OnceLock<Vec<ConfiguredProvider>> = OnceLock::new();
     CACHE.get_or_init(|| configured_from(files().unwrap_or_default()))
 }
 
-/// Merged field by field, later files overriding earlier, the same way
-/// the keys merge: a user file that re-defines an id `/etc` defined
-/// replaces the fields it sets and keeps the rest. (Each file still has
-/// to carry the `base_url` — see [`validate`] — since a file is checked
-/// on its own.) Split out to be testable without a filesystem.
+/// Merged field by field, later files overriding earlier, as keys do.
+/// Split out to be testable without a filesystem.
 fn configured_from(files: &[File]) -> Vec<ConfiguredProvider> {
     let mut merged: HashMap<&str, ConfiguredProvider> = HashMap::new();
     for file in files {
@@ -768,6 +763,16 @@ mod tests {
         assert!(bad("base_url = \"http://\"").contains("base_url"));
         assert!(bad("base_url = \"http://gpubox/v1?x=1\"").contains("query"));
         assert!(bad("base_url = \"\"").contains("base_url"));
+        // The URL is reported by the daemon's API; a secret does not go in it.
+        assert!(bad("base_url = \"https://user:pw@gpubox/v1\"").contains("api_key"));
+        assert!(bad("base_url = \"https://user@gpubox/v1\"").contains("api_key"));
+        // A slash in the id would never survive `split_remote_ref`.
+        assert!(
+            parse("[providers.\"team/gpu\"]\nbase_url = \"http://g/v1\"")
+                .expect_err("slash id")
+                .contains("'/'")
+        );
+        assert!(parse("[providers.\"\"]\napi_key = \"x\"").is_err());
 
         let err = bad("wire = \"anthropic\"");
         assert!(err.contains("no base_url"), "{err}");
@@ -779,15 +784,20 @@ mod tests {
         assert!(bad("base_url = \"http://g/v1\"\napi_key_env = \" \"").contains("blank"));
         assert!(bad("base_url = \"http://g/v1\"\nbase_ulr = \"x\"").contains("base_ulr"));
 
-        // And the good shapes parse: bare host, port, path, no path,
-        // IPv6, https.
-        for url in [
-            "http://gpubox:8000/v1",
-            "http://gpubox",
-            "http://127.0.0.1:11434/v1",
-            "http://[::1]:8000/v1",
-            "https://relay.example/api/v1",
+        // The good shapes parse, and come out normalized: lowercase
+        // scheme and host, no trailing slash.
+        for (url, want) in [
+            ("http://gpubox:8000/v1", "http://gpubox:8000/v1"),
+            ("http://gpubox", "http://gpubox"),
+            ("HTTP://GPUBox:8000/v1/", "http://gpubox:8000/v1"),
+            ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
+            ("http://[::1]:8000/v1", "http://[::1]:8000/v1"),
+            (
+                "https://relay.example/api/v1",
+                "https://relay.example/api/v1",
+            ),
         ] {
+            assert_eq!(base_url_of(url).expect(url), want);
             parse(&format!("[providers.gpubox]\nbase_url = {url:?}")).expect(url);
         }
     }

@@ -388,9 +388,8 @@ fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option
     entry.warn_unlisted(model);
 
     // Naming where the missing key goes beats a 401 mid-conversation —
-    // unless the daemon has the key, in which case it spends its own, or
-    // the provider takes none (one `llmman.conf` defines).
-    let key = entry.api_key();
+    // unless the daemon has one of its own, or the provider takes none.
+    let key = entry.client_key();
     anyhow::ensure!(
         key.is_some() || entry.daemon_key_usable() || entry.key_optional,
         "no API key for {} — {}",

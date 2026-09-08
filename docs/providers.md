@@ -87,24 +87,29 @@ The rules the catalog is filtered by do not apply. They vet a list
 fetched from the network at runtime; a URL you wrote into your own
 owner-only file needs no vetting beyond parsing. So a defined provider
 may be plain `http` — that is the point on a LAN — and may take no key.
-If it has a key *and* a plain-http URL, `llmman serve` warns once at
-startup that the key crosses the network in cleartext, and sends it.
+If it has a key *and* a plain-http URL, whichever process is about to
+send the key warns that it crosses the network in cleartext, and sends
+it.
 
 A defined provider with a catalog id (`[providers.openai]` with a
 `base_url`) replaces the catalog entry, which is how a proxy or regional
 endpoint gets used without renaming the provider in every integration's
 config. The catalog's model list goes with it.
 
-Models are not listed in the file. `list --provider <id>` and the
-`--model` check ask the endpoint's own `GET /models` (the OpenAI route
-every compatible server answers) and take what it says; a box that is
-down or lacks the route lists nothing, and the request still goes to it.
-`llmman providers` shows `-` in the models column for the same reason.
+Models are not listed in the file. For an `openai`-wire provider,
+`list --provider <id>` and the `--model` check ask the endpoint's own
+`GET /models` and take what it says; a box that is down or lacks the
+route lists nothing, and the request still goes to it. An `anthropic`
+provider has no such route and lists nothing. `llmman providers` shows
+`-` in the models column for the same reason.
 
 `llmman serve` reads `llmman.conf` once, at startup, so a provider added
 while it runs needs a restart to appear. A machine that cannot reach
-models.dev at all still has its defined providers: they stand alone
-when the catalog cannot be loaded.
+models.dev at all still has its defined providers.
+
+The `base_url` is reported by the daemon's API and printed in warnings,
+so it may not carry a `user:password@`; `api_key` is where a credential
+goes. The id may not contain `/`.
 
 ## Hybrid model pairs
 

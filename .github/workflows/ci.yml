@@ -224,12 +224,26 @@ jobs:
           }
 
       # ── Upload artefacts ──────────────────────────────────────────────────
+      # Two attempts: the upload's final "FinalizeArtifact" call gets a
+      # transient 403 from GitHub's blob store now and then, after every
+      # byte is up. The action has no retry of its own, so the second
+      # attempt overwrites whatever the first left behind.
       - name: Upload binary (docker)
+        id: upload
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: llmman-docker-${{ matrix.target }}
           path: dist-docker/${{ matrix.binary }}
           if-no-files-found: error
+      - name: Upload binary (docker, retry)
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llmman-docker-${{ matrix.target }}
+          path: dist-docker/${{ matrix.binary }}
+          if-no-files-found: error
+          overwrite: true
 
   # --------------------------------------------------------------------------
   # Unit tests: every #[cfg(test)] module under src/, which live in the
@@ -1579,12 +1593,23 @@ jobs:
             | xargs -0 sha256sum > checksums.txt
           cat checksums.txt
 
+      # Two attempts, as for the binaries above.
       - name: Upload checksums artifact
+        id: upload_checksums
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-checksums
           path: dist/checksums.txt
           if-no-files-found: error
+      - name: Upload checksums artifact (retry)
+        if: steps.upload_checksums.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+          overwrite: true
 
       - name: Build release notes
         id: notes

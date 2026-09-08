@@ -321,18 +321,18 @@ fn resolve_provider_model(
     // Read here, not left to the daemon, so a missing key names the
     // variable to set in llmman's own output. It travels per request in
     // the integration's own Authorization header (see client_api_key in
-    // cmd::serve), never to disk or a command line.
-    //
-    // The placeholder goes instead whenever the daemon's key is the one
-    // that matters — an integration that cannot carry one, or a shell
-    // without one where the daemon has it — since that is what makes
-    // serve fall back to its own.
-    //
-    // A provider that takes no key (one `llmman.conf` defines, see
-    // `key_optional`) gets the placeholder too when nobody has one: the
-    // daemon forwards such a request bare, and the placeholder is what
-    // tells it the integration's header is not a credential.
-    let key = match (entry.api_key(), key_travels_per_request) {
+    // cmd::serve), never to disk or a command line. The placeholder goes
+    // instead whenever the daemon's key is the one that matters — an
+    // integration that cannot carry one, or a shell without one where
+    // the daemon has it — or when the provider takes none at all
+    // (`key_optional`): it is what tells serve the header is not a
+    // credential.
+    let key = if key_travels_per_request {
+        entry.client_key()
+    } else {
+        None
+    };
+    let key = match (key, key_travels_per_request) {
         (Some(key), true) => key,
         (_, false) => {
             // Fatal, not a warning: this integration cannot carry a key,
