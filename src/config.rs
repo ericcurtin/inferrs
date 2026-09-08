@@ -353,12 +353,6 @@ fn validate(conf: &Conf) -> Result<(), String> {
                 }
             }
         }
-        if p.api_key_env
-            .as_deref()
-            .is_some_and(|v| v.trim().is_empty())
-        {
-            return Err(format!("[providers.{id}] api_key_env is blank"));
-        }
     }
     Ok(())
 }
@@ -426,8 +420,10 @@ fn configured_from(files: &[File]) -> Vec<ConfiguredProvider> {
             if let Some(wire) = p.wire {
                 entry.wire = wire;
             }
-            if let Some(var) = &p.api_key_env {
-                entry.key_env = Some(var.trim().to_string());
+            // Blank clears a variable an earlier file named, as `api_key = ""`
+            // clears a key.
+            if let Some(var) = p.api_key_env.as_deref().map(str::trim) {
+                entry.key_env = (!var.is_empty()).then(|| var.to_string());
             }
             if let Some(name) = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 entry.name = name.to_string();
@@ -738,16 +734,22 @@ mod tests {
     /// keeps the rest, as keys merge.
     #[test]
     fn a_later_definition_overrides_field_by_field() {
-        let system =
-            file("[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\nname = \"Shared box\"");
+        let system = file(
+            "[providers.gpubox]\nbase_url = \"http://gpubox:8000/v1\"\nname = \"Shared box\"\n\
+             api_key_env = \"SHARED_KEY\"",
+        );
         let user = file(
-            "[providers.gpubox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"",
+            "[providers.gpubox]\nbase_url = \"http://10.0.0.5:8000/v1\"\nwire = \"anthropic\"\n\
+             api_key_env = \"\"",
         );
         let merged = configured_from(&[system, user]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].base_url, "http://10.0.0.5:8000/v1");
         assert_eq!(merged[0].name, "Shared box");
         assert_eq!(merged[0].wire, crate::providers::Wire::Anthropic);
+        // A blank clears the inherited variable, so /etc's key does not
+        // follow the user to another endpoint.
+        assert_eq!(merged[0].key_env, None);
     }
 
     /// What `config set` has to refuse on the spot: a `base_url` that is
@@ -781,7 +783,6 @@ mod tests {
         assert!(err.contains("api_key_env, name"), "{err}");
 
         assert!(bad("base_url = \"http://g/v1\"\nwire = \"ollama\"").contains("wire"));
-        assert!(bad("base_url = \"http://g/v1\"\napi_key_env = \" \"").contains("blank"));
         assert!(bad("base_url = \"http://g/v1\"\nbase_ulr = \"x\"").contains("base_ulr"));
 
         // The good shapes parse, and come out normalized: lowercase

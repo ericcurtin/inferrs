@@ -80,7 +80,7 @@ From there it is a provider like any other: `run`, `list`, `launch` and
 | `base_url` | Required to define one. An absolute `http://` or `https://` URL the wire's route is appended to — `/chat/completions` for `openai`, `/messages` for `anthropic` — so it usually ends in `/v1`. |
 | `wire` | `openai` (default) or `anthropic`. See [Wire formats](#wire-formats). |
 | `api_key` | Sent as the wire's credential when set. Most local servers take none, and none is sent. |
-| `api_key_env` | An environment variable to read the key from instead; it wins over `api_key`, as for a catalog provider. |
+| `api_key_env` | An environment variable to read the key from instead; it wins over `api_key`, as for a catalog provider. `""` clears one an earlier file named. |
 | `name` | Display name for listings. The id when absent. |
 
 The rules the catalog is filtered by do not apply. They vet a list
