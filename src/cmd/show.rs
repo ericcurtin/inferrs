@@ -10,13 +10,11 @@
 //! model file itself (GGUF metadata) or its `config.json`/
 //! `tokenizer_config.json` (safetensors).
 
-use std::io::Read;
 use std::path::Path;
 
 use clap::Args;
 
 use crate::modelpack::{resolve_model, ModelPath};
-use crate::storage::oci::Descriptor;
 use crate::storage::OciStore;
 
 #[derive(Args, Debug)]
@@ -76,13 +74,6 @@ pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
         }
         ModelPath::Gguf(..) | ModelPath::Diffusion(_) => None,
     };
-    let tokenizer_config = match &resolved {
-        ModelPath::SafeTensors(dir) | ModelPath::Omni(dir) => {
-            read_json_file(&dir.join("tokenizer_config.json"))
-        }
-        ModelPath::Gguf(..) | ModelPath::Diffusion(_) => None,
-    };
-
     // Any single-focus flag suppresses the full summary and prints just
     // that one thing, matching `ollama show --license`/`--template`/
     // `--parameters`'s own behavior.
@@ -93,8 +84,9 @@ pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    let template = || crate::modelpack::chat_template(&store, &store_path, &cache_path, &manifest);
     if args.template {
-        match chat_template(gguf_info.as_ref(), tokenizer_config.as_ref()) {
+        match template() {
             Some(text) => println!("{}", text.trim_end()),
             None => println!("(no chat template found)"),
         }
@@ -150,13 +142,17 @@ pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
         }
     }
 
-    if chat_template(gguf_info.as_ref(), tokenizer_config.as_ref()).is_some() {
+    if let Some(template) = template() {
         println!();
         println!("Template");
         println!(
             "    (present — use `llmman show --template {}` to view it)",
             args.model
         );
+        let choices = crate::chat_template::thinking_controls(&template).choices();
+        if !choices.is_empty() {
+            println!("    thinking             {}", choices.join(", "));
+        }
     }
 
     if let Some(annotations) = &manifest.annotations {
@@ -258,24 +254,6 @@ fn format_value(v: &crate::gguf::Value) -> String {
     }
 }
 
-/// The model's chat template, if one can be found — GGUF's
-/// `tokenizer.chat_template` key, or (for safetensors) a
-/// `tokenizer_config.json`'s own `chat_template` field.
-fn chat_template(
-    gguf_info: Option<&crate::gguf::Info>,
-    tokenizer_config: Option<&serde_json::Value>,
-) -> Option<String> {
-    if let Some(info) = gguf_info {
-        if let Some(t) = info.str("tokenizer.chat_template") {
-            return Some(t.to_string());
-        }
-    }
-    tokenizer_config?
-        .get("chat_template")?
-        .as_str()
-        .map(str::to_string)
-}
-
 /// Finds and reads a manifest layer that looks like a license file
 /// (`LICENSE`, `LICENSE.txt`, `LICENSE.md`, case-insensitive) — or, for a
 /// GGUF file, falls back to any `general.license*` metadata string.
@@ -297,7 +275,7 @@ fn find_license(
             .unwrap_or(filepath)
             .to_lowercase();
         if base == "license" || base.starts_with("license.") {
-            if let Ok(text) = read_layer_text(store, layer) {
+            if let Ok(text) = crate::modelpack::read_layer_text(store, layer) {
                 return Some(text);
             }
         }
@@ -309,29 +287,6 @@ fn find_license(
     info.str("general.license")
         .or_else(|| info.str("general.license.name"))
         .map(str::to_string)
-}
-
-/// Reads a manifest layer's text content — transparently un-tarring it if
-/// it's a single-file tar (as every layer `llmman build` produces is —
-/// see `storage::oci::classify_model_layer`'s own doc comment), or else
-/// treating the whole blob as raw text (as HuggingFace/cloud-source pulls
-/// store un-archived doc/config blobs — see
-/// [`crate::sources::classify_file`]).
-fn read_layer_text(store: &OciStore, layer: &Descriptor) -> anyhow::Result<String> {
-    let blob = store.read_blob(&layer.digest)?;
-    if blob.len() >= 512 {
-        let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
-        if let Ok(entries) = archive.entries() {
-            for entry in entries.flatten() {
-                let mut entry = entry;
-                let mut s = String::new();
-                if entry.read_to_string(&mut s).is_ok() && !s.is_empty() {
-                    return Ok(s);
-                }
-            }
-        }
-    }
-    Ok(String::from_utf8_lossy(&blob).into_owned())
 }
 
 fn read_json_file(path: &Path) -> Option<serde_json::Value> {

@@ -997,15 +997,26 @@ pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Optio
     Ok(pushed_digest)
 }
 
-/// The part of Ollama's `api.ShowResponse` that `llmman run` reads.
+/// The part of Ollama's `api.ShowResponse` that `llmman run` and
+/// `llmman launch` read.
 #[derive(Debug, Default, Deserialize)]
 pub struct ShowResponse {
     /// `"completion"`, `"vision"`, … — see `crate::modelpack::capabilities`.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The model's chat template, if any (see `crate::modelpack::chat_template`).
+    #[serde(default)]
+    pub template: Option<String>,
 }
 
 impl ShowResponse {
+    /// The template's thinking controls; `None` without a template.
+    pub fn thinking_controls(&self) -> Option<crate::chat_template::ThinkingControls> {
+        self.template
+            .as_deref()
+            .map(crate::chat_template::thinking_controls)
+    }
+
     /// Ollama's `RunHandler`: `opts.MultiModal` = vision or audio.
     pub fn multimodal(&self) -> bool {
         self.capabilities

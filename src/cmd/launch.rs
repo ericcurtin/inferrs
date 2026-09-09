@@ -22,6 +22,7 @@ use std::process::Command;
 use anyhow::Context;
 use clap::Args;
 
+use crate::chat_template::ThinkingControls;
 use crate::daemon;
 use crate::providers;
 
@@ -81,6 +82,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         "--overflow-model needs --model naming the local model to pair it with"
     );
 
+    // The local model's thinking controls (see `opencode_variants`); a
+    // provider's model has no template to read.
+    let mut thinking = None;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -123,7 +127,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // synchronously and with progress, before ever handing off to
             // the integration.
             if !model.is_empty() {
-                crate::daemon::ensure_model_pulled(&model)?;
+                thinking = crate::daemon::ensure_model_pulled(&model)?.thinking_controls();
             }
             match overflow {
                 // The hosted half is validated and keyed exactly as a
@@ -142,7 +146,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         }
     };
 
-    launch(name, &model, &api_key, &args.extra_args)
+    launch(name, &model, &api_key, thinking.as_ref(), &args.extra_args)
 }
 
 // ---------------------------------------------------------------------------
@@ -505,10 +509,16 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
 /// the integration's environment can do this; the ones that go through a
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
-fn launch(name: &str, model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch(
+    name: &str,
+    model: &str,
+    api_key: &str,
+    thinking: Option<&ThinkingControls>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, extra_args),
         "codex" => launch_codex(model, api_key, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
@@ -551,15 +561,59 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
     )
 }
 
-/// opencode: pass a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, matching exactly what ollama launch does.
-fn launch_opencode(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+/// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
+/// /v1 endpoint, with the model's thinking variants.
+fn launch_opencode(
+    model: &str,
+    api_key: &str,
+    thinking: Option<&ThinkingControls>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
-    let config = opencode_config(effective_model, api_key);
+    let config = opencode_config(
+        &daemon::server(),
+        effective_model,
+        api_key,
+        &opencode_variants(thinking),
+    );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+}
+
+/// The choices offered when the model's template could not be read (a
+/// provider's model): thinking off, then the levels every wire accepts
+/// (`anthropic::portable_efforts`).
+const PORTABLE_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
+
+/// opencode's `variants` for the model, in cycle order (`variant_cycle`,
+/// ctrl+t by default): the template's own choices (see
+/// [`ThinkingControls::choices`]), or [`PORTABLE_THINKING_LEVELS`] without
+/// a template. A model that does not think gets none. Each variant is the
+/// request options `@ai-sdk/openai-compatible` sends: `reasoningEffort`
+/// as `reasoning_effort`, other keys verbatim. opencode derives variants
+/// only for models it knows from models.dev, so without these a local
+/// model has nothing to cycle.
+fn opencode_variants(
+    thinking: Option<&ThinkingControls>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let choices = match thinking {
+        Some(controls) => controls.choices(),
+        None => PORTABLE_THINKING_LEVELS.to_vec(),
+    };
+    choices
+        .into_iter()
+        .map(|choice| {
+            let options = match choice {
+                "thinking" => {
+                    serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })
+                }
+                level => serde_json::json!({ "reasoningEffort": level }),
+            };
+            (choice, options)
+        })
+        .collect()
 }
 
 /// `PATH`, then opencode's own installer target, `~/.opencode/bin`.
@@ -572,26 +626,84 @@ fn find_opencode() -> Option<PathBuf> {
     })
 }
 
-fn opencode_config(model: &str, api_key: &str) -> String {
-    let base_url = format!("{}/v1", daemon::server());
-    serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            "ollama": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Ollama",
-                "options": {
-                    "baseURL": base_url,
-                    "apiKey": api_key
+/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
+/// than `json!`, whose map sorts keys: opencode cycles variants in the
+/// order listed. No variants leaves the key out.
+fn opencode_config(
+    server: &str,
+    model: &str,
+    api_key: &str,
+    variants: &[(&'static str, serde_json::Value)],
+) -> String {
+    use serde::ser::{SerializeMap, Serializer};
+
+    /// An object with runtime keys, in the order given.
+    fn entries<S: Serializer, V: serde::Serialize>(
+        entries: &[(&str, V)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (key, value) in entries {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+
+    #[derive(serde::Serialize)]
+    struct Config<'a> {
+        #[serde(rename = "$schema")]
+        schema: &'static str,
+        provider: Providers<'a>,
+        model: String,
+    }
+    #[derive(serde::Serialize)]
+    struct Providers<'a> {
+        ollama: Provider<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct Provider<'a> {
+        npm: &'static str,
+        name: &'static str,
+        options: Options<'a>,
+        #[serde(serialize_with = "entries")]
+        models: [(&'a str, Model<'a>); 1],
+    }
+    #[derive(serde::Serialize)]
+    struct Options<'a> {
+        #[serde(rename = "baseURL")]
+        base_url: String,
+        #[serde(rename = "apiKey")]
+        api_key: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct Model<'a> {
+        name: &'a str,
+        #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
+        variants: &'a [(&'static str, serde_json::Value)],
+    }
+
+    let config = Config {
+        schema: "https://opencode.ai/config.json",
+        provider: Providers {
+            ollama: Provider {
+                npm: "@ai-sdk/openai-compatible",
+                name: "Ollama",
+                options: Options {
+                    base_url: format!("{server}/v1"),
+                    api_key,
                 },
-                "models": {
-                    model: { "name": model }
-                }
-            }
+                models: [(
+                    model,
+                    Model {
+                        name: model,
+                        variants,
+                    },
+                )],
+            },
         },
-        "model": format!("ollama/{model}")
-    })
-    .to_string()
+        model: format!("ollama/{model}"),
+    };
+    serde_json::to_string(&config).expect("opencode config serializes")
 }
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
@@ -1835,6 +1947,86 @@ model = \"gpt-5\"
     fn strip_legacy_llmman_profile_handles_the_table_at_end_of_file() {
         let existing = "[profiles.llmman]\nopenai_base_url = \"http://127.0.0.1:17434/v1\"\n";
         assert_eq!(strip_legacy_llmman_profile(existing), "");
+    }
+
+    /// The config points at the daemon's `/v1` and lists the variants in
+    /// the order given (a parsed `Value` would re-sort them).
+    #[test]
+    fn opencode_config_lists_the_variants_in_order() {
+        let variants = opencode_variants(None);
+        let text = opencode_config("http://127.0.0.1:17434", "qwen3.5:0.8b", "k", &variants);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(config["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
+        let provider = &config["provider"]["ollama"];
+        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(provider["name"], "Ollama");
+        assert_eq!(provider["options"]["baseURL"], "http://127.0.0.1:17434/v1");
+        assert_eq!(provider["options"]["apiKey"], "k");
+        assert_eq!(provider["models"].as_object().map(|m| m.len()), Some(1));
+
+        let model = &provider["models"]["qwen3.5:0.8b"];
+        assert_eq!(model["name"], "qwen3.5:0.8b");
+        let written = model["variants"].as_object().expect("variants object");
+        assert_eq!(written.len(), variants.len());
+        for (name, options) in &variants {
+            assert_eq!(&written[*name], options, "variant {name}");
+        }
+        let positions: Vec<usize> = variants
+            .iter()
+            .map(|(name, _)| text.find(&format!("\"{name}\"")).expect(name))
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
+
+        let bare = opencode_config("http://h", "m", "k", &[]);
+        assert!(!bare.contains("variants"), "{bare}");
+    }
+
+    #[test]
+    fn opencode_config_escapes_the_model_name() {
+        let model = "we\"ird/mo\\del";
+        let config: serde_json::Value =
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[]))
+                .expect("valid JSON");
+        assert_eq!(config["model"], format!("ollama/{model}"));
+        assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
+    }
+
+    /// Each choice becomes the options that select it; no template means
+    /// the portable set, no thinking means no variants.
+    #[test]
+    fn opencode_variants_follow_the_templates_controls() {
+        let gemma4 = ThinkingControls {
+            thinks: true,
+            enable_thinking: true,
+            efforts: vec![],
+        };
+        assert_eq!(
+            opencode_variants(Some(&gemma4)),
+            [
+                ("none", serde_json::json!({ "reasoningEffort": "none" })),
+                (
+                    "thinking",
+                    serde_json::json!({ "chat_template_kwargs": { "enable_thinking": true } })
+                ),
+            ]
+        );
+        let qwen3_8 = ThinkingControls {
+            efforts: vec!["low", "xhigh"],
+            ..gemma4
+        };
+        assert_eq!(
+            opencode_variants(Some(&qwen3_8)),
+            [
+                ("none", serde_json::json!({ "reasoningEffort": "none" })),
+                ("low", serde_json::json!({ "reasoningEffort": "low" })),
+                ("xhigh", serde_json::json!({ "reasoningEffort": "xhigh" })),
+            ]
+        );
+        assert!(opencode_variants(Some(&ThinkingControls::default())).is_empty());
+        let fallback = opencode_variants(None);
+        assert_eq!(fallback.len(), PORTABLE_THINKING_LEVELS.len());
+        assert_eq!(fallback[0].0, "none");
     }
 
     #[test]

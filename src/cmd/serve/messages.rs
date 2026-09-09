@@ -115,22 +115,30 @@ pub(super) fn from_messages_request(
     }
     // Providers read `reasoning_effort`; llama-server's templates read
     // `chat_template_kwargs`, which a provider-bound request loses.
-    match req.get("thinking").map(|t| &t["type"]) {
+    // `output_config.effort` (Claude Code's `/effort`) names the level
+    // outright and beats one guessed from `budget_tokens`; `adaptive`
+    // without one leaves the model's default.
+    let named = output_effort(req);
+    let effort = match req.get("thinking").map(|t| &t["type"]) {
         Some(Value::String(kind)) if kind == "enabled" => {
-            let effort = reasoning_effort(&req["thinking"]);
-            object.insert("reasoning_effort".to_string(), json!(effort));
-            object.insert(
-                "chat_template_kwargs".to_string(),
-                json!({ "enable_thinking": true, "reasoning_effort": effort }),
-            );
+            Some(named.unwrap_or_else(|| reasoning_effort(&req["thinking"])))
         }
+        Some(Value::String(kind)) if kind == "adaptive" => named,
         Some(Value::String(kind)) if kind == "disabled" => {
             object.insert(
                 "chat_template_kwargs".to_string(),
                 json!({ "enable_thinking": false }),
             );
+            None
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(effort) = effort {
+        object.insert("reasoning_effort".to_string(), json!(effort));
+        object.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "enable_thinking": true, "reasoning_effort": effort }),
+        );
     }
     if let Some(format) = req
         .get("output_format")
@@ -404,6 +412,20 @@ fn convert_tool_choice(
         }
         _ => None,
     })
+}
+
+/// The request's `output_config.effort`, when it is one of
+/// [`crate::chat_template::EFFORT_LEVELS`].
+fn output_effort(req: &Value) -> Option<&'static str> {
+    let effort = req
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(Value::as_str)?
+        .trim();
+    crate::chat_template::EFFORT_LEVELS
+        .iter()
+        .copied()
+        .find(|level| *level == effort)
 }
 
 /// An enabled `thinking` budget as the largest portable
@@ -1071,6 +1093,70 @@ mod tests {
         }));
         assert!(chat.get("reasoning_effort").is_none());
         assert!(chat.get("chat_template_kwargs").is_none());
+    }
+
+    /// Claude Code's `/effort` arrives as `output_config.effort` with
+    /// `thinking: adaptive`; it becomes `reasoning_effort` as spelled,
+    /// beats a `budget_tokens` guess, and an unknown spelling is dropped.
+    #[test]
+    fn output_config_effort_is_the_thinking_level() {
+        for level in crate::chat_template::EFFORT_LEVELS {
+            let chat = request(json!({
+                "model": "m",
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": level},
+                "messages": [{"role": "user", "content": "hi"}]
+            }));
+            assert_eq!(chat["reasoning_effort"], *level, "effort {level}");
+            assert_eq!(
+                chat["chat_template_kwargs"],
+                json!({"enable_thinking": true, "reasoning_effort": level}),
+                "effort {level}"
+            );
+        }
+
+        // A 50000-token budget alone would be `high`.
+        let chat = request(json!({
+            "model": "m",
+            "thinking": {"type": "enabled", "budget_tokens": 50000},
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(chat["reasoning_effort"], "low");
+        assert_eq!(
+            chat["chat_template_kwargs"],
+            json!({"enable_thinking": true, "reasoning_effort": "low"})
+        );
+
+        let chat = request(json!({
+            "model": "m",
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(chat.get("reasoning_effort").is_none());
+        assert_eq!(
+            chat["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
+
+        let chat = request(json!({
+            "model": "m",
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(chat.get("reasoning_effort").is_none());
+        assert!(chat.get("chat_template_kwargs").is_none());
+
+        let chat = request(json!({
+            "model": "m",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "ultra"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(chat.get("reasoning_effort").is_none());
+        assert!(chat.get("chat_template_kwargs").is_none());
+        assert!(chat.get("output_config").is_none());
     }
 
     #[test]
