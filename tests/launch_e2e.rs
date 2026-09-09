@@ -1054,6 +1054,24 @@ fn openclaw_pull_registry_flake(stderr: &str) -> bool {
     stderr.contains("pull failed: copy image") || stderr.contains("FailoverError")
 }
 
+#[test]
+fn launch_pool_with_model() {
+    eprintln!("[test] launch_pool_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_pool_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("pool") {
+        eprintln!("skipping: pool not on PATH — https://poolside.com");
+        return;
+    }
+
+    // `exec <prompt>`: pool's non-interactive one-shot mode.
+    launch_and_assert("pool", &["exec", PROMPT]);
+}
+
 /// A tiny (135M-parameter, 8-bit-quantized) real safetensors model
 /// already published in `mlx-community`'s own MLX-converted form —
 /// small enough to pull quickly in CI, unlike [`MODEL`] (a ~740MB GGUF,
