@@ -91,12 +91,14 @@ fn spawn_tail_relay(
     });
 }
 
-pub(super) async fn spawn_llama_server(
-    bin: &Path,
+/// The `llama-server` argv [`spawn_llama_server`] runs, split out so each
+/// flag is assertable without spawning anything (as `container::spawn_args`
+/// is). Environment handling stays with the caller, which owns the `Command`.
+pub(super) fn llama_server_args(
     model: &Path,
     mmproj: Option<&Path>,
     opts: crate::container::LlamaOptions<'_>,
-) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+) -> anyhow::Result<Vec<String>> {
     let crate::container::LlamaOptions {
         port,
         ctx_size,
@@ -108,69 +110,101 @@ pub(super) async fn spawn_llama_server(
         embeddings,
         batch_size,
         threads,
+        metrics,
     } = opts;
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.args([
-        "--model",
-        model.to_str().context("non-UTF-8 model path")?,
-        "--port",
-        &port.to_string(),
-        "--host",
-        "127.0.0.1",
-    ]);
+    let mut args: Vec<String> = vec![
+        "--model".into(),
+        model.to_str().context("non-UTF-8 model path")?.into(),
+        "--port".into(),
+        port.to_string(),
+        "--host".into(),
+        "127.0.0.1".into(),
+    ];
     // See ModelPath::mmproj's doc comment — enables llama-server to
     // actually act on `images` (vision) and serve
     // `/v1/audio/transcriptions` (audio) instead of silently ignoring
     // both.
     if let Some(mmproj) = mmproj {
-        cmd.args([
-            "--mmproj",
-            mmproj.to_str().context("non-UTF-8 mmproj path")?,
-        ]);
+        args.push("--mmproj".into());
+        args.push(mmproj.to_str().context("non-UTF-8 mmproj path")?.into());
     }
     // `ctx_size` is already the effective value (see
     // context_length_from_env); `None` leaves --ctx-size unset, falling
     // back to n_ctx_train.
     if let Some(n) = ctx_size {
-        cmd.args(["--ctx-size", &n.to_string()]);
+        args.push("--ctx-size".into());
+        args.push(n.to_string());
     }
     // See flash_attention_from_env's doc comment; `None` leaves
     // --flash-attn unset, falling back to llama-server's own `auto`.
     if let Some(mode) = flash_attention {
-        cmd.args(["--flash-attn", mode]);
+        args.push("--flash-attn".into());
+        args.push(mode.into());
     }
     // See kv_cache_type_from_env's doc comment; `None` leaves
     // --cache-type-k/-v unset, falling back to llama-server's own `f16`.
     if let Some(t) = kv_cache_type {
-        cmd.args(["--cache-type-k", t, "--cache-type-v", t]);
+        args.push("--cache-type-k".into());
+        args.push(t.into());
+        args.push("--cache-type-v".into());
+        args.push(t.into());
     }
     // See supports_context_shift's doc comment.
-    cmd.arg(if context_shift {
-        "--context-shift"
-    } else {
-        "--no-context-shift"
-    });
+    args.push(
+        if context_shift {
+            "--context-shift"
+        } else {
+            "--no-context-shift"
+        }
+        .into(),
+    );
     // See sched_spread_from_env's doc comment; `None` leaves
     // --split-mode unset, falling back to llama-server's own `layer`.
     if let Some(mode) = split_mode {
-        cmd.args(["--split-mode", mode]);
+        args.push("--split-mode".into());
+        args.push(mode.into());
     }
     // See num_parallel_from_env's doc comment.
     if let Some(n) = num_parallel {
-        cmd.args(["--parallel", &n.to_string()]);
+        args.push("--parallel".into());
+        args.push(n.to_string());
     }
     // See threads_from_env_or_host's doc comment; `None` leaves
     // --threads unset, falling back to llama-server's own autodetection.
     if let Some(n) = threads {
-        cmd.args(["--threads", &n.to_string()]);
+        args.push("--threads".into());
+        args.push(n.to_string());
     }
     // See LlamaOptions::embeddings and ::batch_size.
     if embeddings {
-        cmd.arg("--embeddings");
+        args.push("--embeddings".into());
     }
     if let Some(n) = batch_size {
         let n = n.to_string();
-        cmd.args(["-b", &n, "-ub", &n]);
+        args.push("-b".into());
+        args.push(n.clone());
+        args.push("-ub".into());
+        args.push(n);
+    }
+    // See LlamaOptions::metrics and LLAMA_SERVER_ENV_REMOVALS.
+    if metrics {
+        args.push("--metrics".into());
+    }
+
+    Ok(args)
+}
+
+pub(super) async fn spawn_llama_server(
+    bin: &Path,
+    model: &Path,
+    mmproj: Option<&Path>,
+    opts: crate::container::LlamaOptions<'_>,
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(llama_server_args(model, mmproj, opts)?);
+    // Before the passthrough loops below, which must not put one back.
+    for var in LLAMA_SERVER_ENV_REMOVALS {
+        cmd.env_remove(var);
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -572,6 +606,12 @@ pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &[
     "LLAMA_ARG_N_GPU_LAYERS",
 ];
 
+/// Cleared from every local `llama-server` spawn, which inherits the
+/// daemon's environment: each is llama-server's own env spelling of a flag
+/// `llama_server_args` has already decided, and `LLAMA_ARG_ENDPOINT_METRICS`
+/// set anywhere would otherwise re-enable `/metrics` with `LLMMAN_METRICS` off.
+pub(super) const LLAMA_SERVER_ENV_REMOVALS: &[&str] = &["LLAMA_ARG_ENDPOINT_METRICS"];
+
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
 /// `pinned_version` explicitly asks for a specific llama.cpp release, in
@@ -836,5 +876,54 @@ mod tests {
         std::fs::write(&script, b"\x7fELF\x02\x01\x01").unwrap();
         assert_eq!(console_script_interpreter(&script), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn local_opts(metrics: bool) -> crate::container::LlamaOptions<'static> {
+        crate::container::LlamaOptions {
+            port: 18080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: false,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: None,
+            metrics,
+        }
+    }
+
+    fn local_args(metrics: bool) -> Vec<String> {
+        llama_server_args(Path::new("/store/qwen.gguf"), None, local_opts(metrics))
+            .expect("llama_server_args")
+    }
+
+    /// `--metrics` is present when enabled, absent when disabled, and the
+    /// only difference between the two argument vectors.
+    #[test]
+    fn local_spawn_passes_metrics_only_when_enabled() {
+        let mut enabled = local_args(true);
+        let disabled = local_args(false);
+        assert!(!disabled.iter().any(|a| a == "--metrics"));
+        assert_eq!(enabled.pop().as_deref(), Some("--metrics"));
+        assert_eq!(enabled, disabled);
+    }
+
+    /// The env var is an alternative input to `--metrics` on both paths:
+    /// locally it must be cleared and not put back by a passthrough list;
+    /// in a container the passthrough lists are its only route in.
+    #[test]
+    fn endpoint_metrics_env_is_removed_and_never_passed_through() {
+        assert!(
+            LLAMA_SERVER_ENV_REMOVALS.contains(&"LLAMA_ARG_ENDPOINT_METRICS"),
+            "LLAMA_ARG_ENDPOINT_METRICS is no longer cleared from local spawns"
+        );
+        for list in [GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS] {
+            assert!(
+                !list.contains(&"LLAMA_ARG_ENDPOINT_METRICS"),
+                "LLAMA_ARG_ENDPOINT_METRICS must not be in a passthrough list: {list:?}"
+            );
+        }
     }
 }

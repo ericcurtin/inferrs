@@ -426,6 +426,11 @@ pub struct LlamaOptions<'a> {
     /// limits are plumbed deliberately. An explicit LLAMA_ARG_THREADS
     /// still reaches the container via LLAMA_CPP_ENV_PASSTHROUGH_VARS.
     pub threads: Option<u32>,
+
+    /// `--metrics`, passed when true. Gated by the same `LLMMAN_METRICS`
+    /// flag as llmman's own `/metrics` rather than a second knob, so the
+    /// backend's counters are exposed exactly when llmman's own are.
+    pub metrics: bool,
 }
 
 /// Callers must stop this gracefully (SIGTERM, not the default
@@ -450,6 +455,20 @@ pub fn spawn(
     llama_cpp_version: Option<&str>,
     opts: LlamaOptions<'_>,
 ) -> Result<tokio::process::Child> {
+    let args = spawn_args(ociman, model_path, mmproj_path, llama_cpp_version, opts)?;
+    run(ociman, args)
+}
+
+/// The `docker run`/`podman run` argv [`spawn`] executes, split out so each
+/// flag is assertable without a container runtime. See `spawn` for the
+/// arguments themselves.
+pub(crate) fn spawn_args(
+    ociman: ContainerManager,
+    model_path: &Path,
+    mmproj_path: Option<&Path>,
+    llama_cpp_version: Option<&str>,
+    opts: LlamaOptions<'_>,
+) -> Result<Vec<String>> {
     let LlamaOptions {
         port,
         ctx_size,
@@ -463,6 +482,7 @@ pub fn spawn(
         // See the field's doc comment: neither the derived value nor a
         // request's num_thread describes the container's own CPU limits.
         threads: _,
+        metrics,
     } = opts;
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -552,7 +572,14 @@ pub fn spawn(
         args.push(n.to_string());
     }
 
-    run(ociman, args)
+    // No env_remove needed here: a container inherits nothing from the
+    // host, and the passthrough lists run_args forwards are asserted not
+    // to carry LLAMA_ARG_ENDPOINT_METRICS (see cmd::serve::backend's tests).
+    if metrics {
+        args.push("--metrics".into());
+    }
+
+    Ok(args)
 }
 
 /// The `run` prefix every container here starts with: attached with an
@@ -764,6 +791,45 @@ pub fn stop(_pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_opts(metrics: bool) -> LlamaOptions<'static> {
+        LlamaOptions {
+            port: 18080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: false,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: None,
+            metrics,
+        }
+    }
+
+    /// A real directory, since `spawn_args` canonicalizes the mount source.
+    fn container_args(metrics: bool) -> Vec<String> {
+        spawn_args(
+            ContainerManager::Docker,
+            &std::env::temp_dir().join("qwen.gguf"),
+            None,
+            None,
+            test_opts(metrics),
+        )
+        .expect("spawn_args")
+    }
+
+    /// `--metrics` is present when enabled, absent when disabled, and the
+    /// only difference between the two argument vectors.
+    #[test]
+    fn container_passes_metrics_only_when_enabled() {
+        let mut enabled = container_args(true);
+        let disabled = container_args(false);
+        assert!(!disabled.iter().any(|a| a == "--metrics"));
+        assert_eq!(enabled.pop().as_deref(), Some("--metrics"));
+        assert_eq!(enabled, disabled);
+    }
 
     #[test]
     fn cuda_major_12_picks_cuda12_image() {

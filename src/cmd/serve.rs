@@ -244,6 +244,12 @@ struct Inner {
     // to every *local* spawn_llama_server call from ensure_model's OOM
     // retry loop.
     threads: Option<u32>,
+    // See metrics_enabled_from_env's doc comment. Resolved once at
+    // startup — the same value build_router gets, so llmman's own
+    // /metrics and llama-server's backend /metrics turn on and off
+    // together — and forwarded to every spawn_llama_server/
+    // container::spawn call via LlamaOptions::metrics.
+    metrics_enabled: bool,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -2065,6 +2071,7 @@ async fn ensure_model(
             // See ensure_model's `request_threads` doc comment for the
             // full precedence chain this `.or` implements.
             threads: request_threads.or(state.0.threads),
+            metrics: state.0.metrics_enabled,
         };
         // Every piped child gets an output tail for crash reasons; only
         // llama-server ones join the OOM retry loop below, whose
@@ -7470,6 +7477,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
 
+    // Resolved once here rather than read again by build_router below, so
+    // Inner::metrics_enabled and the router's own gate can never disagree.
+    let metrics_enabled = metrics_enabled_from_env();
+
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
@@ -7493,6 +7504,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         split_mode: sched_spread_from_env(),
         num_parallel: num_parallel_from_env(),
         threads,
+        metrics_enabled,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         peers,
@@ -7506,7 +7518,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         client: Client::new(),
     }));
 
-    let app = build_router(state.clone(), metrics_enabled_from_env());
+    let app = build_router(state.clone(), metrics_enabled);
 
     // Before the listener binds, so uptime counts from the daemon coming
     // up rather than from whenever something first scraped it.
@@ -9603,6 +9615,7 @@ mod tests {
             split_mode: None,
             num_parallel: None,
             threads: None,
+            metrics_enabled: false,
             // usize::MAX, not 0 — 0 now means "admit almost nothing"
             // (see try_admit_against's doc comment), and no test here
             // calls ensure_model (the only caller of try_admit) directly
