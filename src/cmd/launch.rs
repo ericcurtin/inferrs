@@ -1314,12 +1314,35 @@ const VIBE_ENV_KEY: &str = "LLMMAN_API_KEY";
 /// variable vibe reads at each launch, so unlike `write_hermes_config`'s
 /// hardcoded placeholder, the real key travels through the environment
 /// same as `claude`/`aider`/`codex` above, never persisted.
+///
+/// `active_model` is also forwarded as `--model` (see `vibe_args`):
+/// vibe resolves it from the highest-precedence source available, and a
+/// trusted `./.vibe/config.toml` in whatever directory the caller
+/// launched from — not llmman's, the caller's own project, unrelated to
+/// this config — can define its own `active_model` that would otherwise
+/// win over the one just written here.
 fn launch_vibe(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("vibe").ok_or_else(|| anyhow::anyhow!("vibe is not installed"))?;
     let effective_model = if model.is_empty() { "default" } else { model };
     write_vibe_config(effective_model, &format!("{}/v1", daemon::server()))?;
 
-    exec_with_env(&bin, extra_args, &[(VIBE_ENV_KEY, api_key)])
+    exec_with_env(
+        &bin,
+        &vibe_args(effective_model, extra_args),
+        &[(VIBE_ENV_KEY, api_key)],
+    )
+}
+
+/// `--model <model>` ahead of the caller's own arguments, dropped when
+/// the caller already passed it — same shape as `qwen_args`'s `--model`
+/// handling, minus the auth-type flag qwen alone needs.
+fn vibe_args(model: &str, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra_args.len() + 2);
+    if !has_flag(extra_args, "--model", None) {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    args.extend_from_slice(extra_args);
+    args
 }
 
 /// `$VIBE_HOME` if set, else `~/.vibe` — matches vibe's own resolution
@@ -1987,6 +2010,22 @@ alias = \"old-model\"
         let url = "http://127.0.0.1:17434/v1";
         assert!(vibe_config_merged("providers = \"not a table\"", "m", url).is_err());
         assert!(vibe_config_merged("not [ valid toml", "m", url).is_err());
+    }
+
+    /// `--model` goes in front unless the caller already spelled it,
+    /// `=`-joined or not — same property `qwen_args` holds to.
+    #[test]
+    fn vibe_args_forces_model_unless_caller_passed_it() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(vibe_args("m", &args(&[])), args(&["--model", "m"]));
+        assert_eq!(
+            vibe_args("m", &args(&["--model", "other"])),
+            args(&["--model", "other"])
+        );
+        assert_eq!(
+            vibe_args("m", &args(&["--model=other"])),
+            args(&["--model=other"])
+        );
     }
 
     /// Regression test for the codex config bug described on
