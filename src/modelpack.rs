@@ -677,20 +677,25 @@ fn extract_safetensors_dir(
             continue;
         }
         let dest = cache_dir.join(rel_path);
-        // exists() is not complete: a killed copy can leave a short dest.
-        if dest
-            .metadata()
-            .map(|m| m.is_file() && m.len() == layer.size)
-            .unwrap_or(false)
-        {
+        if cached_layer_file_matches(&dest, layer.size) {
             continue;
         }
 
         std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-        let layer_hex = digest_hex(&layer.digest)?;
-        let blob = store_path.join("blobs").join("sha256").join(layer_hex);
-        std::fs::copy(&blob, &dest).with_context(|| format!("copy {rel_path} from blob store"))?;
-        eprintln!("[llmman] extracted {rel_path}");
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
+        }
+        let blob = raw_blob_path(store_path, layer)?;
+        let linked = link_or_symlink_file(&blob, &dest)
+            .with_context(|| format!("link {rel_path} from blob store"));
+        if let Err(e) = linked {
+            if !cached_layer_file_matches(&dest, layer.size) {
+                return Err(e);
+            }
+        }
+        eprintln!("[llmman] linked {rel_path}");
     }
 
     let rel_paths: Vec<&str> = manifest
@@ -700,6 +705,40 @@ fn extract_safetensors_dir(
         .filter(|p| crate::sources::is_safe_relative_path(p))
         .collect();
     Ok(safetensors_model_dir(&cache_dir, &rel_paths))
+}
+
+fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
+    dest.metadata()
+        .map(|m| m.is_file() && m.len() == layer_size)
+        .unwrap_or(false)
+}
+
+fn link_or_symlink_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(src, dest) {
+        Ok(()) => Ok(()),
+        Err(hardlink_error) => {
+            let src = src
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", src.display()))?;
+            symlink_file(&src, dest).with_context(|| {
+                format!(
+                    "hardlink {} to {} failed: {hardlink_error}; symlink failed",
+                    src.display(),
+                    dest.display()
+                )
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dest)
+}
+
+#[cfg(windows)]
+fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(src, dest)
 }
 
 #[cfg(test)]
@@ -1028,10 +1067,54 @@ mod tests {
         let digest = format!("sha256:{}", "bb".repeat(32));
         extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), weights);
+    }
 
-        std::fs::remove_file(&blob).unwrap();
+    #[test]
+    fn extract_safetensors_dir_skips_dest_that_already_matches_layer_size() {
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, weights).unwrap();
+
+        let digest = format!("sha256:{}", "bb".repeat(32));
         extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), weights);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_safetensors_dir_links_dest_to_blob() {
+        use std::os::unix::fs::MetadataExt;
+
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        let digest = format!("sha256:{}", "bb".repeat(32));
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+
+        let dest_meta = std::fs::metadata(&dest).unwrap();
+        let blob_meta = std::fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (dest_meta.dev(), dest_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino())
+        );
     }
 
     #[test]
