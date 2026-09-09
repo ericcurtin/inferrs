@@ -724,7 +724,14 @@ jobs:
     # is always a deterministic llmman bug worth failing loudly on, not
     # small-model sampling variance), so unlike the 7 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    timeout-minutes: 340
+    #
+    # +11 more (351 total) for `launch_dsh_web_default_starts_and_stops_cleanly`'s
+    # own single-attempt budget: up to TIMEOUT (10 min) polling for dsh's
+    # web server to accept a connection, plus its own separate 30s bound
+    # on a graceful stop before falling back to a forceful kill — like
+    # `serve_mlx_safetensors_model` above, one deterministic attempt, not
+    # multiplied by MAX_ATTEMPTS.
+    timeout-minutes: 351
     strategy:
       fail-fast: false
       matrix:
