@@ -11184,7 +11184,10 @@ mod tests {
         ]);
         let filtered = String::from_utf8(filtered).unwrap();
         assert!(filtered.contains("name=\"ok_1\""));
-        assert!(!filtered.contains("bad"), "{filtered}");
+        // Look for the field, not the bare word: the boundary is hex from
+        // the clock and does spell "bad" now and then.
+        assert!(!filtered.contains("name=\"bad\""), "{filtered}");
+        assert!(!filtered.contains("X: y"), "{filtered}");
         // a value containing the would-be boundary forces a different one
         let (_, ct2) = multipart_form(&[("prompt".to_string(), format!("x{boundary}y"))]);
         assert_ne!(ct2, content_type);
