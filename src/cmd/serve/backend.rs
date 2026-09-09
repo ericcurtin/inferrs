@@ -13,7 +13,8 @@ use reqwest::Client;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::time::{sleep, Duration, Instant};
 
-use super::{canonical_ref, parse_keep_alive_str, AppState, Engine, ModelProcess};
+use super::sched::parse_keep_alive_str;
+use super::{canonical_ref, AppState, Engine, ModelProcess};
 use crate::modelpack::{resolve_model, ModelPath};
 
 /// Which local engine backs a resolved `ModelPath::SafeTensors`
