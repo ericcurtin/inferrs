@@ -33,6 +33,7 @@ The page has two modes, toggled at the top:
   user running it: the login shell in a pty, bridged over a WebSocket at
   `/llmman/shell`. `llmman` itself is on `PATH` there, so `llmman launch
   claude --model …` or `llmman ps` work as they would in any terminal.
+  Shift- or cmd/ctrl-click a URL in the output to open it in a new tab.
 
 Conversations and generated media are stored in the browser (IndexedDB),
 not by the daemon; *Settings* can export conversations as JSON (without
@@ -80,8 +81,8 @@ the program.
 
 The UI is plain ES modules and CSS under `webui/` with no build step —
 `cargo build` gzips them into the binary (`build.rs`, `src/webui/`). The
-only third-party code is xterm.js (with its fit, WebGL and Unicode 11
-addons), vendored under `webui/vendor/` with its versions recorded in
+only third-party code is xterm.js (with its fit, WebGL, Unicode 11 and
+web-links addons), vendored under `webui/vendor/` with its versions recorded in
 `webui/vendor/VERSIONS`. No binaries live in the repository: the manatee
 mark is downloaded by `build.rs` from the `docs-assets` GitHub release,
 pinned by SHA-256 (`FETCHED_ASSETS`); an offline build warns and ships a
