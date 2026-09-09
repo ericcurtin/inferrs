@@ -596,7 +596,12 @@ fn extract_safetensors_dir(
             continue;
         }
         let dest = cache_dir.join(rel_path);
-        if dest.exists() {
+        // exists() is not complete: a killed copy can leave a short dest.
+        if dest
+            .metadata()
+            .map(|m| m.is_file() && m.len() == layer.size)
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -919,6 +924,33 @@ mod tests {
         assert_eq!(p.format(), "omni");
         assert_eq!(p.path(), Path::new("/cache/cosmos"));
         assert_eq!(p.mmproj(), None);
+    }
+
+    #[test]
+    fn extract_safetensors_dir_replaces_dest_shorter_than_layer_size() {
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"trunc").unwrap();
+
+        let digest = format!("sha256:{}", "bb".repeat(32));
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+
+        std::fs::remove_file(&blob).unwrap();
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
     }
 
     #[test]
