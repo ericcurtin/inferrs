@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `dsh`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -272,6 +272,34 @@ fn kill_process_tree(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Kills and waits on a spawned child if it's still alive when dropped —
+/// including via a panic, since `Drop` runs during unwinding. Needed for
+/// a test that can `assert!`/`panic!` before its own explicit stop
+/// sequence runs (clippy's `zombie_processes` lint won't accept a bare
+/// `Child` there).
+struct ChildGuard(std::process::Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            kill_process_tree(&mut self.0);
+        }
+    }
 }
 
 /// Upper bound on how many bytes of one stream's output a reader thread
@@ -892,6 +920,156 @@ fn launch_qwen_with_model() {
 /// are (see `openclaw_pull_registry_flake` for the same shape).
 fn qwen_loop_detection(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
+}
+
+#[test]
+fn launch_dsh_with_model() {
+    eprintln!("[test] launch_dsh_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_dsh_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("dsh") {
+        eprintln!("skipping: dsh not on PATH — npm install -g @deepseek-ai/dsh");
+        return;
+    }
+
+    // `--profile headless <prompt>`: dsh's own one-shot mode — answers
+    // one task, prints the final assistant message, and exits. The
+    // default `web` profile `llmman launch dsh` execs otherwise boots a
+    // persistent server with no text reply, so it alone wouldn't fit
+    // this file's launch_and_assert/"pong" pattern at all; a caller-
+    // supplied `--profile` overrides it (see `dsh_args` in
+    // `cmd::launch`) for exactly this case.
+    launch_and_assert("dsh", &["--profile", "headless", PROMPT]);
+}
+
+/// Unlike `launch_dsh_with_model` above (the `--profile headless`
+/// override), this covers the *default* profile a plain `llmman launch
+/// dsh --model <model>` actually runs — `web`, which never exits or
+/// prints a reply, so it can't go through `launch_and_assert` at all.
+/// Spawns it directly, polls its port to confirm the generated
+/// settings/patch loaded (a bad one makes dsh refuse to start rather
+/// than bind the port), then bounds a graceful stop before falling back
+/// to this file's own forceful `kill_process_tree`.
+#[test]
+fn launch_dsh_web_default_starts_and_stops_cleanly() {
+    eprintln!("[test] launch_dsh_web_default_starts_and_stops_cleanly: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_dsh_web_default_starts_and_stops_cleanly: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("dsh") {
+        eprintln!("skipping: dsh not on PATH — npm install -g @deepseek-ai/dsh");
+        return;
+    }
+    warm_model();
+
+    let home = fresh_home("dsh-web-default");
+    // dsh's own `--port` takes a literal number it binds directly
+    // (unlike this file's usual reserve-then-drop trick for a daemon
+    // llmman itself picks the port for), so a free one is reserved the
+    // same way `dead_daemon_setup` does and released just before use.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve a free port")
+        .local_addr()
+        .expect("free port addr")
+        .port();
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("launch")
+        .arg("dsh")
+        .arg("--model")
+        .arg(MODEL)
+        .arg("--")
+        .arg("--no-open")
+        .arg("--port")
+        .arg(port.to_string())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = ChildGuard(
+        cmd.spawn()
+            .unwrap_or_else(|e| panic!("spawn `llmman launch dsh` (web default): {e}")),
+    );
+
+    let start_deadline = Instant::now() + TIMEOUT;
+    let mut started = false;
+    while Instant::now() < start_deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            started = true;
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let _ = child
+                .stdout
+                .take()
+                .map(|mut s| s.read_to_string(&mut stdout));
+            let _ = child
+                .stderr
+                .take()
+                .map(|mut s| s.read_to_string(&mut stderr));
+            panic!(
+                "llmman launch dsh (web default) exited before its port ever came up \
+                 (status: {status:?}) — likely a bad generated settings/patch file\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        started,
+        "dsh's web server never accepted a connection on 127.0.0.1:{port} within {TIMEOUT:?}"
+    );
+
+    // Ask it to stop gracefully (SIGTERM / a non-forceful taskkill),
+    // then bound how long that's allowed to take before falling back
+    // to the forceful kill every other test in this file already
+    // relies on — this must never be able to hang the suite.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    let stop_deadline = Instant::now() + Duration::from_secs(30);
+    let mut stopped = false;
+    while Instant::now() < stop_deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !stopped {
+        kill_process_tree(&mut child);
+    }
+    assert!(
+        stopped,
+        "dsh (web default) did not exit within 30s of a graceful stop request"
+    );
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
