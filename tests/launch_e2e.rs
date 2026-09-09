@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `dsh`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -892,6 +892,30 @@ fn launch_qwen_with_model() {
 /// are (see `openclaw_pull_registry_flake` for the same shape).
 fn qwen_loop_detection(stderr: &str) -> bool {
     stderr.contains("Loop detection halted the run")
+}
+
+#[test]
+fn launch_dsh_with_model() {
+    eprintln!("[test] launch_dsh_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_dsh_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("dsh") {
+        eprintln!("skipping: dsh not on PATH — npm install -g @deepseek-ai/dsh");
+        return;
+    }
+
+    // `--profile headless <prompt>`: dsh's own one-shot mode — answers
+    // one task, prints the final assistant message, and exits. The
+    // default `web` profile `llmman launch dsh` execs otherwise boots a
+    // persistent server with no text reply, so it alone wouldn't fit
+    // this file's launch_and_assert/"pong" pattern at all; a caller-
+    // supplied `--profile` overrides it (see `dsh_args` in
+    // `cmd::launch`) for exactly this case.
+    launch_and_assert("dsh", &["--profile", "headless", PROMPT]);
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the

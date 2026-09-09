@@ -1314,6 +1314,11 @@ const DSH_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 /// dsh reads by default. dsh's own `--patch` overlay mechanism lets both
 /// files live under llmman's own config dir and be rewritten in full on
 /// every launch, without ever touching the user's real `$DSH_HOME`.
+///
+/// Defaults to the `web` profile, but a caller-supplied `--profile`
+/// after `--` wins instead — e.g. `--profile headless "<task>"` for a
+/// one-shot, scriptable run, the same way every other flag here already
+/// yields to what the caller explicitly asked for.
 fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     if has_flag(extra_args, "--patch", None) {
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
@@ -1326,16 +1331,26 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
     let patch_path = dir.join("llmman.cordis.yml");
     write_dsh_patch(&patch_path, &settings_path)?;
 
-    let mut args = vec![
-        "web".to_string(),
-        "--patch".to_string(),
-        patch_path.to_string_lossy().into_owned(),
-    ];
-    args.extend_from_slice(extra_args);
-
+    let args = dsh_args(&patch_path, extra_args);
     exec_with_env_and_cleanup(&bin, &args, &[(DSH_API_KEY_ENV, api_key)], || {
         let _ = std::fs::remove_dir_all(&dir);
     })
+}
+
+/// The argv dsh is invoked with. `--patch` is always injected; the
+/// default `web` profile is omitted when the caller already named one
+/// (however spelled) after `--`, so `--profile headless "task"` selects
+/// dsh's real one-shot mode instead of being appended onto `web`, which
+/// does not accept it.
+fn dsh_args(patch_path: &Path, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    if !has_flag(extra_args, "--profile", None) {
+        args.push("web".to_string());
+    }
+    args.push("--patch".to_string());
+    args.push(patch_path.to_string_lossy().into_owned());
+    args.extend_from_slice(extra_args);
+    args
 }
 
 /// `~/.config/llmman/launch/dsh`, alongside `llmman.conf`. dsh never
@@ -2047,6 +2062,46 @@ model = \"gpt-5\"
         assert_ne!(a, b);
         assert_eq!(a.parent(), dsh_config_dir().ok().as_deref());
         assert_eq!(b.parent(), dsh_config_dir().ok().as_deref());
+    }
+
+    /// A caller-supplied `--profile` (however spelled) must win over the
+    /// default `web`, since `web` doesn't accept `--profile` at all;
+    /// `--patch` is injected either way and nothing else is reordered.
+    #[test]
+    fn dsh_args_defaults_to_web_but_yields_to_a_caller_supplied_profile() {
+        let path = Path::new("/tmp/x/llmman.cordis.yml");
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            dsh_args(path, &none),
+            ["web", "--patch", "/tmp/x/llmman.cordis.yml"]
+        );
+
+        let headless = vec![
+            "--profile".to_string(),
+            "headless".to_string(),
+            "hi".to_string(),
+        ];
+        assert_eq!(
+            dsh_args(path, &headless),
+            [
+                "--patch",
+                "/tmp/x/llmman.cordis.yml",
+                "--profile",
+                "headless",
+                "hi"
+            ]
+        );
+
+        let joined = vec!["--profile=headless".to_string(), "hi".to_string()];
+        assert_eq!(
+            dsh_args(path, &joined),
+            [
+                "--patch",
+                "/tmp/x/llmman.cordis.yml",
+                "--profile=headless",
+                "hi"
+            ]
+        );
     }
 
     /// Regression test for `write_hermes_config` preserving unrelated
