@@ -13,19 +13,30 @@ The page has two modes, toggled at the top:
   loaded) and every hosted provider the daemon holds a usable key for
   (`/llmman/providers`; see [providers.md](providers.md)). Replies stream
   over `/v1/chat/completions`; a model's reasoning, when it emits any,
-  is shown collapsed above the answer. Local models that are not chat
-  models (image and video generation) are left out of the picker but
-  listed under *Models*. *Pull a model…* accepts any reference `llmman
-  pull` does — an OCI image, `hf.co/…`, `ms://…`, `ngc://…`, `s3://…`,
-  `gs://…` — and streams `/api/pull`'s progress.
+  is shown collapsed above the answer. *Pull a model…* accepts any
+  reference `llmman pull` does — an OCI image, `hf.co/…`, `ms://…`,
+  `ngc://…`, `s3://…`, `gs://…` — and streams `/api/pull`'s progress.
+
+  Diffusion models (`/api/show` capabilities `image`, `video` or `audio`
+  rather than `completion`) are listed under *Generate* in the same
+  picker. With one selected the composer generates instead, as `llmman
+  run` does: an Image / Video / Audio toggle picks what the prompt
+  becomes, and the settings button holds `run`'s flags — size, seconds,
+  steps, seed, guidance, negative prompt; blank is the model's default.
+  Images stream over `/v1/images/generations` with a step counter; a
+  video is one `/v1/videos` request and then its `content_url`; audio is
+  `/v1/audio/speech`. The result is the reply, with a Download button
+  that names the file as `run` does. Each prompt stands alone: a
+  diffusion model has no conversation. *Stop* abandons the request; a
+  video or audio generation already running finishes on the daemon.
 - **Shell** — a terminal on the machine running `llmman serve`, as the
   user running it: the login shell in a pty, bridged over a WebSocket at
   `/llmman/shell`. `llmman` itself is on `PATH` there, so `llmman launch
   claude --model …` or `llmman ps` work as they would in any terminal.
 
-Conversations are stored in the browser (IndexedDB), not by the daemon;
-*Settings* can export them as JSON or delete them. Theme follows the
-system unless set.
+Conversations and generated media are stored in the browser (IndexedDB),
+not by the daemon; *Settings* can export conversations as JSON (without
+the media) or delete them. Theme follows the system unless set.
 
 ## The shell's guard rails
 

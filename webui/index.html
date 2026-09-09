@@ -96,6 +96,18 @@
               <button class="icon-btn" id="prompt-settings-btn" title="Chat settings" aria-label="Chat settings">
                 <svg viewBox="0 0 24 24"><use href="#i-sliders"/></svg>
               </button>
+              <!-- With a media generation model: what the prompt becomes. -->
+              <div class="kind-toggle hidden" id="media-kind" role="group" aria-label="Output">
+                <button type="button" data-kind="image" aria-pressed="false" title="Generate an image">
+                  <svg viewBox="0 0 24 24"><use href="#i-image"/></svg><span>Image</span>
+                </button>
+                <button type="button" data-kind="video" aria-pressed="false" title="Generate a video">
+                  <svg viewBox="0 0 24 24"><use href="#i-video"/></svg><span>Video</span>
+                </button>
+                <button type="button" data-kind="audio" aria-pressed="false" title="Generate audio">
+                  <svg viewBox="0 0 24 24"><use href="#i-audio"/></svg><span>Audio</span>
+                </button>
+              </div>
             </div>
             <div class="composer-right">
               <button class="model-btn" id="model-btn" aria-haspopup="menu" aria-expanded="false">
@@ -126,20 +138,52 @@
         </div>
       </div>
 
-      <!-- Chat settings popover -->
+      <!-- Chat settings popover; media fields with a generation model. -->
       <div class="popover prompt-settings hidden" id="prompt-settings">
-        <label class="field">
-          <span>System prompt</span>
-          <textarea id="system-prompt" rows="4" placeholder="Optional instructions sent with every message in this conversation"></textarea>
-        </label>
-        <label class="field field-row">
-          <span>Temperature</span>
-          <input type="number" id="temperature" min="0" max="2" step="0.1" placeholder="model default">
-        </label>
-        <label class="field field-row">
-          <span>Max tokens</span>
-          <input type="number" id="max-tokens" min="1" step="1" placeholder="unlimited">
-        </label>
+        <div class="settings-chat" id="settings-chat">
+          <label class="field">
+            <span>System prompt</span>
+            <textarea id="system-prompt" rows="4" placeholder="Optional instructions sent with every message in this conversation"></textarea>
+          </label>
+          <label class="field field-row">
+            <span>Temperature</span>
+            <input type="number" id="temperature" min="0" max="2" step="0.1" placeholder="model default">
+          </label>
+          <label class="field field-row">
+            <span>Max tokens</span>
+            <input type="number" id="max-tokens" min="1" step="1" placeholder="unlimited">
+          </label>
+        </div>
+        <div class="settings-media hidden" id="settings-media">
+          <div class="field field-row media-visual" role="group" aria-labelledby="media-size-label">
+            <span id="media-size-label">Size</span>
+            <span class="size-pair">
+              <input type="number" id="media-width" min="32" max="4096" step="32" placeholder="768" aria-label="Width">
+              <span class="muted">×</span>
+              <input type="number" id="media-height" min="32" max="4096" step="32" placeholder="512" aria-label="Height">
+            </span>
+          </div>
+          <label class="field field-row media-timed">
+            <span>Seconds</span>
+            <input type="number" id="media-seconds" min="0.5" max="42" step="0.5" placeholder="model default">
+          </label>
+          <label class="field field-row">
+            <span>Steps</span>
+            <input type="number" id="media-steps" min="1" max="200" step="1" placeholder="model default">
+          </label>
+          <label class="field field-row">
+            <span>Seed</span>
+            <input type="number" id="media-seed" min="0" max="4294967295" step="1" placeholder="random">
+          </label>
+          <label class="field field-row">
+            <span>Guidance</span>
+            <input type="number" id="media-cfg" min="0" max="30" step="0.5" placeholder="model default">
+          </label>
+          <label class="field">
+            <span>Negative prompt</span>
+            <textarea id="media-negative" rows="2" placeholder="What to keep out (guidance above 1 applies it)"></textarea>
+          </label>
+        </div>
       </div>
     </section>
 
@@ -266,6 +310,10 @@
     <symbol id="i-dots" viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.7" fill="currentColor"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/><circle cx="18" cy="12" r="1.7" fill="currentColor"/></symbol>
     <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.5-8A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9H7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
     <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="9" cy="9.5" r="1.6" fill="currentColor"/><path d="M4.5 17.5l5-5 3.5 3.5 2.5-2.5 4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M16 10.5l5-3v9l-5-3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-audio" viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 10.5v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M12 4v10M8 10.5l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   </defs>
 </svg>
 

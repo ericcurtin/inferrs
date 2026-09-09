@@ -1,13 +1,15 @@
 // The conversation view: messages, composer, streaming replies. One
 // conversation (`current`) is open at a time and persisted after every
 // change; a streaming reply re-renders its markdown once per frame.
+// With a media generation model selected, each prompt becomes an image,
+// a video or an audio clip instead, shown inline as the reply.
 
 import * as api from "./api.js";
 import * as db from "./db.js";
 import * as models from "./models.js";
 import * as settings from "./settings.js";
 import { IncrementalRenderer } from "./markdown.js";
-import { $, toast, copyText, autosize, greeting, icon, iconButton, flashCopied } from "./util.js";
+import { $, $$, toast, copyText, autosize, greeting, icon, iconButton, flashCopied, formatBytes } from "./util.js";
 
 let current = null; // the open conversation, or null for a fresh one
 let streaming = null; // { abort: AbortController, node, message }
@@ -63,8 +65,13 @@ export function init() {
     stickToBottom = gap < 80;
   });
 
-  models.onChange(() => updateSendState());
+  models.onChange(() => {
+    updateSendState();
+    updateComposerMode();
+  });
   initPromptSettings();
+  initKindToggle();
+  updateComposerMode();
   updateGreeting();
   setInterval(updateGreeting, 60_000);
 }
@@ -90,6 +97,71 @@ function updateSendState() {
   send.disabled = !$("#prompt").value.trim() || !models.selected();
 }
 
+// ---- Media generation mode ----------------------------------------------
+//
+// The selected model's capabilities (from /api/show) are the kinds on
+// offer; the options live on the conversation under `media`.
+
+const MEDIA_DEFAULTS = { kind: "image", width: null, height: null, seconds: null, steps: null, seed: null, cfgScale: null, negativePrompt: "" };
+
+const PLACEHOLDERS = {
+  chat: "How can I help you today?",
+  image: "Describe the image to generate",
+  video: "Describe the video to generate",
+  audio: "Describe the sound to generate",
+};
+
+/** The media kinds the selected model generates; `[]` in chat mode. */
+function mediaKinds() {
+  return models.mediaCapabilities(models.selected());
+}
+
+/** `conv`'s media options (or the pending ones), with a kind the model offers. */
+function mediaOptions(conv = current, kinds = mediaKinds()) {
+  const opts = { ...MEDIA_DEFAULTS, ...(conv?.media ?? pendingSettings?.media ?? {}) };
+  if (kinds.length && !kinds.includes(opts.kind)) opts.kind = kinds[0];
+  return opts;
+}
+
+async function setMediaOptions(patch) {
+  await saveSettings({ media: { ...mediaOptions(), ...patch } });
+  updateComposerMode();
+}
+
+/** Onto the open conversation, or held for the next one. */
+async function saveSettings(patch) {
+  if (current) {
+    Object.assign(current, patch);
+    await persist();
+  } else {
+    pendingSettings = { ...pendingSettings, ...patch };
+  }
+}
+
+/** The kind toggle, placeholder and settings title follow the selected model. */
+function updateComposerMode() {
+  const kinds = mediaKinds();
+  const generating = kinds.length > 0;
+  const opts = mediaOptions(current, kinds);
+  $("#media-kind").classList.toggle("hidden", !generating);
+  for (const b of $$("#media-kind button")) {
+    const offered = kinds.includes(b.dataset.kind);
+    b.classList.toggle("hidden", !offered);
+    b.setAttribute("aria-pressed", String(offered && b.dataset.kind === opts.kind));
+  }
+  $("#prompt").placeholder = PLACEHOLDERS[generating ? opts.kind : "chat"];
+  const btn = $("#prompt-settings-btn");
+  btn.title = generating ? "Generation settings" : "Chat settings";
+  btn.setAttribute("aria-label", btn.title);
+  $("#settings-media").dataset.kind = opts.kind;
+}
+
+function initKindToggle() {
+  for (const b of $$("#media-kind button")) {
+    b.addEventListener("click", () => setMediaOptions({ kind: b.dataset.kind }));
+  }
+}
+
 // ---- Per-conversation settings popover --------------------------------
 
 function initPromptSettings() {
@@ -98,6 +170,15 @@ function initPromptSettings() {
   const sys = $("#system-prompt");
   const temp = $("#temperature");
   const max = $("#max-tokens");
+  const media = {
+    width: $("#media-width"),
+    height: $("#media-height"),
+    seconds: $("#media-seconds"),
+    steps: $("#media-steps"),
+    seed: $("#media-seed"),
+    cfgScale: $("#media-cfg"),
+    negativePrompt: $("#media-negative"),
+  };
   let open = false;
 
   const position = () => {
@@ -109,12 +190,17 @@ function initPromptSettings() {
   };
   const show = () => {
     open = true;
+    const generating = mediaKinds().length > 0;
+    $("#settings-chat").classList.toggle("hidden", generating);
+    $("#settings-media").classList.toggle("hidden", !generating);
+    const opts = mediaOptions();
+    for (const [k, input] of Object.entries(media)) input.value = opts[k] ?? "";
     sys.value = current?.systemPrompt ?? settings.get("systemPrompt") ?? "";
     temp.value = current?.temperature ?? "";
     max.value = current?.maxTokens ?? "";
     pop.classList.remove("hidden");
     position();
-    sys.focus();
+    (generating ? media.steps : sys).focus();
   };
   const hide = () => {
     open = false;
@@ -132,28 +218,37 @@ function initPromptSettings() {
   });
   window.addEventListener("resize", () => open && position());
 
+  // The inputs carry min/max/step; an invalid value is reported and not
+  // saved, so it never reaches a request.
+  const valid = (inputs) => {
+    const bad = inputs.find((i) => !i.checkValidity());
+    bad?.reportValidity();
+    return !bad;
+  };
+  const num = (input, int = false) => (input.value === "" ? null : int ? Math.floor(Number(input.value)) : Number(input.value));
+
   const save = async () => {
-    // The inputs carry min/max/step; an out-of-range value is reported
-    // and not saved, so it never reaches the request.
-    for (const input of [temp, max]) {
-      if (!input.checkValidity()) {
-        input.reportValidity();
-        return;
-      }
-    }
-    const patch = {
-      systemPrompt: sys.value,
-      temperature: temp.value === "" ? null : Number(temp.value),
-      maxTokens: max.value === "" ? null : Math.floor(Number(max.value)),
-    };
-    if (current) {
-      Object.assign(current, patch);
-      await persist();
-    } else {
-      pendingSettings = patch;
-    }
+    if (!valid([temp, max])) return;
+    await saveSettings({ systemPrompt: sys.value, temperature: num(temp), maxTokens: num(max, true) });
   };
   for (const input of [sys, temp, max]) input.addEventListener("change", save);
+
+  const saveMedia = async () => {
+    // Some backends need both dimensions or neither.
+    const half = (media.width.value === "") !== (media.height.value === "");
+    media.height.setCustomValidity(half ? "Set both width and height, or neither" : "");
+    if (!valid(Object.values(media))) return;
+    await setMediaOptions({
+      width: num(media.width, true),
+      height: num(media.height, true),
+      seconds: num(media.seconds),
+      steps: num(media.steps, true),
+      seed: num(media.seed, true),
+      cfgScale: num(media.cfgScale),
+      negativePrompt: media.negativePrompt.value,
+    });
+  };
+  for (const input of Object.values(media)) input.addEventListener("change", saveMedia);
 }
 
 let pendingSettings = null;
@@ -165,11 +260,13 @@ export function newConversation() {
   if (streaming) stop();
   current = null;
   pendingSettings = null;
+  releaseObjectUrls();
   $("#messages").replaceChildren();
   $("#view-chat").classList.add("empty");
   $("#topbar-title").textContent = "";
   $("#composer-status").textContent = "";
   stickToBottom = true;
+  updateComposerMode();
   $("#prompt").focus();
   changed();
 }
@@ -194,6 +291,7 @@ export async function open(id, stillWanted = () => true) {
   $("#view-chat").classList.remove("empty");
   $("#topbar-title").textContent = conv.title;
   stickToBottom = true;
+  updateComposerMode();
   requestAnimationFrame(scrollToBottom);
   changed();
   return true;
@@ -242,6 +340,7 @@ function ensureConversation(firstText) {
     systemPrompt: pendingSettings?.systemPrompt ?? settings.get("systemPrompt") ?? "",
     temperature: pendingSettings?.temperature ?? null,
     maxTokens: pendingSettings?.maxTokens ?? null,
+    media: pendingSettings?.media ?? null,
     messages: [],
   };
   pendingSettings = null;
@@ -287,29 +386,26 @@ async function submit() {
 /** Ask the model for the next assistant turn of `current`. */
 async function generate() {
   // Captured: the user can open another conversation mid-stream, and the
-  // cleanup below must land on this one.
+  // cleanup must land on this one.
   const conv = current;
   const model = conv.model || models.selected();
+  const generating = models.mediaCapabilities(model).length > 0;
+  // Mark the prompt: a generation prompt is not a chat turn (and a Retry
+  // may switch it either way).
+  const last = conv.messages.findLast((m) => m.role === "user");
+  if (last) last.generate = generating;
+  if (generating) return generateMedia(conv, model);
   const message = { role: "assistant", content: "", reasoning: "", model, at: Date.now() };
-  conv.messages.push(message);
-  const index = conv.messages.length - 1;
-  const node = renderMessage(message, index);
-  node.classList.add("streaming");
-  $("#messages").appendChild(node);
-  scrollToBottom();
-
-  const abort = new AbortController();
-  streaming = { abort, node, message };
-  updateSendState();
-
-  const status = node.querySelector(".msg-status");
+  const turn = beginTurn(conv, message);
+  const { node, status, abort } = turn;
   const remote = api.splitRemoteRef(model);
   status.textContent = !remote && !models.isLoaded(model) ? `Loading ${model}…` : "Thinking…";
-  const started = performance.now();
 
   const history = [];
   if (conv.systemPrompt?.trim()) history.push({ role: "system", content: conv.systemPrompt.trim() });
-  for (const m of conv.messages.slice(0, index)) {
+  for (const m of conv.messages.slice(0, turn.index)) {
+    // Media prompts and replies are not part of a chat.
+    if (m.generate || m.request) continue;
     if (m.role === "user" || (m.role === "assistant" && m.content)) {
       history.push({ role: m.role, content: m.content });
     }
@@ -354,33 +450,136 @@ async function generate() {
     });
     message.finishReason = result.finishReason;
     if (!remote) models.markLoaded(model, true);
-    if (conv === current) {
-      const secs = ((performance.now() - started) / 1000).toFixed(1);
-      $("#composer-status").textContent = `${models.displayName(model)} · ${secs}s`;
-    }
+    turn.done();
   } catch (e) {
-    if (e.name === "AbortError") message.stopped = true;
-    else message.error = e.message || String(e);
+    turn.fail(e);
   } finally {
     cancelAnimationFrame(frame);
     drain(true);
-    if (streaming?.message === message) streaming = null;
-    node.classList.remove("streaming");
-    status.textContent = "";
-    if (!message.content && !message.reasoning && message.stopped) {
-      // Nothing came back before the stop: drop the empty turn.
-      conv.messages.splice(index, 1);
-      node.remove();
-    } else {
-      if (!message.content && !message.reasoning && !message.error) {
-        message.error = "The model returned nothing.";
-      }
-      renderAssistantBody(node, message, false);
-    }
-    updateSendState();
-    await persist(conv);
-    if (conv === current && stickToBottom) scrollToBottom();
+    const empty = !message.content && !message.reasoning;
+    if (empty && !message.stopped && !message.error) message.error = "The model returned nothing.";
+    await endTurn(turn, empty && message.stopped);
   }
+}
+
+/**
+ * The media counterpart: the last user message is the prompt, the reply
+ * is one picture, clip or sound kept as a Blob on `message.media`.
+ */
+async function generateMedia(conv, model) {
+  const opts = mediaOptions(conv, models.mediaCapabilities(model));
+  const prompt = conv.messages.findLast((m) => m.role === "user")?.content || "";
+  const message = { role: "assistant", content: "", model, at: Date.now(), prompt, request: opts };
+  const turn = beginTurn(conv, message);
+  const { status, abort, started } = turn;
+
+  const fill = document.createElement("div");
+  fill.className = "bar-fill indeterminate";
+  const bar = document.createElement("div");
+  bar.className = "bar media-progress";
+  bar.appendChild(fill);
+  const text = document.createTextNode("");
+  status.replaceChildren(text, bar);
+  const loading = !models.isLoaded(model);
+  let steps = null; // {step, total} once the backend reports progress
+  const tick = () => {
+    if (steps?.total) {
+      text.textContent = `Generating ${opts.kind}… step ${steps.step}/${steps.total}`;
+      fill.classList.remove("indeterminate");
+      fill.style.width = `${Math.min(100, (100 * steps.step) / steps.total).toFixed(1)}%`;
+    } else {
+      const s = Math.floor((performance.now() - started) / 1000);
+      const verb = loading ? `Loading ${model}, then generating` : "Generating";
+      text.textContent = `${verb} ${opts.kind}… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    }
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+
+  const request = { ...opts, model, prompt, signal: abort.signal };
+  try {
+    if (opts.kind === "video") {
+      const { blob, job } = await api.generateVideo(request);
+      const [w, h] = String(job.size || "").split("x").map(Number);
+      message.media = {
+        kind: "video",
+        blob,
+        width: w || null,
+        height: h || null,
+        seconds: Number(job.seconds) || null,
+        fps: job.fps || null,
+        hasAudio: job.has_audio ?? null,
+        revisedPrompt: job.revised_prompt || "",
+      };
+    } else if (opts.kind === "audio") {
+      const { blob } = await api.generateAudio(request);
+      message.media = { kind: "audio", blob, seconds: opts.seconds };
+    } else {
+      const onProgress = (p) => {
+        steps = p;
+        tick();
+      };
+      const { blob, revisedPrompt } = await api.generateImage({ ...request, onProgress });
+      message.media = { kind: "image", blob, revisedPrompt };
+    }
+    models.markLoaded(model, true);
+    turn.done();
+  } catch (e) {
+    turn.fail(e);
+  } finally {
+    clearInterval(timer);
+    status.replaceChildren();
+    await endTurn(turn, message.stopped);
+  }
+}
+
+/** Append `message` as the streaming assistant turn of `conv` and claim `streaming`. */
+function beginTurn(conv, message) {
+  conv.messages.push(message);
+  const index = conv.messages.length - 1;
+  const node = renderMessage(message, index);
+  node.classList.add("streaming");
+  $("#messages").appendChild(node);
+  scrollToBottom();
+  const abort = new AbortController();
+  streaming = { abort, node, message };
+  updateSendState();
+  const started = performance.now();
+  const model = message.model;
+  return {
+    conv,
+    message,
+    index,
+    node,
+    abort,
+    started,
+    status: node.querySelector(".msg-status"),
+    done() {
+      if (conv !== current) return;
+      const secs = ((performance.now() - started) / 1000).toFixed(1);
+      $("#composer-status").textContent = `${models.displayName(model)} · ${secs}s`;
+    },
+    fail(e) {
+      if (e.name === "AbortError") message.stopped = true;
+      else message.error = e.message || String(e);
+    },
+  };
+}
+
+/** Release `streaming`, render the final state (or drop the turn) and persist. */
+async function endTurn({ conv, message, index, node, status }, drop) {
+  if (streaming?.message === message) streaming = null;
+  node.classList.remove("streaming");
+  status.textContent = "";
+  if (drop) {
+    conv.messages.splice(index, 1);
+    node.remove();
+  } else {
+    renderAssistantBody(node, message, false);
+  }
+  updateSendState();
+  await persist(conv);
+  if (conv === current && stickToBottom) scrollToBottom();
 }
 
 export function stop() {
@@ -415,6 +614,7 @@ async function editFrom(index) {
       systemPrompt: keep.systemPrompt,
       temperature: keep.temperature,
       maxTokens: keep.maxTokens,
+      media: keep.media ?? null,
     };
     $("#view-chat").classList.add("empty");
     $("#topbar-title").textContent = "";
@@ -429,6 +629,7 @@ async function editFrom(index) {
 
 function renderAll() {
   const list = $("#messages");
+  releaseObjectUrls();
   list.replaceChildren();
   if (!current) return;
   current.messages.forEach((m, i) => list.appendChild(renderMessage(m, i)));
@@ -460,7 +661,12 @@ function renderMessage(message, index) {
   node.appendChild(status);
   const meta = document.createElement("div");
   meta.className = "msg-meta";
-  meta.appendChild(copyButton(message));
+  const copy = copyButton(message);
+  copy.classList.add("act-copy");
+  meta.appendChild(copy);
+  const save = iconButton("i-save", "Download", () => downloadMedia(message));
+  save.classList.add("act-download", "hidden");
+  meta.appendChild(save);
   meta.appendChild(iconButton("i-retry", "Retry", () => regenerateFrom(index)));
   const label = document.createElement("span");
   label.className = "msg-model";
@@ -490,8 +696,16 @@ function renderAssistantBody(node, message, live) {
       renderer: new IncrementalRenderer(content, { onCopy: (t) => copyText(t) }),
       thinking: null,
       collapsed: false,
+      media: null,
     };
     views.set(node, view);
+  }
+
+  if (message.media?.blob && !view.media) {
+    view.media = renderMedia(message);
+    view.body.insertBefore(view.media, view.content);
+    node.querySelector(".act-copy")?.classList.add("hidden");
+    node.querySelector(".act-download")?.classList.remove("hidden");
   }
 
   if (message.reasoning) {
@@ -542,6 +756,79 @@ function copyButton(message) {
   return iconButton("i-copy", "Copy", async (btn) => {
     if (await copyText(message.content)) flashCopied(btn);
   });
+}
+
+// ---- Generated media ---------------------------------------------------
+
+/** Object URLs for the media on screen; revoked whenever the list is rebuilt. */
+const objectUrls = new Map();
+function urlFor(blob) {
+  let url = objectUrls.get(blob);
+  if (!url) objectUrls.set(blob, (url = URL.createObjectURL(blob)));
+  return url;
+}
+function releaseObjectUrls() {
+  for (const url of objectUrls.values()) URL.revokeObjectURL(url);
+  objectUrls.clear();
+}
+
+/** The `<img>` / `<video>` / `<audio>` for a message's media, with a caption. */
+function renderMedia(message) {
+  const media = message.media;
+  const wrap = document.createElement("div");
+  wrap.className = `media media-${media.kind}`;
+  const caption = document.createElement("div");
+  caption.className = "media-caption";
+  const describe = () => {
+    const req = message.request || {};
+    const parts = [
+      media.width && media.height && `${media.width}×${media.height}`,
+      media.seconds && `${Number(media.seconds).toFixed(1).replace(/\.0$/, "")}s`,
+      media.fps && `${media.fps} fps`,
+      media.hasAudio && "with audio",
+      req.steps && `${req.steps} steps`,
+      Number.isInteger(req.seed) && `seed ${req.seed}`,
+      formatBytes(media.blob.size),
+    ];
+    caption.textContent = parts.filter(Boolean).join(" · ");
+  };
+  const el = document.createElement({ image: "img", video: "video", audio: "audio" }[media.kind]);
+  if (media.kind === "image") {
+    el.alt = message.prompt || "Generated image";
+    el.addEventListener("load", () => {
+      media.width ||= el.naturalWidth;
+      media.height ||= el.naturalHeight;
+      describe();
+    });
+  } else {
+    el.controls = true;
+    el.preload = "metadata";
+    el.playsInline = true;
+    el.addEventListener("loadedmetadata", () => {
+      if (Number.isFinite(el.duration)) media.seconds = el.duration;
+      describe();
+    });
+  }
+  el.src = urlFor(media.blob);
+  describe();
+  if (media.revisedPrompt) caption.title = `Prompt as enhanced by the model:\n${media.revisedPrompt}`;
+  wrap.append(el, caption);
+  return wrap;
+}
+
+/** Save as `<prompt slug>-<YYYYMMDD-HHMMSS>.<ext>`, the name `llmman run` uses. */
+function downloadMedia(message) {
+  const media = message.media;
+  if (!media?.blob) return;
+  const ext = { image: "png", video: "mp4", audio: "wav" }[media.kind];
+  const slug = (message.prompt || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+  const d = new Date(message.at || Date.now());
+  const p = (n) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  const a = document.createElement("a");
+  a.href = urlFor(media.blob);
+  a.download = `${slug || "image"}-${stamp}.${ext}`;
+  a.click();
 }
 
 function scrollToBottom() {

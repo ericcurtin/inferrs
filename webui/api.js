@@ -231,3 +231,86 @@ export async function chat({ model, messages, temperature, maxTokens, signal, on
   }
   return { finishReason };
 }
+
+// ---- Media generation ---------------------------------------------------
+//
+// A diffusion model answers on `/v1/images/generations`, `/v1/videos`
+// and `/v1/audio/speech`. Unset knobs are left out (the model's default).
+
+function blobFromBase64(b64, type) {
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new Blob([bytes], { type });
+}
+
+/** A response body as a Blob, typed `fallback` when the server sent no type. */
+async function typedBlob(response, fallback) {
+  const blob = await response.blob();
+  return blob.type ? blob : blob.slice(0, blob.size, fallback);
+}
+
+/** The knobs shared by the three routes, only those set; `omit` names the ones a route lacks. */
+function mediaFields({ width, height, steps, seed, cfgScale, negativePrompt, seconds }, omit = []) {
+  const body = {};
+  if (width > 0) body.width = Math.round(width);
+  if (height > 0) body.height = Math.round(height);
+  if (steps > 0) body.steps = Math.round(steps);
+  if (Number.isInteger(seed) && seed >= 0) body.seed = seed;
+  if (cfgScale > 0) body.cfg_scale = cfgScale;
+  if (negativePrompt?.trim()) body.negative_prompt = negativePrompt.trim();
+  if (seconds > 0) body.seconds = seconds;
+  for (const k of omit) delete body[k];
+  return body;
+}
+
+function imageResult(item) {
+  if (!item?.b64_json) throw new ApiError("the reply carried no image", 200);
+  return { blob: blobFromBase64(item.b64_json, "image/png"), revisedPrompt: item.revised_prompt || "" };
+}
+
+/**
+ * `POST /v1/images/generations`, streamed: `onProgress` gets `{step,
+ * total}` per denoising step. Resolves with `{blob, revisedPrompt}`.
+ */
+export async function generateImage({ model, prompt, signal, onProgress, ...opts }) {
+  const body = { model, prompt, stream: true, response_format: "b64_json", ...mediaFields(opts, ["seconds"]) };
+  const r = await postJson("v1/images/generations", body, { signal });
+  if (!(r.headers.get("content-type") || "").includes("text/event-stream")) {
+    return imageResult((await r.json()).data?.[0]); // a backend that does not stream
+  }
+  for await (const line of lines(r.body)) {
+    if (!line.startsWith("data:")) continue;
+    let ev;
+    try {
+      ev = JSON.parse(line.slice(5).trim());
+    } catch {
+      continue;
+    }
+    if (ev.type === "image_generation.progress") onProgress?.({ step: ev.step || 0, total: ev.total || 0 });
+    else if (ev.type === "image_generation.completed") return imageResult(ev);
+    else if (ev.type === "error") throw new ApiError(ev.error?.message || "image generation failed", 200);
+  }
+  throw new ApiError("the stream ended without an image", 200);
+}
+
+/** `POST /v1/videos` (synchronous), then `GET` its `content_url`. Resolves with `{blob, job}`. */
+export async function generateVideo({ model, prompt, fps, signal, ...opts }) {
+  const body = { model, prompt, stream: false, ...mediaFields(opts) };
+  if (fps > 0) body.fps = fps;
+  const job = await (await postJson("v1/videos", body, { signal })).json();
+  if (!job.content_url) {
+    const frames = job.n_frames || (job.frames || []).length;
+    throw new ApiError(`the server generated ${frames} frames but has no ffmpeg to mux an mp4`, 200);
+  }
+  // Relative, like every other path here, so a gateway prefix works.
+  const content = await fetch(String(job.content_url).replace(/^\/+/, ""), { signal });
+  if (!content.ok) throw await errorFrom(content);
+  return { blob: await typedBlob(content, "video/mp4"), job };
+}
+
+/** `POST /v1/audio/speech` (OpenAI's field is `input`). Resolves with `{blob}`, a wav. */
+export async function generateAudio({ model, prompt, signal, ...opts }) {
+  const body = { model, input: prompt, response_format: "wav", ...mediaFields(opts, ["width", "height"]) };
+  const r = await postJson("v1/audio/speech", body, { signal });
+  return { blob: await typedBlob(r, "audio/wav") };
+}

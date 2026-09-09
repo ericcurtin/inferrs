@@ -255,7 +255,9 @@ function initSettingsDialog() {
 
   $("#export-chats").addEventListener("click", async () => {
     const all = await db.all();
-    const blob = new Blob([JSON.stringify(all, null, 2)], { type: "application/json" });
+    // Blobs have no JSON form; the Download button saves those.
+    const replacer = (_k, v) => (v instanceof Blob ? { type: v.type, size: v.size, omitted: true } : v);
+    const blob = new Blob([JSON.stringify(all, replacer, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `llmman-chats-${new Date().toISOString().slice(0, 10)}.json`;
