@@ -152,8 +152,11 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 /// Integrations that cannot be launched without `--model`: Qwen Code has
 /// no notion of a missing model and sends its own built-in default
 /// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
+/// dsh has no default of its own either — an empty `--model` would
+/// otherwise land a literal `"default"` in `agent-default-model.model`,
+/// which the first request then tries to resolve as a real model id.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen"];
+const MODEL_REQUIRED: &[&str] = &["qwen", "dsh"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -1316,9 +1319,8 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
         anyhow::bail!("llmman launch dsh manages --patch itself; pass other dsh flags after --");
     }
     let bin = find_on_path("dsh").ok_or_else(|| anyhow::anyhow!("dsh is not installed"))?;
-    let model = if model.is_empty() { "default" } else { model };
 
-    let dir = dsh_config_dir()?;
+    let dir = dsh_launch_dir()?;
     let settings_path = dir.join("settings.yaml");
     write_dsh_settings(&settings_path, model)?;
     let patch_path = dir.join("llmman.cordis.yml");
@@ -1331,7 +1333,9 @@ fn launch_dsh(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Resu
     ];
     args.extend_from_slice(extra_args);
 
-    exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
+    exec_with_env_and_cleanup(&bin, &args, &[(DSH_API_KEY_ENV, api_key)], || {
+        let _ = std::fs::remove_dir_all(&dir);
+    })
 }
 
 /// `~/.config/llmman/launch/dsh`, alongside `llmman.conf`. dsh never
@@ -1343,6 +1347,18 @@ fn dsh_config_dir() -> anyhow::Result<PathBuf> {
         .join("llmman")
         .join("launch")
         .join("dsh"))
+}
+
+/// A directory unique to this launch. dsh's settings-file provider
+/// watches and hot-reloads its document, so a second concurrent
+/// `llmman launch dsh` writing one shared path would silently retarget
+/// an already-running instance's model — see `launch_dsh`'s cleanup.
+fn dsh_launch_dir() -> anyhow::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(dsh_config_dir()?.join(format!("{}-{nanos}", std::process::id())))
 }
 
 /// The settings document `llmman.cordis.yml` points dsh at: registers
@@ -1384,6 +1400,19 @@ fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
+    exec_with_env_and_cleanup(bin, args, extra_env, || {})
+}
+
+/// [`exec_with_env`], running `cleanup` once the child has exited
+/// (success, failure, or a spawn error alike) and before this process
+/// exits in turn — for dsh's per-launch directory (see `dsh_launch_dir`),
+/// which must not outlive the launch that created it.
+fn exec_with_env_and_cleanup(
+    bin: &PathBuf,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    cleanup: impl FnOnce(),
+) -> anyhow::Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::inherit());
@@ -1398,9 +1427,9 @@ fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> 
     }
     cmd.envs(&env);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run {}", bin.display()))?;
+    let status = cmd.status();
+    cleanup();
+    let status = status.with_context(|| format!("failed to run {}", bin.display()))?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -2005,6 +2034,19 @@ model = \"gpt-5\"
         assert!(INTEGRATIONS.iter().any(|i| i.name == "dsh"));
         assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "dsh"));
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"dsh"));
+    }
+
+    /// Two concurrent launches must land under different directories —
+    /// dsh's settings-file provider hot-reloads its document, so sharing
+    /// one path would let a second launch retarget the first (the bug
+    /// this regression test guards against).
+    #[test]
+    fn dsh_launch_dir_is_unique_per_call_and_nested_under_the_config_dir() {
+        let a = dsh_launch_dir().unwrap();
+        let b = dsh_launch_dir().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), dsh_config_dir().ok().as_deref());
+        assert_eq!(b.parent(), dsh_config_dir().ok().as_deref());
     }
 
     /// Regression test for `write_hermes_config` preserving unrelated
