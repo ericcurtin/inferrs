@@ -1,5 +1,10 @@
-use super::sched::{reap_idle_models_once, DEFAULT_KEEP_ALIVE};
-use super::stream::fold_ollama_lines;
+use super::ollama::{
+    embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, options_to_oai,
+    progress_line, staged_blob_path, staged_file, OllamaPullRequest, OllamaPushRequest,
+    PushOutcome, StreamedOutcome,
+};
+use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
+use super::stream::{fold_ollama_lines, stream_ollama};
 use super::*;
 
 // -- pull/push progress relay -------------------------------------------
