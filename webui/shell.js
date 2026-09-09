@@ -92,6 +92,10 @@ function ensureTerminal() {
     term.loadAddon(new Unicode11Addon.Unicode11Addon());
     term.unicode.activeVersion = "11";
   }
+  // URLs in output become links; openLink decides what a click does.
+  if (window.WebLinksAddon) {
+    term.loadAddon(new WebLinksAddon.WebLinksAddon(openLink));
+  }
   term.open($("#terminal-pane"));
   // Cell-exact rendering with its own box/block glyphs; the DOM fallback
   // shows hairlines through TUI frames.
@@ -118,6 +122,13 @@ function ensureTerminal() {
   });
   observer = new ResizeObserver(() => fitNow());
   observer.observe($("#terminal-pane"));
+}
+
+// Shift- or cmd/ctrl-click opens a URL, as in alacritty and iTerm2. A plain
+// click stays a click: focus, selection, or input to a program in mouse mode.
+function openLink(e, uri) {
+  if (!(e.shiftKey || e.metaKey || e.ctrlKey)) return;
+  window.open(uri, "_blank", "noopener,noreferrer");
 }
 
 function fitNow() {
