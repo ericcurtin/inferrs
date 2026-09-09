@@ -127,47 +127,9 @@ Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|
 adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
 `/v1/audio/speech` on `llmman serve`.
 
-NVIDIA's Cosmos3 world models are published as GGUFs under `ai/` (`ai/cosmos3-edge`,
-`ai/cosmos3-nano`, `ai/cosmos3-super`; `:latest` is Q4_K_M, with `:q8_0` and `:bf16` tags) and run
-on the same ggml path — on Metal, CUDA and Vulkan, natively or with `--ociman docker`. They need
-no separate text encoder: the prompt goes through the transformer's own understanding stream.
-
-```sh
-llmman run ai/cosmos3-edge "A ginger cat on a woven mat in a sunlit room"                # 768x512 png, 35 steps
-llmman run ai/cosmos3-nano --video --seconds 2 --width 832 --height 480 "waves on a beach"  # 45-frame mp4 with sound
-llmman run ai/cosmos3-edge --video --image cat.png --seconds 2 "the cat looks around"       # image-to-video
-llmman run ai/cosmos3-edge --video --input-video clip.mp4 --seconds 2 "..."                # video-to-video: continues
-                                                                                           # the clip's first 5 frames
-```
-
-Nano and Super generate a synchronized soundtrack (`"audio": false` on `/v1/videos` turns it off;
-the 10-25 sound tokens are more sensitive to 4-bit weights than the video is, so prefer `:q8_0` when
-the soundtrack matters), and
-all three are world models: an action run rolls a robot or vehicle forward from an observation
-(`forward_dynamics`), reads the actions off an observed clip (`inverse_dynamics`), or predicts both
-the future video and the actions (`policy`), for the embodiment domains and canvas tiers of
-[`CosmosActionCondition`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/cosmos/pipeline_cosmos3_omni.py):
-
-```sh
-llmman run ai/cosmos3-nano --video --input-video bridge_0.mp4 --action-mode forward_dynamics \
-    --action-domain bridge_orig_lerobot --actions bridge_0.json --action-chunk 16 --fps 5 --steps 30 \
-    "Put the pot to the left of the purple item."            # the rollout as mp4
-llmman run ai/cosmos3-nano --video --input-video bridge_0.mp4 --action-mode inverse_dynamics \
-    --action-domain bridge_orig_lerobot --action-chunk 16 --fps 5 --steps 30 "..."   # plus the actions as json
-```
-
-Over HTTP the same runs are `POST /v1/videos` with `image` / `video` (base64) and
-`action: {mode, domain, chunk_size, actions, resolution_tier, view_point}`; the job carries `actions`.
-
-The same repositories as Diffusers-layout safetensors (a root `model_index.json`, e.g. `nvidia/Cosmos3-Edge`)
+Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
 are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
---omni`; install `vllm-omni` next to `vllm`, or use `--ociman docker` for the `vllm/vllm-omni` image):
-
-```sh
-llmman run nvidia/Cosmos3-Edge "A robot arm cleaning a plate in a kitchen"              # 640x640 png
-llmman run nvidia/Cosmos3-Edge --video --seconds 2 "A robot arm cleaning a plate"       # 832x480 mp4
-```
-
+--omni`; install `vllm-omni` next to `vllm`, or use `--ociman docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
 ## Commands

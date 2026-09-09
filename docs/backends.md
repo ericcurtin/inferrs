@@ -10,7 +10,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` |
 | safetensors | `vllm` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | Your `PATH`, on Apple Silicon macOS; preferred over `vllm` when present |
-| GGUF diffusion (LTX-2, Cosmos3) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--ociman docker` / `--ociman podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
 
@@ -70,15 +70,14 @@ forwarded into the container.
 ### vLLM-Omni (Diffusers pipelines)
 
 A safetensors repository laid out as a Diffusers pipeline (a root
-`model_index.json` next to `transformer/`, `vae/`, ...), such as
-[`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge), is
+`model_index.json` next to `transformer/`, `vae/`, ...) is
 served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni): the same
 `vllm` launcher with `--omni`. Plain `vllm serve` cannot load one.
 
 ```sh
 uv pip install vllm==0.28.0 vllm-omni     # into the environment `vllm` runs from
-llmman run nvidia/Cosmos3-Edge "A robot arm cleaning a plate in a kitchen"
-llmman run nvidia/Cosmos3-Edge --video --seconds 2 "A robot arm cleaning a plate"
+llmman run ORG/MODEL "A robot arm cleaning a plate in a kitchen"
+llmman run ORG/MODEL --video --seconds 2 "A robot arm cleaning a plate"
 ```
 
 If `vllm` is a `#!/path/to/python` script whose Python cannot import
@@ -91,11 +90,9 @@ events, a video job with a `content_url`) and vLLM-Omni's own (`size`,
 unsent fields are left to the model's defaults. There is no
 `/v1/audio/speech` for these models.
 
-Cosmos3's safety guardrails are disabled (`--no-guardrails`): they need
-the `cosmos-guardrail` package and a runtime download of the gated
-`nvidia/Cosmos-1.0-Guardrail`, without which the server refuses to start.
-`LLMMAN_VLLM_OMNI_GUARDRAILS=1` leaves them on. `LLMMAN_LOAD_TIMEOUT` is
-also passed as `--init-timeout`.
+The server is started with `--no-guardrails`; `LLMMAN_VLLM_OMNI_GUARDRAILS=1`
+leaves the pipeline's safety guardrails on (they may need extra packages
+and gated weights). `LLMMAN_LOAD_TIMEOUT` is also passed as `--init-timeout`.
 
 With `--ociman`, the image is `vllm/vllm-omni:latest-x86_64` or
 `latest-aarch64` (CUDA only; `--vllm-version` pins vLLM-Omni's release,
