@@ -155,22 +155,20 @@ pub(super) fn format_to_response_format(
 
 /// Translates Ollama's `think` request field into the
 /// `chat_template_kwargs` llama-server actually reads. `true`/`false` →
-/// `{"enable_thinking": <bool>}`. A string level (`"low"`/`"medium"`/
-/// `"high"`/`"max"`) → `{"enable_thinking": true, "reasoning_effort":
-/// <level>}`, the jinja variable gpt-oss's and DeepSeek-V4's own
-/// templates read for reasoning depth. Anything else is a no-op.
+/// `{"enable_thinking": <bool>}`. A string level (one of
+/// [`crate::chat_template::EFFORT_LEVELS`]) → `{"enable_thinking": true,
+/// "reasoning_effort": <level>}`, the jinja variable gpt-oss's, Qwen3.8's
+/// and DeepSeek-V4's own templates read for reasoning depth. Anything
+/// else is a no-op.
 pub(super) fn think_to_chat_template_kwargs(
     think: &Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
     match think {
         Some(serde_json::Value::Bool(b)) => Some(serde_json::json!({ "enable_thinking": b })),
-        // Only forward the four levels llama-server's own templates
-        // actually understand — an unrecognized level (a typo, a future
-        // Ollama addition, ...) is left a no-op rather than forwarded
-        // verbatim, so the template's own default applies instead of
-        // silently misbehaving on an unsupported reasoning_effort value.
+        // An unrecognized level is a no-op, not forwarded verbatim, so
+        // the template's own default applies.
         Some(serde_json::Value::String(level))
-            if matches!(level.trim(), "low" | "medium" | "high" | "max") =>
+            if crate::chat_template::EFFORT_LEVELS.contains(&level.trim()) =>
         {
             Some(serde_json::json!({
                 "enable_thinking": true,
@@ -301,6 +299,10 @@ pub(super) struct OllamaShowResponse {
     /// Ollama's `api.ShowResponse.Capabilities`; see
     /// `crate::modelpack::capabilities`.
     pub(super) capabilities: Vec<String>,
+    /// Ollama's `api.ShowResponse.Template` (see
+    /// `crate::modelpack::chat_template`); absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) template: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1073,9 +1075,9 @@ mod tests {
 
     /// Ported from ollama's openai/openai_test.go
     /// (TestFromChatRequest_ReasoningEffort): a boolean `think` maps to
-    /// `enable_thinking`, and a string thinking level
-    /// ("low"/"medium"/"high"/"max") additionally maps to
-    /// `reasoning_effort` — the jinja variable gpt-oss's and
+    /// `enable_thinking`, and a string thinking level (any of
+    /// `chat_template::EFFORT_LEVELS`) additionally maps to
+    /// `reasoning_effort` — the jinja variable gpt-oss's, Qwen3.8's and
     /// DeepSeek-V4's own chat templates read.
     #[test]
     fn think_to_chat_template_kwargs_maps_booleans_and_reasoning_levels() {
@@ -1087,7 +1089,7 @@ mod tests {
             think_to_chat_template_kwargs(&Some(serde_json::json!(false))),
             Some(serde_json::json!({ "enable_thinking": false }))
         );
-        for level in ["low", "medium", "high", "max"] {
+        for level in crate::chat_template::EFFORT_LEVELS {
             assert_eq!(
                 think_to_chat_template_kwargs(&Some(serde_json::json!(level))),
                 Some(serde_json::json!({
@@ -1097,10 +1099,11 @@ mod tests {
                 "string level {level:?}"
             );
         }
-        // Anything other than the four known levels is a no-op — an
-        // unrecognized value shouldn't be forwarded to the template
-        // verbatim (see think_to_chat_template_kwargs's own comment).
-        for not_a_level in ["", "  ", "verbose", "LOW"] {
+        // Anything other than a known level is a no-op — an unrecognized
+        // value shouldn't be forwarded to the template verbatim (see
+        // think_to_chat_template_kwargs's own comment). `none` is a
+        // switch, not a level: Ollama spells that `think: false`.
+        for not_a_level in ["", "  ", "verbose", "LOW", "none"] {
             assert_eq!(
                 think_to_chat_template_kwargs(&Some(serde_json::json!(not_a_level))),
                 None,

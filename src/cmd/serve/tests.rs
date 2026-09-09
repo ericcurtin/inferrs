@@ -756,6 +756,50 @@ fn provider_compat_translates_think_per_wire() {
     assert_eq!(with(&anthropic, off), Some("none".into()));
 }
 
+/// A local `reasoning_effort` becomes the `chat_template_kwargs` Ollama's
+/// `think` would; the caller's kwargs win; an unknown level changes nothing.
+#[test]
+fn apply_reasoning_effort_mirrors_it_into_template_kwargs() {
+    let with = |req: serde_json::Value| {
+        let mut req = req;
+        apply_reasoning_effort(&mut req);
+        req
+    };
+    assert_eq!(
+        with(serde_json::json!({ "model": "m", "reasoning_effort": "none" })),
+        serde_json::json!({
+            "model": "m", "reasoning_effort": "none",
+            "chat_template_kwargs": { "enable_thinking": false }
+        })
+    );
+    for level in crate::chat_template::EFFORT_LEVELS {
+        assert_eq!(
+            with(serde_json::json!({ "model": "m", "reasoning_effort": level })),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": level,
+                "chat_template_kwargs": { "enable_thinking": true, "reasoning_effort": level }
+            }),
+            "{level}"
+        );
+    }
+    assert_eq!(
+        with(serde_json::json!({
+            "model": "m", "reasoning_effort": "high",
+            "chat_template_kwargs": { "enable_thinking": false }
+        })),
+        serde_json::json!({
+            "model": "m", "reasoning_effort": "high",
+            "chat_template_kwargs": { "enable_thinking": false, "reasoning_effort": "high" }
+        })
+    );
+    let unknown = serde_json::json!({ "model": "m", "reasoning_effort": "verbose" });
+    assert_eq!(with(unknown.clone()), unknown);
+    let absent = serde_json::json!({ "model": "m", "chat_template_kwargs": { "a": 1 } });
+    assert_eq!(with(absent.clone()), absent);
+    let not_a_string = serde_json::json!({ "model": "m", "reasoning_effort": 3 });
+    assert_eq!(with(not_a_string.clone()), not_a_string);
+}
+
 /// OpenAI's reasoning models take `max_completion_tokens` and reject
 /// sampling overrides; its other models reject `reasoning_effort`.
 /// Other providers are left alone beyond the llama.cpp fields.

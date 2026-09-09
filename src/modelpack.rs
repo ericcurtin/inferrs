@@ -205,15 +205,10 @@ fn extract_gguf_layer(
     }
 
     // Otherwise extract from tar layer.
-    let cached_dir = cache_path.join(layer_hex);
-    if cached_dir.exists() {
-        for e in std::fs::read_dir(&cached_dir)?.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                return Ok(p);
-            }
-        }
+    if let Some(p) = cached_gguf(cache_path, layer_hex) {
+        return Ok(p);
     }
+    let cached_dir = cache_path.join(layer_hex);
     std::fs::create_dir_all(&cached_dir)?;
     let blob = store
         .read_blob(&layer.digest)
@@ -365,6 +360,92 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
         caps.push(CAPABILITY_VISION.to_string());
     }
     caps
+}
+
+/// Ollama's `api.ShowResponse.Template`: the model's chat template, read
+/// without extracting anything (a read-only `/api/show` must not copy a
+/// checkout into the cache). A GGUF's `tokenizer.chat_template`, from
+/// the blob as stored or a tar layer already extracted; else a
+/// checkout's `chat_template.jinja`, or `tokenizer_config.json`'s
+/// `chat_template` (the `default` of Transformers' named templates).
+pub fn chat_template(
+    store: &OciStore,
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<String> {
+    if let Some((primary, _)) = gguf_layers(manifest) {
+        let path = raw_blob_path(store_path, primary)
+            .ok()
+            .filter(|p| blob_is_gguf(p))
+            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+        return crate::gguf::read_info(&path)
+            .ok()?
+            .str("tokenizer.chat_template")
+            .map(str::to_string);
+    }
+    let file = |name: &str| {
+        manifest
+            .layers
+            .iter()
+            .find(|l| {
+                layer_filepath(l)
+                    .and_then(|p| Path::new(p).file_name())
+                    .is_some_and(|f| f == name)
+            })
+            .and_then(|l| read_layer_text(store, l).ok())
+    };
+    if let Some(jinja) = file("chat_template.jinja") {
+        return Some(jinja);
+    }
+    let config: serde_json::Value = serde_json::from_str(&file("tokenizer_config.json")?).ok()?;
+    let named_default = |entry: &serde_json::Value| {
+        entry.get("name").and_then(serde_json::Value::as_str) == Some("default")
+    };
+    match config.get("chat_template")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(named) => named.get("default")?.as_str().map(str::to_string),
+        serde_json::Value::Array(named) => named
+            .iter()
+            .find(|e| named_default(e))
+            .or_else(|| named.first())?
+            .get("template")?
+            .as_str()
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A manifest layer's text: the one file of a single-file tar layer (as
+/// `llmman build` writes), else the blob itself (as HuggingFace and cloud
+/// pulls store docs and configs).
+pub fn read_layer_text(
+    store: &OciStore,
+    layer: &crate::storage::oci::Descriptor,
+) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let blob = store.read_blob(&layer.digest)?;
+    if blob.len() >= 512 {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(&blob));
+        if let Ok(entries) = archive.entries() {
+            for mut entry in entries.flatten() {
+                let mut s = String::new();
+                if entry.read_to_string(&mut s).is_ok() && !s.is_empty() {
+                    return Ok(s);
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&blob).into_owned())
+}
+
+/// The GGUF a tar layer was already extracted to, if any.
+fn cached_gguf(cache_path: &Path, layer_hex: &str) -> Option<PathBuf> {
+    std::fs::read_dir(cache_path.join(layer_hex))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
 }
 
 /// The manifest's primary GGUF layer and its companion mmproj layer, if

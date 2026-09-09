@@ -30,19 +30,21 @@ pub(super) const VERSION: &str = "2023-06-01";
 /// 4096 is the smallest ceiling of any Claude model.
 pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Thinking budgets per OpenAI `reasoning_effort` level. The Messages API
-/// has only a token budget, spent from `max_tokens`.
-const THINKING_BUDGETS: [(&str, u32); 5] = [
+/// Thinking budgets per `reasoning_effort` level (every one of
+/// `crate::chat_template::EFFORT_LEVELS`, in its order). The Messages
+/// API has only a token budget, spent from `max_tokens`.
+const THINKING_BUDGETS: [(&str, u32); 6] = [
     ("minimal", 1024),
     ("low", 2048),
     ("medium", 8192),
     ("high", 16384),
+    ("xhigh", 24576),
     ("max", 32768),
 ];
 
 /// The levels every provider's `reasoning_effort` takes: Gemini's
 /// compatibility endpoint and OpenAI's o1 have no `minimal`, OpenAI no
-/// `max`.
+/// `max`, and `xhigh` only OpenAI's newest.
 pub(super) fn portable_efforts() -> &'static [(&'static str, u32)] {
     &THINKING_BUDGETS[1..4]
 }

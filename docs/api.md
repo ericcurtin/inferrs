@@ -58,6 +58,11 @@ chunk carries Ollama's counts and durations (`prompt_eval_count`,
 `llama-server` is started with `--embeddings` for it, so `/v1/embeddings`
 works too.
 
+`think` is `true`/`false` or a level (`minimal`, `low`, `medium`,
+`high`, `xhigh`, `max`), forwarded as llama-server's
+`chat_template_kwargs`. `/api/show` returns `capabilities` and, for a
+local model with one, `template`.
+
 `/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded
 via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such
 as `system` or `quantize` are refused with a 400: the GGUF's own chat
@@ -82,6 +87,12 @@ models get `max_completion_tokens` and lose the sampling overrides they
 refuse. `previous_response_id` is refused when `/v1/responses` has to be
 bridged through chat completions: nothing is stored to resolve it against.
 
+A local `/v1/chat/completions` with `reasoning_effort` also gets the
+`chat_template_kwargs` Ollama's `think` would (`none` →
+`enable_thinking: false`; a level → `enable_thinking: true` plus
+`reasoning_effort`), so it works on llama-server builds that do not read
+`reasoning_effort` themselves. The caller's own kwargs are kept.
+
 `/v1/audio/transcriptions` is likewise a pass-through. The model needs
 audio support (an `--mmproj` projector, supplied when the model image
 carries one). Bodies up to 200 MiB are accepted.
@@ -94,7 +105,8 @@ a local model or a provider on the `openai` wire the daemon translates
 it to a chat completion and the reply back: system-role turns fold into
 one leading system message, `tool_use`/`tool_result` become
 `tool_calls`/`role: "tool"`, tools and `tool_choice` become functions
-(names over 64 characters shortened and restored), `thinking` becomes
+(names over 64 characters shortened and restored), `thinking` and
+`output_config.effort` (Claude Code's `/effort`) become
 `reasoning_effort` and llama-server's `chat_template_kwargs`,
 `output_format` becomes `response_format`. Text,
 reasoning (as `thinking`) and tool input stream back as they arrive,

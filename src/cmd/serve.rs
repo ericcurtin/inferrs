@@ -3502,6 +3502,7 @@ async fn handle_show(
             },
             // Nothing local to inspect.
             capabilities: Vec::new(),
+            template: None,
         }));
     }
     // Resolve the same way handle_pull stored it — otherwise a bare name
@@ -3526,6 +3527,12 @@ async fn handle_show(
     })?;
     let manifest = store.read_manifest(&desc.digest)?;
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
+    let template = crate::modelpack::chat_template(
+        &store,
+        &state.0.store_path,
+        &state.0.cache_path,
+        &manifest,
+    );
     Ok(Json(OllamaShowResponse {
         model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
         details: OllamaModelDetails {
@@ -3535,6 +3542,7 @@ async fn handle_show(
             quantization_level: String::new(),
         },
         capabilities,
+        template,
     }))
 }
 
@@ -4933,6 +4941,40 @@ fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
     }
 }
 
+/// Mirrors a local chat completion's `reasoning_effort` into the
+/// `chat_template_kwargs` llama-server's templates read, as
+/// `think_to_chat_template_kwargs` does for Ollama's `think`: `none` is
+/// thinking off, a level is thinking on at that depth. Recent
+/// llama-server reads `reasoning_effort` itself; older builds and vLLM
+/// read only the kwargs. The caller's own kwargs win key by key.
+/// [`provider_compat`] is the reverse, for a provider.
+fn apply_reasoning_effort(req: &mut serde_json::Value) {
+    let Some(effort) = req.get("reasoning_effort").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let think = if effort == "none" {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::Value::String(effort.to_string())
+    };
+    let Some(serde_json::Value::Object(kwargs)) = think_to_chat_template_kwargs(&Some(think))
+    else {
+        return;
+    };
+    let Some(o) = req.as_object_mut() else {
+        return;
+    };
+    let slot = o
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(existing) = slot.as_object_mut() else {
+        return;
+    };
+    for (key, value) in kwargs {
+        existing.entry(key).or_insert(value);
+    }
+}
+
 /// Shared setup for every plain OpenAI-passthrough route: parse just
 /// enough of the request to find `model`, make sure it's loaded, rewrite
 /// `model` to its canonical name (see `ensure_model`), and open an
@@ -5076,7 +5118,12 @@ async fn proxy_openai_generation_to(
             provider_compat(remote, &mut req)
         }
         Target::Remote(_) => strip_llama_fields(&mut req),
-        _ => apply_default_repeat_penalty(&mut req),
+        _ => {
+            apply_default_repeat_penalty(&mut req);
+            if llama_path == CHAT_COMPLETIONS_ROUTE {
+                apply_reasoning_effort(&mut req);
+            }
+        }
     }
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);

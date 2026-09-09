@@ -195,6 +195,26 @@ the request to a chat completion and the reply back, tool calls included.
 Providers that have the API (`openai`, `groq`, `openrouter`) are used
 natively; any other 4xx is relayed as-is.
 
+### Thinking
+
+Thinking depth is set from inside the integration and reaches the model
+as `reasoning_effort`: llama-server reads it natively (`none` turns
+thinking off; a level goes to the chat template), a provider gets it in
+its own form (see [wire formats](#wire-formats)). Nothing selected leaves
+the model's default.
+
+- `opencode`: variants read off the model's chat template (what `llmman
+  show` lists as `thinking`), cycled with `variant_cycle` (ctrl+t) or
+  `/variants`: `none`, each `reasoning_effort` level the template takes
+  (Qwen3.8: `low`, `medium`, `high`, `xhigh`), or `thinking` for a
+  template with only an `enable_thinking` switch (Gemma 4, Qwen3.5). A
+  provider's model gets `none`, `low`, `medium`, `high`.
+- `claude`: Claude Code's `/effort <low|medium|high|xhigh|max>`, sent as
+  spelled; a level the template rejects is a 400.
+- `codex`: `model_reasoning_effort`, e.g. `-- -c
+  model_reasoning_effort=high`; its `/model` picker lists only OpenAI's
+  catalog.
+
 ## Wire formats
 
 Each provider is spoken to in one of two wire formats, reported as
