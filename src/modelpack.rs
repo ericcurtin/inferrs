@@ -688,14 +688,9 @@ fn extract_safetensors_dir(
             Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
         }
         let blob = raw_blob_path(store_path, layer)?;
-        let linked = link_or_symlink_file(&blob, &dest)
-            .with_context(|| format!("link {rel_path} from blob store"));
-        if let Err(e) = linked {
-            if !cached_layer_file_matches(&dest, layer.size) {
-                return Err(e);
-            }
-        }
-        eprintln!("[llmman] linked {rel_path}");
+        link_or_copy_file(&blob, &dest, layer.size)
+            .with_context(|| format!("cache {rel_path} from blob store"))?;
+        eprintln!("[llmman] cached {rel_path}");
     }
 
     let rel_paths: Vec<&str> = manifest
@@ -713,32 +708,58 @@ fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn link_or_symlink_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    match std::fs::hard_link(src, dest) {
-        Ok(()) => Ok(()),
-        Err(hardlink_error) => {
-            let src = src
-                .canonicalize()
-                .with_context(|| format!("canonicalize {}", src.display()))?;
-            symlink_file(&src, dest).with_context(|| {
+fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        match std::fs::hard_link(src, dest) {
+            Ok(()) => Ok(()),
+            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+            Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
                 format!(
-                    "hardlink {} to {} failed: {hardlink_error}; symlink failed",
+                    "hardlink {} to {} failed: {hardlink_error}; copy failed",
                     src.display(),
                     dest.display()
                 )
-            })
+            }),
         }
+    }
+    #[cfg(not(unix))]
+    {
+        copy_file_atomic(src, dest, layer_size)
     }
 }
 
-#[cfg(unix)]
-fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(src, dest)
+fn copy_file_atomic(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    let tmp = cache_copy_temp_path(dest);
+    let result = (|| {
+        let copied = std::fs::copy(src, &tmp)
+            .with_context(|| format!("copy {} to {}", src.display(), tmp.display()))?;
+        if copied != layer_size {
+            anyhow::bail!("copied {copied} bytes, expected {layer_size}");
+        }
+        match std::fs::rename(&tmp, dest) {
+            Ok(()) => Ok(()),
+            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("rename {} to {}", tmp.display(), dest.display()))
+            }
+        }
+    })();
+    if result.is_err() || tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
-#[cfg(windows)]
-fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(src, dest)
+fn cache_copy_temp_path(dest: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp = dest.to_path_buf().into_os_string();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    PathBuf::from(tmp)
 }
 
 #[cfg(test)]
@@ -1115,6 +1136,33 @@ mod tests {
             (dest_meta.dev(), dest_meta.ino()),
             (blob_meta.dev(), blob_meta.ino())
         );
+    }
+
+    #[test]
+    fn copy_file_atomic_replaces_dest_through_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-modelpack-copy-file-atomic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("blob");
+        let dest = dir.join("model.safetensors");
+        let weights = b"complete-weights-bytes";
+        std::fs::write(&src, weights).unwrap();
+        std::fs::write(&dest, b"trunc").unwrap();
+
+        copy_file_atomic(&src, &dest, weights.len() as u64).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".tmp")),
+            "copy temp file should not remain"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
