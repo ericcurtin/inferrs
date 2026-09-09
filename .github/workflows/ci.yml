@@ -42,17 +42,25 @@ env:
   VLLM_METAL_VERSION: "0.28.0"
 
 jobs:
+  # --------------------------------------------------------------------------
+  # Build + unit tests, one job per target: same profile/target/features,
+  # so deps, the Go shim (build.rs) and the non-test lib compile once.
+  # The binary uploads before clippy/test so it stays downloadable for
+  # debugging when they fail (`release` still needs the whole job).
+  #
+  # Tests run on all five targets: the crate links the Go shim via CGO
+  # everywhere and toolchain breakage has been per-platform. fmt and the
+  # fuzz checks are platform-independent and run once (check-fmt leg).
+  # Clippy runs everywhere: it only sees that target's `#[cfg]` arms.
+  # --------------------------------------------------------------------------
   build:
-    name: Build (${{ matrix.target }})
+    name: Build + test (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    # Every leg finishes in 2-7 min warm, so 60 is pure headroom — it
-    # exists only to bound a wedged runner. CI 33613527281's
-    # ubuntu-24.04-arm leg lost communication with the server mid-build
-    # and, with no timeout here, stalled 46 min before GitHub's own
-    # infrastructure gave up, blocking `release` (which `needs:` this)
-    # the whole time. A timeout can't keep a runner alive, just stop a
-    # dead one from stalling until the 6-hour default.
+    # Bounds a wedged runner (CI 33613527281 stalled 46 min); legs are
+    # far shorter warm.
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +70,7 @@ jobs:
             runner: ubuntu-24.04
             go-os: linux
             binary: llmman
+            check-fmt: true
 
           # ── Linux aarch64 ─────────────────────────────────────────────────
           - target: aarch64-unknown-linux-gnu
@@ -129,10 +138,12 @@ jobs:
           cache-dependency-path: go-shim/go.sum
 
       # ── Rust toolchain ────────────────────────────────────────────────────
+      # rustfmt only on the check-fmt leg; an empty extra component is fine.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
 
       # The version step changes Cargo.lock every commit, so rust-cache
       # never gets an exact key hit; its prefix fallback still restores
@@ -169,8 +180,6 @@ jobs:
       # ── Build (Docker backend, default) ───────────────────────────────────
       - name: Build (docker backend)
         run: cargo build --release --target ${{ matrix.target }}
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # Both builds share an output path (same package, same triple, only
       # feature flags differ), so the podman build below overwrites this
@@ -187,8 +196,6 @@ jobs:
       - name: Build (podman backend)
         if: runner.os != 'Windows'
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # Fail rather than ship a mislabelled binary if those paths ever
       # collide again. Go embeds each function's source path, and the two
@@ -245,272 +252,65 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  # --------------------------------------------------------------------------
-  # Unit tests: every #[cfg(test)] module under src/, which live in the
-  # lib target and the llmman-bench binary. These are pure-
-  # Rust logic tests with no OS-specific behavior, but the crate itself
-  # still links the Go shim via CGO, so a target-specific toolchain issue
-  # (the exact kind the `build`/`e2e` jobs' own git history is full of —
-  # lld-link vs MSVC link.exe, msvc-arch, ...) could just as easily break
-  # `cargo test` as `cargo build`. Mirrors the `build` job's own 5-target
-  # matrix exactly for that reason, rather than assuming Linux x86_64 is
-  # representative of the other four.
-  #
-  # `cargo fmt --check` also lives here rather than in its own job:
-  # formatting is platform-independent, so it only runs once, on the
-  # Linux x86_64 leg (matrix.check-fmt below), instead of duplicating the
-  # same check across all five targets.
-  #
-  # `cargo clippy` is the opposite case and runs on all five: clippy only
-  # sees the `#[cfg]` arms selected for the target it runs against, and
-  # this crate's platform-gated code is substantial (hostgpu/vendor.rs's
-  # CUDA/HIP/Vulkan FFI, ffi.rs's windows-msvc Go-runtime bootstrap,
-  # container::stop). Linting Linux alone is how ~22 dead-code warnings
-  # accumulated on macOS unseen. `--release` shares dependency artefacts
-  # with the `cargo test --release` step below.
-  # --------------------------------------------------------------------------
-  test:
-    name: Unit tests (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 60 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # ── Linux x86_64 ──────────────────────────────────────────────────
-          # check-fmt: true — this is the one leg that also runs
-          # `cargo fmt --check` (see the job's own comment above on why
-          # only here).
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            go-os: linux
-            check-fmt: true
-
-          # ── Linux aarch64 ─────────────────────────────────────────────────
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            go-os: linux
-
-          # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            go-os: darwin
-
-          # ── Windows x86_64 ────────────────────────────────────────────────
-          # No linker override; build.rs makes the default MSVC link.exe
-          # work — see the `build` job's own comment.
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2025
-            go-os: windows
-            msvc-arch: amd64
-            rustflags: ""
-            timeout: 60
-
-          # ── Windows aarch64 ───────────────────────────────────────────────
-          # rustflags empty like x86_64, but for a simpler reason: ARM64's
-          # unwind encoding was never the problem, so it links with MSVC
-          # link.exe and build.rs leaves its unwind data intact.
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            go-os: windows
-            msvc-arch: arm64
-            rustflags: ""
-            timeout: 60
-
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.25"
-          cache-dependency-path: go-shim/go.sum
-
-      # targets: matches the build job's own Set up Rust step — needed
-      # there for genuinely cross-compiled targets, harmless here where
-      # every target is actually native. components: rustfmt is only
-      # actually needed on the check-fmt leg (see this job's own comment
-      # above), but dtolnay/rust-toolchain accepts an empty components
-      # list fine on every other leg, so this stays a single step rather
-      # than a second, conditional "Set up Rust" step.
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          targets: ${{ matrix.target }}
-          components: clippy${{ matrix.check-fmt && ', rustfmt' || '' }}
-
-      - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          key: test-${{ matrix.target }}
-
-      # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
-      # arch: matrix-driven (not a hardcoded amd64) — the ARM64 runner
-      # needs the ARM64 toolchain, or CGO compiling Go's ARM64 runtime
-      # stubs would use the wrong assembler (see the `build` job's own
-      # comment on its identical msvc-arch matrix field).
-      - name: Set up MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
-        with:
-          arch: ${{ matrix.msvc-arch }}
-
-      # ── Linux: C compiler (always needed for CGO). macOS/Windows need
-      # neither: Xcode's command-line tools already provide a C compiler
-      # on the macOS runner image, and Windows' MSVC setup above covers it.
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y gcc
-
-      # Only runs on the check-fmt leg (Linux x86_64) — see this job's
-      # own comment above on why formatting is checked once rather than
-      # once per matrix entry.
+      # ── Lint + unit tests ─────────────────────────────────────────────────
       - name: cargo fmt --check
         if: matrix.check-fmt
         run: cargo fmt --all -- --check
 
       # `fuzzing` gates fuzz_check_parse_registry_ref in src/shortnames.rs,
-      # which the fuzz/ crate below calls but nothing else in the tree
-      # references. Without this step, a rename of ParsedRef's fields, or
-      # of MAX_PART_LEN/MAX_HOST_LEN, compiles clean on every other leg
-      # and only breaks the fuzz harness, with no CI signal. This only
-      # compiles the feature; it does not run cargo-fuzz, which needs a
-      # nightly toolchain this job does not install (actual fuzzing runs
-      # on a developer's workstation, not in CI). Runs once, on the
-      # check-fmt leg, same reason as cargo fmt: pure Rust logic, no
-      # OS-specific `#[cfg]`.
+      # which only the fuzz/ crate calls; without this a rename there
+      # compiles clean everywhere and only breaks the fuzz harness. This
+      # compiles the feature, it does not run cargo-fuzz (needs nightly).
       - name: cargo clippy --features fuzzing
         if: matrix.check-fmt
         run: cargo clippy --features fuzzing --lib -- -D warnings
 
-      # fuzz/ is its own crate (cargo-fuzz's own convention), with its own
-      # Cargo.toml, so the workspace-level clippy/test steps above never
-      # touch it. A plain `cargo check` against its manifest catches it
-      # going stale against src/shortnames.rs's public surface, without
-      # needing cargo-fuzz or nightly. Same check-fmt gating as above: no
-      # OS-specific behavior to test per target.
+      # fuzz/ is its own crate (cargo-fuzz convention), so the workspace
+      # clippy/test steps never touch it. A plain check catches it going
+      # stale against src/shortnames.rs without cargo-fuzz or nightly.
       - name: cargo check fuzz/
         if: matrix.check-fmt
         run: cargo check --manifest-path fuzz/Cargo.toml
 
-      # -D warnings: the tree is clippy-clean as of this step being added,
-      # so anything new is a regression, not a wart to triage.
-      # --all-targets covers tests/ too. Default (docker) feature only:
-      # `podman` gates a handful of `ffi` items, not whole subsystems, and
-      # building its Go archive too would roughly double this job.
+      # -D warnings: the tree is clippy-clean, so anything new is a
+      # regression. --all-targets covers tests/ too. Default (docker)
+      # feature only: `podman` gates a handful of `ffi` items, and its Go
+      # archive would roughly double this step.
       - name: cargo clippy
         run: cargo clippy --release --target ${{ matrix.target }} --all-targets -- -D warnings
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
-      # --target: matches the build job's own invocation (every one of
-      # these is a native build, but explicit --target keeps the output
-      # path/build-plan identical to that job's). RUSTFLAGS no longer
-      # carries a Windows linker choice: build.rs fixes the archive as it
-      # produces it, so the separate test binary compiled here links the
-      # same way the main binary does with nothing repeated per step.
       - name: cargo test --lib --bins
         run: cargo test --release --target ${{ matrix.target }} --lib --bins
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
   # --------------------------------------------------------------------------
-  # Lint: static analysis of go-shim/, which until now had none. `test`
-  # above builds and runs the Go code but never checks it beyond what the
-  # compiler requires, and `cargo fmt --check` covers only the Rust half.
+  # Lint + packaging: cheap Linux-only checks, ~2 min total and off the
+  # critical path, so they share one runner. `release` gates on this.
   #
-  # Which linters, and why, lives in go-shim/.golangci.yml — the single
-  # source of truth, so a local `golangci-lint run` reproduces this job.
+  # Packaging (first, the faster half): version.sh and render.sh output
+  # (Homebrew formula, winget manifests, crate) is checked on every PR so a
+  # broken template fails here, not after it reaches the tap or winget-pkgs.
   #
-  # Scope: this is the Linux view. Go drops OS-tagged files before
-  # analysis, so push_stream_windows.go (19 lines) is compiled by the
-  # `build` matrix but not linted here; cross-GOOS linting would need a
-  # cross C toolchain, since dropping cgo breaks the typecheck.
+  # Lint: go-shim/ static analysis; linters live in go-shim/.golangci.yml.
+  # Linux view only: Go drops OS-tagged files (push_stream_windows.go)
+  # before analysis, and cross-GOOS linting would need a cross C toolchain.
   # --------------------------------------------------------------------------
-  lint:
-    name: Lint (go-shim)
+  lint-packaging:
+    name: Lint (go-shim) + Packaging (version, brew/winget templates, crate)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 60
+    env:
+      GOLANGCI_LINT_VERSION: v2.13.2
+      # Mirrors build.rs's podman tag list exactly.
+      PODMAN_TAGS: podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper
     steps:
-      # persist-credentials: false — this job runs `go test` on the PR's own
-      # code, which has no reason to reach GITHUB_TOKEN via .git/config.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.25"
-          cache-dependency-path: go-shim/go.sum
-
-      # Not golangci-lint's formatter support: this names the files.
-      - name: gofmt --check
-        working-directory: go-shim
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "::error::gofmt would reformat these files:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: golangci-lint (docker backend, production code)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.13.2
-          working-directory: go-shim
-          args: --build-tags docker --tests=false --timeout=10m
-
-      # Second pass with tests: catches a helper stranded in a _test.go
-      # file once the test using it is deleted.
-      - name: golangci-lint (docker backend, including tests)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.13.2
-          working-directory: go-shim
-          args: --build-tags docker --timeout=10m
-
-      # The podman-tagged files are invisible to the runs above. -D unused
-      # is deliberate: `unused` sees one build-tag view at a time, so
-      # docker-only helpers in shared files look dead from this side.
-      # Tags mirror build.rs's podman list exactly.
-      - name: golangci-lint (podman backend)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.13.2
-          working-directory: go-shim
-          args: >-
-            --build-tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper
-            -D unused
-            --timeout=10m
-
-      # No CI job ran these before. Both backends: each has test files the
-      # other's tags exclude.
-      - name: go test (docker backend)
-        working-directory: go-shim
-        run: go test -tags docker ./...
-
-      - name: go test (podman backend)
-        working-directory: go-shim
-        run: go test -tags podman,containers_image_openpgp,exclude_graphdriver_btrfs,exclude_graphdriver_devicemapper ./...
-
-  # --------------------------------------------------------------------------
-  # Packaging: runs packaging/version.sh and packaging/render.sh on every PR
-  # and checks their output (Homebrew formula, winget manifests, the crate),
-  # so a broken template fails here rather than after it has been pushed to
-  # the tap or opened against winget-pkgs. `release` gates on this.
-  # --------------------------------------------------------------------------
-  packaging:
-    name: Packaging (version, brew/winget templates, crate)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
+      # fetch-depth: 0 — version.sh needs the full commit count.
+      # persist-credentials: false — `go test` runs the PR's own code.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
         run: shellcheck packaging/version.sh packaging/render.sh
 
@@ -637,7 +437,7 @@ jobs:
           print(f"OK: x64 and arm64 portable installers for v{version}")
           PY
 
-      # `build`/`test` already compile this source on all five targets; this
+      # `build` already compiles this source on all five targets; this
       # checks the .crate carries what build.rs reads (go-shim/, webui/),
       # drops the dev-only paths, and fits crates.io's 10 MiB limit.
       # publish-crate does the verification build.
@@ -663,6 +463,59 @@ jobs:
           echo "$crate: $size bytes"
           [ "$size" -lt $((10 * 1024 * 1024)) ] || { echo "::error::$crate is over crates.io's 10 MiB limit"; exit 1; }
           echo "OK: crate contents ($(wc -l < "$files") files)"
+
+      # ── Lint (go-shim) ───────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      # Not golangci-lint's formatter support: this names the files.
+      - name: gofmt --check
+        working-directory: go-shim
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would reformat these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: golangci-lint (docker backend, production code)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: go-shim
+          args: --build-tags docker --tests=false --timeout=10m
+
+      # Second pass with tests: catches a helper stranded in a _test.go
+      # file once the test using it is deleted.
+      - name: golangci-lint (docker backend, including tests)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: go-shim
+          args: --build-tags docker --timeout=10m
+
+      # The podman-tagged files are invisible to the runs above. -D unused
+      # is deliberate: `unused` sees one build-tag view at a time, so
+      # docker-only helpers in shared files look dead from this side.
+      - name: golangci-lint (podman backend)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: go-shim
+          args: --build-tags ${{ env.PODMAN_TAGS }} -D unused --timeout=10m
+
+      # Both backends: each has test files the other's tags exclude.
+      - name: go test (docker backend)
+        working-directory: go-shim
+        run: go test -tags docker ./...
+
+      - name: go test (podman backend)
+        working-directory: go-shim
+        run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw> --model
@@ -750,7 +603,7 @@ jobs:
           # against go-shim/backend_podman.go (go.podman.io/image) instead
           # of go-shim/backend_docker.go — this is the only place that
           # backend's actual pull/push code path gets exercised end-to-end
-          # against a real registry; the `test` job's own unit tests never
+          # against a real registry; the `build` job's own unit tests never
           # touch the ffi::* boundary that differs between backends, and
           # the `build` job only compiles this backend, it doesn't run it.
           - target: x86_64-unknown-linux-gnu
@@ -801,7 +654,7 @@ jobs:
             feature-flags: ""
 
           # ── Windows aarch64 (docker backend) ─────────────────────────────
-          # rustflags empty; ARM64 keeps its unwind data — see `test`.
+          # rustflags empty; ARM64 keeps its unwind data — see `build`.
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
@@ -1502,7 +1355,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [build, test, lint, e2e, packaging]
+    needs: [build, lint-packaging, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
