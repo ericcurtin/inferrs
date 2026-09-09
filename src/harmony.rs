@@ -77,7 +77,7 @@ impl HarmonyParser {
     /// stream is known to start mid-message (e.g. directly at
     /// `<|channel|>`, with no leading `<|start|>` of its own) — this
     /// parser's own state machine only recognizes a header once it's seen
-    /// a `<|start|>` to anchor it. `cmd::serve`'s `RawContentExtractor` is
+    /// a `<|start|>` to anchor it. `cmd::serve::stream`'s `RawContentExtractor` is
     /// the one caller that actually needs this today: it inspects a raw
     /// stream's very first non-whitespace bytes to tell `<|start|>...`
     /// and `<|channel|>...` starts apart, and only calls this for the

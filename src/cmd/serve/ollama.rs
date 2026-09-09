@@ -81,7 +81,7 @@ pub(super) async fn handle_tags(
     Ok(Json(OllamaTagsResponse { models }))
 }
 
-/// The subset of a [`RunningModel`] `handle_ps` needs, cloned out while
+/// The subset of a [`RunningModel`](super::RunningModel) `handle_ps` needs, cloned out while
 /// holding `manager`'s lock (see `handle_ps`) so the per-model `/props`
 /// round trips afterward don't hold that lock for the duration.
 struct PsEntry {

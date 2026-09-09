@@ -32,7 +32,7 @@ use xet::xet_session::{
 };
 
 /// How often [`download_to_path`] samples hf-xet's network-byte counter.
-/// Matches the daemon's own poll cadence (`cmd::serve::stream_ffi_progress`).
+/// Matches the daemon's own poll cadence (`cmd::serve::ollama::stream_ffi_progress`).
 const PROGRESS_POLL: Duration = Duration::from_millis(200);
 
 /// Identifies and authenticates one Xet-backed HuggingFace file — just
