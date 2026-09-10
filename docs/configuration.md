@@ -23,8 +23,8 @@ The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/b
 
 Everything that needs a file rather than an environment variable lives in
 one place: short-name aliases, provider API keys and endpoints, the
-signature trust policy, the peers of an aggregation, and the daemon's
-own API keys.
+signature trust policy, the peers of an aggregation, the daemon's own
+API keys, and registry mirrors.
 
 ```toml
 # ~/.config/llmman/llmman.conf
@@ -51,6 +51,9 @@ peers = "asahi, spark:17434"
 
 [auth]
 api_keys = "k1, k2"                # what a request to this daemon must present
+
+[registries."docker.io"]
+mirrors = "https://mirror.gcr.io, registry-mirror.corp:5000"
 ```
 
 Read from two locations, later overriding earlier:
@@ -223,6 +226,40 @@ bind. `llmman serve` refuses to start on a host the network can reach
 `[aggregation] api_key` is the key this daemon presents to its peers;
 see [aggregation.md](aggregation.md#authentication).
 
+### Registry mirrors
+
+`[registries."<host>"] mirrors` names the mirrors a pull from that
+registry tries first, in order, before the registry itself, as dockerd's
+`registry-mirrors` does. The key is the host as a reference spells it
+(`docker.io`, `ghcr.io`, `registry.corp:5000`; Hub's `index.docker.io`
+and `registry-1.docker.io` count as `docker.io`); each mirror is
+`[scheme://]host[:port][/path]`, `https` by default. A mirror without
+the blob answers 404 and the next is tried, then the registry, so a
+stale or unreachable mirror costs a request, never a pull. Pushes,
+`transfer` destinations and signatures always go to the registry.
+
+```toml
+[registries."docker.io"]
+mirrors = "https://mirror.gcr.io, registry-mirror.corp:5000"
+
+[registries."ghcr.io"]
+mirrors = "http://ghcr-cache.corp:5000"   # plain HTTP
+```
+
+A comma-separated string like `peers`, so `llmman config set
+'registries."docker.io".mirrors' https://mirror.gcr.io` can write it. A
+user file's value for a host replaces `/etc`'s rather than merging, and
+`mirrors = ""` opts a host out. `LLMMAN_REGISTRY_MIRRORS` overrides
+Docker Hub's list for one daemon, as dockerd's `--registry-mirror`
+does; other registries are file-only.
+
+A mirror is asked for the same repository path as the registry, with
+containerd's `?ns=<registry>` hint (which a pull-through cache such as
+`registry:2` with `proxy.remoteurl` ignores). A mirror's credentials are
+its own: `llmman login mirror.corp:5000` (the `host[:port]`, no scheme or
+path), and the registry's are never sent to it. Hugging Face has no
+mirrors in this sense; `HF_ENDPOINT` moves the whole host instead.
+
 ## Environment variables
 
 Daemon-wide settings, set before `llmman serve` starts. llmman is a very
@@ -250,6 +287,7 @@ setting may not behave identically.
 | `LLMMAN_MODELS` | Local store directory, overriding the default above. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_NUM_PARALLEL` | Number of parallel request slots (`--parallel`) for GGUF models (llama-server only; no vllm/mlx equivalent). `--ctx-size` is scaled up by this value first, so each slot still gets the full configured/default context rather than an even split of it; ignored (with a warning) for a load with no explicit context size to scale. Unset leaves llama-server's own default of 1 untouched. |
 | `LLMMAN_PEERS` | Comma-separated peer daemons (`[scheme://]host[:port]`) to pool hardware with, overriding `[aggregation]` in `llmman.conf`. Set but empty takes this daemon out of its aggregation. See [aggregation.md](aggregation.md). |
+| `LLMMAN_REGISTRY_MIRRORS` | Comma-separated mirrors (`[scheme://]host[:port][/path]`) to try before Docker Hub for a `docker.io/...` pull, overriding `[registries."docker.io"]` in `llmman.conf`; set but empty removes Hub's mirrors. Hub only, like dockerd's `--registry-mirror`; other registries take theirs from `llmman.conf`. See [registry mirrors](#registry-mirrors). |
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
 | `LLMMAN_SHELL` | The web UI's Shell tab (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split on whitespace (`tmux new -A -s llmman`). Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, requires the daemon's API key when it has one, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
 | `LLMMAN_WEBUI_DIR` | Serves the web UI from this directory instead of the copy built into the binary, uncompressed and uncached, for working on it (`LLMMAN_WEBUI_DIR=webui llmman serve`). Development only. |

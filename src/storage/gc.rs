@@ -99,7 +99,7 @@ pub fn prune_blobs(
         if !is_older_than(&path, grace) {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = freed_file_size(&path);
         if let Err(e) = std::fs::remove_file(&path) {
             eprintln!("[llmman] couldn't remove unreferenced blob {name}: {e:#}");
             continue;
@@ -179,12 +179,29 @@ fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    entries
-        .flatten()
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+    entries.flatten().map(|e| freed_file_size(&e.path())).sum()
+}
+
+fn freed_file_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() && !has_multiple_links(&meta) {
+        meta.len()
+    } else {
+        0
+    }
+}
+
+#[cfg(unix)]
+fn has_multiple_links(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_links(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Skips both the post-`rm` and startup GC sweeps when `LLMMAN_NOPRUNE` is
@@ -284,6 +301,30 @@ mod tests {
         assert!(!cache.join("bbbb").exists(), "orphan cache dir removed");
 
         std::fs::remove_dir_all(&cache).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_counts_hardlinked_blob_and_cache_bytes_once() {
+        let root = temp_dir("prune-hardlinked-cache");
+        let blobs = root.join("blobs").join("sha256");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(cache.join("bbbb")).unwrap();
+        let blob = blobs.join("aaaa");
+        let cache_file = cache.join("bbbb").join("model.safetensors");
+        let weights = b"complete-weights-bytes";
+        std::fs::write(&blob, weights).unwrap();
+        std::fs::hard_link(&blob, &cache_file).unwrap();
+
+        let live = HashSet::new();
+        let blob_stats = prune_blobs(&root, &live, Duration::ZERO).unwrap();
+        let cache_stats = prune_cache(&cache, &live, Duration::ZERO).unwrap();
+
+        assert_eq!(blob_stats.count, 1);
+        assert_eq!(cache_stats.count, 1);
+        assert_eq!(blob_stats.bytes + cache_stats.bytes, weights.len() as u64);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A corrupt (unparsable) manifest pointer file must abort the live-set

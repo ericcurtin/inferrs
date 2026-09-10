@@ -10,7 +10,7 @@ pub struct StopArgs {
 /// `llmman stop MODEL` — unload a running model immediately, mirroring
 /// `ollama stop` (`cmd/cmd.go`'s `StopHandler`/`loadOrUnloadModel`), which
 /// posts `{"model": ..., "keep_alive": 0}` (empty prompt) to
-/// `/api/generate` — the exact sentinel `cmd::serve::handle_ollama_generate`
+/// `/api/generate` — the exact sentinel `cmd::serve::ollama::handle_ollama_generate`
 /// already reads as an immediate-unload request. See `daemon::unload`.
 pub fn run(args: &StopArgs) -> anyhow::Result<()> {
     if !crate::daemon::server_alive() {

@@ -757,7 +757,7 @@ func staticPassFunc(password []byte) func(bool) ([]byte, error) {
 //export llmman_verify
 func llmman_verify(cRef, cDigest, cKeysJSON *C.char) *C.char {
 	ref := C.GoString(cRef)
-	ctx := context.Background()
+	ctx := withoutMirrors(context.Background())
 
 	var keyPaths []string
 	if raw := C.GoString(cKeysJSON); raw != "" {
@@ -787,7 +787,7 @@ func llmman_verify(cRef, cDigest, cKeysJSON *C.char) *C.char {
 //export llmman_sign
 func llmman_sign(cRef, cDigest, cKeyPath, cPassword *C.char) *C.char {
 	ref := C.GoString(cRef)
-	ctx := context.Background()
+	ctx := withoutMirrors(context.Background())
 
 	keyPath := C.GoString(cKeyPath)
 	if keyPath == "" {

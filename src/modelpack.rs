@@ -677,20 +677,20 @@ fn extract_safetensors_dir(
             continue;
         }
         let dest = cache_dir.join(rel_path);
-        // exists() is not complete: a killed copy can leave a short dest.
-        if dest
-            .metadata()
-            .map(|m| m.is_file() && m.len() == layer.size)
-            .unwrap_or(false)
-        {
+        if cached_layer_file_matches(&dest, layer.size) {
             continue;
         }
 
         std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-        let layer_hex = digest_hex(&layer.digest)?;
-        let blob = store_path.join("blobs").join("sha256").join(layer_hex);
-        std::fs::copy(&blob, &dest).with_context(|| format!("copy {rel_path} from blob store"))?;
-        eprintln!("[llmman] extracted {rel_path}");
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", dest.display())),
+        }
+        let blob = raw_blob_path(store_path, layer)?;
+        link_or_copy_file(&blob, &dest, layer.size)
+            .with_context(|| format!("cache {rel_path} from blob store"))?;
+        eprintln!("[llmman] cached {rel_path}");
     }
 
     let rel_paths: Vec<&str> = manifest
@@ -700,6 +700,66 @@ fn extract_safetensors_dir(
         .filter(|p| crate::sources::is_safe_relative_path(p))
         .collect();
     Ok(safetensors_model_dir(&cache_dir, &rel_paths))
+}
+
+fn cached_layer_file_matches(dest: &Path, layer_size: u64) -> bool {
+    dest.metadata()
+        .map(|m| m.is_file() && m.len() == layer_size)
+        .unwrap_or(false)
+}
+
+fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        match std::fs::hard_link(src, dest) {
+            Ok(()) => Ok(()),
+            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+            Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
+                format!(
+                    "hardlink {} to {} failed: {hardlink_error}; copy failed",
+                    src.display(),
+                    dest.display()
+                )
+            }),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        copy_file_atomic(src, dest, layer_size)
+    }
+}
+
+fn copy_file_atomic(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result<()> {
+    let tmp = cache_copy_temp_path(dest);
+    let result = (|| {
+        let copied = std::fs::copy(src, &tmp)
+            .with_context(|| format!("copy {} to {}", src.display(), tmp.display()))?;
+        if copied != layer_size {
+            anyhow::bail!("copied {copied} bytes, expected {layer_size}");
+        }
+        match std::fs::rename(&tmp, dest) {
+            Ok(()) => Ok(()),
+            Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("rename {} to {}", tmp.display(), dest.display()))
+            }
+        }
+    })();
+    if result.is_err() || tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn cache_copy_temp_path(dest: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp = dest.to_path_buf().into_os_string();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    PathBuf::from(tmp)
 }
 
 #[cfg(test)]
@@ -1028,10 +1088,81 @@ mod tests {
         let digest = format!("sha256:{}", "bb".repeat(32));
         extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), weights);
+    }
 
-        std::fs::remove_file(&blob).unwrap();
+    #[test]
+    fn extract_safetensors_dir_skips_dest_that_already_matches_layer_size() {
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, weights).unwrap();
+
+        let digest = format!("sha256:{}", "bb".repeat(32));
         extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), weights);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_safetensors_dir_links_dest_to_blob() {
+        use std::os::unix::fs::MetadataExt;
+
+        let weights = b"complete-weights-bytes";
+        let layer_hex = "aa".repeat(32);
+        let mut layer = descriptor(&format!("sha256:{layer_hex}"), "model.safetensors");
+        layer.media_type = "application/vnd.cncf.model.weight.v1.raw".into();
+        layer.size = weights.len() as u64;
+        let (store, manifest) = manifest_with(vec![layer]);
+
+        let blob = store.root().join("blobs").join("sha256").join(&layer_hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, weights).unwrap();
+
+        let cache = store.root().join("cache");
+        let dest = cache.join("bb".repeat(32)).join("model.safetensors");
+        let digest = format!("sha256:{}", "bb".repeat(32));
+        extract_safetensors_dir(store.root(), &cache, &digest, &manifest).unwrap();
+
+        let dest_meta = std::fs::metadata(&dest).unwrap();
+        let blob_meta = std::fs::metadata(&blob).unwrap();
+        assert_eq!(
+            (dest_meta.dev(), dest_meta.ino()),
+            (blob_meta.dev(), blob_meta.ino())
+        );
+    }
+
+    #[test]
+    fn copy_file_atomic_replaces_dest_through_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-modelpack-copy-file-atomic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("blob");
+        let dest = dir.join("model.safetensors");
+        let weights = b"complete-weights-bytes";
+        std::fs::write(&src, weights).unwrap();
+        std::fs::write(&dest, b"trunc").unwrap();
+
+        copy_file_atomic(&src, &dest, weights.len() as u64).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".tmp")),
+            "copy temp file should not remain"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

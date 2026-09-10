@@ -1,6 +1,6 @@
 //! Byte-level progress snapshots for HF pulls/transfers now done in
 //! Rust — the native equivalent of go-shim/progress_state.go, polled
-//! the same way (`cmd::serve`'s `stream_ffi_progress`, every ~200ms) so
+//! the same way (`cmd::serve::ollama`'s `stream_ffi_progress`, every ~200ms) so
 //! the daemon can relay real byte counts over its NDJSON stream.
 //!
 //! Keyed by model reference, like the Go version, so two concurrent
