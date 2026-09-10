@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`) — not mocks.
+//! (`claude`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`, `talos`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -589,6 +589,7 @@ fn run_launch(
     home: &Path,
     integration: &str,
     extra_args: &[&str],
+    extra_env: &[(&str, String)],
 ) -> Result<std::process::Output, TimedOut> {
     eprintln!("[run_launch] {integration}: calling warm_model()");
     warm_model();
@@ -607,6 +608,12 @@ fn run_launch(
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"));
+    // On top of the fresh HOME, for an integration that needs more than
+    // a home directory to find itself or its operator (see
+    // `launch_talos_with_model`).
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     try_spawn_with_timeout(
         cmd,
@@ -652,7 +659,7 @@ const MAX_ATTEMPTS: u32 = 3;
 /// sampling variance, not an llmman regression, so it must not turn CI
 /// red on its own.
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
-    launch_and_assert_tolerating(integration, extra_args, |_stderr| false);
+    launch_and_assert_tolerating(integration, extra_args, &[], |_stderr| false);
 }
 
 /// [`launch_and_assert`], generalized with an extra tolerated failure
@@ -667,6 +674,7 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
 fn launch_and_assert_tolerating(
     integration: &str,
     extra_args: &[&str],
+    extra_env: &[(&str, String)],
     tolerate_stderr: impl Fn(&str) -> bool,
 ) {
     let mut last_failure = None;
@@ -676,7 +684,7 @@ fn launch_and_assert_tolerating(
     let mut gave_up_after_timeout = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let home = fresh_home(integration);
-        let output = match run_launch(&home, integration, extra_args) {
+        let output = match run_launch(&home, integration, extra_args, extra_env) {
             Ok(output) => output,
             Err(timed_out) => {
                 eprintln!(
@@ -855,6 +863,7 @@ fn launch_openclaw_with_model() {
     launch_and_assert_tolerating(
         "openclaw",
         &["agent", "--local", "--message", PROMPT, "--agent", "main"],
+        &[],
         openclaw_pull_registry_flake,
     );
 }
@@ -882,8 +891,113 @@ fn launch_qwen_with_model() {
     launch_and_assert_tolerating(
         "qwen",
         &[PROMPT, "--safe-mode", "--exclude-tools", "report_findings"],
+        &[],
         qwen_loop_detection,
     );
+}
+
+// Unix only, like `launch_talos` itself (it bails on Windows): the helpers
+// below ask the OS for a uid, which the Windows test binary must not even
+// have to compile.
+#[cfg(unix)]
+#[test]
+fn launch_talos_with_model() {
+    eprintln!("[test] launch_talos_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_talos_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // Resolve the real installation before run_launch supplies a fresh HOME.
+    // The official wrapper may be on PATH, while CI also supports the venv
+    // layout; either way this stable prefix must survive that HOME change.
+    let Some(prefix) = talos_prefix() else {
+        eprintln!("skipping: talos not installed — https://talos-agent.ch/install.sh");
+        return;
+    };
+    // Talos only talks to a terminal it knows: `cli:<uid>` has to be in
+    // TALOS_ALLOWED_PRINCIPALS, a policy key `launch_talos` deliberately
+    // does not write (the kernel decides who may talk to it, not the
+    // launcher). The e2e grants it the way an operator would — in a
+    // secrets env file of its own, which Talos reads on top of its env
+    // file — so the launcher under test stays exactly what a user runs.
+    let secrets = talos_secrets_env(&prefix);
+    // Empty overrides neutralize the runner's private configuration while
+    // forcing Talos to read the provider/model and allowlist from the file.
+    // Supplying the expected model here would mask a broken file handoff.
+    // `ask`: Talos's one-turn command, answer on stdout — `chat` counts
+    // a terminal as attended only when stdin and stdout both are one,
+    // and there is no terminal here.
+    launch_and_assert_tolerating(
+        "talos",
+        &["ask", PROMPT],
+        &[
+            ("TALOS_PREFIX", prefix.to_string_lossy().into_owned()),
+            ("TALOS_SECRETS_ENV", secrets.to_string_lossy().into_owned()),
+            ("TALOS_MODEL_PROVIDER", String::new()),
+            ("TALOS_MODEL", String::new()),
+            ("TALOS_ALLOWED_PRINCIPALS", String::new()),
+        ],
+        |_stderr| false,
+    );
+    let written = std::fs::read_to_string(&secrets).unwrap();
+    let model = llmman::shortnames::resolve_ollama_api(MODEL).unwrap();
+    let uid = unsafe { libc::getuid() };
+    for expected in [
+        "TALOS_MODEL_PROVIDER=ollama".to_string(),
+        format!("TALOS_MODEL={model}"),
+        format!("TALOS_ALLOWED_PRINCIPALS=cli:{uid}"),
+    ] {
+        assert!(
+            written.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    std::fs::remove_file(secrets).unwrap();
+}
+
+/// Where `launch_talos` would find Talos: `$TALOS_PREFIX`, else `~/talos`
+/// under the *real* home — checked for the venv interpreter the
+/// installer creates, which is the invocation both use.
+#[cfg(unix)]
+fn talos_prefix() -> Option<PathBuf> {
+    let prefix = std::env::var("TALOS_PREFIX")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("talos")))?;
+    prefix
+        .join(".venv")
+        .join("bin")
+        .join("python")
+        .is_file()
+        .then_some(prefix)
+}
+
+/// A secrets env file allowing this uid's terminal, next to nothing else
+/// of Talos's — written once per test binary run, mode 600 like Talos
+/// writes its own.
+#[cfg(unix)]
+fn talos_secrets_env(prefix: &Path) -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    let path = std::env::temp_dir().join(format!(
+        "llmman-e2e-talos-{}-{}.env",
+        std::process::id(),
+        uid
+    ));
+    std::fs::write(&path, format!("TALOS_ALLOWED_PRINCIPALS=cli:{uid}\n")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    eprintln!(
+        "[test] launch_talos_with_model: prefix {} · secrets env {}",
+        prefix.display(),
+        path.display()
+    );
+    path
 }
 
 /// Qwen Code's own loop detector stops a run and exits 1 when a small

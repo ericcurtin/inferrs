@@ -238,11 +238,12 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
 
 /// Integrations llmman configures through a file on disk. They take a
 /// model on every launch, so `--provider` works, but they cannot carry
-/// the key: writing a real one into `~/.hermes/config.yaml` would persist
-/// a credential, which this feature promises not to do. They rely on
+/// the key: writing a real one into `~/.hermes/config.yaml` (or into
+/// Talos's env file) would persist a
+/// credential, which this feature promises not to do. They rely on
 /// `llmman serve` having the variable itself — which it only uses for a
 /// daemon nobody else can reach (see `reachable_only_locally`).
-const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes"];
+const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "talos"];
 
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
@@ -434,6 +435,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "Qwen Code",
         binary: "qwen",
     },
+    Integration {
+        name: "talos",
+        description: "Talos",
+        binary: "talos",
+    },
 ];
 
 fn print_integrations() {
@@ -485,11 +491,13 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
 
 /// The binary `launch` will run for `i`, so the listing does not report
 /// as missing what the launcher would find: `PATH`, then what the
-/// launcher knows.
+/// launcher knows. Talos supports its official PATH wrapper as well as
+/// prefix-local installs that have only a venv (see [`talos_command`]).
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
+        "talos" => find_talos(),
         _ => find_on_path(i.binary),
     }
 }
@@ -528,6 +536,7 @@ fn launch(
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
+        "talos" => launch_talos(model, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -1130,6 +1139,451 @@ fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
     args
 }
 
+/// Talos's local provider (talos/catalog.py): OpenAI-compatible wire, no
+/// key, and a default address of Ollama's port — which is why the
+/// daemon's address has to travel alongside it (see `launch_talos`).
+const TALOS_PROVIDER: &str = "ollama";
+/// The two keys `launch_talos` writes, both `SETTING` in Talos's config
+/// schema (talos/schema.py) — the class a script may set.
+const TALOS_PROVIDER_KEY: &str = "TALOS_MODEL_PROVIDER";
+const TALOS_MODEL_KEY: &str = "TALOS_MODEL";
+/// Where Talos reads the local provider's address from. `POLICY` in its
+/// schema (a route to a model) — the operator's, not a launcher's — so it is
+/// set in the launched process's environment instead, never on disk.
+const TALOS_BASE_URL_KEY: &str = "TALOS_BASE_URL_OLLAMA";
+
+/// talos: a permission-gated agent (talos-agent.ch) whose kernel rules on
+/// every action before it runs. Its configuration is a flat env file,
+/// and this writes two keys into it the way `write_hermes_config` writes
+/// its YAML — into the file Talos's own `config set` would pick (see
+/// `talos_env_file`), keeping every other line, atomically, mode 600
+/// (see `write_talos_env`). Both keys are `SETTING` in Talos's schema,
+/// i.e. what a script may set: `TALOS_MODEL_PROVIDER=ollama` (Talos's
+/// local provider: OpenAI-compatible wire, no key) and
+/// `TALOS_MODEL=<model>`.
+///
+/// The daemon's address does not go into the file. Talos's local
+/// provider defaults to Ollama's port, and the per-provider base URL
+/// key is `POLICY` in its schema — the operator's to set, not a
+/// launcher's. Talos reads its environment ahead of its env
+/// file, so `TALOS_BASE_URL_OLLAMA` is set for the process this launches
+/// — per launch, never persisted — the same way the other launchers hand
+/// over their base URLs. Without it Talos would talk to `:11434`, not to
+/// `llmman serve`.
+///
+/// Hands off to `talos chat`, an interactive session in this terminal
+/// where actions the kernel classes as needs-human wait for the person
+/// at it. A leading `ask` after `--` runs Talos's one-turn command
+/// instead (`llmman launch talos --model m -- ask "…"`; answer on
+/// stdout), which is what the e2e test drives — `chat` counts a terminal
+/// as attended only when stdin and stdout both are one.
+///
+/// Two things this leaves to Talos on purpose. Authorization remains
+/// Talos's policy: an explicit `TALOS_ALLOWED_PRINCIPALS` allowlist is
+/// exhaustive, while a fresh CLI-only install supplies `cli:<uid>` for
+/// the current caller itself. And a model picked with `/model` inside a
+/// session persists in Talos's event log and outranks its env file on the
+/// next start — Talos reports the model it runs, and `/model` in the
+/// session changes it. Neither is llmman's to override: both are the
+/// kernel deciding who may talk to it and with what.
+///
+/// `--model` is required: with none, Talos would start on whatever its
+/// env file or shipped default names, which is not what the caller asked
+/// for. An exported `TALOS_MODEL_PROVIDER`/`TALOS_MODEL` that disagrees
+/// with the launch is refused before this function writes anything: it
+/// outranks the env file in Talos's own loader, so the launch would
+/// otherwise save and report one model while the process runs another.
+/// That guarantee is local to this function, not the daemon: `run()`
+/// above already calls `ensure_server`/`ensure_model_pulled` for every
+/// integration before dispatch, so a refusal here can still follow a
+/// daemon start or a model pull — same as it would for any other
+/// integration's own refusal.
+///
+/// macOS and Linux only — Talos's installer ships no Windows path.
+fn launch_talos(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    if cfg!(windows) {
+        anyhow::bail!("talos currently supports macOS and Linux");
+    }
+    let talos = talos_command().ok_or_else(|| anyhow::anyhow!("talos is not installed"))?;
+    if model.is_empty() {
+        anyhow::bail!("talos needs a model: llmman launch talos --model <model>");
+    }
+    talos_check_env_overrides(model, |key| std::env::var(key).ok())?;
+
+    // A recognized wrapper or venv identifies the code that will actually
+    // run. Its local env file lives there, even if TALOS_PREFIX names a
+    // different installation. Only unknown shims need the explicit hint.
+    let config_prefix = talos.config_prefix.clone().or_else(talos_prefix_override);
+    let secrets_env_absolute = absolute_env_path("TALOS_SECRETS_ENV")?;
+    let env_file = talos_env_file(
+        config_prefix.as_deref(),
+        dirs::home_dir().as_deref(),
+        |key| {
+            if key == "TALOS_SECRETS_ENV" {
+                secrets_env_absolute
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+            } else {
+                std::env::var(key).ok()
+            }
+        },
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot tell where talos reads its env file: set TALOS_PREFIX (the install \
+             directory holding talos.env) or TALOS_SECRETS_ENV"
+        )
+    })?;
+    write_talos_env(
+        &env_file,
+        &[
+            (TALOS_PROVIDER_KEY, TALOS_PROVIDER),
+            (TALOS_MODEL_KEY, model),
+        ],
+    )
+    .with_context(|| format!("failed to write {}", env_file.display()))?;
+
+    let base_url = format!("{}/v1", daemon::server());
+    let (bin, args) = talos_exec_argv(&talos, extra_args);
+    let mut extra_env: Vec<(&str, &str)> = vec![(TALOS_BASE_URL_KEY, base_url.as_str())];
+    // Pin both paths so the child sees the same locations used for
+    // configuration. Recognized wrappers take precedence over a stale prefix
+    // override, just as they do in command resolution.
+    let secrets_env_owned = secrets_env_absolute
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let prefix_owned = config_prefix
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    if let Some(value) = &secrets_env_owned {
+        extra_env.push(("TALOS_SECRETS_ENV", value.as_str()));
+    }
+    if let Some(value) = &prefix_owned {
+        extra_env.push(("TALOS_PREFIX", value.as_str()));
+    }
+    exec_with_env_in(&bin, &args, &extra_env, talos.cwd.as_deref())
+}
+
+/// `key`'s value, absolutized — `None` when unset or empty. `~` and
+/// `~/…` expand to the home directory first — Talos's own loader reads
+/// this exact variable through Python's `Path(...).expanduser()`, so a
+/// value like `~/.secrets/talos.env` has to land on the same file here,
+/// not literally under a directory named `~`, which is what
+/// `std::path::absolute` alone would do with it. `~name/…` (someone
+/// else's home) is left untouched — rare enough here that guessing wrong
+/// is worse than not expanding it. Otherwise lexical only (no symlink
+/// resolution, no existence requirement), the same way
+/// [`talos_prefix_override`] absolutizes `TALOS_PREFIX`.
+fn absolute_env_path(key: &str) -> anyhow::Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var(key)
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    expand_and_absolutize(&raw, dirs::home_dir().as_deref())
+        .map(Some)
+        .with_context(|| format!("{key}={raw:?} could not be resolved to an absolute path"))
+}
+
+/// `~`/`~/…` expansion, with `home` injected so this is testable without
+/// touching the real process environment (unlike the var lookup itself,
+/// this part is pure). `~name/…` (someone else's home) is left as-is —
+/// rare enough here that guessing wrong is worse than not expanding it.
+fn expand_and_absolutize(raw: &str, home: Option<&std::path::Path>) -> std::io::Result<PathBuf> {
+    let expanded = if raw == "~" {
+        home.map(std::path::Path::to_path_buf)
+    } else {
+        raw.strip_prefix("~/")
+            .and_then(|rest| home.map(|h| h.join(rest)))
+    }
+    .unwrap_or_else(|| PathBuf::from(raw));
+    std::path::absolute(expanded)
+}
+
+/// How Talos is run: the command line, its installation prefix when known,
+/// and an optional required working directory. The installer does not install
+/// the package into the venv; `-m talos` finds it on the current directory,
+/// which is why its own instructions read
+/// `cd ~/talos && .venv/bin/python -m talos …`. The venv fallback therefore
+/// runs from the prefix. The official wrapper sets `PYTHONPATH` itself and,
+/// like unknown shims, deliberately inherits the caller's directory.
+#[derive(Debug, PartialEq)]
+struct TalosCommand {
+    argv: Vec<String>,
+    config_prefix: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+}
+
+/// How to invoke Talos: its official wrapper (or a custom shim) on PATH,
+/// else the venv interpreter under the install prefix plus `-m talos`.
+/// The 0.18 installer adds the wrapper; older/prefix-local installs may
+/// still need the interpreter fallback.
+fn talos_command() -> Option<TalosCommand> {
+    talos_command_in(find_on_path, talos_prefix().as_deref())
+}
+
+/// What `find_integration_binary` reports for talos: the shim on `PATH`,
+/// else the venv interpreter under the prefix — whichever
+/// [`talos_command`] would run.
+fn find_talos() -> Option<PathBuf> {
+    talos_command().map(|talos| PathBuf::from(&talos.argv[0]))
+}
+
+/// `$TALOS_PREFIX`, home-expanded and absolutized — `None` when unset or empty. Kept apart
+/// from [`talos_prefix`]'s `~/talos` default: an env-file target guessed
+/// from that default would aim at the wrong place for a `talos` shim
+/// installed somewhere else, so [`launch_talos`] only falls back to it
+/// for the venv form, where the prefix is where the venv was actually
+/// found rather than a guess (see its own `config_prefix`).
+///
+/// Absolutized because it is handed to Talos twice over: once here, to
+/// build the env-file path, and once as `current_dir` for the exec'd
+/// process. A relative value would resolve against llmman's cwd for the
+/// first and then AGAIN relative to itself for the second (Talos's own
+/// `current_dir` becoming its own base), doubling the path. Lexical only
+/// (`std::path::absolute`, no symlink resolution, no existence
+/// requirement) — the directory need not exist yet when this runs.
+fn talos_prefix_override() -> Option<PathBuf> {
+    let raw = std::env::var("TALOS_PREFIX")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())?;
+    expand_and_absolutize(&raw, dirs::home_dir().as_deref()).ok()
+}
+
+/// Talos's install directory: `$TALOS_PREFIX`, else `~/talos`, where the
+/// installer puts everything. `None` only when neither can be resolved —
+/// a shim on `PATH` needs no prefix, so this is asked for after that.
+fn talos_prefix() -> Option<PathBuf> {
+    talos_prefix_override().or_else(|| dirs::home_dir().map(|h| h.join("talos")))
+}
+
+/// [`talos_command`] with its two inputs explicit, so it can be tested
+/// without touching PATH or the environment. A shim on `PATH` wins
+/// before a prefix is even needed.
+fn talos_command_in(
+    lookup: impl Fn(&str) -> Option<PathBuf>,
+    prefix: Option<&std::path::Path>,
+) -> Option<TalosCommand> {
+    if let Some(path) = lookup("talos") {
+        return Some(TalosCommand {
+            argv: vec![path.to_string_lossy().into_owned()],
+            config_prefix: talos_wrapper_prefix(&path),
+            cwd: None,
+        });
+    }
+    let prefix = prefix?;
+    let python = prefix.join(".venv").join("bin").join("python");
+    if python.is_file() {
+        return Some(TalosCommand {
+            argv: vec![
+                python.to_string_lossy().into_owned(),
+                "-m".to_string(),
+                "talos".to_string(),
+            ],
+            config_prefix: Some(prefix.to_path_buf()),
+            cwd: Some(prefix.to_path_buf()),
+        });
+    }
+    None
+}
+
+/// Refuses a launch that an exported `TALOS_MODEL_PROVIDER`/`TALOS_MODEL`
+/// would silently override (see `launch_talos`). An empty variable is no
+/// override — Talos's own loader treats it as unset (Python's `or`, which
+/// is falsy only for the literal empty string). NOT trimmed to match: a
+/// whitespace-only value is truthy there too, so Talos would use it as
+/// the value verbatim — the mismatch this function exists to catch.
+fn talos_check_env_overrides(
+    model: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<()> {
+    for (key, want) in [
+        (TALOS_PROVIDER_KEY, TALOS_PROVIDER),
+        (TALOS_MODEL_KEY, model),
+    ] {
+        if let Some(value) = get(key) {
+            if !value.is_empty() && value != want {
+                anyhow::bail!(
+                    "{key} is set to {value:?} in your environment and overrides Talos's env file\n\
+                     Unset it or set it to {want:?}, then re-run: llmman launch talos"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The file `launch_talos` writes the model into — the same one Talos's
+/// own `config set` picks without `--file`: the secrets env file when it
+/// exists (`$TALOS_SECRETS_ENV`, else `~/.secrets/talos-telegram.env` —
+/// `home` is injected rather than read here, so a test can supply a fake
+/// one instead of the machine's real home directory), otherwise
+/// `talos.env` in the install prefix. Talos reads the process
+/// environment first, then the secrets file, then the prefix file, so
+/// writing the one `config set` would write keeps the launch's choice
+/// where Talos will see it.
+fn talos_env_file(
+    prefix: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    let secrets = getenv("TALOS_SECRETS_ENV")
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".secrets").join("talos-telegram.env")));
+    if let Some(secrets) = secrets.filter(|p| p.is_file()) {
+        return Some(secrets);
+    }
+    prefix.map(|p| p.join("talos.env"))
+}
+
+/// Sets `KEY=value` pairs in Talos's flat env file the way Talos's own
+/// writer does: existing lines are kept (comments, other keys), the first
+/// line of each key is replaced and its duplicates dropped, missing keys
+/// are appended; the result lands atomically through a temp file created
+/// with mode 600 (Talos treats the file as holding secrets). A value that
+/// would break the line format is refused rather than written. Values are
+/// stripped before writing — Talos's own `config set` returns `value.strip()`
+/// (see its `_one_line` validator) and its file-loader strips every value it
+/// reads back, so writing the untrimmed form would silently diverge from
+/// what Talos itself would have stored for the same input. A symlink AT
+/// `path` is refused rather than followed: `rename` below replaces
+/// whatever sits at that name, so writing through a symlink to a
+/// centrally managed file would silently sever it from that file instead
+/// of updating it — Talos's own `write_key` refuses the same thing
+/// (`talos/configcli.py`: "refusing a symlink config file").
+fn write_talos_env(path: &std::path::Path, pairs: &[(&str, &str)]) -> anyhow::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        anyhow::bail!(
+            "{}: refusing a symlink config file; point TALOS_PREFIX or TALOS_SECRETS_ENV \
+             at the real path",
+            path.display()
+        );
+    }
+    for (key, value) in pairs {
+        if value.contains(['\n', '\r', '\0']) || key.contains(['=', '\n', '\r', '\0']) {
+            anyhow::bail!("{key}: value would not survive a KEY=VALUE line");
+        }
+    }
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.trim())).collect();
+    let pairs = pairs.as_slice();
+    // Only a file that is not there counts as empty: an unreadable or
+    // non-UTF-8 one must not be quietly replaced by a fresh file that
+    // knows only our two keys — the operator's token and allowlist live
+    // in that file too.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut written: Vec<&str> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let key = trimmed.split_once('=').map(|(k, _)| k.trim());
+        match key.and_then(|k| pairs.iter().find(|(pk, _)| *pk == k)) {
+            Some((pk, pv)) if !trimmed.starts_with('#') => {
+                if !written.contains(pk) {
+                    out.push(format!("{pk}={pv}"));
+                    written.push(pk);
+                }
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    for (pk, pv) in pairs {
+        if !written.contains(pk) {
+            out.push(format!("{pk}={pv}"));
+        }
+    }
+    let mut content = out.join("\n");
+    content.push('\n');
+
+    let tmp = path.with_file_name(format!(
+        "{}.tmp-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("talos.env"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut file = open.open(&tmp)?;
+        // `OpenOptionsExt::mode` is still filtered by umask. Set the
+        // credential-bearing file explicitly after creation so even an
+        // unusually restrictive process umask cannot leave it unreadable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// The install prefix behind a `talos` found on `PATH`, when it is the
+/// wrapper Talos's own installer leaves there (`site/install.sh`, since
+/// 0.18.0): `<prefix>/bin/talos`, symlinked into `~/.local/bin/talos` (or
+/// `$TALOS_BIN_DIR`) — a plain `talos` on PATH is this symlink for every
+/// fresh install now, not an unknown shim. The wrapper finds its own root
+/// the same way (`Path(__file__).resolve().parent.parent`), so resolving
+/// the symlink and walking up two directories here mirrors exactly what
+/// running it would do, rather than guessing. Anything that does not
+/// match this exact shape — a different tool also named `talos`, or an
+/// install layout old enough to predate `bin/talos` — returns `None`
+/// rather than a wrong guess, same as an unrelated shim always has.
+fn talos_wrapper_prefix(shim: &std::path::Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(shim).ok()?;
+    if real.file_name()?.to_str()? != "talos" {
+        return None;
+    }
+    let bin_dir = real.parent()?;
+    if bin_dir.file_name()?.to_str()? != "bin" {
+        return None;
+    }
+    let prefix = bin_dir.parent()?.to_path_buf();
+    prefix
+        .join(".venv")
+        .join("bin")
+        .join("python")
+        .is_file()
+        .then_some(prefix)
+}
+
+/// The command `launch_talos` execs: `talos chat` plus the caller's own
+/// arguments, or the caller's own `ask …` when that is what came after
+/// `--`. Split into the binary and its arguments the way `exec_with_env`
+/// takes them.
+fn talos_exec_argv(talos: &TalosCommand, extra_args: &[String]) -> (PathBuf, Vec<String>) {
+    let argv = &talos.argv;
+    let mut args: Vec<String> = argv[1..].to_vec();
+    if extra_args.first().map(String::as_str) != Some("ask") {
+        args.push("chat".to_string());
+    }
+    args.extend_from_slice(extra_args);
+    (PathBuf::from(&argv[0]), args)
+}
+
 /// `PATH`, then the installers' own targets; see `qwen_fallback_paths`.
 fn find_qwen() -> Option<PathBuf> {
     find_on_path("qwen").or_else(|| qwen_fallback_paths().into_iter().find(|p| p.is_file()))
@@ -1410,8 +1864,23 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
+    exec_with_env_in(bin, args, extra_env, None)
+}
+
+/// [`exec_with_env`] run from `cwd` when one is given — for an
+/// integration that has to be started from a particular directory (see
+/// [`TalosCommand`]). Everything else inherits the caller's.
+fn exec_with_env_in(
+    bin: &PathBuf,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    cwd: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     cmd.stdin(std::process::Stdio::inherit());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
@@ -2102,5 +2571,474 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(cleaned.contains("# a comment"));
         assert!(cleaned.contains("channels:"));
         assert!(cleaned.contains("  telegram: {}"));
+    }
+
+    /// A directory nobody else uses, for the Talos resolver tests: they
+    /// have to create a real `.venv/bin/python` because `talos_command_in`
+    /// checks that the file exists — a prefix without one is "not
+    /// installed", not a path to run.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-launch-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A `talos` shim on PATH wins over the prefix: whoever made one
+    /// meant it. Without one, the venv interpreter under the prefix is
+    /// the invocation — and no interpreter means not installed, never a
+    /// guessed path that fails inside `exec_with_env` instead.
+    #[test]
+    fn talos_command_prefers_a_shim_then_the_venv_then_gives_up() {
+        let prefix = scratch_dir("talos-prefix");
+        let shim = PathBuf::from("/opt/somewhere/bin/talos");
+        let shim_only = Some(TalosCommand {
+            argv: vec![shim.to_string_lossy().into_owned()],
+            config_prefix: None,
+            cwd: None,
+        });
+        assert_eq!(
+            talos_command_in(|_| Some(shim.clone()), Some(&prefix)),
+            shim_only
+        );
+        // …and needs no prefix at all: a shim is found before one is asked for.
+        assert_eq!(talos_command_in(|_| Some(shim.clone()), None), shim_only);
+        assert_eq!(talos_command_in(|_| None, Some(&prefix)), None);
+        assert_eq!(talos_command_in(|_| None, None), None);
+
+        // The venv form runs from the prefix: the package is not installed
+        // into the venv, `-m talos` finds it on the current directory.
+        let python = prefix.join(".venv").join("bin").join("python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, "").unwrap();
+        assert_eq!(
+            talos_command_in(|_| None, Some(&prefix)),
+            Some(TalosCommand {
+                argv: vec![
+                    python.to_string_lossy().into_owned(),
+                    "-m".to_string(),
+                    "talos".to_string(),
+                ],
+                config_prefix: Some(prefix.clone()),
+                cwd: Some(prefix.clone()),
+            })
+        );
+        std::fs::remove_dir_all(&prefix).unwrap();
+    }
+
+    /// The exact layout Talos's own installer leaves since 0.18.0:
+    /// `<prefix>/bin/talos` symlinked onto PATH. `talos_command_in`
+    /// resolves that back to `<prefix>` for config discovery — a fresh,
+    /// standard install must not fall into the "unknown shim" case, which is
+    /// this test's real regression coverage: without prefix discovery, a
+    /// plain `talos` on PATH from the official installer could never find its
+    /// own env file. The wrapper itself sets `PYTHONPATH` and must keep the
+    /// caller's cwd for relative Talos settings.
+    #[cfg(unix)]
+    #[test]
+    fn talos_command_resolves_the_installers_own_wrapper_to_its_prefix() {
+        let dir = scratch_dir("talos-wrapper");
+        let prefix = dir.join("prefix");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join(".venv").join("bin")).unwrap();
+        std::fs::write(prefix.join("bin").join("talos"), "").unwrap();
+        std::fs::write(prefix.join(".venv").join("bin").join("python"), "").unwrap();
+        let on_path = dir.join("talos");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(prefix.join("bin").join("talos"), &on_path).unwrap();
+
+        assert_eq!(
+            talos_command_in(|_| Some(on_path.clone()), None),
+            Some(TalosCommand {
+                argv: vec![on_path.to_string_lossy().into_owned()],
+                config_prefix: Some(prefix.canonicalize().unwrap()),
+                cwd: None,
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A relative PATH entry is resolved in llmman's cwd. The official wrapper
+    /// must inherit that cwd, both so the relative executable still resolves
+    /// and so relative Talos settings retain their caller-relative meaning.
+    #[cfg(unix)]
+    #[test]
+    fn talos_command_preserves_cwd_for_a_recognized_relative_wrapper() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from(format!(
+            ".llmman-launch-test-talos-relative-wrapper-{}-{nonce}",
+            std::process::id()
+        ));
+        let prefix = dir.join("prefix");
+        let wrapper = prefix.join("bin").join("talos");
+        let python = prefix.join(".venv").join("bin").join("python");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "").unwrap();
+        std::fs::write(&python, "").unwrap();
+        let on_path = dir.join("path").join("talos");
+        std::fs::create_dir_all(on_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(std::path::absolute(&wrapper).unwrap(), &on_path).unwrap();
+
+        assert_eq!(
+            talos_command_in(|_| Some(on_path.clone()), None),
+            Some(TalosCommand {
+                argv: vec![on_path.to_string_lossy().into_owned()],
+                config_prefix: Some(prefix.canonicalize().unwrap()),
+                cwd: None,
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Three ways a `talos` on PATH can fail to match the installer's own
+    /// shape — each has to fall back to "unknown shim", not a wrong guess.
+    #[test]
+    fn talos_wrapper_prefix_only_matches_the_installers_exact_layout() {
+        let dir = scratch_dir("talos-wrapper-mismatch");
+
+        // Not named `talos` at the end.
+        let other_name = dir.join("bin").join("something-else");
+        std::fs::create_dir_all(other_name.parent().unwrap()).unwrap();
+        std::fs::write(&other_name, "").unwrap();
+        assert_eq!(talos_wrapper_prefix(&other_name), None);
+
+        // Named `talos`, but its parent isn't `bin`.
+        let not_bin = dir.join("libexec").join("talos");
+        std::fs::create_dir_all(not_bin.parent().unwrap()).unwrap();
+        std::fs::write(&not_bin, "").unwrap();
+        assert_eq!(talos_wrapper_prefix(&not_bin), None);
+
+        // Right shape, but no venv underneath — not an install at all.
+        let no_venv = dir.join("prefix2").join("bin").join("talos");
+        std::fs::create_dir_all(no_venv.parent().unwrap()).unwrap();
+        std::fs::write(&no_venv, "").unwrap();
+        assert_eq!(talos_wrapper_prefix(&no_venv), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Talos's own loader reads `TALOS_SECRETS_ENV` through Python's
+    /// `Path(...).expanduser()` — `~/…` has to land on the same file here.
+    #[test]
+    fn expand_and_absolutize_expands_only_the_current_users_home() {
+        let home = scratch_dir("talos-tilde-home");
+        assert_eq!(expand_and_absolutize("~", Some(&home)).unwrap(), home);
+        assert_eq!(
+            expand_and_absolutize("~/x/y", Some(&home)).unwrap(),
+            home.join("x").join("y")
+        );
+        // Someone else's home: left alone rather than guessed at.
+        assert_eq!(
+            expand_and_absolutize("~other/y", Some(&home)).unwrap(),
+            std::path::absolute("~other/y").unwrap()
+        );
+        // A real absolute path also carries the drive prefix on Windows.
+        let absolute = home.join("already-absolute");
+        assert_eq!(
+            expand_and_absolutize(absolute.to_str().unwrap(), None).unwrap(),
+            absolute
+        );
+        assert_eq!(
+            expand_and_absolutize("relative/talos", None).unwrap(),
+            std::env::current_dir().unwrap().join("relative/talos")
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Writing through a symlink would sever it from whatever it pointed
+    /// at instead of updating it — refused before that happens, matching
+    /// Talos's own `write_key` ("refusing a symlink config file").
+    #[cfg(unix)]
+    #[test]
+    fn write_talos_env_refuses_a_symlink_target() {
+        let dir = scratch_dir("talos-env-write-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.env");
+        std::fs::write(&real, "TALOS_ALLOWED_PRINCIPALS=cli:1\n").unwrap();
+        let link = dir.join("talos.env");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = write_talos_env(&link, &[("TALOS_MODEL", "m")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "TALOS_ALLOWED_PRINCIPALS=cli:1\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The env file is the one Talos's own `config set` would write:
+    /// the secrets file when it exists, else `talos.env` in the prefix.
+    #[test]
+    fn talos_env_file_is_the_secrets_file_when_present_else_the_prefix_file() {
+        let dir = scratch_dir("talos-env-file");
+        let prefix = dir.join("prefix");
+        std::fs::create_dir_all(&prefix).unwrap();
+        let secrets = dir.join("secrets.env");
+        // A fake, guaranteed-nonexistent home — never the machine's real
+        // one, or this test would pass or fail depending on whether the
+        // developer running it happens to have Talos configured (see
+        // `talos_env_file_falls_back_to_home_only_when_named_secrets_is_absent`
+        // for the case this stands in for).
+        let fake_home = dir.join("no-such-home");
+        let getenv = |key: &str| {
+            (key == "TALOS_SECRETS_ENV").then(|| secrets.to_string_lossy().into_owned())
+        };
+        // Named but absent: Talos would not read it either.
+        assert_eq!(
+            talos_env_file(Some(&prefix), Some(&fake_home), getenv),
+            Some(prefix.join("talos.env"))
+        );
+        std::fs::write(&secrets, "").unwrap();
+        assert_eq!(
+            talos_env_file(Some(&prefix), Some(&fake_home), getenv),
+            Some(secrets.clone())
+        );
+        assert_eq!(
+            talos_env_file(None, Some(&fake_home), getenv),
+            Some(secrets.clone())
+        );
+        assert_eq!(talos_env_file(None, Some(&fake_home), |_| None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `home` is used only when `TALOS_SECRETS_ENV` is unset — the exact
+    /// case a hardcoded `dirs::home_dir()` inside `talos_env_file` itself
+    /// could not be tested hermetically (it would read whatever secrets
+    /// file the machine running the test happens to have).
+    #[test]
+    fn talos_env_file_falls_back_to_home_only_when_named_secrets_is_absent() {
+        let dir = scratch_dir("talos-env-file-home");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".secrets")).unwrap();
+        let home_secrets = home.join(".secrets").join("talos-telegram.env");
+        assert_eq!(talos_env_file(None, Some(&home), |_| None), None);
+        std::fs::write(&home_secrets, "").unwrap();
+        assert_eq!(
+            talos_env_file(None, Some(&home), |_| None),
+            Some(home_secrets)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writing keeps everything the operator put there, replaces the
+    /// key's first line, drops its duplicates, appends what is missing —
+    /// and lands with mode 600, as Talos's own writer does.
+    #[cfg(unix)]
+    #[test]
+    fn write_talos_env_replaces_in_place_and_keeps_the_rest() {
+        let dir = scratch_dir("talos-env-write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("talos.env");
+        std::fs::write(
+            &path,
+            "# operator notes\nTELEGRAM_BOT_TOKEN=keep\nTALOS_MODEL=\"old\"\n\nTALOS_MODEL=older\n# TALOS_MODEL=commented\n",
+        )
+        .unwrap();
+        write_talos_env(
+            &path,
+            &[
+                ("TALOS_MODEL_PROVIDER", "ollama"),
+                ("TALOS_MODEL", "qwen3:8b"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# operator notes\nTELEGRAM_BOT_TOKEN=keep\nTALOS_MODEL=qwen3:8b\n\n# TALOS_MODEL=commented\nTALOS_MODEL_PROVIDER=ollama\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
+
+        // No file yet: created, with just ours.
+        let fresh = dir.join("fresh.env");
+        write_talos_env(&fresh, &[("TALOS_MODEL", "m")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "TALOS_MODEL=m\n");
+
+        // A value that would smuggle in a second line is refused, file untouched.
+        assert!(
+            write_talos_env(&fresh, &[("TALOS_MODEL", "m\nTALOS_ALLOWED_PRINCIPALS=*")]).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "TALOS_MODEL=m\n");
+
+        // An existing file that cannot be read as text is an error, not an
+        // empty file: rewriting it would drop everything else it holds.
+        let garbled = dir.join("garbled.env");
+        std::fs::write(&garbled, [0xff, 0xfe, b'\n']).unwrap();
+        assert!(write_talos_env(&garbled, &[("TALOS_MODEL", "m")]).is_err());
+        assert_eq!(std::fs::read(&garbled).unwrap(), [0xff, 0xfe, b'\n']);
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
+
+        // A NUL byte is rejected exactly like a newline — Talos's own
+        // `_one_line` validator refuses it too.
+        let clean = dir.join("clean.env");
+        assert!(write_talos_env(&clean, &[("TALOS_MODEL", "m\0")]).is_err());
+        assert!(!clean.exists());
+
+        // Written stripped, matching Talos's own `config set` (which
+        // returns `value.strip()`) and its file-loader (which strips
+        // every value it reads back) — an untrimmed write here would
+        // silently diverge from what Talos itself would have stored.
+        let padded = dir.join("padded.env");
+        write_talos_env(&padded, &[("TALOS_MODEL", "  qwen3.5  ")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&padded).unwrap(),
+            "TALOS_MODEL=qwen3.5\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Exercise the post-open chmod in a child process so the deliberately
+    /// restrictive umask cannot perturb unrelated tests in this process.
+    #[cfg(unix)]
+    #[test]
+    fn write_talos_env_forces_mode_after_open_under_restrictive_umask() {
+        const CHILD: &str = "LLMMAN_TEST_TALOS_RESTRICTIVE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("write_talos_env_forces_mode_after_open_under_restrictive_umask")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "restrictive-umask child failed: {status}");
+            return;
+        }
+
+        let dir = scratch_dir("talos-env-write-umask");
+        let path = dir.join("talos.env");
+        let old_umask = unsafe { libc::umask(0o777) };
+        write_talos_env(&path, &[("TALOS_MODEL", "m")]).unwrap();
+        unsafe {
+            libc::umask(old_umask);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `chat` is the session; a leading `ask` after `--` is Talos's own
+    /// one-turn command and goes through as typed — `talos chat ask …`
+    /// would hand "ask" to the session as a message.
+    #[test]
+    fn talos_exec_argv_runs_chat_unless_the_caller_asked_for_ask() {
+        let venv = TalosCommand {
+            argv: vec![
+                "/x/.venv/bin/python".to_string(),
+                "-m".to_string(),
+                "talos".to_string(),
+            ],
+            config_prefix: Some(PathBuf::from("/x")),
+            cwd: Some(PathBuf::from("/x")),
+        };
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            talos_exec_argv(&venv, &none),
+            (
+                PathBuf::from("/x/.venv/bin/python"),
+                vec!["-m".to_string(), "talos".to_string(), "chat".to_string()]
+            )
+        );
+        let ask = vec!["ask".to_string(), "how many?".to_string()];
+        assert_eq!(
+            talos_exec_argv(&venv, &ask),
+            (
+                PathBuf::from("/x/.venv/bin/python"),
+                vec![
+                    "-m".to_string(),
+                    "talos".to_string(),
+                    "ask".to_string(),
+                    "how many?".to_string()
+                ]
+            )
+        );
+        let shim = TalosCommand {
+            argv: vec!["/usr/local/bin/talos".to_string()],
+            config_prefix: None,
+            cwd: None,
+        };
+        let extra = vec!["--verbose".to_string()];
+        assert_eq!(
+            talos_exec_argv(&shim, &extra),
+            (
+                PathBuf::from("/usr/local/bin/talos"),
+                vec!["chat".to_string(), "--verbose".to_string()]
+            )
+        );
+    }
+
+    /// An exported model setting that disagrees with the launch is
+    /// refused up front (it would outrank the env file the launcher
+    /// writes); one that agrees, or is empty, is not an override.
+    #[test]
+    fn talos_env_overrides_are_refused_only_when_they_disagree() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(talos_check_env_overrides("m:latest", env(&[])).is_ok());
+        assert!(talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL", "")])).is_ok());
+        // Whitespace-only is NOT treated as unset: Talos's own `or` sees a
+        // truthy string and would use it verbatim, so this has to refuse
+        // exactly like any other disagreeing value.
+        assert!(talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL", "  ")])).is_err());
+        assert!(talos_check_env_overrides(
+            "m:latest",
+            env(&[
+                ("TALOS_MODEL_PROVIDER", "ollama"),
+                ("TALOS_MODEL", "m:latest")
+            ])
+        )
+        .is_ok());
+
+        let err = talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL", "other")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TALOS_MODEL is set to \"other\""), "{err}");
+        assert!(err.contains("llmman launch talos"), "{err}");
+        let err =
+            talos_check_env_overrides("m:latest", env(&[("TALOS_MODEL_PROVIDER", "openai-api")]))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("TALOS_MODEL_PROVIDER"), "{err}");
+    }
+
+    /// `talos` cannot carry a key (it is configured through a file, like
+    /// hermes) — the listing and the refusal above have to agree on that.
+    #[test]
+    fn talos_is_a_file_configured_integration() {
+        assert!(PROVIDER_NEEDS_DAEMON_KEY.contains(&"talos"));
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "talos"));
     }
 }

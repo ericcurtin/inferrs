@@ -518,7 +518,7 @@ jobs:
         run: go test -tags "$PODMAN_TAGS" ./...
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw> --model
+  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|talos> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -546,7 +546,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/talos, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -554,30 +554,30 @@ jobs:
     # `release` job's own `needs`, which includes this job for exactly
     # that reason, and its own identical `if:` condition below.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # 6 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 6's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 7 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 7's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 6*30 + 10 = 190 min; 210 leaves
+    # tests (guarded by WARM's own Once). 7*30 + 10 = 220 min; 240 leaves
     # headroom on top of that for setup/build overhead (5-8 min on
     # Windows). Exhausting every attempt doesn't fail this job either way
     # (see launch_and_assert's own doc comment) — a run can still
     # legitimately take this long in wall-clock time before giving up.
     #
-    # +90 on top of that 210 (300 total) for the vllm-plugin steps'
+    # +90 on top of that 240 (330 total) for the vllm-plugin steps'
     # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
     # (wheel downloads, but a slow/retried one on a bad connection) plus
     # up to 30 min for "pytest -m e2e (vllm-plugin)".
     #
-    # +10 more (310 total) for `serve_mlx_safetensors_model`'s own single
+    # +10 more (340 total) for `serve_mlx_safetensors_model`'s own single
     # TIMEOUT budget (10 min, same 600s as warm_model's) — it doesn't go
     # through launch_and_assert's retry loop at all (a real failure there
     # is always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 6 launch tests above
+    # small-model sampling variance), so unlike the 7 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    timeout-minutes: 310
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -807,6 +807,51 @@ jobs:
         continue-on-error: true
         run: |
           & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
+
+      # talos has no npm package either (macOS/Linux only). Its installer
+      # verifies a sha256 and an Ed25519 signature before unpacking, but the
+      # script itself would arrive unpinned — so this does what the installer
+      # does, against a release pinned here: the versioned tarball, checked
+      # against the digest below before anything is unpacked, then a venv
+      # with Talos's requirements under ~/talos (nothing on PATH — that is
+      # where launch_talos looks, and tests/launch_e2e.rs's
+      # launch_talos_with_model hands the prefix on as TALOS_PREFIX).
+      # Bounded retries, then a real failure: a missing Talos would turn
+      # that test into a skip and this job green without it (the ask on
+      # #332, again). Bump version and digest together when moving on.
+      # Needs Python 3.11+, which every non-Windows runner here has.
+      - name: Install Talos (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TALOS_VERSION: 0.18.0-alpha
+          TALOS_SHA256: 05b4e3345a0027474b7c479a62fdb16681a9ca0f9f277f1b5c872eb45cee9d33
+        run: |
+          set -euo pipefail
+          tarball="talos-${TALOS_VERSION}.tar.gz"
+          for attempt in 1 2 3; do
+            if curl -fsSL --connect-timeout 20 --max-time 120 -o "$tarball" "https://talos-agent.ch/dist/${tarball}"; then
+              break
+            fi
+            echo "talos download attempt ${attempt} failed"
+            rm -f "$tarball"
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
+          [ -s "$tarball" ] || { echo "::error::talos ${TALOS_VERSION} never downloaded"; exit 1; }
+          echo "${TALOS_SHA256}  ${tarball}" | shasum -a 256 -c -
+          mkdir -p "$HOME/talos"
+          tar xzf "$tarball" --strip-components=1 -C "$HOME/talos"
+          rm -f "$tarball"
+          python3 -m venv "$HOME/talos/.venv"
+          "$HOME/talos/.venv/bin/python" -m pip install --quiet --require-hashes -r "$HOME/talos/requirements.lock"
+          # The installer's own first-run file: its template carries an
+          # illustrative Telegram principal, so the installer clears that
+          # placeholder before the first CLI run. Mirror that transformation;
+          # the e2e grants its own terminal separately.
+          sed 's/^TALOS_ALLOWED_PRINCIPALS=.*/TALOS_ALLOWED_PRINCIPALS=/' \
+            "$HOME/talos/.env.example" > "$HOME/talos/talos.env"
+          chmod 600 "$HOME/talos/talos.env"
+          (cd "$HOME/talos" && .venv/bin/python -c "import talos; print('talos', talos.__version__)")
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand
