@@ -16,7 +16,7 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// old file's permissions go on the temp before it holds anything, and
 /// the temp is synced before the rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut tmp = path.clone().into_os_string();
     tmp.push(format!(
         ".{}.{}.tmp",

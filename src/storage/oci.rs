@@ -489,21 +489,43 @@ impl OciStore {
         use walkdir::WalkDir;
 
         let src_dir = src_dir.as_ref();
+
+        // Canonicalize the source directory so that symlinks, NTFS
+        // junctions, and volume mount points all resolve to the real
+        // path before any files are walked.  `dunce::canonicalize`
+        // avoids the `\\?\` verbatim-path prefix on Windows that would
+        // break `strip_prefix` below.
+        let canonical_src = dunce::canonicalize(src_dir)
+            .with_context(|| format!("canonicalize source dir {}", src_dir.display()))?;
+
         let mut layers: Vec<Descriptor> = Vec::new();
         let mut format: Option<&'static str> = None;
 
         // One layer per file (uncompressed tar, filename preserved via annotations)
-        for entry in WalkDir::new(src_dir).follow_links(true) {
+        for entry in WalkDir::new(&canonical_src).follow_links(true) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
-            let rel = entry
-                .path()
-                .strip_prefix(src_dir)
+
+            // Canonicalize each entry to resolve nested symlinks and
+            // detect any that escape the source root.
+            let canonical_entry = dunce::canonicalize(entry.path())
+                .with_context(|| format!("canonicalize {}", entry.path().display()))?;
+            if !canonical_entry.starts_with(&canonical_src) {
+                return Err(anyhow!(
+                    "path {} resolves to {} which is outside source dir {}",
+                    entry.path().display(),
+                    canonical_entry.display(),
+                    canonical_src.display()
+                ));
+            }
+
+            let rel = canonical_entry
+                .strip_prefix(&canonical_src)
                 .unwrap()
                 .to_string_lossy()
-                .into_owned();
+                .replace('\\', "/");
 
             let media_type = classify_model_layer(&rel);
             if media_type == WEIGHT_TAR_MEDIA_TYPE {
@@ -516,7 +538,7 @@ impl OciStore {
             }
 
             // Build a minimal tar with a single entry
-            let tar_data = make_single_file_tar(entry.path(), &rel)?;
+            let tar_data = make_single_file_tar(&canonical_entry, &rel)?;
             let mut desc = self.write_blob(media_type, &tar_data)?;
             desc.annotations = Some({
                 let mut m = std::collections::HashMap::new();
