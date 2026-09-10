@@ -1348,31 +1348,55 @@ fn reject_vibe_project_collisions(workdir: &Path) -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("{} does not parse as TOML", path.display()))?;
 
-    if let Some(providers) = doc.get("providers").and_then(Item::as_array_of_tables) {
-        if providers
-            .iter()
-            .any(|provider| provider.get("name").and_then(Item::as_str) == Some("llmman"))
-        {
-            anyhow::bail!(
-                "Vibe project config {} defines reserved provider `llmman`, which would shadow llmman's provider",
-                path.display()
-            );
-        }
+    if vibe_item_has_inline_table(doc.get("providers"), |table| {
+        table.get("name").and_then(|value| value.as_str()) == Some("llmman")
+    }) || doc
+        .get("providers")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|providers| {
+            providers
+                .iter()
+                .any(|provider| provider.get("name").and_then(Item::as_str) == Some("llmman"))
+        })
+    {
+        anyhow::bail!(
+            "Vibe project config {} defines reserved provider `llmman`, which would shadow llmman's provider",
+            path.display()
+        );
     }
 
-    if let Some(models) = doc.get("models").and_then(Item::as_array_of_tables) {
-        if models
-            .iter()
-            .any(|model| model.get("alias").and_then(Item::as_str) == Some(VIBE_MODEL_ALIAS))
-        {
-            anyhow::bail!(
-                "Vibe project config {} defines reserved model alias `{VIBE_MODEL_ALIAS}`, which would shadow llmman's model",
-                path.display()
-            );
-        }
+    if vibe_item_has_inline_table(doc.get("models"), |table| {
+        table.get("alias").and_then(|value| value.as_str()) == Some(VIBE_MODEL_ALIAS)
+    }) || doc
+        .get("models")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| model.get("alias").and_then(Item::as_str) == Some(VIBE_MODEL_ALIAS))
+        })
+    {
+        anyhow::bail!(
+            "Vibe project config {} defines reserved model alias `{VIBE_MODEL_ALIAS}`, which would shadow llmman's model",
+            path.display()
+        );
     }
 
     Ok(())
+}
+
+/// Checks inline TOML arrays such as `providers = [{ name = "llmman" }]`.
+/// `toml_edit` exposes those as `Item::Array`, not `ArrayOfTables`, so the
+/// collision check has to cover both representations.
+fn vibe_item_has_inline_table(
+    item: Option<&Item>,
+    matches: impl Fn(&toml_edit::InlineTable) -> bool,
+) -> bool {
+    item.and_then(Item::as_array).is_some_and(|array| {
+        array
+            .iter()
+            .any(|value| value.as_inline_table().is_some_and(|table| matches(table)))
+    })
 }
 
 /// Resolves the project directory from Vibe's `--workdir`, or the current
@@ -2161,6 +2185,22 @@ alias = \"old-model\"
         std::fs::write(
             &path,
             "[[models]]\nname = \"someone-elses-model\"\nprovider = \"openrouter\"\nalias = \"__llmman\"\n",
+        )
+        .unwrap();
+        let err = reject_vibe_project_collisions(&dir).unwrap_err();
+        assert!(err.to_string().contains("reserved model alias `__llmman`"));
+
+        std::fs::write(
+            &path,
+            "providers = [{ name = \"llmman\", api_base = \"https://example.com/v1\" }]\n",
+        )
+        .unwrap();
+        let err = reject_vibe_project_collisions(&dir).unwrap_err();
+        assert!(err.to_string().contains("reserved provider `llmman`"));
+
+        std::fs::write(
+            &path,
+            "models = [{ name = \"someone-elses-model\", provider = \"openrouter\", alias = \"__llmman\" }]\n",
         )
         .unwrap();
         let err = reject_vibe_project_collisions(&dir).unwrap_err();
