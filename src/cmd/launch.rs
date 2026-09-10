@@ -1395,7 +1395,7 @@ fn vibe_item_has_inline_table(
     item.and_then(Item::as_array).is_some_and(|array| {
         array
             .iter()
-            .any(|value| value.as_inline_table().is_some_and(|table| matches(table)))
+            .any(|value| value.as_inline_table().is_some_and(&matches))
     })
 }
 
