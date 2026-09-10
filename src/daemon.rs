@@ -43,12 +43,13 @@ fn parse_host(value: Option<&str>) -> (String, String, u16) {
     let mut default_port = DEFAULT_PORT;
     let (scheme, hostport) = match trimmed.split_once("://") {
         Some((scheme, rest)) => {
-            match scheme {
+            let scheme = scheme.to_ascii_lowercase();
+            match scheme.as_str() {
                 "http" => default_port = 80,
                 "https" => default_port = 443,
                 _ => {}
             }
-            (scheme.to_string(), rest)
+            (scheme, rest)
         }
         None => ("http".to_string(), trimmed),
     };
@@ -98,12 +99,53 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// The `http://host:port` origin every client in this process talks to.
-/// Always `http` (`llmman serve` has no TLS support) and built from
-/// `connect_addr`, not the raw configured host, so a wildcard bind
-/// (`0.0.0.0`/`[::]`) still gets a host clients can actually reach.
+/// The `scheme://host:port` origin every client in this process talks
+/// to: `https` only when `LLMMAN_HOST` spells it, and built from
+/// `connect_addr` so a wildcard bind still gets a reachable host.
 pub fn server() -> String {
-    format!("http://{}", connect_addr())
+    format!("{}://{}", scheme(), connect_addr())
+}
+
+fn scheme() -> &'static str {
+    if parsed_host().0 == "https" {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// Whether `LLMMAN_HOST` asks for TLS. `cmd::serve` requires this and
+/// `LLMMAN_TLS_CERT` to agree.
+pub fn tls_scheme() -> bool {
+    scheme() == "https"
+}
+
+/// Whether this process reaches the daemon without a cleartext network
+/// hop — over loopback or TLS — and so may send a credential along.
+pub fn connects_securely() -> bool {
+    connects_over_loopback() || tls_scheme()
+}
+
+/// A blocking client for the daemon: the process's key as a default
+/// header ([`crate::auth::client_headers`]) plus `LLMMAN_TLS_CA`'s roots.
+/// Every client of `server()` is built here or in
+/// [`async_client_builder`], so none can forget either.
+pub fn client_builder() -> anyhow::Result<reqwest::blocking::ClientBuilder> {
+    let mut builder =
+        reqwest::blocking::Client::builder().default_headers(crate::auth::client_headers()?);
+    for cert in crate::auth::tls_ca()? {
+        builder = builder.add_root_certificate(cert);
+    }
+    Ok(builder)
+}
+
+pub fn client() -> anyhow::Result<reqwest::blocking::Client> {
+    client_builder()?.build().context("build http client")
+}
+
+/// The async twin of [`client_builder`].
+pub fn async_client_builder() -> anyhow::Result<reqwest::ClientBuilder> {
+    Ok(crate::auth::trusted_client()?.default_headers(crate::auth::client_headers()?))
 }
 
 /// A peer's `scheme://host:port` origin from a `LLMMAN_HOST`-style spec
@@ -248,7 +290,8 @@ fn is_local_host(host: &str) -> bool {
 /// fetched/parsed at all — whatever is holding the port in that case,
 /// killing processes based on it would be a guess.
 fn stale_daemon() -> Option<DaemonIdentity> {
-    let resp = reqwest::blocking::Client::builder()
+    let resp = client_builder()
+        .ok()?
         .timeout(Some(Duration::from_secs(2)))
         .build()
         .ok()?
@@ -863,7 +906,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
 pub fn stream_progress_with(path: &str, reference: &str) -> anyhow::Result<Option<String>> {
     let body = serde_json::json!({"model": reference});
 
-    let client = reqwest::blocking::Client::builder()
+    let client = client_builder()?
         .timeout(None) // model transfers can take much longer than any sane fixed timeout
         .build()
         .context("build http client")?;
@@ -1035,7 +1078,7 @@ impl ShowResponse {
 /// Ollama's `client.Show`: a read-only `/api/show` lookup. `Ok(None)` is
 /// a 404 only; any other failure is an error, as in `showOrPullModel`.
 pub fn show(reference: &str) -> anyhow::Result<Option<ShowResponse>> {
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()?
         .post(format!("{}/api/show", server()))
         .json(&serde_json::json!({"model": reference}))
         .send()
@@ -1091,7 +1134,7 @@ pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
 /// in front of the daemon answers 404 too, and "couldn't find model"
 /// would be the wrong story for that.
 pub fn unload(reference: &str) -> anyhow::Result<bool> {
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()?
         .post(format!("{}/api/generate", server()))
         .json(&serde_json::json!({"model": reference, "keep_alive": 0}))
         .send()
@@ -1122,7 +1165,9 @@ pub(crate) fn is_model_not_found_body(body: &str, reference: &str) -> bool {
 /// `stream_progress`'s newline-delimited-JSON streaming, just a single
 /// request/response.
 pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
-    let resp = reqwest::blocking::get(format!("{}{path}", server()))
+    let resp = client()?
+        .get(format!("{}{path}", server()))
+        .send()
         .with_context(|| format!("request {path}"))?;
     if !resp.status().is_success() {
         let status = resp.status();

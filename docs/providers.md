@@ -44,11 +44,15 @@ A file carrying one must be `chmod 600` or its keys are ignored with a
 warning; an `export` overrides it. See
 [configuration.md](configuration.md#provider-api-keys).
 
-`--provider` needs a local `llmman serve`. The daemon is plain HTTP with
-no authentication, so `run` and `launch` never send a key to a remote
-`LLMMAN_HOST`, and a daemon bound off loopback never spends its own key
-for a caller that presented none. (`providers` and `list --provider`
-read the catalog only and work against any daemon.)
+`--provider` needs a local `llmman serve`, or one reached over TLS
+(`LLMMAN_HOST=https://...`): `run` and `launch` never send a key over
+plain http to a remote `LLMMAN_HOST`. A daemon bound off loopback spends
+its own key only for a caller that authenticated with the daemon's API
+key ([api.md](api.md#authentication)) — and since that key takes the
+`Authorization` header, `launch`'s integrations then rely on the
+daemon's provider key rather than carrying one; `run --provider` sends
+its own as `x-api-key`. (`providers` and `list --provider` read the
+catalog only and work against any daemon.)
 
 ## Your own endpoints
 

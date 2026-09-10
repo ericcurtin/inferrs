@@ -163,7 +163,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
 
     let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
-    let client = Client::builder()
+    let client = daemon::async_client_builder()?
         .timeout(Duration::from_secs(args.timeout))
         .build()
         .context("build http client")?;

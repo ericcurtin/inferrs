@@ -141,12 +141,19 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                         resolve_provider_model(provider, Some(hosted), name, per_request)?;
                     (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
                 }
-                None => (model, providers::PLACEHOLDER_API_KEY.to_string()),
+                None => (model, integration_key()),
             }
         }
     };
 
     launch(name, &model, &api_key, thinking.as_ref(), &args.extra_args)
+}
+
+/// What an integration authenticates with when no provider key travels:
+/// the daemon's key when this shell has one, else the placeholder that
+/// tells serve the header is not a credential.
+fn integration_key() -> String {
+    crate::auth::client_key().unwrap_or_else(|| providers::PLACEHOLDER_API_KEY.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -255,21 +262,23 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     // The key would go to the integration in cleartext, and from there
     // over plain http to a daemon somewhere else on the network. llmman
     // controls neither hop, so it does not start the handoff. A wildcard
-    // bind is fine here — that hop is still loopback.
-    if !crate::daemon::connects_over_loopback() {
+    // bind is fine here — that hop is still loopback — and so is TLS.
+    if !crate::daemon::connects_securely() {
         anyhow::bail!(
-            "--provider needs a local llmman serve: LLMMAN_HOST points at {}, and the \
-             provider key would cross the network in cleartext.\n\
+            "--provider needs a local llmman serve, or one over TLS: LLMMAN_HOST points at {}, \
+             and the provider key would cross the network in cleartext.\n\
              Export the key where that daemon runs instead.",
             crate::daemon::server()
         );
     }
     // These reach the daemon over loopback, so the check above passes,
     // but they send the placeholder key and the daemon will not fall back
-    // to its own on a bind anyone can reach. Say so here rather than let
-    // it surface as a 401 from inside the integration.
+    // to its own on a bind anyone can reach — unless it authenticates
+    // callers, in which case they send its key and it will. Say so here
+    // rather than let it surface as a 401 from inside the integration.
     if PROVIDER_NEEDS_DAEMON_KEY.contains(&name.as_str())
         && !crate::daemon::reachable_only_locally()
+        && crate::auth::client_key().is_none()
     {
         anyhow::bail!(
             "--provider does not work with {name} while llmman serve is bound to {}: \
@@ -331,7 +340,12 @@ fn resolve_provider_model(
     // the daemon has it — or when the provider takes none at all
     // (`key_optional`): it is what tells serve the header is not a
     // credential.
-    let key = if key_travels_per_request {
+    //
+    // A daemon requiring a key takes that header for it, so the provider
+    // key cannot travel: the daemon's is the only one, and an
+    // authenticated caller may spend it.
+    let daemon_authenticates = crate::auth::client_key().is_some();
+    let key = if key_travels_per_request && !daemon_authenticates {
         entry.client_key()
     } else {
         None
@@ -347,21 +361,30 @@ fn resolve_provider_model(
             anyhow::ensure!(
                 entry.key_usable || entry.key_optional,
                 "{integration} is configured through a file, so it cannot send an API key: \
-                 llmman serve needs a key of its own, and must be bound to loopback to \
-                 spend it.\n\
+                 llmman serve needs a key of its own, and must be bound to loopback (or \
+                 require an API key) to spend it.\n\
                  Where the daemon runs, {}, then restart it.",
                 entry.key_hint()
             );
-            providers::PLACEHOLDER_API_KEY.to_string()
+            integration_key()
         }
         (None, true) if entry.daemon_key_usable() => {
-            eprintln!(
-                "[llmman] warning: no API key for {} here; using the key llmman serve has",
-                entry.name
-            );
-            providers::PLACEHOLDER_API_KEY.to_string()
+            if !daemon_authenticates {
+                eprintln!(
+                    "[llmman] warning: no API key for {} here; using the key llmman serve has",
+                    entry.name
+                );
+            }
+            integration_key()
         }
-        (None, true) if entry.key_optional => providers::PLACEHOLDER_API_KEY.to_string(),
+        (None, true) if entry.key_optional => integration_key(),
+        (None, true) if daemon_authenticates => anyhow::bail!(
+            "llmman serve requires an API key, so {integration} sends that one and cannot \
+             also carry a key for {}: llmman serve needs a key of its own.\n\
+             Where the daemon runs, {}, then restart it.",
+            entry.name,
+            entry.key_hint()
+        ),
         (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 

@@ -366,13 +366,13 @@ enum Route<'a> {
 /// (see `client_api_key` in cmd::serve), never to disk.
 fn provider_model(provider: &str, model: &str) -> anyhow::Result<(String, Option<String>)> {
     // Same rule as `launch --provider` (see check_provider_supported in
-    // cmd::launch): the daemon has no TLS, so a key sent to one elsewhere
-    // on the network would cross it in cleartext. A wildcard bind is
-    // fine — that hop is still loopback.
+    // cmd::launch): a key sent to a daemon elsewhere on the network over
+    // plain http would cross it in cleartext. A wildcard bind is fine —
+    // that hop is still loopback — and so is an `https://` LLMMAN_HOST.
     anyhow::ensure!(
-        crate::daemon::connects_over_loopback(),
-        "--provider needs a local llmman serve: LLMMAN_HOST points at {}, and the provider \
-         key would cross the network in cleartext.\n\
+        crate::daemon::connects_securely(),
+        "--provider needs a local llmman serve, or one over TLS: LLMMAN_HOST points at {}, \
+         and the provider key would cross the network in cleartext.\n\
          Export the key where that daemon runs, and run llmman there.",
         crate::daemon::server()
     );
@@ -429,21 +429,28 @@ impl Msg {
 /// against `tokio::signal::ctrl_c()` in `chat_submit` — no `.timeout()`
 /// needed either, unlike the blocking client's own 30s default.
 ///
-/// A `--provider` key (see `provider_model`) rides along as a default
-/// `Authorization` header — this client has one destination, and that
-/// header is what `client_api_key` in cmd::serve reads. Sensitive, so a
-/// `Debug`-formatted client or request cannot print it.
+/// A `--provider` key rides along as a default header for `client_api_key`
+/// in cmd::serve to read: `Authorization: Bearer`, or `x-api-key` when
+/// the daemon's own key already occupies the bearer, so both arrive.
 fn chat_client(api_key: Option<&str>) -> anyhow::Result<Client> {
-    let mut builder = Client::builder();
+    let mut headers = crate::auth::client_headers()?;
     if let Some(key) = api_key {
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-            .context("provider API key is not a valid HTTP header value")?;
-        value.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        builder = builder.default_headers(headers);
+        if headers.contains_key(reqwest::header::AUTHORIZATION) {
+            let mut value = reqwest::header::HeaderValue::from_str(key)
+                .context("provider API key is not a valid HTTP header value")?;
+            value.set_sensitive(true);
+            headers.insert("x-api-key", value);
+        } else {
+            headers.insert(reqwest::header::AUTHORIZATION, crate::auth::bearer(key)?);
+        }
     }
-    builder.build().context("build http client")
+    // No redirects: reqwest drops `Authorization` across origins but not
+    // `x-api-key`, and the daemon never redirects anyway.
+    crate::daemon::async_client_builder()?
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build http client")
 }
 
 #[derive(Serialize)]

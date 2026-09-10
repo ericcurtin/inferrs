@@ -23,8 +23,8 @@ The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/b
 
 Everything that needs a file rather than an environment variable lives in
 one place: short-name aliases, provider API keys and endpoints, the
-signature trust policy, the peers of an aggregation, and registry
-mirrors.
+signature trust policy, the peers of an aggregation, the daemon's own
+API keys, and registry mirrors.
 
 ```toml
 # ~/.config/llmman/llmman.conf
@@ -48,6 +48,9 @@ mode    = "enforce"
 
 [aggregation]
 peers = "asahi, spark:17434"
+
+[auth]
+api_keys = "k1, k2"                # what a request to this daemon must present
 
 [registries."docker.io"]
 mirrors = "https://mirror.gcr.io, registry-mirror.corp:5000"
@@ -200,6 +203,29 @@ overrides it for one daemon; a user file's value replaces `/etc`'s
 rather than merging with it, and `peers = ""` opts out. See
 [aggregation.md](aggregation.md).
 
+### Authentication
+
+```toml
+[auth]
+api_keys = "k1,k2"
+```
+
+Keys every request to `llmman serve` must present. `LLMMAN_API_KEYS`
+overrides this for one daemon. The same rules as for provider keys: the
+file must be owner-only (`chmod 600`) or the keys are ignored with a
+warning, `llmman config set auth.api_keys ...` tightens the mode itself,
+and `llmman config list` prints them redacted. A blank value in a user
+file opts out of a system-wide set.
+
+Without keys the daemon is open, as before — but only on a loopback
+bind. `llmman serve` refuses to start on a host the network can reach
+(`LLMMAN_HOST=0.0.0.0`, a LAN address) unless keys are configured or
+`LLMMAN_AUTH=off` says the omission is deliberate. See
+[api.md](api.md#authentication) for how a key is presented.
+
+`[aggregation] api_key` is the key this daemon presents to its peers;
+see [aggregation.md](aggregation.md#authentication).
+
 ### Registry mirrors
 
 `[registries."<host>"] mirrors` names the mirrors a pull from that
@@ -244,20 +270,26 @@ setting may not behave identically.
 | Variable | Effect |
 |----------|--------|
 | `LLMMAN_DEBUG` | Enables verbose diagnostic logging (a spawned backend's full command line, per-GPU probe detail, etc). Accepts `1`/`true`/`yes`/`on`, or any other non-zero integer. |
-| `LLMMAN_HOST` | `[host][:port]` `llmman serve` binds to. Every `llmman` client in the same environment connects to it too, rewriting a wildcard host to loopback first. Defaults to `127.0.0.1:17434`. |
+| `LLMMAN_HOST` | `[scheme://][host][:port]` `llmman serve` binds to. Every `llmman` client in the same environment connects to it too, rewriting a wildcard host to loopback first, and over TLS when the scheme is `https://` (see `LLMMAN_TLS_CERT`). Defaults to `127.0.0.1:17434`. |
+| `LLMMAN_API_KEYS` | Comma-separated API keys every request to `llmman serve` must present, as `Authorization: Bearer <key>` or `x-api-key: <key>`. Overrides `[auth] api_keys` in `llmman.conf`; set but empty means none. Required whenever `LLMMAN_HOST` binds beyond loopback: the daemon refuses to start otherwise. See [Authentication](#authentication). |
+| `LLMMAN_AUTH` | `off` (or `0`/`false`/`no`) serves without keys even on a bind the network can reach — for a daemon behind a gateway that authenticates for it. Configured keys are still recognized and stripped from requests, just not required. |
+| `LLMMAN_API_KEY` | The key the `llmman` CLI (and `llmman launch`'s integrations) present to the daemon. Defaults to the first of `LLMMAN_API_KEYS`/`auth.api_keys` (unless `LLMMAN_AUTH=off`), so a CLI and the daemon it manages need only one setting. Sent to a remote `http://` daemon with a one-time warning: prefer TLS. |
+| `LLMMAN_PEER_API_KEY` | The key `llmman serve` presents to its [aggregation](aggregation.md) peers, overriding `[aggregation] api_key`. Defaults to the first of its own keys, so a pool sharing one key set needs nothing more. |
+| `LLMMAN_TLS_CERT` / `LLMMAN_TLS_KEY` | PEM certificate chain and private key; set both and `llmman serve` terminates TLS itself (rustls). Set `LLMMAN_HOST=https://...` too, so the CLI in the same environment connects accordingly. |
+| `LLMMAN_TLS_CA` | A PEM bundle of extra roots to trust, for a private CA: the daemon uses it to reach peers, and the CLI to reach the daemon. |
 | `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM when set. Defaults to `262144` (256k) for llama-server, capped to each model's trained context; backend-specific forwarding is below. |
 | `LLMMAN_HYBRID_LOCAL_BYTES` | Largest request body, in bytes, that a [hybrid model pair](providers.md#hybrid-model-pairs) serves locally; anything larger goes to the hosted half. `0` disables the size rule; a request the local half then refuses as over its context is still retried on the hosted half. Defaults to four bytes per token of the context size. |
 | `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
 | `LLMMAN_MAX_QUEUE` | Caps how many requests `llmman serve` admits into scheduling at once; anything beyond that gets an immediate `503` (`server busy, please try again.  maximum pending requests exceeded`, two spaces included). Defaults to `512`. |
 | `LLMMAN_MAX_TRANSFER_STREAMS` | Maximum number of a HuggingFace safetensors repo's files downloaded concurrently during `pull`. Has no effect on GGUF transfers, and is not read by `transfer`'s own `docker`-feature registry-push path, which streams files sequentially. Defaults to `4`. |
-| `LLMMAN_METRICS` | Serves the Prometheus scrape endpoint at `/metrics`. Accepts `1`/`true`/`yes`/`on`. Off by default: the router has no authentication, so an upgrade should not start publishing this daemon's version, route mix, model names and model churn to whoever can reach the port. Unset, the route is absent and answers `404`. |
+| `LLMMAN_METRICS` | Serves the Prometheus scrape endpoint at `/metrics`. Accepts `1`/`true`/`yes`/`on`. Off by default: a daemon without keys has no authentication, so an upgrade should not start publishing this daemon's version, route mix, model names and model churn to whoever can reach the port. With keys, the scrape route requires one like every other. Unset, the route is absent and answers `404`. |
 | `LLMMAN_MODELS` | Local store directory, overriding the default above. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_NUM_PARALLEL` | Number of parallel request slots (`--parallel`) for GGUF models (llama-server only; no vllm/mlx equivalent). `--ctx-size` is scaled up by this value first, so each slot still gets the full configured/default context rather than an even split of it; ignored (with a warning) for a load with no explicit context size to scale. Unset leaves llama-server's own default of 1 untouched. |
 | `LLMMAN_PEERS` | Comma-separated peer daemons (`[scheme://]host[:port]`) to pool hardware with, overriding `[aggregation]` in `llmman.conf`. Set but empty takes this daemon out of its aggregation. See [aggregation.md](aggregation.md). |
 | `LLMMAN_REGISTRY_MIRRORS` | Comma-separated mirrors (`[scheme://]host[:port][/path]`) to try before Docker Hub for a `docker.io/...` pull, overriding `[registries."docker.io"]` in `llmman.conf`; set but empty removes Hub's mirrors. Hub only, like dockerd's `--registry-mirror`; other registries take theirs from `llmman.conf`. See [registry mirrors](#registry-mirrors). |
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
-| `LLMMAN_SHELL` | The web UI's Shell tab (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split on whitespace (`tmux new -A -s llmman`). Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
+| `LLMMAN_SHELL` | The web UI's Shell tab (`/llmman/shell`, a terminal on the daemon's machine as the daemon's user). `0`/`false`/`no`/`off` removes it; unset (or `1`/`true`/`yes`/`on`) runs the login shell; any other value is the command to run instead, split on whitespace (`tmux new -A -s llmman`). Regardless of this variable the shell is off whenever `LLMMAN_HOST` binds beyond loopback, requires the daemon's API key when it has one, and a browser page may only open one from an origin `LLMMAN_ORIGINS` allows. See [webui.md](webui.md). |
 | `LLMMAN_WEBUI_DIR` | Serves the web UI from this directory instead of the copy built into the binary, uncompressed and uncached, for working on it (`LLMMAN_WEBUI_DIR=webui llmman serve`). Development only. |
 | `LLMMAN_SCHED_SPREAD` | Truthy forwards `--split-mode layer` (spread a model across every GPU, already llama-server's own default); falsey forwards `--split-mode none` (restrict to one GPU). |
 | `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`. |

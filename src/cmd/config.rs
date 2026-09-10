@@ -212,7 +212,7 @@ fn parse_key(name: &str) -> Result<Vec<Key>> {
 }
 
 fn is_credential(key: &str) -> bool {
-    key == "api_key" || key.ends_with(".api_key")
+    key == "api_key" || key.ends_with(".api_key") || key == "auth.api_keys"
 }
 
 /// Whether the document holds a secret — see [`write_atomic`].
@@ -738,6 +738,15 @@ mod tests {
         set_in(&mut d, "providers.openai.api_key", "sk-x").expect("set");
         save(&path, &d).expect("save");
         assert_eq!(mode(&path), 0o600, "a new file holding a key");
+
+        // The daemon's own keys and the peer key are credentials too.
+        for key in ["auth.api_keys", "aggregation.api_key"] {
+            std::fs::remove_file(&path).expect("rm");
+            let mut d = doc("");
+            set_in(&mut d, key, "k").expect("set");
+            save(&path, &d).expect("save");
+            assert_eq!(mode(&path), 0o600, "{key}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

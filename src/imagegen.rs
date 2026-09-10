@@ -298,7 +298,7 @@ pub fn generate(model: &str, prompt: &str, opts: &ImageOptions) -> Result<PathBu
 }
 
 fn client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+    crate::daemon::client_builder()?
         .timeout(None)
         .build()
         .context("build http client")

@@ -5,6 +5,8 @@
 //! scaling, the OOM shrink retry). Each `*_from_env` reads the process
 //! environment; its `parse_*` half is what the tests exercise.
 
+use std::path::PathBuf;
+
 /// Context tokens requested for every backend this daemon spawns — read
 /// from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve` flag).
 /// Forwarded to llama-server as-is for generation models (0 meaning
@@ -231,11 +233,36 @@ fn parse_max_queue(value: Option<&str>) -> usize {
     }
 }
 
+/// The certificate chain and private key `llmman serve` terminates TLS
+/// with, from `LLMMAN_TLS_CERT` and `LLMMAN_TLS_KEY` (PEM paths). Both or
+/// neither: one alone is a misconfiguration, refused at startup rather
+/// than served over plain http.
+pub(super) fn tls_from_env() -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    parse_tls(
+        std::env::var_os("LLMMAN_TLS_CERT"),
+        std::env::var_os("LLMMAN_TLS_KEY"),
+    )
+}
+
+fn parse_tls(
+    cert: Option<std::ffi::OsString>,
+    key: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let present = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    match (present(cert), present(key)) {
+        (Some(cert), Some(key)) => Ok(Some((cert, key))),
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!("LLMMAN_TLS_CERT is set but LLMMAN_TLS_KEY is not"),
+        (None, Some(_)) => anyhow::bail!("LLMMAN_TLS_KEY is set but LLMMAN_TLS_CERT is not"),
+    }
+}
+
 /// Whether to serve `GET /metrics` at all, from `LLMMAN_METRICS`. Off
-/// unless the operator asked for it: the router has no authentication,
-/// `LLMMAN_HOST` can bind it beyond loopback, and a scrape reports
-/// version, route mix, model names and model churn. None of that should
-/// start answering because llmman was upgraded.
+/// unless the operator asked for it: a daemon without keys (see the
+/// `auth` module) has no authentication, and a scrape reports version,
+/// route mix, model names and model churn. None of that should start
+/// answering because llmman was upgraded. With keys configured, the
+/// scrape route requires one like every other.
 pub(super) fn metrics_enabled_from_env() -> bool {
     parse_metrics_enabled(std::env::var("LLMMAN_METRICS").ok().as_deref())
 }
@@ -396,6 +423,25 @@ mod tests {
             !parse_metrics_enabled(None),
             "unset is the default, and the default is off"
         );
+    }
+
+    #[test]
+    fn tls_takes_both_paths_or_neither() {
+        let os = |v: &str| Some(std::ffi::OsString::from(v));
+        assert_eq!(parse_tls(None, None).unwrap(), None);
+        assert_eq!(parse_tls(os(""), os("")).unwrap(), None, "blank is unset");
+        assert_eq!(
+            parse_tls(os("/c.pem"), os("/k.pem")).unwrap(),
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/k.pem")))
+        );
+        assert!(parse_tls(os("/c.pem"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("LLMMAN_TLS_KEY"));
+        assert!(parse_tls(None, os("/k.pem"))
+            .unwrap_err()
+            .to_string()
+            .contains("LLMMAN_TLS_CERT"));
     }
 
     #[test]

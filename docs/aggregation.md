@@ -50,10 +50,29 @@ list a workstation as a peer without the workstation listing the laptop;
 the laptop then offloads to it, and the workstation serves as it always
 did.
 
-`llmman serve` has no authentication and no TLS. An aggregation is for a
-network you already trust — the same caveat as any non-loopback
-`LLMMAN_HOST`. A daemon bound off loopback does not spend its own
-provider API keys; see [configuration.md](configuration.md).
+## Authentication
+
+Every node in an aggregation is bound off loopback, so every node needs
+API keys (or `LLMMAN_AUTH=off`; see
+[configuration.md](configuration.md#authentication)). A node presents
+its *peer key* — `LLMMAN_PEER_API_KEY`, or `[aggregation] api_key` in
+`llmman.conf`, defaulting to the first of its own keys — on every
+request it forwards, so the simplest pool shares one key set:
+
+```toml
+[auth]
+api_keys = "pool-key"
+```
+
+on each node is enough. A peer whose key this node does not accept is
+skipped like a peer that is down (`LLMMAN_DEBUG=1` shows the 401). Over
+plain `http://` peers the key crosses the network in cleartext, as
+everything else in the aggregation does; TLS is below.
+
+For TLS between nodes, each serves a certificate (`LLMMAN_TLS_CERT`/
+`LLMMAN_TLS_KEY`), lists its peers with `https://`, and trusts the
+private CA with `LLMMAN_TLS_CA`. Client-certificate authentication is
+not offered; the peer key over TLS is the equivalent.
 
 ## What each node does
 

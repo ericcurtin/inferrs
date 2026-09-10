@@ -31,6 +31,7 @@ use crate::storage::OciStore;
 
 mod aggregation;
 mod anthropic;
+mod auth;
 mod backend;
 mod config;
 mod messages;
@@ -55,7 +56,7 @@ use config::{
     flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
     looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
     next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
-    threads_from_env_or_host, MAX_CTX_SHRINK_ATTEMPTS,
+    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
 };
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
@@ -79,7 +80,13 @@ use types::*;
 const SERVE_ENV_HELP: &str = "\
 Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
-      LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
+      LLMMAN_HOST                    [scheme://][host][:port] to bind (default \"127.0.0.1:17434\"; https:// tells clients to expect TLS)
+      LLMMAN_API_KEYS                Comma-separated API keys every request must present (overrides [auth] in llmman.conf; required off loopback)
+      LLMMAN_AUTH                    off: serve without keys even on a bind the network can reach
+      LLMMAN_PEER_API_KEY            The key presented to aggregation peers (default: the first of LLMMAN_API_KEYS)
+      LLMMAN_TLS_CERT                PEM certificate chain to terminate TLS with (with LLMMAN_TLS_KEY)
+      LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
+      LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
       LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (default 262144 for llama-server)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
@@ -266,6 +273,10 @@ struct Inner {
     prompt_log: Option<PathBuf>,
     // Who may open the web UI's terminal — see the `shell` module.
     shell: shell::Policy,
+    // Who may call this daemon — see the `auth` module.
+    auth: auth::Policy,
+    // Presented to peers — see `aggregation`; `None` sends the hop alone.
+    peer_key: Option<String>,
     client: Client,
 }
 
@@ -1358,11 +1369,26 @@ fn try_admit(max_queue: usize) -> Result<QueueGuard, AppError> {
 enum Target {
     /// A locally spawned backend listening on loopback.
     Local(u16),
-    /// Another `llmman serve`, by origin; speaks our dialect, so not
-    /// `is_remote`.
-    Peer(String),
+    /// Another `llmman serve`; speaks our dialect, so not `is_remote`.
+    Peer(Arc<PeerTarget>),
     /// A remote provider's API, in whichever [`Wire`] it speaks.
     Remote(Arc<RemoteTarget>),
+}
+
+/// A peer daemon and the key to present to it (`Inner::peer_key`).
+/// `Debug` is hand-written for the same reason as [`RemoteTarget`]'s.
+struct PeerTarget {
+    origin: String,
+    api_key: Option<String>,
+}
+
+impl std::fmt::Debug for PeerTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTarget")
+            .field("origin", &self.origin)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Everything needed to forward one request to a remote provider,
@@ -1414,14 +1440,14 @@ impl Target {
     fn url(&self, route: &str) -> String {
         match self {
             Self::Local(port) => format!("http://127.0.0.1:{port}{route}"),
-            Self::Peer(origin) => format!("{origin}{route}"),
+            Self::Peer(peer) => format!("{}{route}", peer.origin),
             Self::Remote(remote) => crate::providers::rebase_url(&remote.base_url, route),
         }
     }
 
     /// Attaches this target's credentials to an outgoing request, or for
-    /// a peer the hop marker: `Authorization: Bearer` for OpenAI,
-    /// `x-api-key` plus the API version for Anthropic.
+    /// a peer the hop marker and the peer key: `Authorization: Bearer`
+    /// for OpenAI, `x-api-key` plus the API version for Anthropic.
     ///
     /// A no-op for [`Target::Local`]: a loopback `llama-server` has no
     /// auth, which is why nothing below ever forwarded the client's own
@@ -1431,7 +1457,7 @@ impl Target {
     fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::Local(_) => req,
-            Self::Peer(_) => req.header(aggregation::HOP, "1"),
+            Self::Peer(peer) => aggregation::hop(req, peer.api_key.as_deref()),
             Self::Remote(remote) => match (remote.wire, remote.api_key.as_deref()) {
                 (Wire::OpenAi, Some(key)) => req.bearer_auth(key),
                 (Wire::OpenAi, None) => req,
@@ -1472,7 +1498,7 @@ impl Target {
     fn describe(&self) -> String {
         match self {
             Self::Local(_) => "inference backend".to_string(),
-            Self::Peer(origin) => format!("peer {origin}"),
+            Self::Peer(peer) => format!("peer {}", peer.origin),
             Self::Remote(remote) => format!("provider {}", remote.provider),
         }
     }
@@ -1502,16 +1528,7 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
         let k = k.trim();
         (!k.is_empty() && k != PLACEHOLDER_API_KEY).then(|| k.to_string())
     };
-    // The scheme is case-insensitive per RFC 7235, and clients do send
-    // `bearer`. Matching one spelling would silently drop a real key.
-    let bearer = headers
-        .get(reqwest::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, token) = v.trim().split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then_some(token)
-        })
-        .and_then(usable);
+    let bearer = auth::bearer(headers).and_then(usable);
     // Each candidate is filtered before the choice between them, not
     // after: a client that sends both a placeholder `Authorization` and a
     // real `x-api-key` still has a real key.
@@ -1548,6 +1565,14 @@ fn is_cross_site(headers: Option<&HeaderMap>) -> bool {
         })
 }
 
+/// Whether this daemon spends its own provider key for this request: the
+/// caller authenticated (every request reaching a handler under an
+/// enforced `auth::Policy` did), or only the operator can reach the
+/// daemon and this is not a browser acting for another site.
+fn daemon_key_spendable(state: &AppState, headers: Option<&HeaderMap>) -> bool {
+    state.0.auth.enforced() || (crate::daemon::reachable_only_locally() && !is_cross_site(headers))
+}
+
 /// The models.dev catalog, as everything in this module reaches it: off
 /// the runtime, since the first call fetches (and caches) it while every
 /// later one is memoized, and a 502 when that fetch fails — the failure
@@ -1568,6 +1593,7 @@ async fn provider_catalog() -> Result<Arc<crate::providers::Catalog>, AppError> 
 /// integration's requests, and a daemon started with the key already
 /// exported work.
 async fn resolve_remote_target(
+    state: &AppState,
     model_ref: &str,
     headers: Option<&HeaderMap>,
 ) -> Result<Option<Target>, AppError> {
@@ -1585,18 +1611,12 @@ async fn resolve_remote_target(
         )
     })?;
 
-    // This router has no authentication, so the daemon's own key is
-    // withheld from the two cases where the caller is plainly not the
-    // operator: a bind the whole network can reach, and a browser acting
-    // for another site. That is a blast-radius bound, not authentication
-    // — on a shared machine any local account can still reach a loopback
-    // daemon, as it can already reach every other thing this daemon does.
-    // Presenting a key per request is what avoids relying on this at all.
-    let own_key = || {
-        (crate::daemon::reachable_only_locally() && !is_cross_site(headers))
-            .then(|| provider.api_key())
-            .flatten()
-    };
+    // An authenticated caller is the operator. Without keys the daemon's
+    // own key is withheld where the caller plainly is not: a bind the
+    // network can reach, or a browser acting for another site. That is a
+    // blast-radius bound, not authentication — see `daemon_key_spendable`.
+    let trusted = daemon_key_spendable(state, headers);
+    let own_key = || trusted.then(|| provider.api_key()).flatten();
     let api_key = match client_api_key(headers).or_else(own_key) {
         Some(key) => Some(key),
         // A configured provider that takes no key goes up bare.
@@ -1606,11 +1626,11 @@ async fn resolve_remote_target(
                 anyhow!(
                     "no API key for provider {provider_id:?} — send it as an Authorization \
                      header{}",
-                    if is_cross_site(headers) {
+                    if is_cross_site(headers) && !state.0.auth.enforced() {
                         ". This request came from another site, so llmman serve's own \
                          environment is deliberately not used"
                             .to_string()
-                    } else if crate::daemon::reachable_only_locally() {
+                    } else if trusted {
                         format!(
                             ", or give llmman serve a key of its own: {}",
                             crate::providers::key_hint(&provider.id, provider.key_env.as_deref())
@@ -1884,7 +1904,7 @@ async fn ensure_model(
     // `ActivityGuard` operation looks the model up in `running` and is a
     // no-op when absent (see its `Drop` impl and `begin_activity`), so a
     // remote target needs no separate no-op path.
-    if let Some(target) = resolve_remote_target(model_ref, headers).await? {
+    if let Some(target) = resolve_remote_target(state, model_ref, headers).await? {
         return Ok((
             model_ref.to_string(),
             target,
@@ -1925,7 +1945,7 @@ async fn ensure_model(
     if let Some(peer) = aggregation::route(state, model_ref, headers).await {
         return Ok((
             model_ref.to_string(),
-            Target::Peer(peer),
+            aggregation::target(state, peer),
             ActivityGuard::new(state, model_ref),
         ));
     }
@@ -3155,8 +3175,8 @@ struct ProviderSummary {
     models: usize,
 }
 
-impl From<&crate::providers::Provider> for ProviderSummary {
-    fn from(p: &crate::providers::Provider) -> Self {
+impl ProviderSummary {
+    fn new(state: &AppState, p: &crate::providers::Provider) -> Self {
         Self {
             id: p.id.clone(),
             name: p.name.clone(),
@@ -3164,7 +3184,7 @@ impl From<&crate::providers::Provider> for ProviderSummary {
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
-            key_usable: daemon_key_usable(p),
+            key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
             models: p.models.len(),
         }
@@ -3172,10 +3192,11 @@ impl From<&crate::providers::Provider> for ProviderSummary {
 }
 
 /// Whether this daemon would spend its own key for a request that
-/// presents none — the same two conditions `resolve_remote_target`
-/// applies, minus the per-request cross-site check no CLI can trip.
-fn daemon_key_usable(provider: &crate::providers::Provider) -> bool {
-    provider.api_key().is_some() && crate::daemon::reachable_only_locally()
+/// presents none — the same conditions `resolve_remote_target` applies
+/// (see `daemon_key_spendable`), minus the per-request cross-site check
+/// no CLI can trip.
+fn daemon_key_usable(state: &AppState, provider: &crate::providers::Provider) -> bool {
+    provider.api_key().is_some() && daemon_key_spendable(state, None)
 }
 
 /// `GET /llmman/providers`.
@@ -3221,8 +3242,8 @@ struct ProviderCostResponse {
     output: f64,
 }
 
-impl From<&crate::providers::Provider> for ProviderResponse {
-    fn from(p: &crate::providers::Provider) -> Self {
+impl ProviderResponse {
+    fn new(state: &AppState, p: &crate::providers::Provider) -> Self {
         Self {
             id: p.id.clone(),
             name: p.name.clone(),
@@ -3230,7 +3251,7 @@ impl From<&crate::providers::Provider> for ProviderResponse {
             key_env: p.key_env.clone(),
             wire: p.wire.as_str(),
             key_set: p.api_key().is_some(),
-            key_usable: daemon_key_usable(p),
+            key_usable: daemon_key_usable(state, p),
             key_optional: p.key_optional,
             models: p
                 .models
@@ -3248,10 +3269,15 @@ impl From<&crate::providers::Provider> for ProviderResponse {
 }
 
 /// `GET /llmman/providers` — every provider `--provider` accepts.
-async fn handle_llmman_providers() -> Result<impl IntoResponse, AppError> {
+async fn handle_llmman_providers(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
     let catalog = provider_catalog().await?;
     Ok(Json(ProvidersResponse {
-        providers: catalog.iter().map(ProviderSummary::from).collect(),
+        providers: catalog
+            .iter()
+            .map(|p| ProviderSummary::new(&state, p))
+            .collect(),
     }))
 }
 
@@ -3271,9 +3297,9 @@ async fn handle_llmman_provider(
             StatusCode::NOT_FOUND,
         )
     })?;
-    let mut response = ProviderResponse::from(provider);
+    let mut response = ProviderResponse::new(&state, provider);
     if provider.key_optional && provider.models.is_empty() {
-        response.models = configured_provider_models(&state.0.client, provider)
+        response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
             .map(|id| ProviderModelResponse { id, cost: None })
@@ -3293,7 +3319,7 @@ const CONFIGURED_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 /// requests. The daemon's own key is sent under the same bind rule as
 /// for a request (`daemon_key_usable`).
 async fn configured_provider_models(
-    client: &Client,
+    state: &AppState,
     provider: &crate::providers::Provider,
 ) -> Vec<String> {
     #[derive(Deserialize)]
@@ -3310,8 +3336,8 @@ async fn configured_provider_models(
         return Vec::new();
     }
     let url = provider.url("/v1/models");
-    let mut req = client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
-    if daemon_key_usable(provider) {
+    let mut req = state.0.client.get(&url).timeout(CONFIGURED_MODELS_TIMEOUT);
+    if daemon_key_usable(state, provider) {
         if let Some(key) = provider.api_key() {
             req = req.bearer_auth(key);
         }
@@ -5248,8 +5274,13 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         app
     };
 
-    app.layer(cors_layer())
-        .merge(metrics_router(metrics_enabled))
+    // Outside metrics (a refused request is not counted against a route it
+    // never reached), inside CORS (a preflight carries no credential). The
+    // scrape router is merged outside CORS, so it gets its own copy.
+    let require_key = || middleware::from_fn_with_state(app_state.clone(), auth::require_key);
+    app.layer(require_key())
+        .layer(cors_layer())
+        .merge(metrics_router(metrics_enabled).layer(require_key()))
         .with_state(app_state)
 }
 
@@ -5455,6 +5486,29 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
 
+    // Before anything binds, so a misconfiguration fails at exec.
+    let auth = auth::Policy::from_env()?;
+    if auth.enforced() {
+        eprintln!("[llmman] API key required on every request (LLMMAN_API_KEYS)");
+    } else if !crate::daemon::reachable_only_locally() {
+        eprintln!(
+            "[llmman] warning: LLMMAN_AUTH=off — serving everyone who can reach {} without a key",
+            crate::daemon::bind_addr()
+        );
+    }
+    let tls = tls_from_env()?;
+    anyhow::ensure!(
+        tls.is_some() == crate::daemon::tls_scheme(),
+        "LLMMAN_HOST and LLMMAN_TLS_CERT/LLMMAN_TLS_KEY disagree: an https:// host needs the \
+         certificate and key, and they need an https:// host, so clients in this \
+         environment connect the way the daemon listens"
+    );
+
+    // Outbound: peers and providers. `LLMMAN_TLS_CA` is trusted for both.
+    let client = crate::auth::trusted_client()?
+        .build()
+        .context("build http client")?;
+
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
@@ -5488,7 +5542,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .then(crate::promptlog::path)
             .transpose()?,
         shell: shell::Policy::from_env(),
-        client: Client::new(),
+        auth,
+        peer_key: crate::auth::peer_key(),
+        client,
     }));
 
     let app = build_router(state.clone(), metrics_enabled_from_env());
@@ -5506,7 +5562,10 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    eprintln!("llmman serve listening on {addr}");
+    eprintln!(
+        "llmman serve listening on {addr}{}",
+        if tls.is_some() { " (TLS)" } else { "" }
+    );
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.
     tokio::spawn(reap_idle_models(state.clone()));
@@ -5549,9 +5608,39 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    match tls {
+        None => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?
+        }
+        Some((cert, key)) => {
+            // Both rustls providers are compiled in (reqwest's, the AWS
+            // SDK's), so none is the default until one is installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "load TLS certificate {} and key {}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            let handle = axum_server::Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    shutdown_signal().await;
+                    handle.graceful_shutdown(Some(Duration::from_secs(30)));
+                }
+            });
+            axum_server::from_tcp_rustls(listener.into_std()?, config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?
+        }
+    }
 
     // Unload every running inference backend before exiting — the same
     // explicit unload `ollama serve` does when it traps SIGINT/SIGTERM
