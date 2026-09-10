@@ -415,6 +415,61 @@ pub fn fuzz_check_parse_registry_ref(reference: &str) {
     }
 }
 
+/// Fuzz-target entry point (see `fuzz/fuzz_targets/validate_reference.rs`).
+/// Checks that [`validate_reference`]'s branch (c), everything that is
+/// neither an absolute path nor a [`PASSTHROUGH_SCHEMES`] URI, can never
+/// drift from [`parse_registry_ref`], since branch (c) is defined as calling
+/// it: if `validate_reference(reference)` accepts, `parse_registry_ref`
+/// must accept too, and the parse it produces must hold
+/// [`assert_parsed_ref_grammar`]. Branches (a) and (b) are exempt from this
+/// cross-check (they never call `parse_registry_ref`), so this only asserts
+/// they do not panic.
+///
+/// Reuses `assert_parsed_ref_grammar` directly instead of re-deriving its
+/// checks here, unlike this file's usual deliberate-copy philosophy (see
+/// the rejoin test and `assert_parsed_ref_grammar`'s own doc comment). That
+/// philosophy guards against a bug shared between an implementation and its
+/// own oracle. This oracle instead checks agreement between two different
+/// functions, so there is no shared-bug risk from reuse here: a regression
+/// in the grammar `assert_parsed_ref_grammar` enforces is already caught by
+/// its own test coverage, not by this cross-check.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_check_validate_reference(reference: &str) {
+    if reference.starts_with('/') || PASSTHROUGH_SCHEMES.iter().any(|s| reference.starts_with(s)) {
+        let _ = validate_reference(reference);
+        return;
+    }
+    if validate_reference(reference).is_ok() {
+        match parse_registry_ref(reference) {
+            Ok(parsed) => assert_parsed_ref_grammar(&parsed, reference),
+            Err(e) => panic!(
+                "{reference:?}: validate_reference() accepted but parse_registry_ref() \
+                 rejected it: {e}"
+            ),
+        }
+    }
+}
+
+/// Fuzz-target entry point (see `fuzz/fuzz_targets/resolve_ollama_api.rs`).
+/// Checks that [`resolve_ollama_api`] and [`validate_reference`] never
+/// disagree on whether a reference is valid: both start by calling the same
+/// [`validate_reference_parsed`] internally, so an Ok/Err split between them
+/// would mean one of the two stopped sharing that validation. Panics
+/// showing both results when they disagree.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_check_resolve_ollama_api(reference: &str) {
+    let resolved = resolve_ollama_api(reference);
+    let validated = validate_reference(reference);
+    assert_eq!(
+        resolved.is_ok(),
+        validated.is_ok(),
+        "{reference:?}: resolve_ollama_api() and validate_reference() disagree: \
+         resolve_ollama_api={resolved:?}, validate_reference={validated:?}"
+    );
+}
+
 /// Rejects a raw user-supplied model reference that can never resolve to a
 /// real source, before any resolution or network I/O runs.
 ///
@@ -829,6 +884,60 @@ mod tests {
             }
         }
         // A wrong path must fail loudly, not pass over zero files.
+        assert!(seeds > 0, "seed corpus at {dir:?} is empty");
+    }
+
+    /// Sanity-runs the `fuzz_check_validate_reference` oracle against the
+    /// checked-in seed corpus on every `cargo test`. Mirrors the fuzz
+    /// target's logic inline (rather than calling the feature-gated
+    /// `fuzz_check_validate_reference` itself) so this runs in a plain
+    /// `cargo test --lib`, with no `fuzzing` feature required.
+    #[test]
+    fn validate_reference_oracle_holds_on_the_seed_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/validate_reference");
+        let mut seeds = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read the seed corpus directory") {
+            let path = entry.expect("read a corpus directory entry").path();
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            seeds += 1;
+            let Ok(s) = std::str::from_utf8(&data) else {
+                continue;
+            };
+            if s.starts_with('/') || PASSTHROUGH_SCHEMES.iter().any(|p| s.starts_with(p)) {
+                continue;
+            }
+            if validate_reference(s).is_ok() {
+                let parsed = parse_registry_ref(s).unwrap_or_else(|e| {
+                    panic!("{s:?}: validate_reference() accepted but parse_registry_ref() rejected it: {e}")
+                });
+                assert_parsed_ref_grammar(&parsed, s);
+            }
+        }
+        assert!(seeds > 0, "seed corpus at {dir:?} is empty");
+    }
+
+    /// Sanity-runs the `fuzz_check_resolve_ollama_api` oracle against the
+    /// checked-in seed corpus on every `cargo test`. Mirrors the fuzz
+    /// target's logic inline, same reason as the sibling test above.
+    #[test]
+    fn resolve_ollama_api_oracle_holds_on_the_seed_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/resolve_ollama_api");
+        let mut seeds = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read the seed corpus directory") {
+            let path = entry.expect("read a corpus directory entry").path();
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            seeds += 1;
+            let Ok(s) = std::str::from_utf8(&data) else {
+                continue;
+            };
+            assert_eq!(
+                resolve_ollama_api(s).is_ok(),
+                validate_reference(s).is_ok(),
+                "{s:?}: resolve_ollama_api() and validate_reference() disagree"
+            );
+        }
         assert!(seeds > 0, "seed corpus at {dir:?} is empty");
     }
 

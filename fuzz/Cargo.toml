@@ -20,3 +20,17 @@ path = "fuzz_targets/parse_registry_ref.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "validate_reference"
+path = "fuzz_targets/validate_reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resolve_ollama_api"
+path = "fuzz_targets/resolve_ollama_api.rs"
+test = false
+doc = false
+bench = false

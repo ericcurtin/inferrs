@@ -5,3 +5,5 @@ coverage
 # hand-curated seed corpus (corpus/parse_registry_ref/*) trackable.
 corpus/*
 !corpus/parse_registry_ref/
+!corpus/validate_reference/
+!corpus/resolve_ollama_api/
