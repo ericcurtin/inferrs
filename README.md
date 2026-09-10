@@ -319,7 +319,7 @@ so it works from any client on every inference endpoint. Details in
 | [docs/aggregation.md](docs/aggregation.md) | Pooling several machines into one endpoint |
 | [docs/backends.md](docs/backends.md) | llama.cpp, vLLM, MLX, containers, and building from source |
 | [docs/compose.md](docs/compose.md) | Compose deployment behind a gateway, with persistent model storage |
-| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, environment variables, store layout |
+| [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

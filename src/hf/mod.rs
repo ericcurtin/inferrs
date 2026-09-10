@@ -278,11 +278,17 @@ async fn is_oci_registry(host: &str) -> bool {
 /// Reports whether `host` should be treated as an OCI Distribution
 /// registry (true) or a HuggingFace-compatible host (false): known-host
 /// shortcuts first, then a live `/v2/` probe as the fallback.
+///
+/// A host `llmman.conf` configures mirrors for counts as known: only an
+/// OCI registry has them, and the point of a mirror is to keep pulls
+/// working when the registry itself is slow or unreachable — which is
+/// exactly when the probe of *it* would fail and misfile the reference
+/// as HuggingFace before the mirror ever got a chance.
 pub async fn is_oci_host(host: &str) -> bool {
     if is_known_hf_host(host) {
         return false;
     }
-    if is_known_oci_host(host) {
+    if is_known_oci_host(host) || crate::config::has_registry_mirrors(host) {
         return true;
     }
     is_oci_registry(host).await

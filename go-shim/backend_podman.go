@@ -285,6 +285,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	progressSetStatus(progressKey, "pulling")
 	manifestData, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
 		MaxParallelDownloads: 6,
+		SourceCtx:            registrySourceCtx(ctx),
 		DestinationCtx:       sharedBlobDirOpts(layoutDir),
 	}, nil, progressKey)
 	if err != nil {
@@ -736,7 +737,7 @@ func fetchManifestRaw(ctx context.Context, ref string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse ref %q: %w", srcStr, err)
 	}
-	src, err := srcRef.NewImageSource(ctx, &types.SystemContext{})
+	src, err := srcRef.NewImageSource(ctx, registrySourceCtx(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("open image source: %w", err)
 	}

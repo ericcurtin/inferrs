@@ -73,6 +73,7 @@ func podmanTransferOCI(ctx context.Context, source, destination string) (changed
 	// these bytes to.
 	copied, err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Transferring", "Transferred", &copy.Options{
 		ReportWriter: os.Stderr,
+		SourceCtx:    registrySourceCtx(ctx),
 	}, &changed, "")
 	if err != nil {
 		return false, "", fmt.Errorf("transfer image: %w", err)

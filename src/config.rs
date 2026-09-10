@@ -30,6 +30,9 @@
 //!
 //! [aggregation]                        # cmd::serve::aggregation
 //! peers = "asahi,spark:17434"
+//!
+//! [registries."docker.io"]             # crate::ffi, go-shim
+//! mirrors = "https://mirror.gcr.io,registry-mirror.corp:5000"
 //! ```
 //!
 //! Parsing happens once, in [`files`]; what a *failed* parse means is
@@ -38,7 +41,7 @@
 //! `off`; aliases and keys degrade to none. The error is reported once,
 //! centrally, so one typo is not announced three times.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -68,6 +71,10 @@ pub struct Conf {
     /// Peer daemons — see `cmd::serve::aggregation`.
     #[serde(default)]
     pub aggregation: AggregationConf,
+    /// `[registries."<host>"]` tables, keyed by the registry host a
+    /// reference names — see [`registry_mirrors`].
+    #[serde(default)]
+    pub registries: HashMap<String, RegistryConf>,
 }
 
 /// The `[aggregation]` section.
@@ -78,6 +85,17 @@ pub struct AggregationConf {
     /// string so `llmman config set aggregation.peers a,b` can write it.
     #[serde(default)]
     pub peers: Option<String>,
+}
+
+/// One `[registries."<host>"]` table.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConf {
+    /// Comma-separated `[scheme://]host[:port][/path]` mirrors, tried in
+    /// order before the registry for pulls. A string, like `peers`, so
+    /// `llmman config set` can write it.
+    #[serde(default)]
+    pub mirrors: Option<String>,
 }
 
 /// One `[providers.<id>]` table. Without `base_url` it keys a catalog
@@ -329,6 +347,22 @@ pub(crate) fn parse(text: &str) -> Result<Conf, String> {
 /// What the TOML shape alone cannot say, checked at parse time so
 /// `llmman config set` refuses it on the spot.
 fn validate(conf: &Conf) -> Result<(), String> {
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for (host, r) in &conf.registries {
+        let canonical = canonical_registry_host(host).ok_or_else(|| {
+            format!(
+                "[registries.{host:?}]: expected a host[:port], as in [registries.\"docker.io\"]"
+            )
+        })?;
+        if let Some(other) = seen.insert(canonical, host) {
+            return Err(format!(
+                "[registries.{host:?}] and [registries.{other:?}] name the same registry"
+            ));
+        }
+        for mirror in split_list(r.mirrors.as_deref()) {
+            mirror_url_of(&mirror).map_err(|e| format!("[registries.{host:?}] mirrors: {e}"))?;
+        }
+    }
     for (id, p) in &conf.providers {
         // `<provider>/<model>` is how a reference travels (see
         // `crate::providers::split_remote_ref`), so a slash in the id
@@ -357,13 +391,10 @@ fn validate(conf: &Conf) -> Result<(), String> {
     Ok(())
 }
 
-/// Normalizes a configured `base_url`: an absolute `http`/`https` URL
-/// with no query, fragment or userinfo, lowercased scheme and host, and
-/// no trailing slash. Userinfo is refused because the URL is reported by
-/// the daemon's API and printed in warnings; `api_key` is where a
-/// credential goes.
-fn base_url_of(url: &str) -> Result<String, String> {
-    let url = url.trim();
+/// Parses an `http`/`https` URL with a host and no userinfo, query or
+/// fragment. Userinfo is refused because these URLs are reported and
+/// logged; `credential` names where a credential goes instead.
+fn plain_http_url(url: &str, credential: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url:?}: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -378,13 +409,125 @@ fn base_url_of(url: &str) -> Result<String, String> {
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
-            "{url:?}: a base URL cannot carry a username or password; use api_key"
+            "{url:?}: cannot carry a username or password; use {credential}"
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(format!("{url:?}: a base URL has no query or fragment"));
+        return Err(format!("{url:?}: no query or fragment allowed"));
     }
+    Ok(parsed)
+}
+
+/// Normalizes a configured `base_url`: lowercased scheme and host, no
+/// trailing slash.
+fn base_url_of(url: &str) -> Result<String, String> {
+    let parsed = plain_http_url(url.trim(), "api_key")?;
     Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+/// Normalizes a mirror, `[scheme://]host[:port][/path]`, `https` when no
+/// scheme is given. A path is kept (a mirror served under a prefix);
+/// `llmman login <mirror-host>` is where a mirror's credential goes.
+fn mirror_url_of(mirror: &str) -> Result<String, String> {
+    let mirror = mirror.trim();
+    if mirror.is_empty() {
+        return Err("an empty entry".to_string());
+    }
+    let with_scheme = if mirror.contains("://") {
+        mirror.to_string()
+    } else {
+        format!("https://{mirror}")
+    };
+    let parsed = plain_http_url(&with_scheme, "`llmman login`")?;
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+/// The `host[:port]` a `[registries."<host>"]` key names, as the Go shim
+/// looks it up: lowercased, Docker Hub's several names folded onto
+/// `docker.io`. `None` for anything that is not a bare authority.
+fn canonical_registry_host(host: &str) -> Option<String> {
+    let host = host.trim();
+    // `*` is a wildcard in registries.conf, which the url crate lets through.
+    if host.is_empty() || host.contains("://") || host.contains(['/', '*']) {
+        return None;
+    }
+    let parsed = plain_http_url(&format!("https://{host}"), "").ok()?;
+    if parsed.path() != "/" {
+        return None;
+    }
+    let mut canonical = parsed.host_str()?.to_string();
+    if let Some(port) = parsed.port() {
+        canonical = format!("{canonical}:{port}");
+    }
+    Some(match canonical.as_str() {
+        "index.docker.io" | "registry-1.docker.io" => "docker.io".to_string(),
+        _ => canonical,
+    })
+}
+
+/// Splits a comma-separated setting into its trimmed, non-empty entries.
+fn split_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Registry mirrors
+// ---------------------------------------------------------------------------
+
+/// Mirrors per registry host, normalized and in order: for Docker Hub
+/// `LLMMAN_REGISTRY_MIRRORS` when set (even empty; Hub-only, like
+/// dockerd's `--registry-mirror`), else the last file that sets the
+/// host's `mirrors`. Replaced per host, not merged, so `mirrors = ""`
+/// opts a host out. What a mirror does is the Go shim's business (see
+/// go-shim/registry_mirrors.go).
+pub fn registry_mirrors() -> BTreeMap<String, Vec<String>> {
+    registry_mirrors_from(
+        std::env::var("LLMMAN_REGISTRY_MIRRORS").ok().as_deref(),
+        files().unwrap_or_default(),
+    )
+}
+
+/// Whether `host`, as a reference spells it, has mirrors configured.
+/// Cached for the process; `crate::hf` asks per reference classified.
+pub fn has_registry_mirrors(host: &str) -> bool {
+    static CACHE: OnceLock<BTreeMap<String, Vec<String>>> = OnceLock::new();
+    canonical_registry_host(host)
+        .is_some_and(|host| CACHE.get_or_init(registry_mirrors).contains_key(&host))
+}
+
+fn registry_mirrors_from(env: Option<&str>, files: &[File]) -> BTreeMap<String, Vec<String>> {
+    let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in files {
+        for (host, r) in &file.conf.registries {
+            let Some(mirrors) = r.mirrors.as_deref() else {
+                continue;
+            };
+            let host = canonical_registry_host(host).expect("validated at parse");
+            let mirrors = split_list(Some(mirrors))
+                .iter()
+                .map(|m| mirror_url_of(m).expect("validated at parse"))
+                .collect();
+            by_host.insert(host, mirrors);
+        }
+    }
+    if let Some(env) = env {
+        let mut mirrors = Vec::new();
+        for m in split_list(Some(env)) {
+            match mirror_url_of(&m) {
+                Ok(m) => mirrors.push(m),
+                Err(e) => eprintln!("[llmman] warning: ignoring LLMMAN_REGISTRY_MIRRORS entry {e}"),
+            }
+        }
+        by_host.insert("docker.io".to_string(), mirrors);
+    }
+    by_host.retain(|_, mirrors| !mirrors.is_empty());
+    by_host
 }
 
 // ---------------------------------------------------------------------------
@@ -508,12 +651,8 @@ fn peers_from(env: Option<&str>, files: &[File]) -> Vec<String> {
             .rev()
             .find_map(|f| f.conf.aggregation.peers.as_deref())
     })
+    .map(|peers| split_list(Some(peers)))
     .unwrap_or_default()
-    .split(',')
-    .map(str::trim)
-    .filter(|s| !s.is_empty())
-    .map(str::to_string)
-    .collect()
 }
 
 /// Refuses a file that group or other can read, the way `ssh` refuses a
@@ -585,11 +724,22 @@ mod tests {
             pattern = "docker.io/myorg/**"
             keys    = ["keys/myorg.pub"]
             mode    = "enforce"
+
+            [aggregation]
+            peers = "asahi,spark:17434"
+
+            [registries."docker.io"]
+            mirrors = "https://mirror.gcr.io,registry-mirror.corp:5000"
             "#,
         );
         assert_eq!(
             c.aliases.get("gemma4").map(String::as_str),
             Some("docker.io/ai/gemma4")
+        );
+        assert_eq!(c.aggregation.peers.as_deref(), Some("asahi,spark:17434"));
+        assert_eq!(
+            c.registries["docker.io"].mirrors.as_deref(),
+            Some("https://mirror.gcr.io,registry-mirror.corp:5000")
         );
         assert_eq!(
             c.provider_keys().get("openrouter").map(String::as_str),
@@ -666,6 +816,8 @@ mod tests {
         assert!(parse("[alias]\nx = \"y\"").is_err());
         assert!(parse("[verify]\ndefualt = \"off\"").is_err());
         assert!(parse("[[verify.trust]]\npattern = \"a/b\"\nkyes = []").is_err());
+        assert!(parse("[registry.\"docker.io\"]\nmirrors = \"m\"").is_err());
+        assert!(parse("[registries.\"docker.io\"]\nmirror = \"m\"").is_err());
         assert!(parse("api_key = \"x\"").is_err());
     }
 
@@ -844,6 +996,147 @@ mod tests {
         assert!(peers_from(None, &[system(), opted_out]).is_empty());
         assert!(peers_from(None, &[]).is_empty());
         assert!(parse("[aggregation]\npeer = \"a\"").is_err());
+    }
+
+    // -- registry mirrors ----------------------------------------------------
+
+    /// A mirror is spelled like a URL with the scheme optional, and
+    /// comes out normalized the way the Go shim wants it.
+    #[test]
+    fn a_mirror_is_normalized_and_defaults_to_https() {
+        assert_eq!(
+            mirror_url_of("mirror.gcr.io").as_deref(),
+            Ok("https://mirror.gcr.io")
+        );
+        assert_eq!(
+            mirror_url_of(" HTTP://Mirror.Corp:5000/ ").as_deref(),
+            Ok("http://mirror.corp:5000")
+        );
+        assert_eq!(
+            mirror_url_of("https://proxy.corp/registry/").as_deref(),
+            Ok("https://proxy.corp/registry")
+        );
+        for bad in [
+            "",
+            "ftp://mirror",
+            "https://",
+            "https://user:pw@mirror",
+            "https://mirror?x=1",
+            "https://mirror#frag",
+        ] {
+            assert!(mirror_url_of(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The table key is a host. Hub's aliases fold onto `docker.io`,
+    /// which is what a reference's `docker.io/ai/x` names and what the
+    /// Go shim is asked for.
+    #[test]
+    fn a_registry_key_is_a_host_and_hub_has_one_name() {
+        assert_eq!(
+            canonical_registry_host("Index.Docker.io").as_deref(),
+            Some("docker.io")
+        );
+        assert_eq!(
+            canonical_registry_host("registry-1.docker.io").as_deref(),
+            Some("docker.io")
+        );
+        assert_eq!(
+            canonical_registry_host("localhost:5000").as_deref(),
+            Some("localhost:5000")
+        );
+        assert_eq!(
+            canonical_registry_host("ghcr.io").as_deref(),
+            Some("ghcr.io")
+        );
+        assert_eq!(
+            canonical_registry_host("[::1]:5000").as_deref(),
+            Some("[::1]:5000")
+        );
+        assert_eq!(
+            canonical_registry_host("ghcr.io:443").as_deref(),
+            Some("ghcr.io")
+        );
+        for bad in [
+            "",
+            "https://ghcr.io",
+            "ghcr.io/org",
+            "*.example.com",
+            "host:port",
+            ":5000",
+            "user@registry",
+            "registry?q=1",
+            "registry#f",
+            "[not-an-ip]:5000",
+            "a b",
+        ] {
+            assert_eq!(canonical_registry_host(bad), None, "{bad:?}");
+        }
+        assert!(parse("[registries.\"https://ghcr.io\"]\nmirrors = \"m\"").is_err());
+        assert!(parse("[registries.\"ghcr.io\"]\nmirrors = \"ftp://m\"").is_err());
+        assert!(parse("[registries.\"ghcr.io\"]\nmirrors = \"m\"").is_ok());
+        // Two keys for one registry would leave which wins to HashMap order.
+        assert!(parse(
+            "[registries.\"docker.io\"]\nmirrors = \"a\"\n[registries.\"index.docker.io\"]\nmirrors = \"b\""
+        )
+        .is_err());
+        assert!(parse(
+            "[registries.\"ghcr.io\"]\nmirrors = \"a\"\n[registries.\"GHCR.io\"]\nmirrors = \"b\""
+        )
+        .is_err());
+    }
+
+    /// Per host, the environment (Hub only), then the last file that
+    /// sets it; a blank opts a host out; hosts sort, mirrors keep order.
+    #[test]
+    fn mirrors_come_from_the_environment_then_the_last_file_that_sets_them() {
+        let system = || {
+            file(
+                r#"
+                [registries."docker.io"]
+                mirrors = "https://a, b:5000"
+
+                [registries."ghcr.io"]
+                mirrors = "http://g"
+                "#,
+            )
+        };
+        let user = file("[registries.\"index.docker.io\"]\nmirrors = \"c\"");
+        let opted_out = file("[registries.\"docker.io\"]\nmirrors = \"\"");
+        let silent = file("[registries.\"docker.io\"]");
+
+        let got = registry_mirrors_from(None, &[system(), silent]);
+        assert_eq!(
+            got.get("docker.io").map(Vec::as_slice),
+            Some(&["https://a".to_string(), "https://b:5000".to_string()][..])
+        );
+        assert_eq!(
+            got.get("ghcr.io").map(Vec::as_slice),
+            Some(&["http://g".to_string()][..])
+        );
+
+        let got = registry_mirrors_from(None, &[system(), user]);
+        assert_eq!(
+            got.get("docker.io").map(Vec::as_slice),
+            Some(&["https://c".to_string()][..]),
+            "a Hub alias replaces docker.io's own entry"
+        );
+
+        let got = registry_mirrors_from(None, &[system(), opted_out]);
+        assert!(!got.contains_key("docker.io"));
+        assert!(
+            got.contains_key("ghcr.io"),
+            "opting Hub out leaves ghcr.io alone"
+        );
+
+        let got = registry_mirrors_from(Some(" x , ,http://y:1/ "), &[system()]);
+        assert_eq!(
+            got.get("docker.io").map(Vec::as_slice),
+            Some(&["https://x".to_string(), "http://y:1".to_string()][..])
+        );
+        assert!(!registry_mirrors_from(Some(""), &[system()]).contains_key("docker.io"));
+        assert!(registry_mirrors_from(Some("ftp://nope"), &[]).is_empty());
+        assert!(registry_mirrors_from(None, &[]).is_empty());
     }
 
     // -- search paths --------------------------------------------------------

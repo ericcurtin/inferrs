@@ -133,13 +133,55 @@ func dockerHubCredentialKeys(host string) []string {
 }
 
 func newResolver(ctx context.Context) remotes.Resolver {
+	hosts := dockerconfig.ConfigureHosts(ctx, dockerconfig.HostOptions{
+		Credentials: dockerCredentials,
+	})
+	if !mirrorsDisabled(ctx) {
+		hosts = mirroredHosts(hosts)
+	}
 	return docker.NewResolver(docker.ResolverOptions{
-		Hosts: dockerconfig.ConfigureHosts(ctx, dockerconfig.HostOptions{
-			Credentials: dockerCredentials,
-		}),
+		Hosts:  hosts,
 		Client: &http.Client{Timeout: 120 * time.Second},
 	})
 }
+
+// mirroredHosts puts a registry's configured mirrors ahead of containerd's
+// default host list. containerd's resolver and fetcher already walk that
+// list in order, moving on when a host answers 404 or is unreachable, so
+// the fallback to the registry is its own — the same mechanism as its
+// hosts.toml mirrors, built in memory. Mirrors get Pull|Resolve only
+// (pushes stay with the registry) and borrow the registry's client and
+// authorizer, which asks dockerCredentials for the *mirror's* host: a
+// mirror's login is `llmman login <mirror>`, and the registry's
+// credentials never reach it. containerd adds `?ns=<registry>` to
+// requests it sends to a host other than the reference's.
+func mirroredHosts(defaults docker.RegistryHosts) docker.RegistryHosts {
+	return func(host string) ([]docker.RegistryHost, error) {
+		hosts, err := defaults(host)
+		mirrors := mirrorsFor(host)
+		if err != nil || len(hosts) == 0 || len(mirrors) == 0 {
+			return hosts, err
+		}
+		registry := hosts[0]
+		out := make([]docker.RegistryHost, 0, len(mirrors)+len(hosts))
+		for _, m := range mirrors {
+			out = append(out, docker.RegistryHost{
+				Client:       registry.Client,
+				Authorizer:   registry.Authorizer,
+				Host:         m.host,
+				Scheme:       m.scheme,
+				Path:         m.path + "/v2",
+				Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve,
+				Header:       registry.Header,
+			})
+		}
+		return append(out, hosts...), nil
+	}
+}
+
+// applyRegistryMirrors has nothing to do here: newResolver reads the
+// configuration afresh for every operation.
+func applyRegistryMirrors(mirrorSet) error { return nil }
 
 // describeErr enriches a containerd registry error with the response body,
 // when there is one — containerd's own ErrUnexpectedStatus.Error() deliberately

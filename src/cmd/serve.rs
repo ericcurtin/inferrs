@@ -93,6 +93,7 @@ Environment Variables:
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
       LLMMAN_PEERS                   A comma separated list of peer daemons ([scheme://]host[:port]) to pool hardware with (overrides [aggregation] in llmman.conf)
+      LLMMAN_REGISTRY_MIRRORS        A comma separated list of Docker Hub mirrors ([scheme://]host[:port]) to try before docker.io (overrides [registries.\"docker.io\"] in llmman.conf)
       LLMMAN_SCHED_SPREAD            Always schedule model across all GPUs
       LLMMAN_FLASH_ATTENTION         Enable flash attention
       LLMMAN_KV_CACHE_TYPE           Quantization type for the K/V cache (default: f16)
