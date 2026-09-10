@@ -70,7 +70,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "MODEL")]
     pub overflow_model: Option<String>,
     /// Forwarded as Ollama's own top-level `think` field on every request
-    /// this sends (see cmd::serve's think_to_chat_template_kwargs) —
+    /// this sends (see cmd::serve::types's think_to_chat_template_kwargs) —
     /// `--think false` disables a reasoning model's thinking block
     /// entirely, `--think true` forces it on. Omitted (leaving the
     /// model's own template default in effect) if not passed at all.

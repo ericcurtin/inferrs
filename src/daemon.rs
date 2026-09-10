@@ -785,7 +785,7 @@ pub fn disable_std_handle_inheritance() {
 /// api.ProgressResponse) — status text plus an optional error, and
 /// (unlike real Ollama's per-layer digest/total/completed) our own
 /// aggregate total/completed byte counts across the whole pull/push, once
-/// cmd::serve's stream_ffi_progress has one to report — see that
+/// cmd::serve::ollama's stream_ffi_progress has one to report — see that
 /// function's own doc comment for where these come from.
 #[derive(Deserialize)]
 struct ProgressLine {
@@ -798,7 +798,7 @@ struct ProgressLine {
     #[serde(default)]
     notice: Option<String>,
     /// The manifest digest a push landed on, for `--sign-key` to sign
-    /// here rather than in the daemon. See `cmd::serve`'s `push_impl`.
+    /// here rather than in the daemon. See `cmd::serve::ollama`'s `push_impl`.
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
@@ -1070,16 +1070,16 @@ pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<ShowResponse> {
 /// Pushes `reference` via the daemon's `/api/push` and returns the
 /// manifest digest it landed on, for `cmd::push --sign-key` to sign.
 ///
-/// The daemon is deliberately not asked to sign: see `cmd::serve`'s
-/// `push_impl` for why a caller-supplied key path is not something an
-/// unauthenticated loopback endpoint may accept.
+/// The daemon is deliberately not asked to sign: see
+/// `cmd::serve::ollama`'s `push_impl` for why a caller-supplied key path
+/// is not something an unauthenticated loopback endpoint may accept.
 pub fn push(reference: &str) -> anyhow::Result<Option<String>> {
     stream_progress_with("/api/push", reference)
 }
 
 /// POSTs the Ollama unload sentinel (`{"model": reference, "keep_alive":
 /// 0}`, no `prompt` field — i.e. an empty prompt) to `/api/generate` —
-/// see `cmd::serve`'s `handle_ollama_generate` for the server side that
+/// see `cmd::serve::ollama`'s `handle_ollama_generate` for the server side that
 /// reads this exact shape as an immediate-unload request, mirroring real
 /// Ollama's own `ollama stop` (`cmd/cmd.go`'s `loadOrUnloadModel`). Used
 /// by `llmman stop`.

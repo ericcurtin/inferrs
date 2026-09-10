@@ -21,7 +21,7 @@ pub struct PushArgs {
 ///
 /// `--sign-key` is signed here, not by the daemon: the daemon reports
 /// which digest it pushed and this process signs it with its own key and
-/// its own registry credentials. See `cmd::serve`'s `push_impl` for why
+/// its own registry credentials. See `cmd::serve::ollama`'s `push_impl` for why
 /// an unauthenticated loopback endpoint must not take a key path.
 pub fn run(args: &PushArgs) -> anyhow::Result<()> {
     // Fast-fail before starting the daemon (which would create the store

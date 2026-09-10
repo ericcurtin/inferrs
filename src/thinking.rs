@@ -1,7 +1,7 @@
 //! Native `<think>...</think>` extraction — a direct port of ollama's
 //! `thinking/parser.go`, used as a fallback when the inference backend
 //! doesn't already separate reasoning from content itself (see
-//! `cmd::serve`'s own `oai_chunk_to_content`, which prefers a backend's
+//! `cmd::serve::stream`'s own `oai_chunk_to_content`, which prefers a backend's
 //! structured `reasoning_content`/`thinking` delta field whenever one is
 //! present and only ever falls back to this parser scanning raw `content`
 //! text for literal tag characters).
