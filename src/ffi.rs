@@ -37,6 +37,7 @@ extern "C" {
         password: *const c_char,
     ) -> *mut c_char;
     fn llmman_resolve_digest(reference: *const c_char) -> *mut c_char;
+    fn llmman_set_registry_mirrors(mirrors_json: *const c_char) -> *mut c_char;
 }
 
 // go-shim/push_stream.go is `!podman`-only: containerd's docker.Resolver
@@ -174,6 +175,40 @@ fn cstr(s: &str) -> anyhow::Result<CString> {
 }
 
 // ---------------------------------------------------------------------------
+// Registry configuration
+// ---------------------------------------------------------------------------
+
+/// Tells the Go shim the mirrors `llmman.conf` configures, once per
+/// process. Nothing but these arguments crosses the boundary, so it has
+/// to be told; a refused mirror is reported and dropped, since a pull
+/// straight from the registry is the right fallback.
+fn ensure_registries_configured() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mirrors = crate::config::registry_mirrors();
+        if mirrors.is_empty() {
+            return;
+        }
+        let result = serde_json::to_string(&mirrors)
+            .context("encode registry mirrors")
+            .and_then(|json| {
+                let j = cstr(&json)?;
+                consume(unsafe { llmman_set_registry_mirrors(j.as_ptr()) })
+            });
+        if let Err(e) = result {
+            eprintln!("[llmman] warning: ignoring registry mirrors: {e}");
+        }
+    });
+}
+
+/// [`consume`] for a call that reaches a registry: configures mirrors
+/// first, so no wrapper can forget to.
+fn registry_call(call: impl FnOnce() -> *mut c_char) -> anyhow::Result<String> {
+    ensure_registries_configured();
+    consume(call())
+}
+
+// ---------------------------------------------------------------------------
 // Safe public API
 // ---------------------------------------------------------------------------
 
@@ -195,20 +230,20 @@ pub fn logout(server: &str) -> anyhow::Result<()> {
 pub fn push(layout_dir: &str, reference: &str) -> anyhow::Result<()> {
     let l = cstr(layout_dir)?;
     let r = cstr(reference)?;
-    consume(unsafe { llmman_push(l.as_ptr(), r.as_ptr()) }).map(|_| ())
+    registry_call(|| unsafe { llmman_push(l.as_ptr(), r.as_ptr()) }).map(|_| ())
 }
 
 /// Pull an image from a registry into `layout_dir` (OCI layout).
 pub fn pull(reference: &str, layout_dir: &str) -> anyhow::Result<()> {
     let r = cstr(reference)?;
     let l = cstr(layout_dir)?;
-    consume(unsafe { llmman_pull(r.as_ptr(), l.as_ptr()) }).map(|_| ())
+    registry_call(|| unsafe { llmman_pull(r.as_ptr(), l.as_ptr()) }).map(|_| ())
 }
 
 /// Fetch and return the raw manifest JSON for a remote registry reference.
 pub fn inspect_remote(reference: &str) -> anyhow::Result<String> {
     let r = cstr(reference)?;
-    consume(unsafe { llmman_inspect(r.as_ptr()) })
+    registry_call(|| unsafe { llmman_inspect(r.as_ptr()) })
 }
 
 /// The result of one completed transfer, whichever of the three
@@ -248,7 +283,7 @@ impl TransferOutcome {
 pub fn transfer(source: &str, destination: &str) -> anyhow::Result<TransferOutcome> {
     let s = cstr(source)?;
     let d = cstr(destination)?;
-    let data = consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) })?;
+    let data = registry_call(|| unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) })?;
     serde_json::from_str(&data).context("decode transfer outcome")
 }
 
@@ -287,7 +322,7 @@ pub fn verify(reference: &str, digest: &str, keys: &[String]) -> anyhow::Result<
     let r = cstr(reference)?;
     let d = cstr(digest)?;
     let k = cstr(&serde_json::to_string(keys).context("encode trusted key list")?)?;
-    let data = consume(unsafe { llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr()) })?;
+    let data = registry_call(|| unsafe { llmman_verify(r.as_ptr(), d.as_ptr(), k.as_ptr()) })?;
     serde_json::from_str(&data).context("decode verification report")
 }
 
@@ -307,7 +342,7 @@ pub fn sign(
     let d = cstr(digest)?;
     let k = cstr(key_path)?;
     let p = cstr(password)?;
-    consume(unsafe { llmman_sign(r.as_ptr(), d.as_ptr(), k.as_ptr(), p.as_ptr()) })
+    registry_call(|| unsafe { llmman_sign(r.as_ptr(), d.as_ptr(), k.as_ptr(), p.as_ptr()) })
 }
 
 /// The manifest digest the registry currently serves for `reference`,
@@ -315,7 +350,7 @@ pub fn sign(
 /// check a signature before starting a multi-gigabyte download.
 pub fn resolved_digest_of(reference: &str) -> anyhow::Result<String> {
     let r = cstr(reference)?;
-    consume(unsafe { llmman_resolve_digest(r.as_ptr()) })
+    registry_call(|| unsafe { llmman_resolve_digest(r.as_ptr()) })
 }
 
 /// A registry destination resolved once via [`push_session_open`] and
@@ -334,7 +369,7 @@ pub fn push_session_open(destination: &str) -> anyhow::Result<PushSession> {
         session: i64,
     }
     let d = cstr(destination)?;
-    let data = consume(unsafe { llmman_push_session_open(d.as_ptr()) })?;
+    let data = registry_call(|| unsafe { llmman_push_session_open(d.as_ptr()) })?;
     let result: Result_ =
         serde_json::from_str(&data).context("decode push_session_open response")?;
     Ok(PushSession(result.session))
