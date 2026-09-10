@@ -39,6 +39,13 @@ Conversations and generated media are stored in the browser (IndexedDB),
 not by the daemon; *Settings* can export conversations as JSON (without
 the media) or delete them. Theme follows the system unless set.
 
+A daemon that requires an API key ([api.md](api.md#authentication))
+serves the page itself without one — it is only files — and the page
+asks for the key on its first `401`, keeps it in the browser's local
+storage, and sends it on every call thereafter; *Settings* shows and
+changes it. The shell's WebSocket carries it as a subprotocol, since a
+browser cannot set a header on an upgrade.
+
 ## The shell's guard rails
 
 A shell endpoint is only acceptable because the daemon is, by default,
@@ -48,8 +55,9 @@ way:
 1. **Loopback only.** When `LLMMAN_HOST` binds beyond loopback
    (`0.0.0.0`, a LAN address), the shell is off: a WebSocket upgrade gets
    `403` and the UI greys out the tab with the reason. Inference over the
-   network without authentication is a choice an operator can make; a
-   shell is not.
+   network behind an API key is a choice an operator can make; a shell
+   is not, even behind one. On loopback, a daemon with keys requires one
+   for the shell as for every other route.
 2. **Same-site browsers only.** Browsers do not apply CORS to WebSockets,
    so a page on any site could otherwise open
    `ws://127.0.0.1:17434/llmman/shell` from a visitor's browser. The

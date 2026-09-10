@@ -14,6 +14,9 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
+Every route but the web UI's own files requires an API key when the
+daemon has any configured; see [Authentication](#authentication).
+
 Use it as a drop-in Ollama server:
 
 ```
@@ -138,11 +141,53 @@ reports, unpriced.
 `/llmman/node` reports this node's memory and loaded/stored models; it
 is what aggregation peers ask each other. See [aggregation.md](aggregation.md).
 
+## Authentication
+
+With `LLMMAN_API_KEYS` (or `[auth] api_keys` in `llmman.conf`; see
+[configuration.md](configuration.md#authentication)) set, every request
+must present one of the keys, in either spelling the compatible surfaces
+already use:
+
+```http
+Authorization: Bearer <key>      # OpenAI clients
+x-api-key: <key>                 # Anthropic clients
+```
+
+Anything else is a `401` with `WWW-Authenticate: Bearer realm="llmman"`
+and the daemon's usual `{"error": ...}` body. Only `GET /` and `/ui/*`
+— the web UI's own files — are exempt, so the page can load and ask its
+user for the key; it then sends the key on every call, and, since a
+browser cannot set a header on a WebSocket, opens `/llmman/shell` with
+the subprotocol `llmman.bearer.<base64url(key)>`, which the daemon
+echoes back.
+
+The `llmman` CLI sends `LLMMAN_API_KEY`, defaulting to the first
+configured server key; `llmman launch` hands the same key to the
+integration it starts.
+
+A key that opens the daemon is not a provider key: the header it
+arrived in is removed before routing, so it is never relayed upstream.
+An authenticated caller *is* the operator, though, so the daemon spends
+its own provider keys for it whatever `LLMMAN_HOST` it is bound to —
+where an open daemon spends them only on a loopback bind. A caller that
+wants to use its own provider key sends it in the other header
+(`llmman run --provider` does this on its own).
+
+Without keys the daemon is open, and only allowed to be so on loopback:
+bound anywhere else it refuses to start unless `LLMMAN_AUTH=off`.
+
+TLS is terminated by the daemon itself with `LLMMAN_TLS_CERT` and
+`LLMMAN_TLS_KEY`, together with an `https://` `LLMMAN_HOST` so clients
+in the same environment connect the same way (the daemon refuses one
+without the other). `LLMMAN_TLS_CA` trusts a private CA — for every
+connection the process makes, providers included.
+
 ## Metrics
 
-`/metrics` is a Prometheus scrape target, off by default because the
-router has no authentication. `LLMMAN_METRICS=1 llmman serve` turns it
-on; the fifteen metric families and how to read them are in
+`/metrics` is a Prometheus scrape target, off by default because an
+open daemon has no authentication; with keys configured it requires one
+like every other route. `LLMMAN_METRICS=1 llmman serve` turns it on;
+the fifteen metric families and how to read them are in
 [metrics.md](metrics.md).
 
 ## CORS

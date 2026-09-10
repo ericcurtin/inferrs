@@ -1,5 +1,10 @@
 // The daemon's HTTP API as this page uses it: nothing UI-private beyond
 // /llmman/shell. Paths are relative so a gateway prefix works.
+//
+// A keyed daemon (LLMMAN_API_KEYS) gets the key as a bearer on every
+// same-origin call; the first 401 asks the user for one. The shell's
+// WebSocket cannot carry a header, so it goes as a subprotocol
+// (`llmman.bearer.` + base64url key) the daemon echoes back.
 
 /** A hosted model is addressed as `llmman.provider/<provider>/<model>`. */
 export const REMOTE_PREFIX = "llmman.provider/";
@@ -37,14 +42,54 @@ async function errorFrom(response) {
   return new ApiError(message.trim(), response.status);
 }
 
+// ---- API key -----------------------------------------------------------
+
+// Scoped by base path: two daemons behind one gateway must not share a key.
+const KEY_STORAGE = `llmman.apiKey:${new URL(document.baseURI).pathname}`;
+let pending = null; // the one open prompt, shared by concurrent 401s
+
+export function apiKey() {
+  return localStorage.getItem(KEY_STORAGE) || "";
+}
+
+export function setApiKey(key) {
+  if (key) localStorage.setItem(KEY_STORAGE, key);
+  else localStorage.removeItem(KEY_STORAGE);
+  pending = null;
+}
+
+/** Asks once for a key; resolves true if one was entered. */
+function askForKey() {
+  pending ??= new Promise((resolve) => {
+    const entered = prompt("This llmman serve requires an API key (LLMMAN_API_KEYS). Enter it to continue:", "");
+    if (entered !== null) setApiKey(entered.trim());
+    resolve(entered !== null);
+  });
+  return pending;
+}
+
+/** `fetch` with the key on same-origin URLs, asking on the first 401 and retrying once. */
+async function request(path, init = {}) {
+  const sameOrigin = new URL(path, document.baseURI).origin === location.origin;
+  const send = () => {
+    const key = sameOrigin ? apiKey() : "";
+    const headers = key ? { ...init.headers, authorization: `Bearer ${key}` } : init.headers;
+    return fetch(path, { ...init, headers });
+  };
+  const sent = apiKey();
+  let r = await send();
+  if (r.status === 401 && sameOrigin && (apiKey() !== sent || (await askForKey()))) r = await send();
+  return r;
+}
+
 async function getJson(path, init) {
-  const r = await fetch(path, init);
+  const r = await request(path, init);
   if (!r.ok) throw await errorFrom(r);
   return r.json();
 }
 
 async function postJson(path, body, init = {}) {
-  const r = await fetch(path, {
+  const r = await request(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -108,7 +153,7 @@ export async function unloadModel(model) {
 
 /** `DELETE /api/delete`. */
 export async function deleteModel(model) {
-  const r = await fetch("api/delete", {
+  const r = await request("api/delete", {
     method: "DELETE",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model }),
@@ -139,6 +184,17 @@ export function shellSocketUrl() {
   const url = new URL("llmman/shell", document.baseURI);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+/** A shell WebSocket, presenting the key as a subprotocol when there is one. */
+export function shellSocket() {
+  const key = apiKey();
+  if (!key) return new WebSocket(shellSocketUrl());
+  const b64url = btoa(String.fromCharCode(...new TextEncoder().encode(key)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return new WebSocket(shellSocketUrl(), [`llmman.bearer.${b64url}`]);
 }
 
 /** A streaming body's non-empty lines. */
@@ -303,7 +359,7 @@ export async function generateVideo({ model, prompt, fps, signal, ...opts }) {
     throw new ApiError(`the server generated ${frames} frames but has no ffmpeg to mux an mp4`, 200);
   }
   // Relative, like every other path here, so a gateway prefix works.
-  const content = await fetch(String(job.content_url).replace(/^\/+/, ""), { signal });
+  const content = await request(String(job.content_url).replace(/^\/+/, ""), { signal });
   if (!content.ok) throw await errorFrom(content);
   return { blob: await typedBlob(content, "video/mp4"), job };
 }

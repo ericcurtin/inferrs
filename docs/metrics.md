@@ -1,11 +1,13 @@
 # Prometheus metrics
 
 `llmman serve` can expose a Prometheus scrape target at `/metrics`. It is
-off by default: the router has no authentication, and `LLMMAN_HOST` can
-bind it beyond loopback, so an upgrade should not start publishing this
-daemon's version, route mix, model names and model churn to whoever can
-reach the port. `LLMMAN_METRICS=1` (or `true`, `yes`, `on`) serves it;
-unset, the route is absent, answers 404 and records nothing.
+off by default: a daemon without API keys has no authentication, so an
+upgrade should not start publishing this daemon's version, route mix,
+model names and model churn to whoever can reach the port.
+`LLMMAN_METRICS=1` (or `true`, `yes`, `on`) serves it; unset, the route
+is absent, answers 404 and records nothing. With keys configured (see
+[api.md](api.md#authentication)) the scrape needs one like any other
+request — Prometheus's `authorization: { credentials: <key> }`.
 
 ```bash
 LLMMAN_METRICS=1 llmman serve

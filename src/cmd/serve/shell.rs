@@ -3,11 +3,13 @@
 //!
 //! A real shell as the daemon's user, so who may open one is the design:
 //! only when the daemon is bound to loopback
-//! (`daemon::reachable_only_locally`); only from an `Origin` the CORS
-//! layer would allow, minus host wildcards, checked here because browsers
-//! do not apply CORS to WebSockets; and not at all under
-//! `LLMMAN_SHELL=off`. Any other `LLMMAN_SHELL` value is the command to
-//! run instead of the login shell.
+//! (`daemon::reachable_only_locally`); only with the daemon's API key
+//! when it has one (the `auth` module, which checks this route like every
+//! other — a browser presents the key as a subprotocol); only from an
+//! `Origin` the CORS layer would allow, minus host wildcards, checked
+//! here because browsers do not apply CORS to WebSockets; and not at all
+//! under `LLMMAN_SHELL=off`. Any other `LLMMAN_SHELL` value is the
+//! command to run instead of the login shell.
 //!
 //! Protocol: binary frames carry terminal bytes both ways; the client's
 //! text frames are `{"resize":{"cols":N,"rows":N}}`; the daemon's one text
@@ -162,6 +164,12 @@ pub(super) async fn handle_shell(
         (Some(_), Some(reason)) => (StatusCode::FORBIDDEN, reason).into_response(),
         (Some(ws), None) => {
             let command = state.0.shell.command.clone();
+            // A browser presents its API key as a subprotocol (see the
+            // `auth` module); the handshake fails unless it is echoed.
+            let ws = match super::auth::offered_ws_protocol(&headers) {
+                Some(protocol) => ws.protocols([protocol]),
+                None => ws,
+            };
             ws.on_upgrade(|socket| async move {
                 if let Err(e) = run_session(socket, &command).await {
                     eprintln!("[llmman] shell session ended with an error: {e:#}");

@@ -236,13 +236,20 @@ function initSettingsDialog() {
   const name = $("#setting-name");
   const system = $("#setting-system");
   const enter = $("#setting-enter");
+  const apiKey = $("#setting-api-key");
 
   $("#settings-btn").addEventListener("click", () => {
     theme.value = settings.get("theme");
     name.value = settings.get("name");
     system.value = settings.get("systemPrompt");
     enter.value = settings.get("sendWith");
+    apiKey.value = api.apiKey();
     dialog.showModal();
+  });
+  apiKey.addEventListener("change", () => {
+    api.setApiKey(apiKey.value.trim());
+    models.refresh({ quiet: true });
+    pollDaemon();
   });
   $("#settings-close").addEventListener("click", () => dialog.close());
   theme.addEventListener("change", () => settings.set({ theme: theme.value }));

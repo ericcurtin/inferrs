@@ -148,7 +148,7 @@ function connect() {
   hideOverlay();
   term.reset();
   fitNow();
-  const ws = new WebSocket(api.shellSocketUrl());
+  const ws = api.shellSocket();
   ws.binaryType = "arraybuffer";
   socket = ws;
   ws.addEventListener("open", () => {

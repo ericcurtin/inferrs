@@ -861,7 +861,7 @@ fn provider_compat_applies_openais_reasoning_model_rules() {
 
 #[test]
 fn a_peer_target_is_a_local_backend_in_all_but_address() {
-    let peer = Target::Peer("http://spark:17434".into());
+    let peer = aggregation::target(&test_state(), "http://spark:17434".into());
     assert_eq!(
         peer.url("/v1/chat/completions"),
         "http://spark:17434/v1/chat/completions"
@@ -948,9 +948,13 @@ async fn a_peer_request_carries_the_hop_marker_and_nothing_else() {
         model: "docker.io/ai/m:latest".into(),
         ..Default::default()
     };
-    let _body = post_chat(&Client::new(), &Target::Peer(origin), &mut req)
-        .await
-        .unwrap();
+    let _body = post_chat(
+        &Client::new(),
+        &aggregation::target(&test_state(), origin),
+        &mut req,
+    )
+    .await
+    .unwrap();
 
     let calls = seen.lock().await;
     let (path, headers, body) = &calls[0];
@@ -973,7 +977,7 @@ async fn ensure_model_forwards_to_the_peer_that_has_the_model_loaded() {
         .unwrap();
     assert_eq!(name, "docker.io/ai/m:latest");
     assert!(
-        matches!(&target, Target::Peer(o) if *o == origin),
+        matches!(&target, Target::Peer(p) if p.origin == origin),
         "{target:?}"
     );
 
@@ -1012,7 +1016,7 @@ async fn ensure_model_places_a_cold_model_on_the_roomiest_reachable_node() {
         .await
         .unwrap();
     assert!(
-        matches!(&target, Target::Peer(o) if *o == roomy),
+        matches!(&target, Target::Peer(p) if p.origin == roomy),
         "{target:?}"
     );
 
@@ -1784,7 +1788,10 @@ fn fixture_catalog() -> crate::providers::Catalog {
 #[test]
 fn the_provider_listing_reports_model_counts_not_model_ids() {
     let catalog = fixture_catalog();
-    let summaries: Vec<ProviderSummary> = catalog.iter().map(ProviderSummary::from).collect();
+    let summaries: Vec<ProviderSummary> = catalog
+        .iter()
+        .map(|p| ProviderSummary::new(&test_state(), p))
+        .collect();
     let json = serde_json::to_value(&summaries).unwrap();
     assert_eq!(json[0]["id"], "openrouter");
     assert_eq!(json[0]["name"], "OpenRouter");
@@ -1801,7 +1808,7 @@ fn the_provider_listing_reports_model_counts_not_model_ids() {
 fn a_single_provider_carries_its_models_and_their_prices() {
     let catalog = fixture_catalog();
     let provider = catalog.get("openrouter").unwrap();
-    let json = serde_json::to_value(ProviderResponse::from(provider)).unwrap();
+    let json = serde_json::to_value(ProviderResponse::new(&test_state(), provider)).unwrap();
     assert_eq!(json["base_url"], "https://openrouter.ai/api/v1");
     assert_eq!(
         json["models"],
@@ -1818,8 +1825,8 @@ fn provider_responses_carry_no_api_key() {
     let catalog = fixture_catalog();
     let provider = catalog.get("openrouter").unwrap();
     for json in [
-        serde_json::to_value(ProviderSummary::from(provider)).unwrap(),
-        serde_json::to_value(ProviderResponse::from(provider)).unwrap(),
+        serde_json::to_value(ProviderSummary::new(&test_state(), provider)).unwrap(),
+        serde_json::to_value(ProviderResponse::new(&test_state(), provider)).unwrap(),
     ] {
         let fields: Vec<&String> = json.as_object().unwrap().keys().collect();
         assert!(
@@ -1843,14 +1850,17 @@ fn a_configured_provider_reports_its_key_as_optional() {
         key_env: None,
     }]);
     let provider = catalog.get("gpubox").unwrap();
-    let json = serde_json::to_value(ProviderSummary::from(provider)).unwrap();
+    let json = serde_json::to_value(ProviderSummary::new(&test_state(), provider)).unwrap();
     assert_eq!(json["key_optional"], true);
     assert_eq!(json["key_set"], false);
     assert!(json.get("key_env").is_none(), "{json}");
     assert_eq!(json["base_url"], "http://gpubox:8000/v1");
     // The catalog entry is untouched, and still demands its key.
-    let json =
-        serde_json::to_value(ProviderSummary::from(catalog.get("openrouter").unwrap())).unwrap();
+    let json = serde_json::to_value(ProviderSummary::new(
+        &test_state(),
+        catalog.get("openrouter").unwrap(),
+    ))
+    .unwrap();
     assert_eq!(json["key_optional"], false);
 }
 
@@ -1933,8 +1943,8 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
             wire: Wire::OpenAi,
             key_env: None,
         });
-    let client = Client::new();
-    let models = configured_provider_models(&client, &provider).await;
+    let state = test_state();
+    let models = configured_provider_models(&state, &provider).await;
     assert_eq!(
         models,
         vec!["gemma4".to_string(), "qwen3-coder".to_string()]
@@ -1950,12 +1960,12 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
     // Nothing listening: an empty list, not a failure.
     let mut down = provider.clone();
     down.base_url = "http://127.0.0.1:9/v1".into();
-    assert!(configured_provider_models(&client, &down).await.is_empty());
+    assert!(configured_provider_models(&state, &down).await.is_empty());
 
     // The Anthropic wire has no /models, and is not asked.
     let mut anthropic = provider.clone();
     anthropic.wire = Wire::Anthropic;
-    assert!(configured_provider_models(&client, &anthropic)
+    assert!(configured_provider_models(&state, &anthropic)
         .await
         .is_empty());
     assert_eq!(seen.lock().await.len(), 1, "no second request was made");
@@ -2016,6 +2026,8 @@ fn test_inner(store_path: PathBuf) -> Inner {
             origins: default_allowed_origins(),
             command: Vec::new(),
         },
+        auth: auth::Policy::default(),
+        peer_key: None,
         client: Client::new(),
     }
 }
@@ -4755,9 +4767,13 @@ async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
 
 /// Binds `build_router(state, false)` on a free loopback port.
 async fn serve_router(state: AppState) -> String {
+    serve_router_with(state, false).await
+}
+
+async fn serve_router_with(state: AppState, metrics: bool) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router(state, false);
+    let app = build_router(state, metrics);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://127.0.0.1:{}", addr.port())
 }
@@ -5233,4 +5249,316 @@ async fn record_prompt_keeps_the_body_limit() {
     assert_eq!(send(256).await, StatusCode::PAYLOAD_TOO_LARGE);
     // The control: under the limit, the body reaches the handler.
     assert_eq!(send(32).await, StatusCode::OK);
+}
+
+// -- API keys (the `auth` module) -----------------------------------------
+
+fn keyed_state(keys: &[&str]) -> AppState {
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.auth = auth::Policy::with_keys(keys.iter().copied());
+    AppState(Arc::new(inner))
+}
+
+/// Every route but the UI's own files wants the key, in either header
+/// spelling; a wrong or missing one is a 401 with a challenge.
+#[tokio::test]
+async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
+    let url = serve_router_with(keyed_state(&["k1", "k2"]), true).await;
+    let client = Client::new();
+
+    for path in [
+        "/api/version",
+        "/v1/models",
+        "/llmman/node",
+        "/llmman/shell",
+        "/metrics",
+    ] {
+        let r = client.get(format!("{url}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(r.headers()["www-authenticate"], "Bearer realm=\"llmman\"");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("API key"),
+            "{body}"
+        );
+
+        let wrong = client
+            .get(format!("{url}{path}"))
+            .bearer_auth("k3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    // A POST route too, with a body that would otherwise be a 400.
+    let r = client
+        .post(format!("{url}/api/show"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // Either spelling, either key.
+    let bearer = client
+        .get(format!("{url}/api/version"))
+        .bearer_auth("k1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bearer.status(), StatusCode::OK);
+    let x_api_key = client
+        .get(format!("{url}/api/version"))
+        .header("x-api-key", "k2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(x_api_key.status(), StatusCode::OK);
+    let scrape = client
+        .get(format!("{url}/metrics"))
+        .bearer_auth("k2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scrape.status(), StatusCode::OK);
+
+    // The page loads, so it can ask for the key. Metrics off: another test
+    // asserts the process-wide registry never sees `/ui/*path`.
+    let url = serve_router(keyed_state(&["k1"])).await;
+    for path in ["/", "/ui/app.js"] {
+        let r = client.get(format!("{url}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{path}");
+    }
+}
+
+/// A browser's preflight carries no credential; refusing it would make
+/// every cross-origin page fail before it could send the key.
+#[tokio::test]
+async fn a_keyed_daemon_still_answers_cors_preflights() {
+    let url = serve_router(keyed_state(&["k1"])).await;
+    let r = Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{url}/v1/chat/completions"),
+        )
+        .header("origin", "http://localhost:3000")
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers()["access-control-allow-origin"],
+        "http://localhost:3000"
+    );
+}
+
+/// The key that opened the daemon is not a provider key, and must not be
+/// relayed as one — while a provider key in the other header still is.
+#[tokio::test]
+async fn the_daemon_key_is_stripped_before_the_handler_sees_the_headers() {
+    let state = keyed_state(&["daemon-key"]);
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::<HeaderMap>::new()));
+    let captured = seen.clone();
+    let app = Router::new()
+        .route(
+            "/api/version",
+            get(move |headers: HeaderMap| async move {
+                captured.lock().await.push(headers);
+                "ok"
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_key,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/api/version",
+        listener.local_addr().unwrap().port()
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = Client::new();
+
+    client
+        .get(&url)
+        .bearer_auth("daemon-key")
+        .send()
+        .await
+        .unwrap();
+    client
+        .get(&url)
+        .bearer_auth("sk-provider")
+        .header("x-api-key", "daemon-key")
+        .send()
+        .await
+        .unwrap();
+    client
+        .get(&url)
+        .bearer_auth("daemon-key")
+        .header("x-api-key", "sk-provider")
+        .send()
+        .await
+        .unwrap();
+    client
+        .get(&url)
+        .bearer_auth("daemon-key")
+        .header("x-api-key", "daemon-key")
+        .send()
+        .await
+        .unwrap();
+
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 4);
+    assert!(seen[0].get("authorization").is_none());
+    assert_eq!(client_api_key(Some(&seen[0])), None);
+    assert!(seen[1].get("x-api-key").is_none());
+    assert_eq!(
+        client_api_key(Some(&seen[1])).as_deref(),
+        Some("sk-provider")
+    );
+    assert!(seen[2].get("authorization").is_none());
+    assert_eq!(
+        client_api_key(Some(&seen[2])).as_deref(),
+        Some("sk-provider")
+    );
+}
+
+/// An authenticated caller is the operator, so the daemon's own provider
+/// key is spent for it however the daemon is bound — `key_usable` says so.
+#[test]
+fn an_authenticated_caller_may_spend_the_daemon_provider_key() {
+    let mut cross_site = HeaderMap::new();
+    cross_site.insert("sec-fetch-site", "cross-site".parse().unwrap());
+    let keyed = keyed_state(&["k"]);
+    assert!(daemon_key_spendable(&keyed, None));
+    assert!(daemon_key_spendable(&keyed, Some(&cross_site)));
+    // Open: the loopback rule, as before (the test process's LLMMAN_HOST
+    // decides the first half; the cross-site half is refused regardless).
+    assert!(!daemon_key_spendable(&test_state(), Some(&cross_site)));
+}
+
+/// The browser cannot set a header on an upgrade, so the shell takes
+/// the key as a subprotocol and echoes it, as the handshake requires.
+#[tokio::test]
+async fn a_shell_upgrade_presents_its_key_as_a_subprotocol() {
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.auth = auth::Policy::with_keys(["k"]);
+    inner.shell = shell::Policy {
+        disabled: None,
+        origins: default_allowed_origins(),
+        command: Vec::new(),
+    };
+    let url = serve_router(AppState(Arc::new(inner))).await;
+    let client = Client::new();
+    let shell_url = format!("{url}/llmman/shell");
+
+    let bare = ws_upgrade(&client, &shell_url, None).send().await.unwrap();
+    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = ws_upgrade(&client, &shell_url, None)
+        .header("sec-websocket-protocol", crate::auth::ws_protocol("nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let protocol = crate::auth::ws_protocol("k");
+    let keyed = ws_upgrade(&client, &shell_url, None)
+        .header("sec-websocket-protocol", format!("chat, {protocol}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keyed.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(keyed.headers()["sec-websocket-protocol"], protocol.as_str());
+}
+
+/// A peer is sent this node's peer key along with the hop marker.
+#[tokio::test]
+async fn a_peer_request_carries_the_peer_key_when_there_is_one() {
+    let (origin, seen) = mock_peer(node(0, &[], &[])).await;
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.peers = vec![origin.clone()];
+    inner.peer_key = Some("pool-key".into());
+    let state = AppState(Arc::new(inner));
+
+    let mut req = OAIChatRequest {
+        model: "docker.io/ai/m:latest".into(),
+        ..Default::default()
+    };
+    let _body = post_chat(
+        &Client::new(),
+        &aggregation::target(&state, origin),
+        &mut req,
+    )
+    .await
+    .unwrap();
+    let mut headers = HeaderMap::new();
+    aggregation::unload(&state, "docker.io/ai/m:latest", &headers).await;
+    headers.insert(aggregation::HOP, "1".parse().unwrap());
+    assert!(
+        !aggregation::unload(&state, "docker.io/ai/m:latest", &headers).await,
+        "a hopped request is not forwarded again"
+    );
+
+    let calls = seen.lock().await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for (_, headers, _) in calls.iter() {
+        assert_eq!(headers[aggregation::HOP], "1");
+        assert_eq!(headers["authorization"], "Bearer pool-key");
+    }
+}
+
+/// Under `LLMMAN_AUTH=off` a configured key is still recognized and
+/// stripped, never relayed as the caller's own; nothing is refused.
+#[tokio::test]
+async fn an_unenforced_policy_strips_its_keys_without_refusing_anyone() {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::<HeaderMap>::new()));
+    let captured = seen.clone();
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.auth = auth::Policy::with_keys(["daemon-key"]).optional();
+    let state = AppState(Arc::new(inner));
+    let app = Router::new()
+        .route(
+            "/api/version",
+            get(move |headers: HeaderMap| async move {
+                captured.lock().await.push(headers);
+                "ok"
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_key,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/api/version",
+        listener.local_addr().unwrap().port()
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = Client::new();
+
+    let bare = client.get(&url).send().await.unwrap();
+    assert_eq!(bare.status(), StatusCode::OK);
+    let keyed = client
+        .get(&url)
+        .bearer_auth("daemon-key")
+        .header("x-api-key", "sk-provider")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keyed.status(), StatusCode::OK);
+    let seen = seen.lock().await;
+    assert!(seen[1].get("authorization").is_none());
+    assert_eq!(
+        client_api_key(Some(&seen[1])).as_deref(),
+        Some("sk-provider")
+    );
 }

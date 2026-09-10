@@ -244,6 +244,7 @@ the most room to load it:
 
 ```
 llmman config set aggregation.peers asahi,spark
+llmman config set auth.api_keys <shared-key>
 LLMMAN_HOST=0.0.0.0 llmman serve
 ```
 
@@ -251,6 +252,11 @@ LLMMAN_HOST=0.0.0.0 llmman serve
 aggregation, and `llmman stop` reaches a model wherever it was loaded.
 Nothing is elected and nothing is shared: every node is a whole llmman
 that knows the others' addresses. See [docs/aggregation.md](docs/aggregation.md).
+
+A daemon the network can reach requires an API key on every request
+(`LLMMAN_API_KEYS`, or `auth.api_keys` as above; the CLI sends
+`LLMMAN_API_KEY`) unless `LLMMAN_AUTH=off`, and can terminate TLS itself
+with `LLMMAN_TLS_CERT`/`LLMMAN_TLS_KEY`. See [docs/api.md](docs/api.md#authentication).
 
 ## Launch an integration
 

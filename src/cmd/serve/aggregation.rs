@@ -6,6 +6,9 @@
 //! has the model loaded, or to the node with the most room; the listing
 //! routes answer for every node. A forwarded request carries [`HOP`] and
 //! is never forwarded again.
+//!
+//! Peers are sent this node's peer key (`Inner::peer_key`, defaulting to
+//! the first of its own), so one shared key set is all a pool needs.
 
 use std::collections::HashMap;
 
@@ -17,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
-use super::AppState;
+use super::{AppState, PeerTarget, Target};
 use crate::storage::OciStore;
 
 /// Marks a request forwarded by a peer: answer for this node alone.
@@ -70,6 +73,23 @@ pub(super) async fn handle_node(State(state): State<AppState>) -> Json<Node> {
     Json(local_node(&state).await)
 }
 
+/// Marks `req` as a hop to a peer, with the peer key when there is one.
+pub(super) fn hop(req: reqwest::RequestBuilder, key: Option<&str>) -> reqwest::RequestBuilder {
+    let req = req.header(HOP, "1");
+    match key {
+        Some(key) => req.bearer_auth(key),
+        None => req,
+    }
+}
+
+/// The [`Target`] for the peer at `origin`, carrying this node's peer key.
+pub(super) fn target(state: &AppState, origin: String) -> Target {
+    Target::Peer(std::sync::Arc::new(PeerTarget {
+        origin,
+        api_key: state.0.peer_key.clone(),
+    }))
+}
+
 /// Whether this node answers for the aggregation: it has peers, and the
 /// request did not come from one.
 pub(super) fn aggregates(state: &AppState, headers: &HeaderMap) -> bool {
@@ -80,15 +100,14 @@ pub(super) fn aggregates(state: &AppState, headers: &HeaderMap) -> bool {
 /// that is down, slow or unparseable.
 pub(super) async fn poll<T: DeserializeOwned>(state: &AppState, path: &str) -> Vec<(String, T)> {
     join_all(state.0.peers.iter().map(|peer| async move {
-        let sent = state
-            .0
-            .client
-            .get(format!("{peer}{path}"))
-            .header(HOP, "1")
-            .timeout(PEER_TIMEOUT)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status());
+        let sent = hop(
+            state.0.client.get(format!("{peer}{path}")),
+            state.0.peer_key.as_deref(),
+        )
+        .timeout(PEER_TIMEOUT)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status());
         let body = match sent {
             Ok(resp) => resp.json::<T>().await,
             Err(e) => Err(e),
@@ -156,14 +175,13 @@ pub(super) async fn unload(state: &AppState, model: &str, headers: &HeaderMap) -
     }
     let body = serde_json::json!({ "model": model, "keep_alive": 0 });
     join_all(state.0.peers.iter().map(|peer| {
-        state
-            .0
-            .client
-            .post(format!("{peer}/api/generate"))
-            .header(HOP, "1")
-            .json(&body)
-            .timeout(PEER_TIMEOUT)
-            .send()
+        hop(
+            state.0.client.post(format!("{peer}/api/generate")),
+            state.0.peer_key.as_deref(),
+        )
+        .json(&body)
+        .timeout(PEER_TIMEOUT)
+        .send()
     }))
     .await
     .into_iter()

@@ -50,6 +50,12 @@ dirs       = "5"
 tar        = "0.4"
 # `ws` for the web UI's terminal (`/llmman/shell`, src/cmd/serve/shell.rs).
 axum       = { version = "0.7", features = ["ws"] }
+# TLS termination for `llmman serve` (LLMMAN_TLS_CERT/LLMMAN_TLS_KEY).
+# `no-provider`: rustls's ring and aws-lc-rs providers are both already
+# in the tree (reqwest's and the AWS SDK's); serve installs ring itself
+# rather than have this pull a preference of its own.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls     = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tower-http = { version = "0.6", features = ["cors"] }
 # The pty behind that terminal: one crate for Unix ptys and Windows
 # ConPTY, and its default program is already "the user's login shell".

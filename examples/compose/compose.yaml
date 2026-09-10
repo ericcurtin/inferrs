@@ -6,6 +6,14 @@ services:
         LLMMAN_VERSION: ${LLMMAN_VERSION:-0.1.336}
     cpus: ${LLMMAN_CPUS:-4}
     restart: unless-stopped
+    environment:
+      # The daemon binds 0.0.0.0 inside the container, which it refuses to
+      # do without API keys unless told the omission is deliberate. Only
+      # the gateway's port is published, so authentication is Caddy's
+      # job here. To have the daemon check keys itself:
+      #   LLMMAN_AUTH= LLMMAN_API_KEYS=<key> docker compose ... up
+      LLMMAN_AUTH: ${LLMMAN_AUTH-off}
+      LLMMAN_API_KEYS: ${LLMMAN_API_KEYS-}
     volumes:
       - llmman-data:/var/lib/llmman
 

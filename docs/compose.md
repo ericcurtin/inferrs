@@ -20,6 +20,14 @@ Clients can use the same address as their API base URL. For example:
 curl http://localhost:8080/api/version
 ```
 
+The daemon binds `0.0.0.0` inside the container, which it only does with
+API keys or `LLMMAN_AUTH=off` ([configuration.md](configuration.md#authentication)).
+The example sets `LLMMAN_AUTH=off`, leaving authentication to the
+gateway, since the daemon's port is not published — only Caddy's is.
+To have the daemon check keys itself, clear that and set the keys —
+`LLMMAN_AUTH= LLMMAN_API_KEYS=<key> docker compose ... up`; the web UI
+then asks for one.
+
 The image includes checksum-verified, pinned llmman and llama.cpp CPU binaries.
 Override the llmman version at build time when needed:
 
@@ -55,4 +63,5 @@ apply a CPU limit to the backend container separately.
 
 The example only publishes Caddy's port. Add authentication and TLS to the
 [`Caddyfile`](../examples/compose/Caddyfile) before exposing it outside a trusted
-network; the llmman API itself does not authenticate requests.
+network, or have the daemon do both itself (`LLMMAN_API_KEYS`,
+`LLMMAN_TLS_CERT`/`LLMMAN_TLS_KEY`; see [api.md](api.md#authentication)).

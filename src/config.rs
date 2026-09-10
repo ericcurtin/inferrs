@@ -30,6 +30,10 @@
 //!
 //! [aggregation]                        # cmd::serve::aggregation
 //! peers = "asahi,spark:17434"
+//! api_key = "..."                      # presented to peers; defaults to the first auth key
+//!
+//! [auth]                               # cmd::serve::auth
+//! api_keys = "k1,k2"                   # what a request to this daemon must present
 //! ```
 //!
 //! Parsing happens once, in [`files`]; what a *failed* parse means is
@@ -68,16 +72,49 @@ pub struct Conf {
     /// Peer daemons — see `cmd::serve::aggregation`.
     #[serde(default)]
     pub aggregation: AggregationConf,
+    /// Private, like `providers`: reached through [`auth_api_keys`] only.
+    #[serde(default)]
+    auth: AuthConf,
 }
 
 /// The `[aggregation]` section.
-#[derive(Deserialize, Default, Debug, Clone)]
+#[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AggregationConf {
     /// Comma-separated `[scheme://]host[:port]`, as `LLMMAN_PEERS` — a
     /// string so `llmman config set aggregation.peers a,b` can write it.
     #[serde(default)]
     pub peers: Option<String>,
+    /// Presented to peers, as `LLMMAN_PEER_API_KEY`; see [`peer_api_key`].
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+impl std::fmt::Debug for AggregationConf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AggregationConf")
+            .field("peers", &self.peers)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The `[auth]` section — see `cmd::serve::auth`.
+#[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+struct AuthConf {
+    /// Comma-separated keys a request must present, as `LLMMAN_API_KEYS`
+    /// — a string so `llmman config set auth.api_keys a,b` can write it.
+    #[serde(default)]
+    api_keys: Option<String>,
+}
+
+impl std::fmt::Debug for AuthConf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConf")
+            .field("api_keys", &self.api_keys.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// One `[providers.<id>]` table. Without `base_url` it keys a catalog
@@ -502,18 +539,81 @@ pub fn peers() -> Vec<String> {
 }
 
 fn peers_from(env: Option<&str>, files: &[File]) -> Vec<String> {
-    env.or_else(|| {
+    split_list(env.or_else(|| {
         files
             .iter()
             .rev()
             .find_map(|f| f.conf.aggregation.peers.as_deref())
-    })
-    .unwrap_or_default()
-    .split(',')
-    .map(str::trim)
-    .filter(|s| !s.is_empty())
-    .map(str::to_string)
-    .collect()
+    }))
+}
+
+/// A comma-separated setting as its non-blank, trimmed items.
+fn split_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Daemon API keys
+// ---------------------------------------------------------------------------
+
+/// The keys `llmman serve` requires: `LLMMAN_API_KEYS` when set (even
+/// empty), else the last file setting `auth.api_keys` that passes the
+/// mode gate. Replaced, not merged, like [`peers`].
+pub fn auth_api_keys() -> Vec<String> {
+    split_list(
+        std::env::var("LLMMAN_API_KEYS")
+            .ok()
+            .or_else(|| {
+                secret_from_files(files().unwrap_or_default(), "auth.api_keys", |f| {
+                    f.conf.auth.api_keys.as_deref()
+                })
+            })
+            .as_deref(),
+    )
+}
+
+/// The key presented to peers: `LLMMAN_PEER_API_KEY`, else the last file
+/// setting `aggregation.api_key` that passes the mode gate. `None` for blank.
+pub fn peer_api_key() -> Option<String> {
+    std::env::var("LLMMAN_PEER_API_KEY")
+        .ok()
+        .or_else(|| {
+            secret_from_files(files().unwrap_or_default(), "aggregation.api_key", |f| {
+                f.conf.aggregation.api_key.as_deref()
+            })
+        })
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+/// The last file that sets a secret field, behind [`load_provider_keys`]'s
+/// mode gate: a loose file is skipped with a warning. A blank is returned
+/// as such — it is how a user file clears a system-wide value.
+fn secret_from_files<'a>(
+    files: &'a [File],
+    field: &str,
+    pick: impl Fn(&'a File) -> Option<&'a str>,
+) -> Option<String> {
+    for file in files.iter().rev() {
+        let Some(value) = pick(file) else { continue };
+        if !value.trim().is_empty() {
+            if let Err(e) = owner_readable_only(&file.path) {
+                eprintln!(
+                    "[llmman] warning: ignoring {field} in {}: {e}",
+                    file.path.display()
+                );
+                continue;
+            }
+        }
+        return Some(value.to_string());
+    }
+    None
 }
 
 /// Refuses a file that group or other can read, the way `ssh` refuses a
@@ -844,6 +944,88 @@ mod tests {
         assert!(peers_from(None, &[system(), opted_out]).is_empty());
         assert!(peers_from(None, &[]).is_empty());
         assert!(parse("[aggregation]\npeer = \"a\"").is_err());
+    }
+
+    /// The daemon's own keys and the peer key are secrets: redacted in
+    /// `Debug`, and read from the last file that sets them — skipping,
+    /// with a warning, one that other users can read.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_and_peer_keys_are_redacted_and_gated_on_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let c = conf("[auth]\napi_keys = \"k-secret,k2\"\n[aggregation]\napi_key = \"p-secret\"");
+        let rendered = format!("{c:?}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(
+            parse("[auth]\napi_key = \"k\"").is_err(),
+            "the field is plural"
+        );
+
+        let dir = std::env::temp_dir().join(format!("llmman-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write = |name: &str, text: &str, mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        write(
+            "system.conf",
+            "[auth]\napi_keys = \"a, b\"\n[aggregation]\napi_key = \"pa\"",
+            0o600,
+        );
+        write(
+            "loose.conf",
+            "[auth]\napi_keys = \"c\"\n[aggregation]\napi_key = \"pc\"",
+            0o644,
+        );
+        write(
+            "out.conf",
+            "[auth]\napi_keys = \"\"\n[aggregation]\napi_key = \"\"",
+            0o644,
+        );
+        let files = |names: &[&str]| -> Vec<File> {
+            names
+                .iter()
+                .map(|n| {
+                    let path = dir.join(n);
+                    File {
+                        dir: dir.clone(),
+                        conf: parse(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+                        path,
+                    }
+                })
+                .collect()
+        };
+        let keys = |files: &[File]| {
+            split_list(
+                secret_from_files(files, "auth.api_keys", |f| f.conf.auth.api_keys.as_deref())
+                    .as_deref(),
+            )
+        };
+        let peer = |files: &[File]| {
+            secret_from_files(files, "aggregation.api_key", |f| {
+                f.conf.aggregation.api_key.as_deref()
+            })
+        };
+        let ab = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(keys(&files(&["system.conf"])), ab);
+        assert_eq!(peer(&files(&["system.conf"])).as_deref(), Some("pa"));
+        // The loose file's secret is skipped, and the system one used.
+        assert_eq!(keys(&files(&["system.conf", "loose.conf"])), ab);
+        assert_eq!(
+            peer(&files(&["system.conf", "loose.conf"])).as_deref(),
+            Some("pa")
+        );
+        // A blank needs no mode: it holds nothing, and clears the system one.
+        assert!(keys(&files(&["system.conf", "out.conf"])).is_empty());
+        assert_eq!(
+            peer(&files(&["system.conf", "out.conf"])).as_deref(),
+            Some("")
+        );
+        assert!(keys(&[]).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- search paths --------------------------------------------------------
