@@ -370,7 +370,7 @@ pub(super) async fn proxy_openai_passthrough(
 }
 
 /// [`proxy_openai_passthrough`] after the model is loaded: wire checks,
-/// then the proxy. Split out for [`handle_openai_media`].
+/// then the proxy. Split out for [`handle_openai_media`](super::handle_openai_media).
 pub(super) async fn forward_openai_request(
     state: &AppState,
     headers: &HeaderMap,
