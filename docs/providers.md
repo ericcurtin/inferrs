@@ -174,6 +174,7 @@ installed:
 | `codex` | OpenAI Codex CLI | yes (below) |
 | `aider` | Aider | yes |
 | `qwen` | Qwen Code | yes |
+| `vibe` | Mistral Vibe CLI | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
 | `cline` | Cline | no: it picks its own model rather than taking llmman's |

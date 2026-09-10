@@ -21,6 +21,7 @@ use std::process::Command;
 
 use anyhow::Context;
 use clap::Args;
+use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 use crate::chat_template::ThinkingControls;
 use crate::daemon;
@@ -187,11 +188,14 @@ fn check_model_flag(
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
 fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
-    extra_args.iter().any(|a| {
-        a == long
-            || a.starts_with(&format!("{long}="))
-            || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
-    })
+    extra_args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| {
+            a == long
+                || a.starts_with(&format!("{long}="))
+                || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +438,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "Qwen Code",
         binary: "qwen",
     },
+    Integration {
+        name: "vibe",
+        description: "Mistral Vibe CLI",
+        binary: "vibe",
+    },
 ];
 
 fn print_integrations() {
@@ -528,6 +537,7 @@ fn launch(
         "hermes" => launch_hermes(model, extra_args),
         "openclaw" => launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, extra_args),
+        "vibe" => launch_vibe(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -1405,6 +1415,264 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
 }
 
+/// The variable llmman's vibe provider entry names as its key — same
+/// convention as [`QWEN_ENV_KEY`], its own constant since the two entries
+/// live in unrelated config files and nothing is gained by coupling them.
+const VIBE_ENV_KEY: &str = "LLMMAN_API_KEY";
+
+/// vibe: Mistral Vibe CLI's `config.toml` custom-provider form, pointed at our
+/// `/v1` endpoint. The provider and model use reserved llmman names so a
+/// project-local config cannot shadow the user-level entries this launcher owns.
+/// The active model is selected through Vibe's environment override rather than
+/// inheriting `active_model` from either config file.
+fn launch_vibe(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_on_path("vibe").ok_or_else(|| anyhow::anyhow!("vibe is not installed"))?;
+    let workdir = vibe_workdir(extra_args)?;
+    reject_vibe_project_collisions(&workdir)?;
+    let effective_model = if model.trim().is_empty() {
+        "default"
+    } else {
+        model.trim()
+    };
+    write_vibe_config(effective_model, &format!("{}/v1", daemon::server()))?;
+
+    exec_with_env(
+        &bin,
+        extra_args,
+        &[
+            (VIBE_ENV_KEY, api_key),
+            ("VIBE_ACTIVE_MODEL", VIBE_MODEL_ALIAS),
+        ],
+    )
+}
+
+const VIBE_MODEL_ALIAS: &str = "__llmman";
+
+/// Project configuration outranks the user config in Vibe, so either collision
+/// would let a project silently redirect the reserved llmman entry. Refuse the
+/// launch before writing anything when that happens.
+fn reject_vibe_project_collisions(workdir: &Path) -> anyhow::Result<()> {
+    let path = workdir.join(".vibe").join("config.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let doc: DocumentMut = contents
+        .parse()
+        .with_context(|| format!("{} does not parse as TOML", path.display()))?;
+
+    if vibe_item_has_inline_table(doc.get("providers"), |table| {
+        table.get("name").and_then(|value| value.as_str()) == Some("llmman")
+    }) || doc
+        .get("providers")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|providers| {
+            providers
+                .iter()
+                .any(|provider| provider.get("name").and_then(Item::as_str) == Some("llmman"))
+        })
+    {
+        anyhow::bail!(
+            "Vibe project config {} defines reserved provider `llmman`, which would shadow llmman's provider",
+            path.display()
+        );
+    }
+
+    if vibe_item_has_inline_table(doc.get("models"), |table| {
+        table.get("alias").and_then(|value| value.as_str()) == Some(VIBE_MODEL_ALIAS)
+    }) || doc
+        .get("models")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| model.get("alias").and_then(Item::as_str) == Some(VIBE_MODEL_ALIAS))
+        })
+    {
+        anyhow::bail!(
+            "Vibe project config {} defines reserved model alias `{VIBE_MODEL_ALIAS}`, which would shadow llmman's model",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Checks inline TOML arrays such as `providers = [{ name = "llmman" }]`.
+/// `toml_edit` exposes those as `Item::Array`, not `ArrayOfTables`, so the
+/// collision check has to cover both representations.
+fn vibe_item_has_inline_table(
+    item: Option<&Item>,
+    matches: impl Fn(&toml_edit::InlineTable) -> bool,
+) -> bool {
+    item.and_then(Item::as_array).is_some_and(|array| {
+        array
+            .iter()
+            .any(|value| value.as_inline_table().is_some_and(&matches))
+    })
+}
+
+/// Resolves the project directory from Vibe's `--workdir`, or the current
+/// directory when Vibe was not given one. Only CLI options before `--` count.
+fn vibe_workdir(extra_args: &[String]) -> anyhow::Result<PathBuf> {
+    let mut args = extra_args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        let workdir = if arg == "--workdir" {
+            args.next()
+        } else {
+            arg.strip_prefix("--workdir=")
+        };
+        if let Some(workdir) = workdir.filter(|dir| !dir.is_empty()) {
+            let path = PathBuf::from(workdir);
+            return if path.is_absolute() {
+                Ok(path)
+            } else {
+                Ok(std::env::current_dir()?.join(path))
+            };
+        }
+    }
+    std::env::current_dir().context("no current directory")
+}
+
+/// `$VIBE_HOME` if set, else `~/.vibe` — matches vibe's own resolution
+/// (see the "Vibe home directory" section of its configuration docs).
+fn vibe_home() -> anyhow::Result<PathBuf> {
+    match std::env::var("VIBE_HOME").ok().filter(|d| !d.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(dirs::home_dir().context("no home directory")?.join(".vibe")),
+    }
+}
+
+/// Records llmman as a provider in vibe's `config.toml`, as
+/// `write_codex_config`/`write_hermes_config`/`write_qwen_settings` do for
+/// theirs. See `vibe_config_merged` for what goes in.
+fn write_vibe_config(model: &str, base_url: &str) -> anyhow::Result<()> {
+    let config_dir = vibe_home()?;
+    let config_path = config_dir.join("config.toml");
+
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", config_path.display())),
+    };
+    let merged = vibe_config_merged(&existing, model, base_url)
+        .with_context(|| format!("{} does not parse as TOML", config_path.display()))?;
+    if merged == existing {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("create {}", config_dir.display()))?;
+    crate::fsutil::write_atomic(&config_path, merged.as_bytes())
+        .with_context(|| format!("write {}", config_path.display()))
+}
+
+/// `existing` with llmman's provider and reserved model alias merged in, pure
+/// so a test can hand it a literal. An existing `llmman` provider is replaced
+/// only when its ownership fingerprint matches. Any other provider with that
+/// name, or any other model using the reserved alias, is rejected.
+/// Unrelated providers/models and top-level content are preserved.
+fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Result<String> {
+    let mut doc: DocumentMut = if existing.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing.parse().context("invalid TOML")?
+    };
+
+    let provider_ours = if let Some(providers) = doc
+        .as_table()
+        .get("providers")
+        .and_then(Item::as_array_of_tables)
+    {
+        let mut found = false;
+        for provider in providers
+            .iter()
+            .filter(|t| t.get("name").and_then(Item::as_str) == Some("llmman"))
+        {
+            found = true;
+            anyhow::ensure!(
+                vibe_provider_is_ours(provider),
+                "cannot update Vibe provider `llmman`: an existing provider with that name is not managed by llmman"
+            );
+        }
+        found
+    } else {
+        false
+    };
+
+    let model_alias_conflict = if let Some(models) = doc
+        .as_table()
+        .get("models")
+        .and_then(Item::as_array_of_tables)
+    {
+        let mut conflict = false;
+        for model_table in models
+            .iter()
+            .filter(|t| t.get("alias").and_then(Item::as_str) == Some(VIBE_MODEL_ALIAS))
+        {
+            let ours = model_table.get("provider").and_then(Item::as_str) == Some("llmman");
+            anyhow::ensure!(
+                ours,
+                "cannot update Vibe reserved model alias `{VIBE_MODEL_ALIAS}`: an existing model with that alias is not managed by llmman"
+            );
+            conflict = true;
+        }
+        conflict
+    } else {
+        false
+    };
+
+    let providers = doc
+        .as_table_mut()
+        .entry("providers")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or_else(|| anyhow::anyhow!("`providers` is not an array of tables"))?;
+    if provider_ours {
+        providers.retain(|t| t.get("name").and_then(Item::as_str) != Some("llmman"));
+    }
+    let mut provider = Table::new();
+    provider.insert("name", value("llmman"));
+    provider.insert("api_base", value(base_url));
+    provider.insert("api_key_env_var", value(VIBE_ENV_KEY));
+    provider.insert("api_style", value("openai"));
+    provider.insert("backend", value("generic"));
+    providers.push(provider);
+
+    let models = doc
+        .as_table_mut()
+        .entry("models")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or_else(|| anyhow::anyhow!("`models` is not an array of tables"))?;
+    if model_alias_conflict {
+        models.retain(|t| t.get("alias").and_then(Item::as_str) != Some(VIBE_MODEL_ALIAS));
+    }
+    let mut model_table = Table::new();
+    model_table.insert("name", value(model));
+    model_table.insert("provider", value("llmman"));
+    model_table.insert("alias", value(VIBE_MODEL_ALIAS));
+    models.push(model_table);
+
+    Ok(doc.to_string())
+}
+
+/// Matches the stable fields that identify the provider written by llmman.
+/// The API base is intentionally not part of the fingerprint because the
+/// daemon address may change between launches.
+fn vibe_provider_is_ours(provider: &Table) -> bool {
+    let api_key_env_var = provider.get("api_key_env_var").and_then(Item::as_str);
+    let api_style = provider.get("api_style").and_then(Item::as_str);
+    let backend = provider.get("backend").and_then(Item::as_str);
+
+    api_key_env_var == Some(VIBE_ENV_KEY)
+        && api_style == Some("openai")
+        && backend == Some("generic")
+}
+
 // ---------------------------------------------------------------------------
 // Process execution helper
 // ---------------------------------------------------------------------------
@@ -1619,6 +1887,11 @@ mod tests {
         assert!(!has_flag(&args(&["-sm", "x"]), "--model", Some("-m")));
         assert!(!has_flag(
             &args(&["--model-context", "x"]),
+            "--model",
+            Some("-m")
+        ));
+        assert!(!has_flag(
+            &args(&["--", "--model", "x"]),
             "--model",
             Some("-m")
         ));
@@ -1909,6 +2182,154 @@ mod tests {
         write_qwen_settings_at(&dir, "m:latest", url).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh file gets exactly one provider/model pair in the shape
+    /// Mistral's own docs show for a custom provider, using the reserved alias.
+    #[test]
+    fn vibe_config_merged_writes_a_fresh_file() {
+        let url = "http://127.0.0.1:17434/v1";
+        let out = vibe_config_merged("", "gemma4", url).unwrap();
+        assert!(out.contains("[[providers]]"));
+        assert!(out.contains("name = \"llmman\""));
+        assert!(out.contains(&format!("api_base = \"{url}\"")));
+        assert!(out.contains(&format!("api_key_env_var = \"{VIBE_ENV_KEY}\"")));
+        assert!(out.contains("[[models]]"));
+        assert!(out.contains("provider = \"llmman\""));
+        assert!(out.contains(&format!("alias = \"{VIBE_MODEL_ALIAS}\"")));
+    }
+
+    /// A second launch with the same model must not touch the file — the
+    /// same "correct file is not touched" property
+    /// `write_qwen_settings_at_writes_once_keeps_a_bak_and_refuses_non_json`
+    /// checks for Qwen Code's settings.json.
+    #[test]
+    fn vibe_config_merged_is_idempotent_for_the_same_model() {
+        let url = "http://127.0.0.1:17434/v1";
+        let once = vibe_config_merged("", "gemma4", url).unwrap();
+        let twice = vibe_config_merged(&once, "gemma4", url).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    /// A user's own providers/models and unrelated top-level keys survive; an
+    /// llmman provider is replaced only by ownership, and only llmman's reserved
+    /// model alias is replaced.
+    #[test]
+    fn vibe_config_merged_replaces_only_llmmans_own_entries() {
+        let existing = "\
+default_agent = \"plan\"
+
+[[providers]]
+name = \"openrouter\"
+api_base = \"https://openrouter.ai/api/v1\"
+api_key_env_var = \"OPENROUTER_API_KEY\"
+api_style = \"openai\"
+backend = \"generic\"
+
+[[providers]]
+name = \"llmman\"
+api_base = \"http://10.0.0.2:17434/v1\"
+api_key_env_var = \"LLMMAN_API_KEY\"
+api_style = \"openai\"
+backend = \"generic\"
+
+[[models]]
+name = \"mistralai/codestral\"
+provider = \"openrouter\"
+alias = \"codestral-openrouter\"
+
+[[models]]
+name = \"old-model\"
+provider = \"llmman\"
+alias = \"old-model\"
+";
+        let url = "http://127.0.0.1:17434/v1";
+        let out = vibe_config_merged(existing, "new-model", url).unwrap();
+        assert!(out.contains("name = \"openrouter\""));
+        assert!(out.contains("codestral-openrouter"));
+        assert!(out.contains("default_agent = \"plan\""));
+        assert!(out.contains("old-model"));
+        assert!(!out.contains("10.0.0.2"));
+        assert_eq!(out.matches("name = \"llmman\"").count(), 1);
+        assert_eq!(out.matches("provider = \"llmman\"").count(), 2);
+        assert!(out.contains(&format!("api_base = \"{url}\"")));
+        assert!(!out.contains("active_model ="));
+        assert!(out.contains(&format!("alias = \"{VIBE_MODEL_ALIAS}\"")));
+    }
+
+    #[test]
+    fn vibe_config_merged_rejects_a_foreign_llmman_provider() {
+        let existing = "[[providers]]\nname = \"llmman\"\napi_base = \"https://example.com/v1\"\napi_key_env_var = \"OTHER_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n";
+        let err =
+            vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap_err();
+        assert!(err.to_string().contains("provider `llmman`"));
+        assert!(err.to_string().contains("not managed by llmman"));
+    }
+
+    #[test]
+    fn vibe_config_merged_rejects_a_foreign_reserved_model_alias() {
+        let existing = "[[models]]\nname = \"someone-elses-model\"\nprovider = \"openrouter\"\nalias = \"__llmman\"\n";
+        let err =
+            vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap_err();
+        assert!(err.to_string().contains("reserved model alias"));
+        assert!(err.to_string().contains("not managed by llmman"));
+    }
+
+    #[test]
+    fn reject_vibe_project_collisions_rejects_reserved_provider_and_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-vibe-project-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = dir.join(".vibe");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[[providers]]\nname = \"llmman\"\napi_base = \"https://example.com/v1\"\n",
+        )
+        .unwrap();
+        let err = reject_vibe_project_collisions(&dir).unwrap_err();
+        assert!(err.to_string().contains("reserved provider `llmman`"));
+
+        std::fs::write(
+            &path,
+            "[[models]]\nname = \"someone-elses-model\"\nprovider = \"openrouter\"\nalias = \"__llmman\"\n",
+        )
+        .unwrap();
+        let err = reject_vibe_project_collisions(&dir).unwrap_err();
+        assert!(err.to_string().contains("reserved model alias `__llmman`"));
+
+        std::fs::write(
+            &path,
+            "providers = [{ name = \"llmman\", api_base = \"https://example.com/v1\" }]\n",
+        )
+        .unwrap();
+        let err = reject_vibe_project_collisions(&dir).unwrap_err();
+        assert!(err.to_string().contains("reserved provider `llmman`"));
+
+        std::fs::write(
+            &path,
+            "models = [{ name = \"someone-elses-model\", provider = \"openrouter\", alias = \"__llmman\" }]\n",
+        )
+        .unwrap();
+        let err = reject_vibe_project_collisions(&dir).unwrap_err();
+        assert!(err.to_string().contains("reserved model alias `__llmman`"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-edited `providers`/`models` key that is not an array of
+    /// tables, or a file that is not valid TOML at all, is a clear error
+    /// rather than a silent overwrite of whatever the user actually meant.
+    #[test]
+    fn vibe_config_merged_rejects_what_it_cannot_safely_merge_into() {
+        let url = "http://127.0.0.1:17434/v1";
+        assert!(vibe_config_merged("providers = \"not a table\"", "m", url).is_err());
+        assert!(vibe_config_merged("not [ valid toml", "m", url).is_err());
     }
 
     /// Regression test for the codex config bug described on
