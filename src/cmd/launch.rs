@@ -184,11 +184,14 @@ fn check_model_flag(
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
 fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
-    extra_args.iter().any(|a| {
-        a == long
-            || a.starts_with(&format!("{long}="))
-            || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
-    })
+    extra_args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| {
+            a == long
+                || a.starts_with(&format!("{long}="))
+                || short.is_some_and(|s| a == s || a.starts_with(&format!("{s}=")))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,35 +1317,94 @@ const VIBE_ENV_KEY: &str = "LLMMAN_API_KEY";
 /// variable vibe reads at each launch, so unlike `write_hermes_config`'s
 /// hardcoded placeholder, the real key travels through the environment
 /// same as `claude`/`aider`/`codex` above, never persisted.
-///
-/// `active_model` is also forwarded as `--model` (see `vibe_args`):
-/// vibe resolves it from the highest-precedence source available, and a
-/// trusted `./.vibe/config.toml` in whatever directory the caller
-/// launched from — not llmman's, the caller's own project, unrelated to
-/// this config — can define its own `active_model` that would otherwise
-/// win over the one just written here.
 fn launch_vibe(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("vibe").ok_or_else(|| anyhow::anyhow!("vibe is not installed"))?;
-    let effective_model = if model.is_empty() { "default" } else { model };
-    write_vibe_config(effective_model, &format!("{}/v1", daemon::server()))?;
+    let effective_model = resolve_vibe_active_model(model, extra_args)?;
+    write_vibe_config(&effective_model, &format!("{}/v1", daemon::server()))?;
 
     exec_with_env(
         &bin,
-        &vibe_args(effective_model, extra_args),
-        &[(VIBE_ENV_KEY, api_key)],
+        extra_args,
+        &[
+            (VIBE_ENV_KEY, api_key),
+            ("VIBE_ACTIVE_MODEL", &effective_model),
+        ],
     )
 }
 
-/// `--model <model>` ahead of the caller's own arguments, dropped when
-/// the caller already passed it — same shape as `qwen_args`'s `--model`
-/// handling, minus the auth-type flag qwen alone needs.
-fn vibe_args(model: &str, extra_args: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(extra_args.len() + 2);
-    if !has_flag(extra_args, "--model", None) {
-        args.extend(["--model".to_string(), model.to_string()]);
+/// Resolves the active model Vibe should use. An explicit llmman `--model` wins;
+/// otherwise the project config wins over the user config, matching Vibe's
+/// configuration precedence. If neither config names a model, keep the same
+/// `default` fallback this integration historically used.
+fn resolve_vibe_active_model(model: &str, extra_args: &[String]) -> anyhow::Result<String> {
+    let model = model.trim();
+    let workdir = vibe_workdir(extra_args)?;
+    let project_config = workdir.join(".vibe").join("config.toml");
+    let user_config = vibe_home()?.join("config.toml");
+
+    let project_model = read_vibe_active_model(&project_config)?;
+    let user_model = read_vibe_active_model(&user_config)?;
+
+    Ok(resolve_vibe_active_model_from_configs(
+        project_model.as_deref(),
+        user_model.as_deref(),
+        Some(model),
+    )
+    .unwrap_or_else(|| "default".to_string()))
+}
+
+fn resolve_vibe_active_model_from_configs(
+    project_model: Option<&str>,
+    user_model: Option<&str>,
+    explicit_model: Option<&str>,
+) -> Option<String> {
+    explicit_model
+        .filter(|model| !model.trim().is_empty())
+        .or(project_model.filter(|model| !model.trim().is_empty()))
+        .or(user_model.filter(|model| !model.trim().is_empty()))
+        .map(str::to_string)
+}
+
+/// Reads the active model from one Vibe config file, if it exists.
+fn read_vibe_active_model(path: &Path) -> anyhow::Result<Option<String>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+
+    let doc: DocumentMut = contents
+        .parse()
+        .with_context(|| format!("{} does not parse as TOML", path.display()))?;
+    Ok(doc
+        .get("active_model")
+        .and_then(Item::as_str)
+        .map(str::to_string))
+}
+
+/// Resolves the project directory from Vibe's `--workdir`, or the current
+/// directory when Vibe was not given one. Only CLI options before `--` count.
+fn vibe_workdir(extra_args: &[String]) -> anyhow::Result<PathBuf> {
+    let mut args = extra_args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        let workdir = if arg == "--workdir" {
+            args.next()
+        } else {
+            arg.strip_prefix("--workdir=")
+        };
+        if let Some(workdir) = workdir.filter(|dir| !dir.is_empty()) {
+            let path = PathBuf::from(workdir);
+            return if path.is_absolute() {
+                Ok(path)
+            } else {
+                Ok(std::env::current_dir()?.join(path))
+            };
+        }
     }
-    args.extend_from_slice(extra_args);
-    args
+    std::env::current_dir().context("no current directory")
 }
 
 /// `$VIBE_HOME` if set, else `~/.vibe` — matches vibe's own resolution
@@ -1377,17 +1439,38 @@ fn write_vibe_config(model: &str, base_url: &str) -> anyhow::Result<()> {
         .with_context(|| format!("write {}", config_path.display()))
 }
 
-/// `existing` with llmman's provider, model and `active_model` merged in,
-/// pure so a test can hand it a literal — see `qwen_settings_merged`. Any
-/// previous llmman entries (a provider named `"llmman"`, and a model
-/// whose `provider` is `"llmman"`) are replaced rather than duplicated;
-/// every other provider and model, and any other top-level key, comment
-/// or formatting, is left exactly as `toml_edit` found it.
+/// `existing` with llmman's provider and model merged in, pure so a test can
+/// hand it a literal — see `qwen_settings_merged`. A previous llmman provider
+/// is replaced only after its ownership fingerprint matches. If a different
+/// provider is already named `llmman`, the merge fails rather than deleting it.
+/// Every other provider and model, and every other top-level key, comment or
+/// formatting, is left exactly as `toml_edit` found it.
 fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Result<String> {
     let mut doc: DocumentMut = if existing.trim().is_empty() {
         DocumentMut::new()
     } else {
         existing.parse().context("invalid TOML")?
+    };
+
+    let provider_ours = if let Some(providers) = doc
+        .as_table()
+        .get("providers")
+        .and_then(Item::as_array_of_tables)
+    {
+        let mut found = false;
+        for provider in providers
+            .iter()
+            .filter(|t| t.get("name").and_then(Item::as_str) == Some("llmman"))
+        {
+            found = true;
+            anyhow::ensure!(
+                vibe_provider_is_ours(provider),
+                "cannot update Vibe provider `llmman`: an existing provider with that name is not managed by llmman"
+            );
+        }
+        found
+    } else {
+        false
     };
 
     let providers = doc
@@ -1396,7 +1479,9 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("`providers` is not an array of tables"))?;
-    providers.retain(|t| t.get("name").and_then(Item::as_str) != Some("llmman"));
+    if provider_ours {
+        providers.retain(|t| t.get("name").and_then(Item::as_str) != Some("llmman"));
+    }
     let mut provider = Table::new();
     provider.insert("name", value("llmman"));
     provider.insert("api_base", value(base_url));
@@ -1411,7 +1496,9 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("`models` is not an array of tables"))?;
-    models.retain(|t| t.get("provider").and_then(Item::as_str) != Some("llmman"));
+    if provider_ours {
+        models.retain(|t| t.get("provider").and_then(Item::as_str) != Some("llmman"));
+    }
     let mut model_table = Table::new();
     model_table.insert("name", value(model));
     model_table.insert("provider", value("llmman"));
@@ -1421,6 +1508,19 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
     doc.as_table_mut().insert("active_model", value(model));
 
     Ok(doc.to_string())
+}
+
+/// Matches the stable fields that identify the provider written by llmman.
+/// The API base is intentionally not part of the fingerprint because the
+/// daemon address may change between launches.
+fn vibe_provider_is_ours(provider: &Table) -> bool {
+    let api_key_env_var = provider.get("api_key_env_var").and_then(Item::as_str);
+    let api_style = provider.get("api_style").and_then(Item::as_str);
+    let backend = provider.get("backend").and_then(Item::as_str);
+
+    api_key_env_var == Some(VIBE_ENV_KEY)
+        && api_style == Some("openai")
+        && backend == Some("generic")
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,6 +1737,11 @@ mod tests {
         assert!(!has_flag(&args(&["-sm", "x"]), "--model", Some("-m")));
         assert!(!has_flag(
             &args(&["--model-context", "x"]),
+            "--model",
+            Some("-m")
+        ));
+        assert!(!has_flag(
+            &args(&["--", "--model", "x"]),
             "--model",
             Some("-m")
         ));
@@ -1929,6 +2034,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn vibe_active_model_prefers_explicit_then_project_then_user() {
+        assert_eq!(
+            resolve_vibe_active_model_from_configs(Some("project"), Some("user"), Some("cli")),
+            Some("cli".to_string())
+        );
+        assert_eq!(
+            resolve_vibe_active_model_from_configs(Some("project"), Some("user"), None),
+            Some("project".to_string())
+        );
+        assert_eq!(
+            resolve_vibe_active_model_from_configs(None, Some("user"), None),
+            Some("user".to_string())
+        );
+        assert_eq!(
+            resolve_vibe_active_model_from_configs(None, None, None),
+            None
+        );
+    }
+
     /// A fresh file gets exactly one provider/model pair in the shape
     /// Mistral's own docs show for a custom provider, plus `active_model`.
     #[test]
@@ -2002,6 +2127,15 @@ alias = \"old-model\"
         assert!(out.contains("active_model = \"new-model\""));
     }
 
+    #[test]
+    fn vibe_config_merged_rejects_a_foreign_llmman_provider() {
+        let existing = "[[providers]]\nname = \"llmman\"\napi_base = \"https://example.com/v1\"\napi_key_env_var = \"OTHER_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n";
+        let err =
+            vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap_err();
+        assert!(err.to_string().contains("provider `llmman`"));
+        assert!(err.to_string().contains("not managed by llmman"));
+    }
+
     /// A hand-edited `providers`/`models` key that is not an array of
     /// tables, or a file that is not valid TOML at all, is a clear error
     /// rather than a silent overwrite of whatever the user actually meant.
@@ -2010,22 +2144,6 @@ alias = \"old-model\"
         let url = "http://127.0.0.1:17434/v1";
         assert!(vibe_config_merged("providers = \"not a table\"", "m", url).is_err());
         assert!(vibe_config_merged("not [ valid toml", "m", url).is_err());
-    }
-
-    /// `--model` goes in front unless the caller already spelled it,
-    /// `=`-joined or not — same property `qwen_args` holds to.
-    #[test]
-    fn vibe_args_forces_model_unless_caller_passed_it() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(vibe_args("m", &args(&[])), args(&["--model", "m"]));
-        assert_eq!(
-            vibe_args("m", &args(&["--model", "other"])),
-            args(&["--model", "other"])
-        );
-        assert_eq!(
-            vibe_args("m", &args(&["--model=other"])),
-            args(&["--model=other"])
-        );
     }
 
     /// Regression test for the codex config bug described on
